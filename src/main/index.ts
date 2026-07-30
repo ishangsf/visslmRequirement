@@ -11,7 +11,14 @@ import type {
   SyncProgress,
   SyncScopeConfig
 } from '../shared/types'
+import type { DataScope, QuerySpec } from '../shared/query-spec'
+import type { DashboardSaveInput, DashboardSpec } from '../shared/dashboard'
+import { QueryEngine } from './analytics/query-engine'
 import { AppDatabase } from './database'
+import { validateDashboardSpec } from './dashboards/validator'
+import { diagnoseDashboard } from './dashboards/diagnostics'
+import { ExpertRouter } from './experts/router'
+import { VisualizationAgent } from './experts/visualization-agent'
 import { OllamaAgent } from './ollama'
 import { SettingsService } from './settings'
 import { PushService, SyncService, VisslmClient } from './visslm'
@@ -22,6 +29,7 @@ let db: AppDatabase
 let settings: SettingsService
 let syncService: SyncService
 let pushService: PushService
+const expertRouter = new ExpertRouter()
 
 const createWindow = (): void => {
   mainWindow = new BrowserWindow({
@@ -116,8 +124,126 @@ const registerIpc = (): void => {
     db.listCollectionRequestLogs(page, pageSize)
   )
   ipcMain.handle('agent:ask', (_event, request: ChatRequest) => {
+    const route = expertRouter.route(request)
+    if (route.expert.id === 'visualization') {
+      const scope = request.dataScope ?? {
+        ...(request.projectId ? { projectIds: [request.projectId] } : {})
+      }
+      const queryEngine = new QueryEngine(db)
+      const agent = new VisualizationAgent(
+        queryEngine,
+        settings.getAll().model,
+        (run) => db.recordVisualizationRun(run)
+      )
+      return agent.generate(route.question, scope)
+        .then((dashboard) => ({
+          answer: `已生成“${dashboard.title}”，共 ${dashboard.components.length} 个组件。所有指标均由 QuerySpec 在本地数据范围内计算。`,
+          sources: [],
+          dataViews: [],
+          expertId: route.expert.id,
+          dashboard,
+          events: [
+            {
+              type: 'status' as const,
+              stage: 'validate',
+              message: 'DashboardSpec 与查询结果校验通过'
+            },
+            {
+              type: 'artifact' as const,
+              artifactId: dashboard.id,
+              version: 1,
+              dashboard
+            }
+          ]
+        }))
+        .catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error)
+          if (message === '当前数据范围没有可用字段，请先采集数据') {
+            return {
+              answer: '当前数据范围内没有可用于生成大屏的记录。请先完成数据采集，或调整数据范围后重试。',
+              sources: [],
+              dataViews: [],
+              expertId: route.expert.id,
+              events: [{
+                type: 'error' as const,
+                code: 'NO_ANALYTICS_DATA',
+                message,
+                recoverable: true
+              }]
+            }
+          }
+          throw error
+        })
+    }
     const agent = new OllamaAgent(db, settings.getAll().model)
-    return agent.ask(request)
+    return agent.ask({ ...request, question: route.question }).then((response) => ({
+      ...response,
+      expertId: route.expert.id
+    }))
+  })
+  ipcMain.handle('analytics:field-profiles', (_event, scope?: DataScope) =>
+    new QueryEngine(db).profile(scope ?? {})
+  )
+  ipcMain.handle('analytics:execute-query', (_event, spec: QuerySpec) =>
+    new QueryEngine(db).execute(spec)
+  )
+  ipcMain.handle('dashboards:list', () => db.listDashboards())
+  ipcMain.handle('dashboards:get', (_event, id: string, version?: number) =>
+    db.getDashboard(id, version)
+  )
+  ipcMain.handle('dashboards:versions', (_event, id: string) =>
+    db.listDashboardVersions(id)
+  )
+  ipcMain.handle('dashboards:save', (_event, input: DashboardSaveInput) => {
+    const errors = validateDashboardSpec(input.spec, new QueryEngine(db))
+    if (errors.length) throw new Error(`大屏校验失败：${errors.join('；')}`)
+    return db.saveDashboard(input)
+  })
+  ipcMain.handle('dashboards:restore', (_event, id: string, version: number) =>
+    db.restoreDashboard(id, version)
+  )
+  ipcMain.handle('dashboards:diagnose', (_event, spec: DashboardSpec) =>
+    diagnoseDashboard(spec, new QueryEngine(db))
+  )
+  ipcMain.handle('dashboards:runs', (_event, limit?: number) =>
+    db.listVisualizationRuns(limit)
+  )
+  ipcMain.handle('dashboards:export-json', async (_event, spec: DashboardSpec) => {
+    const errors = validateDashboardSpec(spec, new QueryEngine(db))
+    if (errors.length) throw new Error(`导出前校验失败：${errors.join('；')}`)
+    const safeTitle = spec.title.replace(/[<>:"/\\|?*\u0000-\u001F]/g, '-').slice(0, 80)
+    const result = await dialog.showSaveDialog(mainWindow!, {
+      title: '导出 DashboardSpec JSON',
+      defaultPath: `${safeTitle || 'dashboard'}.json`,
+      filters: [{ name: 'DashboardSpec JSON', extensions: ['json'] }]
+    })
+    if (result.canceled || !result.filePath) {
+      return { ok: false, canceled: true, message: '已取消导出' }
+    }
+    writeFileSync(result.filePath, `${JSON.stringify(spec, null, 2)}\n`, 'utf8')
+    return { ok: true, path: result.filePath, message: 'DashboardSpec 已导出' }
+  })
+  ipcMain.handle('dashboards:export-pdf', async (_event, spec: DashboardSpec) => {
+    const errors = validateDashboardSpec(spec, new QueryEngine(db))
+    if (errors.length) throw new Error(`导出前校验失败：${errors.join('；')}`)
+    if (!mainWindow) throw new Error('主窗口尚未就绪')
+    const safeTitle = spec.title.replace(/[<>:"/\\|?*\u0000-\u001F]/g, '-').slice(0, 80)
+    const result = await dialog.showSaveDialog(mainWindow, {
+      title: '导出大屏 PDF',
+      defaultPath: `${safeTitle || 'dashboard'}.pdf`,
+      filters: [{ name: 'PDF 文档', extensions: ['pdf'] }]
+    })
+    if (result.canceled || !result.filePath) {
+      return { ok: false, canceled: true, message: '已取消导出' }
+    }
+    const pdf = await mainWindow.webContents.printToPDF({
+      landscape: true,
+      printBackground: true,
+      pageSize: 'A4',
+      margins: { marginType: 'none' }
+    })
+    writeFileSync(result.filePath, pdf)
+    return { ok: true, path: result.filePath, message: '大屏 PDF 已导出' }
   })
 
   ipcMain.handle('data:export', async () => {

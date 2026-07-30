@@ -21,6 +21,15 @@ import type {
   RecordRow,
   SyncRun
 } from '../shared/types'
+import type { DataScope } from '../shared/query-spec'
+import type {
+  DashboardSaveInput,
+  DashboardSpec,
+  DashboardSummary,
+  DashboardVersion,
+  VisualizationRun,
+  VisualizationRunInput
+} from '../shared/dashboard'
 
 export interface RecordInput {
   uid: string
@@ -45,6 +54,248 @@ export interface ImageInput {
 type SqlRow = Record<string, unknown>
 
 const nowIso = (): string => new Date().toISOString()
+
+export interface FieldAggregateOptions {
+  field: string
+  projectId?: string
+  nodeType?: string
+  limit?: number
+  splitMultiValue?: boolean
+}
+
+export interface FieldAggregateResult {
+  field: string
+  totalRecords: number
+  matchedRecords: number
+  emptyRecords: number
+  valueOccurrences: number
+  splitMultiValue: boolean
+  items: Array<{
+    name: string
+    value: number
+    examples: Array<{ source: ChatSource }>
+  }>
+}
+
+export interface FieldInspectionOptions {
+  projectId?: string
+  nodeType?: string
+  search?: string
+  limit?: number
+}
+
+export interface FieldInspectionResult {
+  totalRecords: number
+  fields: Array<{
+    field: string
+    nonEmptyRecords: number
+    coverageRate: number
+    types: string[]
+    samples: string[]
+  }>
+}
+
+export type FieldQueryOperator =
+  | 'equals'
+  | 'not_equals'
+  | 'contains'
+  | 'not_contains'
+  | 'is_empty'
+  | 'not_empty'
+  | 'gt'
+  | 'gte'
+  | 'lt'
+  | 'lte'
+
+export interface FieldQueryFilter {
+  field: string
+  operator: FieldQueryOperator
+  value?: string
+}
+
+export interface FieldQueryOptions {
+  projectId?: string
+  nodeType?: string
+  search?: string
+  searchTerms?: string[]
+  searchMode?: 'any' | 'all'
+  filters?: FieldQueryFilter[]
+  fields?: string[]
+  sort?: { field: string; direction: 'asc' | 'desc' }
+  limit?: number
+}
+
+export interface FieldQueryResult {
+  totalScanned: number
+  matchedCount: number
+  returnedCount: number
+  fields: string[]
+  records: Array<{
+    source: ChatSource
+    values: Record<string, string | string[]>
+  }>
+}
+
+export interface AnalyticsRecord {
+  uid: string
+  projectId: string
+  nodeType: string
+  itemId: string
+  name: string
+  lastModifyTime: string
+  raw: Record<string, unknown>
+}
+
+const fieldValuesAtPath = (raw: Record<string, unknown>, fieldPath: string): unknown[] => {
+  const direct = raw[fieldPath]
+  if (direct !== undefined) return [direct]
+
+  const segments = fieldPath.split('.').map((segment) => segment.trim()).filter(Boolean)
+  const descend = (current: unknown, remaining: string[]): unknown[] => {
+    if (!remaining.length) return [current]
+    if (Array.isArray(current)) {
+      return current.flatMap((item) => descend(item, remaining))
+    }
+    if (!current || typeof current !== 'object') return []
+    const object = current as Record<string, unknown>
+    const [segment, ...rest] = remaining
+    const actualKey = Object.keys(object).find(
+      (key) => key.localeCompare(segment, undefined, { sensitivity: 'accent' }) === 0
+    )
+    return actualKey ? descend(object[actualKey], rest) : []
+  }
+  return descend(raw, segments)
+}
+
+const scalarFieldValues = (value: unknown): string[] => {
+  if (value === null || value === undefined) return []
+  if (Array.isArray(value)) return value.flatMap(scalarFieldValues)
+  if (typeof value === 'object') {
+    const object = value as Record<string, unknown>
+    for (const key of ['name', 'Name', 'label', 'Label', 'value', 'Value']) {
+      if (object[key] !== undefined) return scalarFieldValues(object[key])
+    }
+    return []
+  }
+  const text = String(value).trim()
+  return text ? [text] : []
+}
+
+const normalizedFieldValues = (value: unknown, splitMultiValue: boolean): string[] => {
+  const values = scalarFieldValues(value).flatMap((item) =>
+    splitMultiValue ? item.split(/[，,；;\n\r、|]+/) : [item]
+  )
+  return [...new Set(values.map((item) => item.trim()).filter(Boolean))]
+}
+
+const dateLikePattern =
+  /^\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:[T\s]\d{1,2}:\d{2}(?::\d{2})?)?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?$/
+
+const scalarType = (value: unknown): string => {
+  if (Array.isArray(value)) return 'array'
+  if (value === null) return 'null'
+  if (
+    typeof value === 'string' &&
+    dateLikePattern.test(value.trim()) &&
+    Number.isFinite(Date.parse(value))
+  ) return 'date'
+  return typeof value
+}
+
+const collectRecordFieldValues = (
+  input: Record<string, unknown>,
+  maxDepth = 3
+): Map<string, unknown[]> => {
+  const collected = new Map<string, unknown[]>()
+  const add = (path: string, value: unknown): void => {
+    const values = collected.get(path) ?? []
+    values.push(value)
+    collected.set(path, values)
+  }
+  const visit = (value: unknown, path: string, depth: number): void => {
+    if (value === null || value === undefined) return
+    if (Array.isArray(value)) {
+      const scalarItems = value.filter(
+        (item) => item === null || typeof item !== 'object'
+      )
+      if (scalarItems.length) add(path, scalarItems)
+      if (depth < maxDepth) {
+        value
+          .filter((item) => item && typeof item === 'object')
+          .forEach((item) => visit(item, path, depth + 1))
+      }
+      return
+    }
+    if (typeof value === 'object') {
+      if (depth >= maxDepth) return
+      for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+        visit(child, path ? `${path}.${key}` : key, depth + 1)
+      }
+      return
+    }
+    add(path, value)
+  }
+  visit(input, '', 0)
+  return collected
+}
+
+const comparisonValue = (value: string): number | string => {
+  const numeric = Number(value)
+  if (value.trim() && Number.isFinite(numeric)) return numeric
+  if (dateLikePattern.test(value.trim())) {
+    const date = Date.parse(value)
+    if (Number.isFinite(date)) return date
+  }
+  return value.toLocaleLowerCase()
+}
+
+const matchesFieldFilter = (values: string[], filter: FieldQueryFilter): boolean => {
+  if (filter.operator === 'is_empty') return values.length === 0
+  if (filter.operator === 'not_empty') return values.length > 0
+  if (!values.length) return false
+  const expected = String(filter.value ?? '').trim()
+  const expectedLower = expected.toLocaleLowerCase()
+  if (filter.operator === 'equals') {
+    return values.some((value) => value.toLocaleLowerCase() === expectedLower)
+  }
+  if (filter.operator === 'not_equals') {
+    return values.every((value) => value.toLocaleLowerCase() !== expectedLower)
+  }
+  if (filter.operator === 'contains') {
+    return values.some((value) => value.toLocaleLowerCase().includes(expectedLower))
+  }
+  if (filter.operator === 'not_contains') {
+    return values.every((value) => !value.toLocaleLowerCase().includes(expectedLower))
+  }
+  const right = comparisonValue(expected)
+  return values.some((value) => {
+    const left = comparisonValue(value)
+    if (typeof left !== typeof right) return false
+    if (filter.operator === 'gt') return left > right
+    if (filter.operator === 'gte') return left >= right
+    if (filter.operator === 'lt') return left < right
+    return left <= right
+  })
+}
+
+const fieldSearchTerms = (search?: string): string[] => {
+  const input = search?.trim().toLocaleLowerCase()
+  if (!input) return []
+  const terms = [input]
+  const aliases: Array<[RegExp, string[]]> = [
+    [/负责人|责任人|处理人/, ['assigned', 'assignee', 'owner', 'username']],
+    [/来源|来源单位/, ['source']],
+    [/状态/, ['state', 'status']],
+    [/版本|发布/, ['release', 'version']],
+    [/创建时间/, ['createtime', 'created']],
+    [/修改时间|更新时间/, ['lastmodifytime', 'updated']],
+    [/操作人|执行人|活动人/, ['record.username', 'username']]
+  ]
+  for (const [pattern, mapped] of aliases) {
+    if (pattern.test(input)) terms.push(...mapped)
+  }
+  return [...new Set(terms)]
+}
 
 export class AppDatabase {
   private readonly db: DatabaseSync
@@ -165,6 +416,49 @@ export class AppDatabase {
         ON collection_request_logs(created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_collection_logs_status
         ON collection_request_logs(status);
+
+      CREATE TABLE IF NOT EXISTS dashboards (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        subtitle TEXT NOT NULL DEFAULT '',
+        theme TEXT NOT NULL,
+        current_version INTEGER NOT NULL,
+        component_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS dashboard_versions (
+        dashboard_id TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        spec_json TEXT NOT NULL,
+        change_summary TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(dashboard_id, version),
+        FOREIGN KEY(dashboard_id) REFERENCES dashboards(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_dashboards_updated ON dashboards(updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_dashboard_versions_created
+        ON dashboard_versions(dashboard_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS visualization_runs (
+        id TEXT PRIMARY KEY,
+        dashboard_id TEXT NOT NULL DEFAULT '',
+        request_summary TEXT NOT NULL DEFAULT '',
+        model_name TEXT NOT NULL DEFAULT '',
+        prompt_version TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        component_count INTEGER NOT NULL DEFAULT 0,
+        query_count INTEGER NOT NULL DEFAULT 0,
+        duration_ms REAL NOT NULL DEFAULT 0,
+        error_message TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_visualization_runs_created
+        ON visualization_runs(created_at DESC);
     `)
 
     for (const statement of [
@@ -226,6 +520,228 @@ export class AppDatabase {
 
   close(): void {
     this.db.close()
+  }
+
+  listDashboards(): DashboardSummary[] {
+    return this.db.prepare(`
+      SELECT id, title, subtitle, theme, current_version, component_count, created_at, updated_at
+      FROM dashboards
+      ORDER BY updated_at DESC
+    `).all().map((row) => {
+      const value = row as SqlRow
+      return {
+        id: String(value.id),
+        title: String(value.title),
+        subtitle: String(value.subtitle),
+        theme: String(value.theme) as DashboardSummary['theme'],
+        currentVersion: Number(value.current_version),
+        componentCount: Number(value.component_count),
+        createdAt: String(value.created_at),
+        updatedAt: String(value.updated_at)
+      }
+    })
+  }
+
+  getDashboard(id: string, version?: number): DashboardVersion | null {
+    const row = version === undefined
+      ? this.db.prepare(`
+          SELECT v.dashboard_id, v.version, v.spec_json, v.change_summary, v.created_at
+          FROM dashboard_versions v
+          JOIN dashboards d ON d.id = v.dashboard_id AND d.current_version = v.version
+          WHERE v.dashboard_id = ?
+        `).get(id)
+      : this.db.prepare(`
+          SELECT dashboard_id, version, spec_json, change_summary, created_at
+          FROM dashboard_versions
+          WHERE dashboard_id = ? AND version = ?
+        `).get(id, version)
+    if (!row) return null
+    const value = row as SqlRow
+    return {
+      dashboardId: String(value.dashboard_id),
+      version: Number(value.version),
+      spec: JSON.parse(String(value.spec_json)) as DashboardSpec,
+      changeSummary: String(value.change_summary),
+      createdAt: String(value.created_at)
+    }
+  }
+
+  listDashboardVersions(id: string): DashboardVersion[] {
+    return this.db.prepare(`
+      SELECT dashboard_id, version, spec_json, change_summary, created_at
+      FROM dashboard_versions
+      WHERE dashboard_id = ?
+      ORDER BY version DESC
+    `).all(id).map((row) => {
+      const value = row as SqlRow
+      return {
+        dashboardId: String(value.dashboard_id),
+        version: Number(value.version),
+        spec: JSON.parse(String(value.spec_json)) as DashboardSpec,
+        changeSummary: String(value.change_summary),
+        createdAt: String(value.created_at)
+      }
+    })
+  }
+
+  saveDashboard(input: DashboardSaveInput): DashboardVersion {
+    const timestamp = nowIso()
+    const existing = this.db.prepare(
+      'SELECT current_version, created_at FROM dashboards WHERE id = ?'
+    ).get(input.spec.id) as SqlRow | undefined
+    const version = existing ? Number(existing.current_version) + 1 : 1
+    const spec: DashboardSpec = { ...input.spec, updatedAt: timestamp }
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      this.db.prepare(`
+        INSERT INTO dashboards (
+          id, title, subtitle, theme, current_version, component_count, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          title = excluded.title,
+          subtitle = excluded.subtitle,
+          theme = excluded.theme,
+          current_version = excluded.current_version,
+          component_count = excluded.component_count,
+          updated_at = excluded.updated_at
+      `).run(
+        spec.id,
+        spec.title,
+        spec.subtitle,
+        spec.theme,
+        version,
+        spec.components.length,
+        existing ? String(existing.created_at) : timestamp,
+        timestamp
+      )
+      this.db.prepare(`
+        INSERT INTO dashboard_versions (
+          dashboard_id, version, spec_json, change_summary, created_at
+        ) VALUES (?, ?, ?, ?, ?)
+      `).run(
+        spec.id,
+        version,
+        JSON.stringify(spec),
+        input.changeSummary.trim() || (version === 1 ? '创建大屏' : '保存编辑'),
+        timestamp
+      )
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+    return this.getDashboard(spec.id, version)!
+  }
+
+  restoreDashboard(id: string, version: number): DashboardVersion {
+    const source = this.getDashboard(id, version)
+    if (!source) throw new Error(`找不到大屏 ${id} 的版本 ${version}`)
+    return this.saveDashboard({
+      spec: source.spec,
+      changeSummary: `恢复自版本 V${version}`
+    })
+  }
+
+  recordVisualizationRun(input: VisualizationRunInput): VisualizationRun {
+    const run: VisualizationRun = {
+      ...input,
+      id: randomUUID(),
+      requestSummary: input.requestSummary.slice(0, 500),
+      errorMessage: input.errorMessage?.slice(0, 1000),
+      createdAt: nowIso()
+    }
+    this.db.prepare(`
+      INSERT INTO visualization_runs (
+        id, dashboard_id, request_summary, model_name, prompt_version, status,
+        attempt_count, component_count, query_count, duration_ms, error_message, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      run.id,
+      run.dashboardId ?? '',
+      run.requestSummary,
+      run.modelName,
+      run.promptVersion,
+      run.status,
+      run.attemptCount,
+      run.componentCount,
+      run.queryCount,
+      run.durationMs,
+      run.errorMessage ?? '',
+      run.createdAt
+    )
+    return run
+  }
+
+  listVisualizationRuns(limit = 30): VisualizationRun[] {
+    return this.db.prepare(`
+      SELECT *
+      FROM visualization_runs
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(Math.min(100, Math.max(1, limit))).map((row) => {
+      const value = row as SqlRow
+      return {
+        id: String(value.id),
+        dashboardId: String(value.dashboard_id) || undefined,
+        requestSummary: String(value.request_summary),
+        modelName: String(value.model_name),
+        promptVersion: String(value.prompt_version),
+        status: String(value.status) as VisualizationRun['status'],
+        attemptCount: Number(value.attempt_count),
+        componentCount: Number(value.component_count),
+        queryCount: Number(value.query_count),
+        durationMs: Number(value.duration_ms),
+        errorMessage: String(value.error_message) || undefined,
+        createdAt: String(value.created_at)
+      }
+    })
+  }
+
+  scanAnalyticsRecords(scope: DataScope, maximumRows = 100_000): AnalyticsRecord[] {
+    const clauses: string[] = []
+    const params: string[] = []
+    const addListFilter = (column: string, values?: string[]): void => {
+      const normalized = [...new Set((values ?? []).map((value) => value.trim()).filter(Boolean))]
+      if (!normalized.length) return
+      if (normalized.length > 200) throw new Error(`数据范围 ${column} 最多允许 200 个值`)
+      clauses.push(`${column} IN (${normalized.map(() => '?').join(', ')})`)
+      params.push(...normalized)
+    }
+    addListFilter('project_id', scope.projectIds)
+    addListFilter('node_type', scope.nodeTypes)
+    addListFilter('uid', scope.recordUids)
+    if (scope.snapshotAt) {
+      const timestamp = Date.parse(scope.snapshotAt)
+      if (!Number.isFinite(timestamp)) throw new Error('snapshotAt 不是有效时间')
+      clauses.push('synced_at <= ?')
+      params.push(new Date(timestamp).toISOString())
+    }
+    const where = clauses.length ? ` WHERE ${clauses.join(' AND ')}` : ''
+    const limit = Math.min(100_000, Math.max(1, Math.trunc(maximumRows)))
+    const rows = this.db.prepare(
+      `SELECT uid, project_id, node_type, item_id, name, last_modify_time, raw_json
+       FROM records${where}
+       ORDER BY uid
+       LIMIT ?`
+    ).all(...params, limit + 1) as SqlRow[]
+    if (rows.length > limit) {
+      throw new Error(`查询扫描行数超过安全上限 ${limit}，请缩小 DataScope`)
+    }
+    return rows.flatMap((row) => {
+      try {
+        return [{
+          uid: String(row.uid),
+          projectId: String(row.project_id),
+          nodeType: String(row.node_type),
+          itemId: String(row.item_id),
+          name: String(row.name),
+          lastModifyTime: String(row.last_modify_time),
+          raw: JSON.parse(String(row.raw_json)) as Record<string, unknown>
+        }]
+      } catch {
+        return []
+      }
+    })
   }
 
   getSetting(key: string): string | null {
@@ -868,6 +1384,268 @@ export class AppDatabase {
       )
       .all(...params) as SqlRow[]
     return rows.map((row) => ({ name: String(row.name), value: Number(row.value) }))
+  }
+
+  aggregateByField(options: FieldAggregateOptions): FieldAggregateResult {
+    const field = options.field.trim()
+    if (!field || field.length > 160) throw new Error('统计字段不能为空且不能超过 160 个字符')
+
+    const clauses: string[] = []
+    const params: string[] = []
+    if (options.projectId?.trim()) {
+      clauses.push('project_id = ?')
+      params.push(options.projectId.trim())
+    }
+    if (options.nodeType?.trim()) {
+      clauses.push('node_type = ?')
+      params.push(options.nodeType.trim())
+    }
+    const where = clauses.length ? ` WHERE ${clauses.join(' AND ')}` : ''
+    const rows = this.db
+      .prepare(
+        `SELECT uid, name, node_type, item_id, raw_json
+         FROM records${where}`
+      )
+      .all(...params) as SqlRow[]
+
+    const splitMultiValue = options.splitMultiValue !== false
+    const counts = new Map<string, {
+      name: string
+      value: number
+      examples: Array<{ source: ChatSource }>
+    }>()
+    let matchedRecords = 0
+    let valueOccurrences = 0
+
+    for (const row of rows) {
+      let raw: Record<string, unknown>
+      try {
+        raw = JSON.parse(String(row.raw_json)) as Record<string, unknown>
+      } catch {
+        continue
+      }
+      const values = normalizedFieldValues(fieldValuesAtPath(raw, field), splitMultiValue)
+      if (!values.length) continue
+      matchedRecords += 1
+      valueOccurrences += values.length
+      for (const currentValue of values) {
+        const normalizedKey = currentValue.toLocaleLowerCase()
+        const current = counts.get(normalizedKey) ?? {
+          name: currentValue,
+          value: 0,
+          examples: []
+        }
+        current.value += 1
+        if (current.examples.length < 2) {
+          current.examples.push({
+            source: {
+              uid: String(row.uid),
+              name: String(row.name),
+              nodeType: String(row.node_type),
+              itemId: String(row.item_id)
+            }
+          })
+        }
+        counts.set(normalizedKey, current)
+      }
+    }
+
+    const limit = Math.min(50, Math.max(1, Math.trunc(options.limit ?? 10)))
+    const items = [...counts.values()]
+      .sort((left, right) => right.value - left.value || left.name.localeCompare(right.name, 'zh-CN'))
+      .slice(0, limit)
+
+    return {
+      field,
+      totalRecords: rows.length,
+      matchedRecords,
+      emptyRecords: rows.length - matchedRecords,
+      valueOccurrences,
+      splitMultiValue,
+      items
+    }
+  }
+
+  inspectFields(options: FieldInspectionOptions = {}): FieldInspectionResult {
+    const clauses: string[] = []
+    const params: string[] = []
+    if (options.projectId?.trim()) {
+      clauses.push('project_id = ?')
+      params.push(options.projectId.trim())
+    }
+    if (options.nodeType?.trim()) {
+      clauses.push('node_type = ?')
+      params.push(options.nodeType.trim())
+    }
+    const where = clauses.length ? ` WHERE ${clauses.join(' AND ')}` : ''
+    const rows = this.db.prepare(`SELECT raw_json FROM records${where}`).all(...params) as SqlRow[]
+    const profiles = new Map<string, {
+      nonEmptyRecords: number
+      types: Set<string>
+      samples: string[]
+    }>()
+
+    for (const row of rows) {
+      let raw: Record<string, unknown>
+      try {
+        raw = JSON.parse(String(row.raw_json)) as Record<string, unknown>
+      } catch {
+        continue
+      }
+      for (const [field, rawValues] of collectRecordFieldValues(raw)) {
+        const values = normalizedFieldValues(rawValues, false)
+        if (!values.length) continue
+        const profile = profiles.get(field) ?? {
+          nonEmptyRecords: 0,
+          types: new Set<string>(),
+          samples: []
+        }
+        profile.nonEmptyRecords += 1
+        rawValues.forEach((value) => {
+          if (Array.isArray(value)) {
+            value.forEach((item) => profile.types.add(scalarType(item)))
+          } else {
+            profile.types.add(scalarType(value))
+          }
+        })
+        for (const value of values) {
+          const sample = value.length > 120 ? `${value.slice(0, 117)}...` : value
+          if (!profile.samples.includes(sample) && profile.samples.length < 5) {
+            profile.samples.push(sample)
+          }
+        }
+        profiles.set(field, profile)
+      }
+    }
+
+    const searchTerms = fieldSearchTerms(options.search)
+    const limit = Math.min(100, Math.max(1, Math.trunc(options.limit ?? 40)))
+    const fields = [...profiles.entries()]
+      .filter(([field]) =>
+        !searchTerms.length ||
+        searchTerms.some((term) => field.toLocaleLowerCase().includes(term))
+      )
+      .sort((left, right) =>
+        right[1].nonEmptyRecords - left[1].nonEmptyRecords ||
+        left[0].localeCompare(right[0], 'zh-CN')
+      )
+      .slice(0, limit)
+      .map(([field, profile]) => ({
+        field,
+        nonEmptyRecords: profile.nonEmptyRecords,
+        coverageRate: rows.length
+          ? Number(((profile.nonEmptyRecords / rows.length) * 100).toFixed(2))
+          : 0,
+        types: [...profile.types].sort(),
+        samples: profile.samples
+      }))
+
+    return { totalRecords: rows.length, fields }
+  }
+
+  queryRecordsByFields(options: FieldQueryOptions): FieldQueryResult {
+    const clauses: string[] = []
+    const params: string[] = []
+    if (options.projectId?.trim()) {
+      clauses.push('project_id = ?')
+      params.push(options.projectId.trim())
+    }
+    if (options.nodeType?.trim()) {
+      clauses.push('node_type = ?')
+      params.push(options.nodeType.trim())
+    }
+    const where = clauses.length ? ` WHERE ${clauses.join(' AND ')}` : ''
+    const rows = this.db
+      .prepare(
+        `SELECT uid, name, node_type, item_id, raw_json, normalized_text
+         FROM records${where}`
+      )
+      .all(...params) as SqlRow[]
+    const fields = [...new Set((options.fields ?? []).map((field) => field.trim()).filter(Boolean))]
+      .slice(0, 20)
+    const filters = (options.filters ?? [])
+      .filter((filter) => filter.field?.trim())
+      .slice(0, 10)
+    const searchTerms = [
+      ...(options.searchTerms ?? []),
+      ...(options.search?.trim() ? [options.search] : [])
+    ]
+      .map((term) => term.trim().toLocaleLowerCase())
+      .filter(Boolean)
+      .filter((term, index, values) => values.indexOf(term) === index)
+      .slice(0, 10)
+    const searchMode = options.searchMode === 'all' ? 'all' : 'any'
+
+    const matched = rows.flatMap((row) => {
+      let raw: Record<string, unknown>
+      try {
+        raw = JSON.parse(String(row.raw_json)) as Record<string, unknown>
+      } catch {
+        return []
+      }
+      if (searchTerms.length) {
+        const searchable = [
+          String(row.name),
+          String(row.item_id),
+          String(row.normalized_text)
+        ].join('\n').toLocaleLowerCase()
+        const termMatches = searchTerms.map((term) => searchable.includes(term))
+        if (
+          (searchMode === 'all' && !termMatches.every(Boolean)) ||
+          (searchMode === 'any' && !termMatches.some(Boolean))
+        ) return []
+      }
+      const passes = filters.every((filter) => {
+        const values = normalizedFieldValues(
+          fieldValuesAtPath(raw, filter.field.trim()),
+          false
+        )
+        return matchesFieldFilter(values, filter)
+      })
+      if (!passes) return []
+
+      const values: Record<string, string | string[]> = {}
+      for (const field of fields) {
+        const selected = normalizedFieldValues(fieldValuesAtPath(raw, field), false)
+        values[field] = selected.length <= 1 ? selected[0] ?? '' : selected
+      }
+      return [{
+        source: {
+          uid: String(row.uid),
+          name: String(row.name),
+          nodeType: String(row.node_type),
+          itemId: String(row.item_id)
+        },
+        values,
+        raw
+      }]
+    })
+
+    if (options.sort?.field.trim()) {
+      const sortField = options.sort.field.trim()
+      const direction = options.sort.direction === 'desc' ? -1 : 1
+      matched.sort((left, right) => {
+        const leftValue = normalizedFieldValues(fieldValuesAtPath(left.raw, sortField), false)[0] ?? ''
+        const rightValue = normalizedFieldValues(fieldValuesAtPath(right.raw, sortField), false)[0] ?? ''
+        const a = comparisonValue(leftValue)
+        const b = comparisonValue(rightValue)
+        if (typeof a === typeof b) {
+          if (a < b) return -1 * direction
+          if (a > b) return 1 * direction
+        }
+        return 0
+      })
+    }
+
+    const limit = Math.min(50, Math.max(1, Math.trunc(options.limit ?? 10)))
+    const records = matched.slice(0, limit).map(({ source, values }) => ({ source, values }))
+    return {
+      totalScanned: rows.length,
+      matchedCount: matched.length,
+      returnedCount: records.length,
+      fields,
+      records
+    }
   }
 
   beginSync(): number {

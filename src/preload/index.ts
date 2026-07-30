@@ -9,6 +9,8 @@ import type {
   SyncProgress,
   SyncScopeConfig
 } from '../shared/types'
+import type { DataScope, QuerySpec } from '../shared/query-spec'
+import type { DashboardSaveInput, DashboardSpec } from '../shared/dashboard'
 
 const api: AppApi = {
   minimizeWindow: () => ipcRenderer.invoke('window:minimize'),
@@ -42,6 +44,27 @@ const api: AppApi = {
   listCollectionRequestLogs: (page?: number, pageSize?: number) =>
     ipcRenderer.invoke('sync:request-logs', page, pageSize),
   askAgent: (request: ChatRequest) => ipcRenderer.invoke('agent:ask', request),
+  listFieldProfiles: (scope?: DataScope) =>
+    ipcRenderer.invoke('analytics:field-profiles', scope),
+  executeQuery: (spec: QuerySpec) =>
+    ipcRenderer.invoke('analytics:execute-query', spec),
+  listDashboards: () => ipcRenderer.invoke('dashboards:list'),
+  getDashboard: (id: string, version?: number) =>
+    ipcRenderer.invoke('dashboards:get', id, version),
+  listDashboardVersions: (id: string) =>
+    ipcRenderer.invoke('dashboards:versions', id),
+  saveDashboard: (input: DashboardSaveInput) =>
+    ipcRenderer.invoke('dashboards:save', input),
+  restoreDashboard: (id: string, version: number) =>
+    ipcRenderer.invoke('dashboards:restore', id, version),
+  diagnoseDashboard: (spec: DashboardSpec) =>
+    ipcRenderer.invoke('dashboards:diagnose', spec),
+  listVisualizationRuns: (limit?: number) =>
+    ipcRenderer.invoke('dashboards:runs', limit),
+  exportDashboardJson: (spec: DashboardSpec) =>
+    ipcRenderer.invoke('dashboards:export-json', spec),
+  exportDashboardPdf: (spec: DashboardSpec) =>
+    ipcRenderer.invoke('dashboards:export-pdf', spec),
   importData: () => ipcRenderer.invoke('data:import'),
   exportData: () => ipcRenderer.invoke('data:export'),
   deleteData: (uids?: string[]) => ipcRenderer.invoke('data:delete', uids),

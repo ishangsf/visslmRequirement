@@ -10,8 +10,10 @@ import {
   ExportOutlined,
   FileSearchOutlined,
   FilterOutlined,
+  FundProjectionScreenOutlined,
   FullscreenExitOutlined,
   ImportOutlined,
+  LeftOutlined,
   MessageOutlined,
   MinusOutlined,
   PictureOutlined,
@@ -38,6 +40,7 @@ import {
   Input,
   Layout,
   Menu,
+  Modal,
   Progress,
   Row,
   Select,
@@ -56,8 +59,12 @@ import ReactECharts from 'echarts-for-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import appIcon from './assets/visslm-icon.png'
+import { DashboardStudio } from './dashboard/DashboardStudio'
+import type { DashboardSpec } from '../../shared/dashboard'
 import type {
   AppSettings,
+  ChatDataRow,
+  ChatDataView,
   ChatMessage,
   CollectionRequestLogRow,
   DashboardStats,
@@ -79,7 +86,7 @@ import type {
 const { Content, Sider } = Layout
 const { Title, Text, Paragraph } = Typography
 
-type PageKey = 'dashboard' | 'data' | 'chat' | 'sync' | 'push' | 'settings'
+type PageKey = 'dashboard' | 'visualization' | 'data' | 'chat' | 'sync' | 'push' | 'settings'
 
 const formatDate = (value?: string): string => {
   if (!value) return '—'
@@ -666,11 +673,79 @@ function DataPage({
   )
 }
 
-function ChatPage(): React.JSX.Element {
-  const [messages, setMessages] = useState<ChatMessage[]>([])
-  const [question, setQuestion] = useState('')
-  const [loading, setLoading] = useState(false)
+function ChatPage({
+  messages,
+  setMessages,
+  question,
+  setQuestion,
+  loading,
+  setLoading,
+  onOpenDashboard
+}: {
+  messages: ChatMessage[]
+  setMessages: React.Dispatch<React.SetStateAction<ChatMessage[]>>
+  question: string
+  setQuestion: React.Dispatch<React.SetStateAction<string>>
+  loading: boolean
+  setLoading: React.Dispatch<React.SetStateAction<boolean>>
+  onOpenDashboard: (dashboard: DashboardSpec) => void
+}): React.JSX.Element {
+  const { message, modal } = AntApp.useApp()
   const messageListRef = useRef<HTMLDivElement>(null)
+  const [activeDataView, setActiveDataView] = useState<ChatDataView | null>(null)
+  const [activeDataGroup, setActiveDataGroup] = useState('')
+  const [activeRecordDetail, setActiveRecordDetail] = useState<RecordDetail | null>(null)
+  const [recordDetailLoading, setRecordDetailLoading] = useState(false)
+  const conversationId = useRef(crypto.randomUUID())
+  const selectedDataGroup = activeDataView?.groups.find(
+    (group) => group.name === activeDataGroup
+  ) ?? activeDataView?.groups[0]
+
+  const openDataView = (view: ChatDataView): void => {
+    setActiveDataView(view)
+    setActiveDataGroup(view.groups[0]?.name ?? '')
+    setActiveRecordDetail(null)
+  }
+
+  const closeDataView = (): void => {
+    setActiveDataView(null)
+    setActiveDataGroup('')
+    setActiveRecordDetail(null)
+    setRecordDetailLoading(false)
+  }
+
+  const resetConversation = (): void => {
+    conversationId.current = crypto.randomUUID()
+    setMessages([])
+    setQuestion('')
+    closeDataView()
+    message.success('已开始新会话')
+  }
+
+  const startNewConversation = (): void => {
+    if (loading) return
+    if (messages.length === 0 && !question.trim()) {
+      resetConversation()
+      return
+    }
+    modal.confirm({
+      title: '开始新会话？',
+      content: '当前消息和未发送内容将被清空，后续提问不会沿用本次会话上下文。',
+      okText: '开始新会话',
+      cancelText: '取消',
+      onOk: resetConversation
+    })
+  }
+
+  const openRecordDetail = async (row: ChatDataRow): Promise<void> => {
+    setRecordDetailLoading(true)
+    try {
+      const detail = await window.visslm.getRecord(row.uid)
+      if (detail) setActiveRecordDetail(detail)
+    } finally {
+      setRecordDetailLoading(false)
+    }
+  }
 
   useEffect(() => {
     const frame = requestAnimationFrame(() => {
@@ -698,8 +773,12 @@ function ChatPage(): React.JSX.Element {
     try {
       const response = await window.visslm.askAgent({
         question: text,
+        conversationId: conversationId.current,
         history: messages.slice(-8).map(({ role, content }) => ({ role, content }))
       })
+      if (response.events?.some((event) => event.type === 'error' && event.recoverable)) {
+        setQuestion(text)
+      }
       setMessages([
         ...next,
         {
@@ -707,16 +786,25 @@ function ChatPage(): React.JSX.Element {
           role: 'assistant',
           content: response.answer,
           sources: response.sources,
+          dataViews: response.dataViews,
+          dashboard: response.dashboard,
+          expertId: response.expertId,
           createdAt: new Date().toISOString()
         }
       ])
     } catch (error) {
+      const rawMessage = error instanceof Error ? error.message : String(error)
+      const userMessage = rawMessage.replace(
+        /^Error invoking remote method '[^']+':\s*(?:Error:\s*)?/,
+        ''
+      )
+      setQuestion(text)
       setMessages([
         ...next,
         {
           id: crypto.randomUUID(),
           role: 'assistant',
-          content: `请求失败：${error instanceof Error ? error.message : String(error)}`,
+          content: `请求失败：${userMessage}`,
           createdAt: new Date().toISOString()
         }
       ])
@@ -749,6 +837,24 @@ function ChatPage(): React.JSX.Element {
   return (
     <div className="chat-page">
       <Card className="chat-card">
+        <div className="chat-toolbar">
+          <div className="chat-session-label">
+            <MessageOutlined />
+            <Text strong>当前会话</Text>
+            {messages.length > 0 && (
+              <Text type="secondary">{messages.length} 条消息</Text>
+            )}
+          </div>
+          <Button
+            className="new-conversation-button"
+            type="text"
+            icon={<PlusOutlined />}
+            disabled={loading}
+            onClick={startNewConversation}
+          >
+            新建会话
+          </Button>
+        </div>
         <div className="message-list" ref={messageListRef}>
           {messages.length === 0 ? (
             <div className="chat-empty">
@@ -761,7 +867,7 @@ function ChatPage(): React.JSX.Element {
               </Tag>
               <Title level={3}>今天想从数据中了解什么？</Title>
               <Text type="secondary" className="chat-empty-description">
-                我会检索本地 VISSLM 数据，进行统计、归纳和内容查询，并在回答中标注依据。
+                我会检索本地 VISSLM 数据，进行统计、归纳和内容查询，并提供可查看的数据清单。
               </Text>
               <div className="prompt-grid">
                 {promptSuggestions.map((item) => (
@@ -804,24 +910,31 @@ function ChatPage(): React.JSX.Element {
                     ) : (
                       <Paragraph>{message.content}</Paragraph>
                     )}
-                    {message.sources?.length ? (
-                      <div className="source-list">
-                        <div className="source-list-title">
-                          <FileSearchOutlined />
-                          <Text strong>回答依据</Text>
-                          <Text type="secondary">{message.sources.length} 条</Text>
-                        </div>
-                        <div className="source-chips">
-                          {message.sources.map((source) => (
-                            <div className="source-chip" key={source.uid}>
-                              <DatabaseOutlined />
-                              <span>
-                                <strong>{source.name}</strong>
-                                <small>{source.itemId || `UID ${source.uid}`}</small>
-                              </span>
-                            </div>
-                          ))}
-                        </div>
+                    {message.dataViews?.length ? (
+                      <div className="chat-data-action">
+                        <Button
+                          icon={<EyeOutlined />}
+                          onClick={() => openDataView(message.dataViews![0])}
+                        >
+                          查看查询数据
+                        </Button>
+                        <Text type="secondary">
+                          {message.dataViews[0].total} 条
+                        </Text>
+                      </div>
+                    ) : null}
+                    {message.dashboard ? (
+                      <div className="chat-data-action">
+                        <Button
+                          type="primary"
+                          icon={<FundProjectionScreenOutlined />}
+                          onClick={() => onOpenDashboard(message.dashboard!)}
+                        >
+                          打开可视化大屏
+                        </Button>
+                        <Text type="secondary">
+                          {message.dashboard.components.length} 个组件
+                        </Text>
                       </div>
                     ) : null}
                   </div>
@@ -873,6 +986,17 @@ function ChatPage(): React.JSX.Element {
                 <kbd>Shift + Enter</kbd> 换行
               </span>
               <Button
+                size="small"
+                icon={<FundProjectionScreenOutlined />}
+                onClick={() => {
+                  if (!question.includes('@数据可视化专家')) {
+                    setQuestion(`@数据可视化专家 ${question}`)
+                  }
+                }}
+              >
+                @数据可视化专家
+              </Button>
+              <Button
                 className="chat-send-button"
                 type="primary"
                 icon={<SendOutlined />}
@@ -885,10 +1009,182 @@ function ChatPage(): React.JSX.Element {
             </div>
           </div>
           <Text type="secondary" className="composer-disclaimer">
-            AI 回答基于本地采集数据，请结合来源记录核实关键信息
+            AI 回答基于本地采集数据，可通过“查看查询数据”核实关键信息
           </Text>
         </div>
       </Card>
+      <Modal
+        className="chat-data-modal"
+        width="min(1120px, calc(100vw - 48px))"
+        centered
+        footer={null}
+        open={Boolean(activeDataView)}
+        onCancel={closeDataView}
+        destroyOnHidden
+        title={
+          <div className="chat-data-modal-title">
+            <DatabaseOutlined />
+            <span>
+              {activeRecordDetail?.name ?? activeDataView?.title ?? '查询数据'}
+            </span>
+          </div>
+        }
+      >
+        {activeDataView && (
+          <Spin spinning={recordDetailLoading}>
+            {activeRecordDetail ? (
+              <div className="chat-record-detail">
+                <Button
+                  className="chat-record-back"
+                  type="link"
+                  icon={<LeftOutlined />}
+                  onClick={() => setActiveRecordDetail(null)}
+                >
+                  返回查询列表
+                </Button>
+                <Descriptions bordered size="small" column={2}>
+                  <Descriptions.Item label="名称" span={2}>
+                    {activeRecordDetail.name}
+                  </Descriptions.Item>
+                  <Descriptions.Item label="UID">
+                    {activeRecordDetail.uid}
+                  </Descriptions.Item>
+                  <Descriptions.Item label="类型">
+                    {activeRecordDetail.nodeType}
+                  </Descriptions.Item>
+                  <Descriptions.Item label="业务编号">
+                    {activeRecordDetail.itemId || '—'}
+                  </Descriptions.Item>
+                  <Descriptions.Item label="项目 UID">
+                    {activeRecordDetail.projectId || '—'}
+                  </Descriptions.Item>
+                  <Descriptions.Item label="最后修改时间" span={2}>
+                    {formatDate(activeRecordDetail.lastModifyTime)}
+                  </Descriptions.Item>
+                </Descriptions>
+                {activeRecordDetail.images.length > 0 && (
+                  <>
+                    <Divider titlePlacement="start">图片资源</Divider>
+                    <Image.PreviewGroup>
+                      <div className="image-grid">
+                        {activeRecordDetail.images.map((image) => (
+                          <div className="image-tile" key={image.id}>
+                            <Image
+                              src={image.dataUri ?? image.sourceUrl}
+                              alt={image.name}
+                              fallback=""
+                            />
+                            <div>{image.name}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </Image.PreviewGroup>
+                  </>
+                )}
+                <Divider titlePlacement="start">知识文本</Divider>
+                <pre className="text-preview">
+                  {activeRecordDetail.normalizedText || '暂无可索引文本'}
+                </pre>
+                <Divider titlePlacement="start">完整属性</Divider>
+                <pre className="json-preview">
+                  {JSON.stringify(activeRecordDetail.raw, null, 2)}
+                </pre>
+              </div>
+            ) : (
+              <div className="chat-data-modal-content">
+                <div className="chat-data-summary">
+                  <div>
+                    <strong>{activeDataView.total}</strong>
+                    <span>查询命中</span>
+                  </div>
+                  <Text type="secondary">{activeDataView.description}</Text>
+                </div>
+                {activeDataView.groups.length > 1 && (
+                  <div className="chat-data-group-picker">
+                    <Text strong>查看分组</Text>
+                    <Select
+                      value={selectedDataGroup?.name}
+                      onChange={setActiveDataGroup}
+                      options={activeDataView.groups.map((group) => ({
+                        value: group.name,
+                        label: `${group.name}（${group.count} 条）`
+                      }))}
+                      style={{ minWidth: 280 }}
+                    />
+                  </div>
+                )}
+                {selectedDataGroup && (
+                  <>
+                    <div className="chat-data-table-meta">
+                      <Text strong>{selectedDataGroup.name}</Text>
+                      <Text type="secondary">
+                        共 {selectedDataGroup.count} 条，当前展示{' '}
+                        {selectedDataGroup.rows.length} 条
+                      </Text>
+                    </div>
+                    <Table<ChatDataRow>
+                      rowKey="uid"
+                      size="small"
+                      dataSource={selectedDataGroup.rows}
+                      scroll={{ x: 960, y: 'calc(100vh - 390px)' }}
+                      pagination={{
+                        pageSize: 20,
+                        showSizeChanger: true,
+                        pageSizeOptions: [20, 50, 100],
+                        showTotal: (count) => `当前清单 ${count} 条`
+                      }}
+                      columns={[
+                        {
+                          title: '名称',
+                          dataIndex: 'name',
+                          width: 280,
+                          ellipsis: true,
+                          render: (name: string, row: ChatDataRow) => (
+                            <Button
+                              className="chat-data-name-button"
+                              type="link"
+                              title={name}
+                              onClick={() => void openRecordDetail(row)}
+                            >
+                              {name || '未命名记录'}
+                            </Button>
+                          )
+                        },
+                        {
+                          title: '类型',
+                          dataIndex: 'nodeType',
+                          width: 110
+                        },
+                        {
+                          title: '业务编号',
+                          dataIndex: 'itemId',
+                          width: 160,
+                          ellipsis: true
+                        },
+                        {
+                          title: 'UID',
+                          dataIndex: 'uid',
+                          width: 100
+                        },
+                        ...activeDataView.fields.map((field) => ({
+                          title: field,
+                          key: field,
+                          width: 180,
+                          ellipsis: true,
+                          render: (_value: unknown, row: ChatDataRow) => {
+                            const value = row.values[field]
+                            return Array.isArray(value) ? value.join('、') : value || '—'
+                          }
+                        }))
+                      ]}
+                    />
+                  </>
+                )}
+              </div>
+            )}
+          </Spin>
+        )}
+      </Modal>
     </div>
   )
 }
@@ -2351,6 +2647,10 @@ function AppShell(): React.JSX.Element {
   const [progress, setProgress] = useState<SyncProgress | null>(null)
   const [refreshKey, setRefreshKey] = useState(0)
   const [modelOnline, setModelOnline] = useState<boolean | null>(null)
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
+  const [chatQuestion, setChatQuestion] = useState('')
+  const [chatLoading, setChatLoading] = useState(false)
+  const [generatedDashboard, setGeneratedDashboard] = useState<DashboardSpec | null>(null)
 
   useEffect(() => {
     void window.visslm.getSettings().then(setSettings)
@@ -2386,6 +2686,7 @@ function AppShell(): React.JSX.Element {
 
   const titleMap: Record<PageKey, string> = {
     dashboard: '数据概览',
+    visualization: '可视化大屏',
     data: '数据中心',
     chat: 'AI 助手',
     sync: '数据采集',
@@ -2395,6 +2696,9 @@ function AppShell(): React.JSX.Element {
 
   const currentPage = useMemo(() => {
     if (page === 'dashboard') return <DashboardPage refreshKey={refreshKey} />
+    if (page === 'visualization') {
+      return <DashboardStudio generatedDashboard={generatedDashboard} />
+    }
     if (page === 'data') {
       return (
         <DataPage
@@ -2403,7 +2707,22 @@ function AppShell(): React.JSX.Element {
         />
       )
     }
-    if (page === 'chat') return <ChatPage />
+    if (page === 'chat') {
+      return (
+        <ChatPage
+          messages={chatMessages}
+          setMessages={setChatMessages}
+          question={chatQuestion}
+          setQuestion={setChatQuestion}
+          loading={chatLoading}
+          setLoading={setChatLoading}
+          onOpenDashboard={(dashboard) => {
+            setGeneratedDashboard(dashboard)
+            setPage('visualization')
+          }}
+        />
+      )
+    }
     if (page === 'sync') {
       return (
         <SyncPage
@@ -2422,7 +2741,17 @@ function AppShell(): React.JSX.Element {
       )
     }
     return <SettingsPage settings={settings} onChanged={setSettings} />
-  }, [page, progress, refreshKey, settings, syncing])
+  }, [
+    chatLoading,
+    chatMessages,
+    chatQuestion,
+    generatedDashboard,
+    page,
+    progress,
+    refreshKey,
+    settings,
+    syncing
+  ])
 
   return (
     <div className="app-frame">
@@ -2444,6 +2773,11 @@ function AppShell(): React.JSX.Element {
             onClick={({ key }) => setPage(key as PageKey)}
             items={[
               { key: 'dashboard', icon: <BarChartOutlined />, label: '数据概览' },
+              {
+                key: 'visualization',
+                icon: <FundProjectionScreenOutlined />,
+                label: '可视化大屏'
+              },
               { key: 'data', icon: <DatabaseOutlined />, label: '数据中心' },
               { key: 'chat', icon: <MessageOutlined />, label: 'AI 助手' },
               { key: 'sync', icon: <SyncOutlined />, label: '数据采集' },

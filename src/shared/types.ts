@@ -1,3 +1,15 @@
+import type {
+  DashboardExportResult,
+  DashboardQualityReport,
+  DashboardSaveInput,
+  DashboardSpec,
+  DashboardSummary,
+  DashboardVersion,
+  VisualizationRun
+} from './dashboard'
+import type { AgentEvent, ExpertId } from './expert-types'
+import type { DataScope, FieldProfile, QueryDataset, QuerySpec } from './query-spec'
+
 export interface PlatformSettings {
   baseUrl: string
   username: string
@@ -290,6 +302,9 @@ export interface ChatMessage {
   content: string
   createdAt: string
   sources?: ChatSource[]
+  dataViews?: ChatDataView[]
+  dashboard?: DashboardSpec
+  expertId?: ExpertId
 }
 
 export interface ChatSource {
@@ -299,15 +314,46 @@ export interface ChatSource {
   itemId: string
 }
 
+export interface ChatDataRow {
+  uid: string
+  name: string
+  nodeType: string
+  itemId: string
+  values: Record<string, string | string[]>
+}
+
+export interface ChatDataGroup {
+  name: string
+  count: number
+  rows: ChatDataRow[]
+}
+
+export interface ChatDataView {
+  id: string
+  title: string
+  description: string
+  total: number
+  fields: string[]
+  groups: ChatDataGroup[]
+}
+
 export interface ChatRequest {
   question: string
   projectId?: string
+  conversationId?: string
+  expertId?: ExpertId
+  entrypoint?: 'chat' | 'dashboard'
+  dataScope?: DataScope
   history?: Array<{ role: 'user' | 'assistant'; content: string }>
 }
 
 export interface ChatResponse {
   answer: string
   sources: ChatSource[]
+  dataViews: ChatDataView[]
+  expertId?: ExpertId
+  dashboard?: DashboardSpec
+  events?: AgentEvent[]
 }
 
 export interface AppApi {
@@ -332,6 +378,17 @@ export interface AppApi {
   startSync(config?: SyncScopeConfig): Promise<SyncResult>
   listCollectionRequestLogs(page?: number, pageSize?: number): Promise<CollectionRequestLogPage>
   askAgent(request: ChatRequest): Promise<ChatResponse>
+  listFieldProfiles(scope?: DataScope): Promise<FieldProfile[]>
+  executeQuery(spec: QuerySpec): Promise<QueryDataset>
+  listDashboards(): Promise<DashboardSummary[]>
+  getDashboard(id: string, version?: number): Promise<DashboardVersion | null>
+  listDashboardVersions(id: string): Promise<DashboardVersion[]>
+  saveDashboard(input: DashboardSaveInput): Promise<DashboardVersion>
+  restoreDashboard(id: string, version: number): Promise<DashboardVersion>
+  exportDashboardJson(spec: DashboardSpec): Promise<DashboardExportResult>
+  exportDashboardPdf(spec: DashboardSpec): Promise<DashboardExportResult>
+  diagnoseDashboard(spec: DashboardSpec): Promise<DashboardQualityReport>
+  listVisualizationRuns(limit?: number): Promise<VisualizationRun[]>
   importData(): Promise<DataImportResult>
   exportData(): Promise<DataExportResult>
   deleteData(uids?: string[]): Promise<DataDeleteResult>

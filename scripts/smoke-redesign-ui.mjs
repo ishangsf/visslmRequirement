@@ -2,7 +2,8 @@ import WebSocket from 'ws'
 import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-const targets = await (await fetch('http://127.0.0.1:9223/json/list')).json()
+const cdpPort = process.env.VISSLM_CDP_PORT ?? '9223'
+const targets = await (await fetch(`http://127.0.0.1:${cdpPort}/json/list`)).json()
 const target = targets.find((item) => item.type === 'page' && item.title === 'VISSLM Agent')
 if (!target) throw new Error('VISSLM Agent CDP target not found')
 const socket = new WebSocket(target.webSocketDebuggerUrl)
@@ -83,6 +84,20 @@ const checks = await evaluate(`(async () => ({
 await call('Page.enable')
 const dashboardScreenshot = await capture('visslm-redesign-dashboard.png')
 
+await openPage('可视化大屏', '.dashboard-studio')
+const visualizationChecks = await evaluate(`({
+  title: document.querySelector('.content-page-title')?.textContent?.trim(),
+  studio: Boolean(document.querySelector('.dashboard-studio')),
+  componentTypes: document.querySelectorAll('.dashboard-component-list button').length,
+  widgets: document.querySelectorAll('.dashboard-widget').length,
+  dashboardTitle: document.querySelector('.dashboard-preview-header h2')?.textContent?.trim(),
+  gridColumns: getComputedStyle(document.querySelector('.dashboard-grid')).gridTemplateColumns.split(' ').length,
+  previewFits: document.querySelector('.dashboard-preview')?.getBoundingClientRect().right <=
+    document.querySelector('.dashboard-preview-shell')?.scrollWidth +
+    document.querySelector('.dashboard-preview-shell')?.getBoundingClientRect().left
+})`)
+const visualizationScreenshot = await capture('visslm-visualization-studio.png')
+
 await openPage('数据中心', '.filter-bar')
 const dataChecks = await evaluate(`({
   toolbar: Boolean(document.querySelector('.page-toolbar')),
@@ -103,6 +118,22 @@ const chatChecks = await evaluate(`({
   composerVisible: document.querySelector('.composer')?.getBoundingClientRect().bottom <= window.innerHeight
 })`)
 const chatScreenshot = await capture('visslm-redesign-chat.png')
+const chatPersistenceSeed = await evaluate(`(async () => {
+  const input = document.querySelector('.composer textarea');
+  const setter = Object.getOwnPropertyDescriptor(
+    HTMLTextAreaElement.prototype,
+    'value'
+  )?.set;
+  setter?.call(input, '导航切换聊天记录保留测试');
+  input?.dispatchEvent(new Event('input', { bubbles: true }));
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  document.querySelector('.chat-send-button')?.click();
+  const started = Date.now();
+  while (!document.querySelector('.message-row.user') && Date.now() - started < 3000) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return document.querySelector('.message-row.user .message-bubble')?.textContent?.trim();
+})()`)
 
 await openPage('数据采集', '.page-inner-tabs')
 const syncChecks = await evaluate(`({
@@ -138,6 +169,17 @@ const settingsChecks = await evaluate(`({
 })`)
 const settingsScreenshot = await capture('visslm-redesign-settings.png')
 
+await openPage('AI 助手', '.chat-card')
+const chatPersistenceChecks = await evaluate(`({
+  seededMessage: ${JSON.stringify(chatPersistenceSeed)},
+  retainedMessage: document.querySelector('.message-row.user .message-bubble')?.textContent?.trim(),
+  retained:
+    document.querySelector('.message-row.user .message-bubble')?.textContent?.trim() ===
+    ${JSON.stringify(chatPersistenceSeed)},
+  composerVisible:
+    document.querySelector('.composer')?.getBoundingClientRect().bottom <= window.innerHeight
+})`)
+
 const windowStateChecks = await evaluate(`(async () => {
   const before = await window.visslm.isWindowMaximized();
   const maximized = await window.visslm.toggleMaximizeWindow();
@@ -148,13 +190,16 @@ const windowStateChecks = await evaluate(`(async () => {
 
 console.log(JSON.stringify({
   ...checks,
+  visualizationChecks,
   dataChecks,
   chatChecks,
+  chatPersistenceChecks,
   syncChecks,
   pushChecks,
   settingsChecks,
   windowStateChecks,
   dashboardScreenshot,
+  visualizationScreenshot,
   dataScreenshot,
   chatScreenshot,
   syncScreenshot,

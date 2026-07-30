@@ -39,6 +39,9 @@ const evaluate = async (expression) => {
   return response.result?.result?.value
 }
 
+await call('Page.reload')
+await new Promise((resolve) => setTimeout(resolve, 500))
+
 const checks = await evaluate(`(async () => {
   [...document.querySelectorAll('.ant-menu-item')]
     .find((element) => element.textContent?.trim() === 'AI 助手')
@@ -59,6 +62,8 @@ const checks = await evaluate(`(async () => {
     scopeHintRemoved: !document.querySelector('.chat-scope-hint'),
     composer: Boolean(document.querySelector('.composer-input')),
     sendButton: Boolean(document.querySelector('.chat-send-button')),
+    newConversationButton:
+      document.querySelector('.new-conversation-button')?.textContent?.trim() === '新建会话',
     pageFitsViewport:
       Boolean(chatPage && chatPage.getBoundingClientRect().bottom <= window.innerHeight),
     composerVisible:
@@ -71,6 +76,30 @@ await call('Page.enable')
 const shot = await call('Page.captureScreenshot', { format: 'png', fromSurface: true })
 const screenshot = join(process.env.TEMP, 'visslm-chat-redesign.png')
 writeFileSync(screenshot, Buffer.from(shot.result.data, 'base64'))
+const newConversationChecks = await evaluate(`(async () => {
+  const input = document.querySelector('.composer textarea');
+  const valueSetter = Object.getOwnPropertyDescriptor(
+    HTMLTextAreaElement.prototype,
+    'value'
+  )?.set;
+  valueSetter?.call(input, '待清空的会话草稿');
+  input?.dispatchEvent(new Event('input', { bubbles: true }));
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  document.querySelector('.new-conversation-button')?.click();
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const confirmation = [...document.querySelectorAll('.ant-modal-confirm-btns button')]
+    .find((element) => element.textContent?.trim() === '开始新会话');
+  const confirmationVisible = Boolean(confirmation);
+  confirmation?.click();
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  return {
+    newConversationConfirmation: confirmationVisible,
+    draftCleared: input?.value === '',
+    emptyStateRestored: Boolean(document.querySelector('.chat-empty')),
+    confirmationClosed:
+      !document.querySelector('.ant-modal-confirm')?.getClientRects().length
+  };
+})()`)
 const focusChecks = await evaluate(`(() => {
   const input = document.querySelector('.composer textarea');
   input?.focus();
@@ -102,6 +131,7 @@ const conversationScreenshot = join(process.env.TEMP, 'visslm-chat-conversation.
 writeFileSync(conversationScreenshot, Buffer.from(conversationShot.result.data, 'base64'))
 console.log(JSON.stringify({
   ...checks,
+  ...newConversationChecks,
   ...focusChecks,
   ...conversationChecks,
   screenshot,

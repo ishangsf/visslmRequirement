@@ -11,6 +11,7 @@
 - 提供项目/类型筛选、全文检索、记录详情、图片预览、数据量与类型分布统计。
 - 导出知识库 JSONL，每行一条独立知识文档，图片以 Base64 Data URL 内联。
 - 使用 Ollama 原生 Chat API 和工具调用完成本地 AI 问答；默认模型为 `qwen3:8b`。
+- 通过 `@数据可视化专家` 生成结构化大屏，支持组件编辑、版本恢复、质量诊断和 JSON/PDF 导出。
 
 ## 使用
 
@@ -67,3 +68,21 @@ $env:VISSLM_TEST_USER='your-user'
 $env:VISSLM_TEST_TOKEN='your-token'
 node .\scripts\smoke-app.mjs
 ```
+
+可视化专家的离线回归不需要连接 Ollama：
+
+```powershell
+npx tsx .\scripts\smoke-visualization-core.ts
+npx tsx .\scripts\smoke-dashboard-versions.ts
+npx tsx .\scripts\smoke-dashboard-quality.ts
+npx tsx .\scripts\smoke-visualization-regression.ts
+```
+
+阶段 5 桌面 UI 回归需要先以 `9223` 端口启动 Electron 调试预览，然后执行：
+
+```powershell
+$env:VISSLM_CDP_PORT='9223'
+node .\scripts\smoke-stage5-ui.mjs
+```
+
+该门禁在 1280×800 视口检查质量诊断抽屉、查询数据列表和记录详情，并把截图保存到系统临时目录。
