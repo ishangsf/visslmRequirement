@@ -21,6 +21,16 @@ export const diagnoseDashboard = (
   )
   const components: DashboardComponentDiagnostic[] = []
 
+  for (const filter of spec.globalFilters ?? []) {
+    if (sensitiveFieldPattern.test(filter.field)) {
+      issues.push({
+        code: 'sensitive-global-filter',
+        severity: 'warning',
+        message: `全局筛选器引用疑似敏感字段 ${filter.field}，导出前需要确认展示范围`
+      })
+    }
+  }
+
   for (const component of spec.components) {
     if (component.title.length > 30) {
       issues.push({

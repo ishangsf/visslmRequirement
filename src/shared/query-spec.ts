@@ -1,4 +1,8 @@
-export type QueryFieldType = 'string' | 'number' | 'boolean' | 'date'
+export type QueryFieldType = 'string' | 'number' | 'boolean' | 'date' | 'enum' | 'array' | 'object'
+
+export type FieldSensitivity = 'normal' | 'internal' | 'sensitive'
+
+export type FieldProfileRole = 'dimension' | 'measure' | 'time' | 'identifier'
 
 export type FilterOperator =
   | 'equals'
@@ -18,6 +22,8 @@ export interface FilterSpec {
   field: string
   operator: FilterOperator
   value?: string | number | boolean | Array<string | number | boolean>
+  /** Marks filters injected by the dashboard-level filter bar. */
+  source?: 'component' | 'dashboard'
 }
 
 export interface DataScope {
@@ -30,6 +36,14 @@ export interface DataScope {
 
 export type QueryAggregation = 'count' | 'countDistinct' | 'sum' | 'avg' | 'min' | 'max'
 export type TimeGrain = 'day' | 'week' | 'month' | 'quarter'
+export type QueryCalculation = 'yoy' | 'mom' | 'share' | 'cumulative'
+export type QueryComparisonMode = 'percent' | 'difference'
+
+export interface QueryPeriodComparison {
+  /** Number of periods to move backwards at the selected time grain. */
+  offset: number
+  mode: QueryComparisonMode
+}
 
 export interface QueryDimension {
   field: string
@@ -40,6 +54,10 @@ export interface QueryMeasure {
   id: string
   field?: string
   aggregation: QueryAggregation
+  calculation?: QueryCalculation
+  comparison?: QueryPeriodComparison
+  /** A restricted arithmetic expression referencing other measure ids. */
+  formula?: string
 }
 
 export interface QuerySpec {
@@ -55,9 +73,21 @@ export interface QuerySpec {
 export interface FieldProfile {
   field: string
   inferredType: QueryFieldType
+  sensitivity: FieldSensitivity
   nonNullRate: number
   distinctCount: number
   samples: string[]
+  displayName?: string
+  role?: FieldProfileRole
+  synonyms?: string[]
+  profiledAt?: string
+}
+
+export interface FieldProfileSemanticPatch {
+  displayName?: string
+  role?: FieldProfileRole
+  synonyms?: string[]
+  sensitivity?: FieldSensitivity
 }
 
 export interface QueryDataset {
@@ -98,6 +128,16 @@ const aggregations = new Set<QueryAggregation>([
   'max'
 ])
 
+const calculations = new Set<QueryCalculation>([
+  'yoy',
+  'mom',
+  'share',
+  'cumulative'
+])
+
+const comparisonModes = new Set<QueryComparisonMode>(['percent', 'difference'])
+const formulaPattern = /^[A-Za-z0-9_+\-*/%().\s]+$/
+
 export const validateQuerySpecShape = (input: unknown): QueryValidationResult => {
   const errors: string[] = []
   if (!input || typeof input !== 'object' || Array.isArray(input)) {
@@ -119,7 +159,35 @@ export const validateQuerySpecShape = (input: unknown): QueryValidationResult =>
       if (!aggregations.has(measure?.aggregation)) {
         errors.push(`不支持的聚合方式: ${String(measure?.aggregation)}`)
       }
-      if (measure?.aggregation !== 'count' && !measure?.field?.trim()) {
+      if (measure?.calculation !== undefined && !calculations.has(measure.calculation)) {
+        errors.push(`不支持的指标计算: ${String(measure?.calculation)}`)
+      }
+      if (measure?.comparison !== undefined) {
+        const comparison = measure.comparison
+        if (!comparison || !Number.isInteger(comparison.offset) || comparison.offset < 1 || comparison.offset > 24) {
+          errors.push(`指标 ${measure?.id || '(未命名)'} 的周期对比 offset 必须是 1 到 24`)
+        }
+        if (!comparisonModes.has(comparison?.mode)) {
+          errors.push(`指标 ${measure?.id || '(未命名)'} 的周期对比模式无效`)
+        }
+      }
+      if (measure?.formula !== undefined) {
+        if (
+          typeof measure.formula !== 'string' ||
+          measure.formula.length > 200 ||
+          !measure.formula.trim() ||
+          !formulaPattern.test(measure.formula)
+        ) {
+          errors.push(`指标 ${measure?.id || '(未命名)'} 的自定义公式格式无效`)
+        }
+      }
+      if (measure?.formula?.trim() && (measure?.calculation || measure?.comparison)) {
+        errors.push(`指标 ${measure?.id || '(未命名)'} 的公式不能同时设置指标计算或周期对比`)
+      }
+      if (measure?.calculation && measure?.comparison) {
+        errors.push(`指标 ${measure?.id || '(未命名)'} 不能同时设置指标计算和周期对比`)
+      }
+      if (measure?.aggregation !== 'count' && !measure?.field?.trim() && !measure?.formula?.trim()) {
         errors.push(`指标 ${measure?.id || '(未命名)'} 必须指定 field`)
       }
     }

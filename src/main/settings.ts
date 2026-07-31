@@ -1,14 +1,45 @@
 import { safeStorage } from 'electron'
 import type {
   AppSettings,
+  FeatureNavigationOrder,
+  FeatureModuleKey,
+  FeatureModuleSettings,
   ModelSettings,
   PlatformSettingsInput,
   SyncScopeConfig
+} from '../shared/types'
+import {
+  DEFAULT_FEATURE_MODULE_SETTINGS,
+  DEFAULT_FEATURE_NAVIGATION_ORDER
 } from '../shared/types'
 import { AppDatabase } from './database'
 
 const DEFAULT_PLATFORM_URL = 'http://visionmc.vicp.net:889/alm'
 const DEFAULT_MODEL_URL = 'http://127.0.0.1:11434'
+const FEATURE_MODULE_KEYS = Object.keys(DEFAULT_FEATURE_MODULE_SETTINGS) as FeatureModuleKey[]
+const NAVIGATION_ORDER_VERSION = 1
+
+const normalizeNavigationOrder = (input: unknown): FeatureNavigationOrder => {
+  const seen = new Set<FeatureModuleKey>()
+  const normalized: FeatureNavigationOrder = []
+
+  if (Array.isArray(input)) {
+    for (const value of input) {
+      if (typeof value !== 'string') continue
+      const key = value as FeatureModuleKey
+      if (!DEFAULT_FEATURE_NAVIGATION_ORDER.includes(key) || seen.has(key)) continue
+      seen.add(key)
+      normalized.push(key)
+    }
+  }
+
+  for (const key of DEFAULT_FEATURE_NAVIGATION_ORDER) {
+    if (seen.has(key)) continue
+    seen.add(key)
+    normalized.push(key)
+  }
+  return normalized
+}
 
 export class SettingsService {
   constructor(private readonly db: AppDatabase) {}
@@ -21,11 +52,26 @@ export class SettingsService {
         hasToken: Boolean(this.db.getSetting('platform.token'))
       },
       model: {
+        source: (this.db.getSetting('model.source') ?? 'local') as ModelSettings['source'],
+        provider: (this.db.getSetting('model.provider') ?? 'ollama') as ModelSettings['provider'],
         baseUrl: this.db.getSetting('model.baseUrl') ?? DEFAULT_MODEL_URL,
         model: this.db.getSetting('model.model') ?? 'qwen3:8b',
-        thinking: (this.db.getSetting('model.thinking') ?? 'false') === 'true'
-      }
+        thinking: (this.db.getSetting('model.thinking') ?? 'false') === 'true',
+        hasApiKey: Boolean(this.db.getSetting(`model.apiKey.${this.db.getSetting('model.provider') ?? 'ollama'}`))
+      },
+      features: this.getFeatureSettings(),
+      navigationOrder: this.getNavigationOrder()
     }
+  }
+
+  getFeatureSettings(): FeatureModuleSettings {
+    return FEATURE_MODULE_KEYS.reduce<FeatureModuleSettings>((features, key) => {
+      const saved = this.db.getSetting(`feature.${key}`)
+      features[key] = saved === null
+        ? DEFAULT_FEATURE_MODULE_SETTINGS[key]
+        : saved === 'true'
+      return features
+    }, { ...DEFAULT_FEATURE_MODULE_SETTINGS })
   }
 
   getPlatformCredentials(override?: PlatformSettingsInput): {
@@ -49,10 +95,66 @@ export class SettingsService {
   }
 
   saveModel(input: ModelSettings): AppSettings {
+    const source = input.source ?? 'local'
+    const provider = input.provider ?? (source === 'local' ? 'ollama' : 'openai-compatible')
+    this.db.setSetting('model.source', source)
+    this.db.setSetting('model.provider', provider)
     this.db.setSetting('model.baseUrl', input.baseUrl.trim().replace(/\/+$/, ''))
     this.db.setSetting('model.model', input.model.trim())
     this.db.setSetting('model.thinking', String(input.thinking))
+    if (input.apiKey?.trim()) this.writeSecret(`model.apiKey.${provider}`, input.apiKey.trim())
     return this.getAll()
+  }
+
+  saveFeatures(input: FeatureModuleSettings): AppSettings {
+    for (const key of FEATURE_MODULE_KEYS) {
+      this.db.setSetting(`feature.${key}`, String(Boolean(input[key])))
+    }
+    return this.getAll()
+  }
+
+  getNavigationOrder(): FeatureNavigationOrder {
+    const raw = this.db.getSetting('navigation.order')
+    if (!raw) return [...DEFAULT_FEATURE_NAVIGATION_ORDER]
+
+    try {
+      const parsed = JSON.parse(raw) as { version?: unknown; order?: unknown }
+      if (parsed.version !== NAVIGATION_ORDER_VERSION) {
+        return [...DEFAULT_FEATURE_NAVIGATION_ORDER]
+      }
+      return normalizeNavigationOrder(parsed.order)
+    } catch {
+      return [...DEFAULT_FEATURE_NAVIGATION_ORDER]
+    }
+  }
+
+  saveNavigationOrder(input: FeatureNavigationOrder): AppSettings {
+    const order = normalizeNavigationOrder(input)
+    this.db.setSetting(
+      'navigation.order',
+      JSON.stringify({ version: NAVIGATION_ORDER_VERSION, order })
+    )
+    return this.getAll()
+  }
+
+  getModelCredentials(override?: ModelSettings): ModelSettings {
+    const saved = this.getAll().model
+    const source = override?.source ?? saved.source
+    return {
+      source,
+      provider: override?.provider ?? saved.provider,
+      baseUrl: override?.baseUrl?.trim() || saved.baseUrl,
+      model: override?.model?.trim() || saved.model,
+      thinking: override?.thinking ?? saved.thinking,
+      apiKey:
+        source === 'online'
+          ? override?.apiKey?.trim() || this.readSecret(`model.apiKey.${override?.provider ?? saved.provider}`)
+          : undefined,
+      hasApiKey:
+        source === 'online'
+          ? Boolean(this.db.getSetting(`model.apiKey.${override?.provider ?? saved.provider}`))
+          : false
+    }
   }
 
   getSyncConfig(): SyncScopeConfig | null {

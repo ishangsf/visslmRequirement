@@ -8,19 +8,10 @@ import type {
   ModelSettings
 } from '../shared/types'
 import { AppDatabase } from './database'
-
-type OllamaMessage = {
-  role: 'system' | 'user' | 'assistant' | 'tool'
-  content: string
-  tool_calls?: Array<{
-    function: { name: string; arguments: Record<string, unknown> }
-  }>
-}
-
-interface OllamaResponse {
-  message?: OllamaMessage
-  done_reason?: string
-}
+import { ModelClient } from './model-client'
+import type { ModelMessage, ModelResponse } from './model-client'
+import type { KnowledgeSearchHit } from './knowledge'
+import { KnowledgeService } from './knowledge'
 
 type QuestionPlanIntent =
   | 'conversation'
@@ -308,37 +299,19 @@ const questionPlanFormat = {
 export class OllamaAgent {
   constructor(
     private readonly db: AppDatabase,
-    private readonly settings: ModelSettings
+    private readonly settings: ModelSettings,
+    private readonly knowledge?: KnowledgeService
   ) {}
 
   async test(): Promise<ConnectionResult> {
-    try {
-      const response = await fetch(`${this.settings.baseUrl.replace(/\/+$/, '')}/api/tags`, {
-        signal: AbortSignal.timeout(10_000)
-      })
-      if (!response.ok) throw new Error(`Ollama HTTP ${response.status}`)
-      const payload = (await response.json()) as { models?: Array<{ name?: string }> }
-      const names = (payload.models ?? []).map((model) => model.name)
-      if (!names.includes(this.settings.model)) {
-        return {
-          ok: false,
-          message: `Ollama 已连接，但未找到模型 ${this.settings.model}`,
-          details: { models: names }
-        }
-      }
-      return {
-        ok: true,
-        message: `Ollama 连接成功，模型 ${this.settings.model} 可用`
-      }
-    } catch (error) {
-      return {
-        ok: false,
-        message: error instanceof Error ? error.message : String(error)
-      }
-    }
+    return new ModelClient(this.settings).test()
   }
 
   async ask(request: ChatRequest): Promise<ChatResponse> {
+    if (this.knowledge && !this.isStructuredDataQuestion(request.question)) {
+      const response = await this.askWithKnowledge(request)
+      if (response) return response
+    }
     let plan: QuestionPlan | undefined
     let planningError: unknown
     for (let attempt = 1; attempt <= 2; attempt += 1) {
@@ -371,6 +344,86 @@ export class OllamaAgent {
         `查询计划执行或结果校验失败，本次未生成猜测性回答。${message ? ` 原因：${message}` : ''}`
       )
     }
+  }
+
+  private isStructuredDataQuestion(question: string): boolean {
+    return /总数|数量|多少|统计|排名|分布|前\s*\d+|大于|小于|不小于|不大于|等于|筛选|排序|字段|可视化/.test(question)
+  }
+
+  private async askWithKnowledge(request: ChatRequest): Promise<ChatResponse | null> {
+    if (!this.knowledge) return null
+    const hits = await this.knowledge.search(request.question, 8)
+    if (!hits.length) {
+      const stats = this.db.getKnowledgeStats(this.knowledge.modelVersion)
+      if (!stats.indexedChunkCount) {
+        return {
+          answer: '当前知识库还没有完成可用索引，暂时无法基于本地资料回答。请先上传文档或完成数据采集，等待索引完成后再试。',
+          sources: [],
+          dataViews: []
+        }
+      }
+      return {
+        answer: '当前问题没有检索到足够的本地依据，因此我不会生成猜测性结论。可以换一个更具体的关键词，或先检查知识库文档是否已完成索引。',
+        sources: [],
+        dataViews: []
+      }
+    }
+    const evidence = hits.map((hit, index) => this.formatKnowledgeEvidence(hit, index + 1)).join('\n\n')
+    const response = await this.callModel({
+      messages: [
+        {
+          role: 'system',
+          content: [
+            '你是 VISSLM 本地知识库助手，只能依据用户问题和下面提供的检索证据回答。',
+            '证据编号必须使用正文引用 [1]、[2]；不能编造未出现在证据中的事实。',
+            '回答时区分事实、基于事实的分析判断和不确定性；证据不足时明确说证据不足。',
+            '不要把采集记录当成上传文档，也不要把上传文档当成结构化统计结果。',
+            '使用简洁、清晰的中文 Markdown。'
+          ].join('\n')
+        },
+        ...(request.history ?? []).slice(-6).map((message) => ({
+          role: message.role,
+          content: message.content
+        })),
+        {
+          role: 'user',
+          content: `问题：${request.question}\n\n检索证据：\n${evidence}`
+        }
+      ],
+      think: false,
+      temperature: 0.1,
+      numPredict: 1600
+    })
+    const answer = this.ensureKnowledgeCitations(
+      response.message?.content?.trim() || '检索到依据，但模型没有生成可验证的回答。',
+      hits
+    )
+    return {
+      answer,
+      sources: hits.map((hit) => hit.source),
+      dataViews: []
+    }
+  }
+
+  private formatKnowledgeEvidence(hit: KnowledgeSearchHit, index: number): string {
+    const source = hit.source
+    const location = source.location ? `，位置：${source.location}` : ''
+    return `[${index}] 来源：${source.name}${location}\n${hit.chunk.content.slice(0, 1800)}`
+  }
+
+  private ensureKnowledgeCitations(answer: string, hits: KnowledgeSearchHit[]): string {
+    const valid = new Set<number>()
+    const normalized = answer.replace(/\[(\d+)\]/g, (full, raw: string) => {
+      const number = Number(raw)
+      if (number >= 1 && number <= hits.length) {
+        valid.add(number)
+        return full
+      }
+      return ''
+    }).trim()
+    if (valid.size) return normalized
+    const references = hits.slice(0, 4).map((_hit, index) => `[${index + 1}]`).join('、')
+    return `${normalized}\n\n依据：${references}`
   }
 
   private async planQuestion(request: ChatRequest): Promise<QuestionPlan> {
@@ -842,34 +895,13 @@ export class OllamaAgent {
   }
 
   private async callModel(input: {
-    messages: OllamaMessage[]
+    messages: ModelMessage[]
     think: boolean
     format?: 'json' | Record<string, unknown>
     temperature: number
     numPredict: number
-  }): Promise<OllamaResponse> {
-    const response = await fetch(`${this.settings.baseUrl.replace(/\/+$/, '')}/api/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: this.settings.model,
-        messages: input.messages,
-        think: input.think,
-        stream: false,
-        ...(input.format ? { format: input.format } : {}),
-        options: {
-          temperature: input.temperature,
-          num_ctx: 32768,
-          num_predict: input.numPredict
-        }
-      }),
-      signal: AbortSignal.timeout(180_000)
-    })
-    if (!response.ok) {
-      const body = await response.text()
-      throw new Error(`Ollama HTTP ${response.status}: ${body.slice(0, 300)}`)
-    }
-    return (await response.json()) as OllamaResponse
+  }): Promise<ModelResponse> {
+    return new ModelClient(this.settings).chat(input)
   }
 
   private async askWithTools(request: ChatRequest): Promise<ChatResponse> {
@@ -905,7 +937,7 @@ export class OllamaAgent {
           : ''
     const asksOnlyForFieldSchema =
       /有哪些(?:可用)?字段|字段列表|数据结构|字段结构|字段覆盖率|查看字段/.test(request.question)
-    const system: OllamaMessage = {
+    const system: ModelMessage = {
       role: 'system',
       content: [
         '你是 VISSLM 项目数据助手，只能依据工具返回的本地采集数据回答。',
@@ -926,7 +958,7 @@ export class OllamaAgent {
         '回答使用中文，简洁清楚。引用记录时必须使用工具 source.uid 写成 [UID:实际UID]，不要把 source.itemId 当成 UID。'
       ].join('\n')
     }
-    const messages: OllamaMessage[] = [
+    const messages: ModelMessage[] = [
       system,
       ...(
         /^(继续|再|那|那么)|上一个|刚才|上述|其中|它们|这些|该问题|该记录/.test(
@@ -935,7 +967,7 @@ export class OllamaAgent {
           ? (request.history ?? []).slice(-8)
           : []
       ).map(
-        (message): OllamaMessage => ({
+        (message): ModelMessage => ({
           role: message.role,
           content: message.content
         })
@@ -998,6 +1030,7 @@ export class OllamaAgent {
         }
         messages.push({
           role: 'tool',
+          tool_call_id: call.id,
           content: JSON.stringify(result)
         })
       }
@@ -1005,29 +1038,14 @@ export class OllamaAgent {
     throw new Error('Agent 工具调用次数过多，请缩小问题范围后重试')
   }
 
-  private async chat(messages: OllamaMessage[]): Promise<OllamaResponse> {
-    const response = await fetch(`${this.settings.baseUrl.replace(/\/+$/, '')}/api/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: this.settings.model,
-        messages,
-        tools,
-        think: this.settings.thinking,
-        stream: false,
-        options: {
-          temperature: 0.1,
-          num_ctx: 32768,
-          num_predict: 2048
-        }
-      }),
-      signal: AbortSignal.timeout(180_000)
+  private async chat(messages: ModelMessage[]): Promise<ModelResponse> {
+    return new ModelClient(this.settings).chat({
+      messages,
+      tools,
+      think: this.settings.thinking,
+      temperature: 0.1,
+      numPredict: 2048
     })
-    if (!response.ok) {
-      const body = await response.text()
-      throw new Error(`Ollama HTTP ${response.status}: ${body.slice(0, 300)}`)
-    }
-    return (await response.json()) as OllamaResponse
   }
 
   private executeTool(

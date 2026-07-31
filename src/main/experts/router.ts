@@ -22,8 +22,8 @@ export const expertRegistry: readonly ExpertDefinition[] = [
     mention: '@数据可视化专家',
     description: '基于本地数据生成可追溯的可视化大屏',
     icon: 'dashboard',
-    capabilities: ['field-profile', 'query-spec', 'dashboard-spec'],
-    allowedTools: ['list_field_profiles', 'execute_query', 'validate_dashboard_spec'],
+    capabilities: ['field-profile', 'query-spec', 'dashboard-spec', 'dashboard-patch'],
+    allowedTools: ['list_field_profiles', 'execute_query', 'validate_dashboard_spec', 'patch_dashboard'],
     systemPromptVersion: 'visualization-v1'
   }
 ] as const
@@ -39,12 +39,19 @@ export class ExpertRouter {
     const visualization = byId.get('visualization')!
     const general = byId.get('general')!
     const explicitVisualization = /@数据可视化专家(?:\s|$)/.test(input.question)
+    const explicitGeneral = /@通用数据助手(?:\s|$)/.test(input.question)
     let result: ExpertRouteResult
     if (explicitVisualization) {
       result = {
         expert: visualization,
         reason: 'explicit-mention',
         question: input.question.replace(/@数据可视化专家\s*/g, '').trim()
+      }
+    } else if (explicitGeneral) {
+      result = {
+        expert: general,
+        reason: 'explicit-mention',
+        question: input.question.replace(/@通用数据助手\s*/g, '').trim()
       }
     } else if (input.entrypoint === 'dashboard') {
       result = { expert: visualization, reason: 'entrypoint', question: input.question.trim() }

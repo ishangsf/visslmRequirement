@@ -7,7 +7,8 @@ import type { DashboardSpec } from '../src/shared/dashboard'
 import {
   arrangeDashboardComponents,
   dashboardLayoutProfiles,
-  dashboardRowCount
+  dashboardRowCount,
+  validateDashboardLayout
 } from '../src/shared/dashboard-layout'
 import type { DataScope, QuerySpec } from '../src/shared/query-spec'
 
@@ -129,6 +130,13 @@ const dashboard: DashboardSpec = {
   }]
 }
 assert.deepEqual(validateDashboardSpec(dashboard, engine), [])
+const layoutPair = [
+  { ...dashboard.components[0], id: 'layout-a', layout: { x: 0, y: 0, w: 12, h: 5 } },
+  { ...dashboard.components[0], id: 'layout-b', layout: { x: 12, y: 0, w: 12, h: 5 } }
+]
+assert.deepEqual(validateDashboardLayout(layoutPair, 'layout-a', layoutPair[0].layout), [])
+assert.ok(validateDashboardLayout(layoutPair, 'layout-a', { x: 8, y: 0, w: 12, h: 5 }).length)
+assert.ok(validateDashboardLayout(layoutPair, 'layout-a', { x: 0, y: 0, w: 2, h: 1 }).length)
 
 const arranged = arrangeDashboardComponents([
   { ...dashboard.components[0], id: 'kpi', type: 'kpi' },

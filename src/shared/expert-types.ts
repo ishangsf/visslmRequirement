@@ -20,6 +20,11 @@ export type AgentEvent =
   | { type: 'artifact'; artifactId: string; version: number; dashboard: DashboardSpec }
   | { type: 'error'; code: string; message: string; recoverable: boolean }
 
+export interface AgentProgressUpdate {
+  conversationId?: string
+  event: AgentEvent
+}
+
 export interface ExpertRouteInput {
   question: string
   expertId?: ExpertId

@@ -4,20 +4,29 @@ import {
   BulbOutlined,
   CloudDownloadOutlined,
   CloseOutlined,
+  CloudUploadOutlined,
   DatabaseOutlined,
   DeleteOutlined,
   EyeOutlined,
   ExportOutlined,
+  FileExcelOutlined,
+  FilePdfOutlined,
   FileSearchOutlined,
+  FileTextOutlined,
   FilterOutlined,
+  FileWordOutlined,
   FundProjectionScreenOutlined,
   FullscreenExitOutlined,
+  HistoryOutlined,
+  HolderOutlined,
   ImportOutlined,
   LeftOutlined,
   MessageOutlined,
   MinusOutlined,
   PictureOutlined,
   PlusOutlined,
+  ProjectOutlined,
+  ReloadOutlined,
   SearchOutlined,
   SendOutlined,
   SettingOutlined,
@@ -44,11 +53,11 @@ import {
   Progress,
   Row,
   Select,
+  Segmented,
   Space,
   Spin,
   Statistic,
   Switch,
-  Table,
   Tabs,
   Tag,
   Typography
@@ -60,15 +69,34 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import appIcon from './assets/visslm-icon.png'
 import { DashboardStudio } from './dashboard/DashboardStudio'
+import { RichDescription } from './RichDescription'
+import { ResizableTable } from './ResizableTable'
+import { ProjectManagementPage } from './project-management/ProjectManagementPage'
 import type { DashboardSpec } from '../../shared/dashboard'
+import type { DataScope } from '../../shared/query-spec'
+import type { AgentEvent, ExpertId } from '../../shared/expert-types'
+import {
+  DEFAULT_FEATURE_MODULE_SETTINGS,
+  DEFAULT_FEATURE_NAVIGATION_ORDER
+} from '../../shared/types'
 import type {
   AppSettings,
   ChatDataRow,
   ChatDataView,
   ChatMessage,
+  ChatSessionSummary,
   CollectionRequestLogRow,
   DashboardStats,
+  FeatureNavigationOrder,
+  FeatureModuleKey,
+  FeatureModuleSettings,
+  KnowledgeDocument,
+  KnowledgeDocumentDetail,
+  KnowledgeIndexProgress,
+  KnowledgeStats,
   ModelSettings,
+  ModelProvider,
+  ModelSource,
   PlatformSettingsInput,
   ProjectRow,
   PushConfig,
@@ -86,7 +114,154 @@ import type {
 const { Content, Sider } = Layout
 const { Title, Text, Paragraph } = Typography
 
-type PageKey = 'dashboard' | 'visualization' | 'data' | 'chat' | 'sync' | 'push' | 'settings'
+type PageKey = 'dashboard' | 'visualization' | 'projects' | 'data' | 'chat' | 'sync' | 'push' | 'settings'
+type FeatureDropPosition = 'before' | 'after'
+type FeatureDropTarget = {
+  key: FeatureModuleKey
+  position: FeatureDropPosition
+}
+
+const appTableScrollY = 'min(560px, max(260px, calc(100vh - 300px)))'
+const compactTableScrollY = 'min(360px, max(180px, calc(100vh - 420px)))'
+
+const featureNavigationItems: Array<{
+  key: Exclude<PageKey, 'settings'>
+  feature: FeatureModuleKey
+  icon: React.ReactNode
+  label: string
+}> = [
+  { key: 'dashboard', feature: 'dashboard', icon: <BarChartOutlined />, label: '数据概览' },
+  {
+    key: 'visualization',
+    feature: 'visualization',
+    icon: <FundProjectionScreenOutlined />,
+    label: '可视化大屏'
+  },
+  { key: 'projects', feature: 'projects', icon: <ProjectOutlined />, label: '项目管理' },
+  { key: 'data', feature: 'data', icon: <DatabaseOutlined />, label: '资产中心' },
+  { key: 'chat', feature: 'chat', icon: <MessageOutlined />, label: 'AI 助手' },
+  { key: 'sync', feature: 'sync', icon: <SyncOutlined />, label: '数据采集' },
+  { key: 'push', feature: 'push', icon: <SendOutlined />, label: '数据推送' }
+]
+
+const featureDefinitions: Array<{
+  key: FeatureModuleKey
+  label: string
+  description: string
+  icon: React.ReactNode
+  defaultDisabled?: boolean
+}> = [
+  {
+    key: 'dashboard',
+    label: '数据概览',
+    description: '查看本地数据统计、类型构成与发布状态。',
+    icon: <BarChartOutlined />
+  },
+  {
+    key: 'visualization',
+    label: '可视化大屏',
+    description: '创建、编辑和导出可追溯的数据可视化大屏。',
+    icon: <FundProjectionScreenOutlined />
+  },
+  {
+    key: 'projects',
+    label: '项目管理',
+    description: '管理项目成本、协议需求和数据中心资产。',
+    icon: <ProjectOutlined />
+  },
+  {
+    key: 'data',
+    label: '资产中心',
+    description: '管理已同步的数据记录与本地知识库资产。',
+    icon: <DatabaseOutlined />
+  },
+  {
+    key: 'chat',
+    label: 'AI 助手',
+    description: '使用本地或在线模型进行数据问答和分析。',
+    icon: <MessageOutlined />
+  },
+  {
+    key: 'sync',
+    label: '数据采集',
+    description: '从 VISSLM 平台读取数据并同步到本地。',
+    icon: <SyncOutlined />
+  },
+  {
+    key: 'push',
+    label: '数据推送',
+    description: '将本地处理后的数据按配置推送回业务平台。',
+    icon: <SendOutlined />,
+    defaultDisabled: true
+  }
+]
+
+const normalizeFeatureNavigationOrder = (
+  input?: readonly FeatureModuleKey[]
+): FeatureNavigationOrder => {
+  const seen = new Set<FeatureModuleKey>()
+  const normalized: FeatureNavigationOrder = []
+
+  for (const key of input ?? []) {
+    if (!DEFAULT_FEATURE_NAVIGATION_ORDER.includes(key) || seen.has(key)) continue
+    seen.add(key)
+    normalized.push(key)
+  }
+
+  for (const key of DEFAULT_FEATURE_NAVIGATION_ORDER) {
+    if (seen.has(key)) continue
+    seen.add(key)
+    normalized.push(key)
+  }
+  return normalized
+}
+
+const onlineModelProviders: Array<{
+  value: ModelProvider
+  label: string
+  baseUrl: string
+  models: string[]
+}> = [
+  { value: 'openai', label: 'OpenAI', baseUrl: 'https://api.openai.com/v1', models: ['gpt-5.2', 'gpt-4.1', 'gpt-4.1-mini'] },
+  { value: 'anthropic', label: 'Anthropic', baseUrl: 'https://api.anthropic.com/v1', models: ['claude-opus-4-1', 'claude-sonnet-4-0', 'claude-3-7-sonnet-latest'] },
+  { value: 'deepseek', label: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', models: ['deepseek-chat', 'deepseek-reasoner'] },
+  { value: 'qwen', label: '通义千问', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', models: ['qwen-max', 'qwen-plus', 'qwen-turbo'] },
+  { value: 'zhipu', label: '智谱 AI', baseUrl: 'https://open.bigmodel.cn/api/paas/v4', models: ['glm-4.5', 'glm-4-plus', 'glm-4-flash'] },
+  { value: 'moonshot', label: 'Moonshot', baseUrl: 'https://api.moonshot.cn/v1', models: ['moonshot-v1-8k', 'moonshot-v1-32k', 'kimi-k2-0711-preview'] },
+  { value: 'minimax', label: 'MiniMax', baseUrl: 'https://api.minimax.chat/v1', models: ['MiniMax-M2.5', 'MiniMax-M2.1'] },
+  { value: 'openai-compatible', label: 'OpenAI 兼容接口', baseUrl: '', models: [] }
+]
+
+const chatExperts: Array<{
+  id: ExpertId
+  name: string
+  mention: string
+  description: string
+}> = [
+  {
+    id: 'visualization',
+    name: '数据可视化专家',
+    mention: '@数据可视化专家',
+    description: '生成可追溯、可编辑的数据大屏'
+  },
+  {
+    id: 'general',
+    name: '通用数据助手',
+    mention: '@通用数据助手',
+    description: '检索、统计和解释本地数据'
+  }
+]
+
+const visualizationStages = [
+  { id: 'intent', label: '理解需求' },
+  { id: 'profile', label: '分析数据' },
+  { id: 'plan', label: '规划指标' },
+  { id: 'query', label: '校验查询' },
+  { id: 'execute', label: '计算数据' },
+  { id: 'compose', label: '生成大屏' },
+  { id: 'validate', label: '质量检查' },
+  { id: 'persist', label: '完成' }
+] as const
 
 const formatDate = (value?: string): string => {
   if (!value) return '—'
@@ -94,82 +269,19 @@ const formatDate = (value?: string): string => {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString('zh-CN')
 }
 
+const formatChatSessionTime = (value: string): string => {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return '—'
+  const elapsed = Date.now() - date.getTime()
+  if (elapsed < 60 * 60 * 1000) return `${Math.max(1, Math.floor(elapsed / 60000))} 分钟前`
+  if (elapsed < 24 * 60 * 60 * 1000) return `${Math.floor(elapsed / 3600000)} 小时前`
+  return date.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' })
+}
+
 const plainTextFromHtml = (value?: string): string => {
   if (!value) return ''
   const document = new DOMParser().parseFromString(value, 'text/html')
   return (document.body.textContent ?? '').replace(/\s+/g, ' ').trim()
-}
-
-function RichDescription({
-  html,
-  images
-}: {
-  html: string
-  images: RecordDetail['images']
-}): React.JSX.Element {
-  const safeHtml = useMemo(() => {
-    if (!html) return ''
-    const document = new DOMParser().parseFromString(html, 'text/html')
-    document
-      .querySelectorAll('script,style,iframe,object,embed,link,meta,form,input,button,svg')
-      .forEach((element) => element.remove())
-
-    const allowedTags = new Set([
-      'P', 'BR', 'DIV', 'SPAN', 'STRONG', 'B', 'EM', 'I', 'U',
-      'UL', 'OL', 'LI', 'BLOCKQUOTE', 'PRE', 'CODE',
-      'TABLE', 'THEAD', 'TBODY', 'TR', 'TH', 'TD', 'A', 'IMG'
-    ])
-    for (const element of [...document.body.querySelectorAll('*')]) {
-      if (!allowedTags.has(element.tagName)) {
-        element.replaceWith(...element.childNodes)
-        continue
-      }
-      if (element.tagName === 'IMG') {
-        const source = element.getAttribute('src') ?? ''
-        const alt = element.getAttribute('alt') ?? '描述图片'
-        const normalizedSource = (() => {
-          try {
-            return decodeURIComponent(source)
-          } catch {
-            return source
-          }
-        })()
-        const localImage = images.find((image) =>
-          Boolean(
-            image.dataUri &&
-            (
-              image.sourceUrl.includes(source) ||
-              image.sourceUrl.includes(normalizedSource) ||
-              (source.startsWith('data:image/') && image.sourceUrl === 'inline:data-uri')
-            )
-          )
-        )
-        for (const attribute of [...element.attributes]) {
-          element.removeAttribute(attribute.name)
-        }
-        if (localImage?.dataUri) {
-          element.setAttribute('src', localImage.dataUri)
-          element.setAttribute('alt', alt)
-          element.setAttribute('loading', 'lazy')
-        } else {
-          element.replaceWith(document.createTextNode(`[图片暂未同步：${alt}]`))
-        }
-      } else {
-        for (const attribute of [...element.attributes]) {
-          element.removeAttribute(attribute.name)
-        }
-      }
-    }
-    return document.body.innerHTML
-  }, [html, images])
-
-  if (!safeHtml) return <Text type="secondary">暂无描述</Text>
-  return (
-    <div
-      className="rich-description"
-      dangerouslySetInnerHTML={{ __html: safeHtml }}
-    />
-  )
 }
 
 const renderPushStatus = (record: Pick<
@@ -356,10 +468,12 @@ function DashboardPage({ refreshKey }: { refreshKey: number }): React.JSX.Elemen
 
 function DataPage({
   refreshKey,
-  onDataChanged
+  onDataChanged,
+  onVisualize
 }: {
   refreshKey: number
   onDataChanged: () => void
+  onVisualize: (scope: DataScope, summary: string) => void
 }): React.JSX.Element {
   const { message, modal } = AntApp.useApp()
   const [projects, setProjects] = useState<ProjectRow[]>([])
@@ -484,6 +598,25 @@ function DataPage({
     })
   }
 
+  const handoffToVisualization = (): void => {
+    const selectedRecords = selectedRowKeys.length > 0
+    const scope: DataScope = selectedRecords
+      ? { recordUids: selectedRowKeys }
+      : {
+          ...(projectId ? { projectIds: [projectId] } : {}),
+          ...(nodeType ? { nodeTypes: [nodeType] } : {})
+        }
+    const parts = selectedRecords
+      ? [`已选 ${selectedRowKeys.length} 条记录`]
+      : [
+          projectId
+            ? `项目 ${projects.find((project) => project.uid === projectId)?.name ?? projectId}`
+            : '',
+          nodeType ? `类型 ${nodeType}` : ''
+        ].filter(Boolean)
+    onVisualize(scope, parts.join(' · '))
+  }
+
   return (
     <div className="page-stack">
       <div className="page-toolbar">
@@ -501,6 +634,15 @@ function DataPage({
             onClick={() => void exportData()}
           >
             导出数据
+          </Button>
+          <Button
+            type="primary"
+            icon={<FundProjectionScreenOutlined />}
+            disabled={!selectedRowKeys.length && !projectId && !nodeType}
+            onClick={handoffToVisualization}
+          >
+            交给可视化专家
+            {selectedRowKeys.length ? `（${selectedRowKeys.length}）` : ''}
           </Button>
           <Button
             danger
@@ -523,7 +665,7 @@ function DataPage({
           </Button>
         </Space>
       </div>
-      <Card>
+      <Card className="data-workbench-card">
         <div className="filter-bar">
           <Input.Search
             allowClear
@@ -544,7 +686,7 @@ function DataPage({
               setPage(1)
             }}
             options={projects.map((project) => ({ label: project.name, value: project.uid }))}
-            style={{ minWidth: 220 }}
+            style={{ width: 220 }}
           />
           <Select
             allowClear
@@ -555,10 +697,11 @@ function DataPage({
               setPage(1)
             }}
             options={nodeTypes.map((type) => ({ label: type, value: type }))}
-            style={{ minWidth: 160 }}
+            style={{ width: 160 }}
           />
         </div>
-        <Table<RecordRow>
+        <ResizableTable<RecordRow>
+          tableKey="asset-center-records"
           rowKey="uid"
           rowSelection={{
             selectedRowKeys,
@@ -567,7 +710,7 @@ function DataPage({
           }}
           loading={loading}
           dataSource={records}
-          scroll={{ x: 1450 }}
+          scroll={{ x: 1450, y: appTableScrollY }}
           pagination={{
             current: page,
             pageSize,
@@ -629,7 +772,14 @@ function DataPage({
         />
       </Card>
       <Drawer
-        title={detail?.name ?? '记录详情'}
+        className="record-detail-drawer"
+        title={detail ? (
+          <div className="drawer-context-title">
+            <DatabaseOutlined />
+            <span>数据中心记录</span>
+            <strong title={detail.name}>{detail.name}</strong>
+          </div>
+        ) : '数据中心记录'}
         size={720}
         open={Boolean(detail)}
         onClose={() => setDetail(null)}
@@ -673,6 +823,318 @@ function DataPage({
   )
 }
 
+const knowledgeStatusMeta: Record<KnowledgeDocument['status'], { label: string; color: string }> = {
+  queued: { label: '排队中', color: 'default' },
+  processing: { label: '处理中', color: 'processing' },
+  ready: { label: '已就绪', color: 'success' },
+  failed: { label: '失败', color: 'error' }
+}
+
+const knowledgeFileIcon = (extension: string): React.JSX.Element => {
+  if (extension === '.pdf') return <FilePdfOutlined />
+  if (extension === '.docx') return <FileWordOutlined />
+  if (extension === '.xlsx' || extension === '.xls') return <FileExcelOutlined />
+  return <FileTextOutlined />
+}
+
+const formatBytes = (bytes: number): string => {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function KnowledgeBasePage({ refreshKey }: { refreshKey: number }): React.JSX.Element {
+  const { message, modal } = AntApp.useApp()
+  const [documents, setDocuments] = useState<KnowledgeDocument[]>([])
+  const [total, setTotal] = useState(0)
+  const [stats, setStats] = useState<KnowledgeStats | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [uploading, setUploading] = useState(false)
+  const [rebuilding, setRebuilding] = useState(false)
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(20)
+  const [search, setSearch] = useState('')
+  const [status, setStatus] = useState<KnowledgeDocument['status']>()
+  const [extension, setExtension] = useState<string>()
+  const [tag, setTag] = useState('')
+  const [progress, setProgress] = useState<KnowledgeIndexProgress | null>(null)
+  const [detail, setDetail] = useState<KnowledgeDocumentDetail | null>(null)
+  const [detailLoading, setDetailLoading] = useState(false)
+  const [tagDraft, setTagDraft] = useState('')
+
+  const load = useCallback(async (): Promise<void> => {
+    setLoading(true)
+    try {
+      const [pageResult, statsResult] = await Promise.all([
+        window.visslm.listKnowledgeDocuments({ page, pageSize, search, status, extension, tag }),
+        window.visslm.getKnowledgeStats()
+      ])
+      setDocuments(pageResult.rows)
+      setTotal(pageResult.total)
+      setStats(statsResult)
+    } finally {
+      setLoading(false)
+    }
+  }, [extension, page, pageSize, search, status, tag])
+
+  useEffect(() => {
+    void load()
+  }, [load, refreshKey])
+
+  useEffect(() => window.visslm.onKnowledgeProgress((next) => {
+    setProgress(next)
+    if (next.phase === 'done' || next.phase === 'error') void load()
+  }), [load])
+
+  const upload = async (): Promise<void> => {
+    setUploading(true)
+    try {
+      const result = await window.visslm.uploadKnowledgeDocuments()
+      if (result.canceled) return
+      result.ok ? message.success(result.message) : message.warning(result.message)
+      if (result.skipped.length) {
+        modal.warning({
+          title: '部分文件未加入知识库',
+          content: <pre className="knowledge-error-list">{result.skipped.map((item) => `${item.fileName}: ${item.reason}`).join('\n')}</pre>
+        })
+      }
+      await load()
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : String(error))
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  const openDetail = async (id: string): Promise<void> => {
+    setDetailLoading(true)
+    try {
+      const result = await window.visslm.getKnowledgeDocument(id)
+      setDetail(result)
+      setTagDraft(result?.tags.join(', ') ?? '')
+    } finally {
+      setDetailLoading(false)
+    }
+  }
+
+  const retry = async (id: string): Promise<void> => {
+    try {
+      const result = await window.visslm.retryKnowledgeDocument(id)
+      result ? message.success(`已重新处理 ${result.fileName}`) : message.error('文档不存在')
+      await load()
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  const remove = (document: KnowledgeDocument): void => {
+    modal.confirm({
+      title: `确认从知识库删除“${document.fileName}”？`,
+      content: '只会移除知识库索引和元数据，不会删除电脑上的原始文件。',
+      okText: '删除',
+      okType: 'danger',
+      cancelText: '取消',
+      onOk: async () => {
+        const result = await window.visslm.deleteKnowledgeDocument(document.id)
+        result.ok ? message.success(result.message) : message.error(result.message)
+        if (detail?.id === document.id) setDetail(null)
+        await load()
+      }
+    })
+  }
+
+  const rebuild = async (): Promise<void> => {
+    setRebuilding(true)
+    try {
+      const result = await window.visslm.rebuildKnowledgeIndex()
+      message.success(result.message)
+      await load()
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : String(error))
+    } finally {
+      setRebuilding(false)
+    }
+  }
+
+  const saveTags = async (): Promise<void> => {
+    if (!detail) return
+    const result = await window.visslm.updateKnowledgeDocumentTags(
+      detail.id,
+      tagDraft.split(/[,，]/g)
+    )
+    if (result) {
+      setDetail({ ...detail, tags: result.tags, updatedAt: result.updatedAt })
+      message.success('标签已保存')
+      await load()
+    }
+  }
+
+  return (
+    <div className="knowledge-page page-stack">
+      <div className="knowledge-toolbar page-toolbar">
+        <Space wrap>
+          <Button type="primary" icon={<CloudUploadOutlined />} loading={uploading} onClick={() => void upload()}>
+            上传文档
+          </Button>
+          <Button icon={<ReloadOutlined />} loading={rebuilding} onClick={() => void rebuild()}>
+            重建向量索引
+          </Button>
+        </Space>
+        <Text type="secondary">支持 DOCX、PDF、XLSX/XLS、TXT，单文件不超过 100 MB</Text>
+      </div>
+      <div className="knowledge-metric-grid">
+        <Card size="small"><Statistic title="文档" value={stats?.documentCount ?? 0} /></Card>
+        <Card size="small" className="knowledge-metric-card knowledge-metric-card-success"><Statistic title="已就绪" value={stats?.readyCount ?? 0} /></Card>
+        <Card size="small"><Statistic title="索引分块" value={stats?.indexedChunkCount ?? 0} /></Card>
+        <Card size="small"><Statistic title="采集记录" value={stats?.recordCount ?? 0} /></Card>
+      </div>
+      {(progress?.status === 'running' || progress?.phase === 'error') && (
+        <div className={`knowledge-progress ${progress.phase === 'error' ? 'has-error' : ''}`}>
+          <div className="knowledge-progress-heading">
+            <Text strong>{progress.message}</Text>
+            {progress.total > 0 && <Text type="secondary">{progress.current}/{progress.total}</Text>}
+          </div>
+          <Progress
+            percent={progress.total ? Math.min(100, Math.round((progress.current / progress.total) * 100)) : undefined}
+            status={progress.status === 'failed' ? 'exception' : 'active'}
+            showInfo={false}
+          />
+        </div>
+      )}
+      <Card className="knowledge-list-card">
+        <div className="knowledge-filter-bar">
+          <Input.Search
+            allowClear
+            placeholder="搜索文件名或失败原因"
+            prefix={<SearchOutlined />}
+            onSearch={(value) => { setSearch(value); setPage(1) }}
+            style={{ width: 300 }}
+          />
+          <Select
+            allowClear
+            placeholder="全部状态"
+            value={status}
+            onChange={(value) => { setStatus(value); setPage(1) }}
+            options={Object.entries(knowledgeStatusMeta).map(([value, item]) => ({ value, label: item.label }))}
+            style={{ width: 140 }}
+          />
+          <Select
+            allowClear
+            placeholder="全部类型"
+            value={extension}
+            onChange={(value) => { setExtension(value); setPage(1) }}
+            options={['.docx', '.pdf', '.xlsx', '.xls', '.txt'].map((value) => ({ value, label: value.toUpperCase() }))}
+            style={{ width: 130 }}
+          />
+          <Input
+            allowClear
+            placeholder="标签"
+            value={tag}
+            onChange={(event) => setTag(event.target.value)}
+            onPressEnter={() => setPage(1)}
+            style={{ width: 160 }}
+          />
+        </div>
+        <ResizableTable<KnowledgeDocument>
+          tableKey="knowledge-documents"
+          rowKey="id"
+          loading={loading}
+          dataSource={documents}
+          scroll={{ x: 980, y: appTableScrollY }}
+          pagination={{
+            current: page,
+            pageSize,
+            total,
+            showSizeChanger: true,
+            showTotal: (count) => `共 ${count} 个文档`
+          }}
+          onChange={(pagination: TablePaginationConfig) => {
+            setPage(pagination.current ?? 1)
+            setPageSize(pagination.pageSize ?? 20)
+          }}
+          columns={[
+            {
+              title: '文档',
+              key: 'fileName',
+              width: 330,
+              render: (_value, document) => (
+                <Button type="link" className="knowledge-name-button" onClick={() => void openDetail(document.id)}>
+                  <span className="knowledge-file-icon">{knowledgeFileIcon(document.extension)}</span>
+                  <span>{document.fileName}</span>
+                </Button>
+              )
+            },
+            { title: '状态', dataIndex: 'status', width: 110, render: (value: KnowledgeDocument['status']) => <Tag color={knowledgeStatusMeta[value].color}>{knowledgeStatusMeta[value].label}</Tag> },
+            { title: '分块', dataIndex: 'chunkCount', width: 80 },
+            { title: '标签', dataIndex: 'tags', width: 200, render: (tags: string[]) => tags.length ? tags.map((item) => <Tag key={item}>{item}</Tag>) : <Text type="secondary">未设置</Text> },
+            { title: '大小', dataIndex: 'byteSize', width: 100, render: formatBytes },
+            { title: '更新时间', dataIndex: 'updatedAt', width: 180, render: formatDate },
+            {
+              title: '操作',
+              key: 'actions',
+              fixed: 'right',
+              width: 150,
+              render: (_value, document) => (
+                <Space size={4}>
+                  {(document.status === 'failed' || document.status === 'ready') && (
+                    <Button type="link" size="small" icon={<ReloadOutlined />} onClick={() => void retry(document.id)}>
+                      {document.status === 'failed' ? '重试' : '重新解析'}
+                    </Button>
+                  )}
+                  <Button type="link" danger size="small" icon={<DeleteOutlined />} onClick={() => remove(document)}>删除</Button>
+                </Space>
+              )
+            }
+          ]}
+        />
+      </Card>
+      <Drawer
+        className="knowledge-detail-drawer"
+        title={detail ? (
+          <div className="drawer-context-title">
+            <BulbOutlined />
+            <span>知识库文档</span>
+            <strong title={detail.fileName}>{detail.fileName}</strong>
+          </div>
+        ) : '知识库文档'}
+        size={720}
+        open={Boolean(detail)}
+        onClose={() => setDetail(null)}
+      >
+        <Spin spinning={detailLoading}>
+          {detail && (
+            <div className="knowledge-detail-stack">
+              <Descriptions bordered size="small" column={2}>
+                <Descriptions.Item label="格式">{detail.extension.toUpperCase()}</Descriptions.Item>
+                <Descriptions.Item label="大小">{formatBytes(detail.byteSize)}</Descriptions.Item>
+                <Descriptions.Item label="状态"><Tag color={knowledgeStatusMeta[detail.status].color}>{knowledgeStatusMeta[detail.status].label}</Tag></Descriptions.Item>
+                <Descriptions.Item label="页数/工作表">{detail.pageCount || '-'}</Descriptions.Item>
+                <Descriptions.Item label="SHA-256" span={2}><Text copyable ellipsis>{detail.sha256}</Text></Descriptions.Item>
+              </Descriptions>
+              {detail.errorMessage && <Alert type="error" showIcon title={detail.errorMessage} />}
+              <div className="knowledge-tag-editor">
+                <Text strong>标签</Text>
+                <Input value={tagDraft} onChange={(event) => setTagDraft(event.target.value)} placeholder="用逗号分隔多个标签" />
+                <Button onClick={() => void saveTags()}>保存标签</Button>
+              </div>
+              <Divider titlePlacement="start">分块预览（{detail.chunks.length}）</Divider>
+              <div className="knowledge-chunk-list">
+                {detail.chunks.slice(0, 30).map((chunk) => (
+                  <div className="knowledge-chunk-item" key={chunk.id}>
+                    <div className="knowledge-chunk-meta"><Tag>{chunk.location || `分块 ${chunk.chunkIndex + 1}`}</Tag><Text type="secondary">#{chunk.chunkIndex + 1}</Text></div>
+                    <Paragraph ellipsis={{ rows: 4, expandable: true }}>{chunk.content}</Paragraph>
+                  </div>
+                ))}
+              </div>
+              {detail.chunks.length > 30 && <Text type="secondary">仅预览前 30 个分块</Text>}
+            </div>
+          )}
+        </Spin>
+      </Drawer>
+    </div>
+  )
+}
+
 function ChatPage({
   messages,
   setMessages,
@@ -680,7 +1142,12 @@ function ChatPage({
   setQuestion,
   loading,
   setLoading,
-  onOpenDashboard
+  onOpenDashboard,
+  onDashboardUpdate,
+  activeArtifact,
+  dataScope,
+  dataScopeSummary,
+  onClearDataScope
 }: {
   messages: ChatMessage[]
   setMessages: React.Dispatch<React.SetStateAction<ChatMessage[]>>
@@ -689,17 +1156,46 @@ function ChatPage({
   loading: boolean
   setLoading: React.Dispatch<React.SetStateAction<boolean>>
   onOpenDashboard: (dashboard: DashboardSpec) => void
+  onDashboardUpdate: (dashboard: DashboardSpec) => void
+  activeArtifact: DashboardSpec | null
+  dataScope: DataScope | null
+  dataScopeSummary: string
+  onClearDataScope: () => void
 }): React.JSX.Element {
   const { message, modal } = AntApp.useApp()
   const messageListRef = useRef<HTMLDivElement>(null)
   const [activeDataView, setActiveDataView] = useState<ChatDataView | null>(null)
   const [activeDataGroup, setActiveDataGroup] = useState('')
   const [activeRecordDetail, setActiveRecordDetail] = useState<RecordDetail | null>(null)
+  const [activeKnowledgeDetail, setActiveKnowledgeDetail] = useState<KnowledgeDocumentDetail | null>(null)
   const [recordDetailLoading, setRecordDetailLoading] = useState(false)
-  const conversationId = useRef(crypto.randomUUID())
+  const [mentionOpen, setMentionOpen] = useState(false)
+  const [mentionQuery, setMentionQuery] = useState('')
+  const [mentionIndex, setMentionIndex] = useState(0)
+  const [agentProgress, setAgentProgress] = useState<Array<Extract<AgentEvent, { type: 'status' }>>>([])
+  const conversationId = useRef<string>(crypto.randomUUID())
+  const [activeConversationId, setActiveConversationId] = useState(conversationId.current)
+  const [historySessions, setHistorySessions] = useState<ChatSessionSummary[]>([])
+  const [historyRefreshing, setHistoryRefreshing] = useState(false)
+  const [historyLoading, setHistoryLoading] = useState(false)
   const selectedDataGroup = activeDataView?.groups.find(
     (group) => group.name === activeDataGroup
   ) ?? activeDataView?.groups[0]
+
+  const refreshHistory = useCallback(async (): Promise<void> => {
+    setHistoryRefreshing(true)
+    try {
+      setHistorySessions(await window.visslm.listChatSessions(50))
+    } catch (error) {
+      message.warning(`历史会话加载失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setHistoryRefreshing(false)
+    }
+  }, [message])
+
+  useEffect(() => {
+    void refreshHistory()
+  }, [refreshHistory])
 
   const openDataView = (view: ChatDataView): void => {
     setActiveDataView(view)
@@ -711,15 +1207,61 @@ function ChatPage({
     setActiveDataView(null)
     setActiveDataGroup('')
     setActiveRecordDetail(null)
+    setActiveKnowledgeDetail(null)
     setRecordDetailLoading(false)
   }
 
-  const resetConversation = (): void => {
-    conversationId.current = crypto.randomUUID()
+  const persistSession = useCallback(async (sessionMessages: ChatMessage[]): Promise<void> => {
+    if (!sessionMessages.length) return
+    const firstUserMessage = sessionMessages.find((item) => item.role === 'user')
+    try {
+      await window.visslm.saveChatSession({
+        id: conversationId.current,
+        title: firstUserMessage?.content,
+        messages: sessionMessages
+      })
+      await refreshHistory()
+    } catch (error) {
+      message.warning(`历史会话保存失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }, [message, refreshHistory])
+
+  const resetConversation = (successMessage = '已开始新会话'): void => {
+    const nextConversationId = crypto.randomUUID()
+    conversationId.current = nextConversationId
+    setActiveConversationId(nextConversationId)
     setMessages([])
     setQuestion('')
+    setMentionOpen(false)
+    setAgentProgress([])
+    onClearDataScope()
     closeDataView()
-    message.success('已开始新会话')
+    message.success(successMessage)
+  }
+
+  const mentionCandidates = useMemo(
+    () => chatExperts.filter((expert) =>
+      `${expert.name}${expert.mention}`.toLocaleLowerCase().includes(mentionQuery.toLocaleLowerCase())
+    ),
+    [mentionQuery]
+  )
+
+  const updateQuestion = (value: string): void => {
+    setQuestion(value)
+    const match = value.match(/(?:^|\s)@([^@\s]*)$/)
+    setMentionOpen(Boolean(match))
+    setMentionQuery(match?.[1] ?? '')
+    setMentionIndex(0)
+  }
+
+  const selectExpert = (expert: (typeof chatExperts)[number]): void => {
+    setQuestion((current) => {
+      const match = current.match(/(^|\s)@[^@\s]*$/)
+      if (!match || match.index === undefined) return `${expert.mention} ${current}`.trimStart()
+      const prefix = current.slice(0, match.index) + match[1]
+      return `${prefix}${expert.mention} `
+    })
+    setMentionOpen(false)
   }
 
   const startNewConversation = (): void => {
@@ -737,6 +1279,82 @@ function ChatPage({
     })
   }
 
+  const loadSessionById = async (sessionId: string): Promise<void> => {
+    setHistoryLoading(true)
+    try {
+      const session = await window.visslm.getChatSession(sessionId)
+      if (!session) {
+        message.warning('历史会话不存在或已被清理')
+        await refreshHistory()
+        return
+      }
+      conversationId.current = session.id
+      setActiveConversationId(session.id)
+      setMessages(session.messages)
+      setQuestion('')
+      setMentionOpen(false)
+      setAgentProgress([])
+      onClearDataScope()
+      closeDataView()
+      const latestDashboard = [...session.messages]
+        .reverse()
+        .find((item) => item.dashboard)?.dashboard
+      if (latestDashboard) onDashboardUpdate(latestDashboard)
+      message.success(`已加载历史会话：${session.title}`)
+    } catch (error) {
+      message.error(`历史会话加载失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setHistoryLoading(false)
+    }
+  }
+
+  const requestLoadSession = (session: ChatSessionSummary): void => {
+    if (loading || historyLoading || session.id === activeConversationId) return
+    const load = (): Promise<void> => loadSessionById(session.id)
+    if (!messages.length && !question.trim()) {
+      void load()
+      return
+    }
+    modal.confirm({
+      title: '切换历史会话？',
+      content: '当前会话中的草稿和未保存内容将被清空。',
+      okText: '加载会话',
+      cancelText: '继续当前会话',
+      onOk: load
+    })
+  }
+
+  const requestDeleteSession = (session: ChatSessionSummary): void => {
+    if (loading || historyLoading) return
+    modal.confirm({
+      title: '删除历史会话？',
+      content: `“${session.title}”及其消息记录将被删除，无法恢复。`,
+      okText: '删除',
+      okButtonProps: { danger: true },
+      cancelText: '取消',
+      onOk: async () => {
+        setHistoryLoading(true)
+        try {
+          const result = await window.visslm.deleteChatSession(session.id)
+          if (!result.ok) {
+            message.warning(result.message)
+            return
+          }
+          setHistorySessions((items) => items.filter((item) => item.id !== session.id))
+          if (session.id === activeConversationId) {
+            resetConversation('当前会话已删除，已开始新会话')
+          } else {
+            message.success('历史会话已删除')
+          }
+        } catch (error) {
+          message.error(`历史会话删除失败：${error instanceof Error ? error.message : String(error)}`)
+        } finally {
+          setHistoryLoading(false)
+        }
+      }
+    })
+  }
+
   const openRecordDetail = async (row: ChatDataRow): Promise<void> => {
     setRecordDetailLoading(true)
     try {
@@ -745,6 +1363,11 @@ function ChatPage({
     } finally {
       setRecordDetailLoading(false)
     }
+  }
+
+  const openKnowledgeDetail = async (documentId: string): Promise<void> => {
+    const detail = await window.visslm.getKnowledgeDocument(documentId)
+    if (detail) setActiveKnowledgeDetail(detail)
   }
 
   useEffect(() => {
@@ -756,6 +1379,12 @@ function ChatPage({
     })
     return () => cancelAnimationFrame(frame)
   }, [messages.length, loading])
+
+  useEffect(() => window.visslm.onAgentEvent((update) => {
+    if (update.conversationId !== conversationId.current || update.event.type !== 'status') return
+    const statusEvent: Extract<AgentEvent, { type: 'status' }> = update.event
+    setAgentProgress((items) => [...items, statusEvent].slice(-20))
+  }), [])
 
   const send = async (): Promise<void> => {
     const text = question.trim()
@@ -769,17 +1398,30 @@ function ChatPage({
     const next = [...messages, userMessage]
     setMessages(next)
     setQuestion('')
+    setMentionOpen(false)
+    setAgentProgress([])
     setLoading(true)
     try {
       const response = await window.visslm.askAgent({
         question: text,
         conversationId: conversationId.current,
+        entrypoint: dataScope || activeArtifact ? 'dashboard' : 'chat',
+        ...(dataScope ? { dataScope } : {}),
+        ...(activeArtifact
+          ? {
+              activeArtifact: {
+                artifactId: activeArtifact.id,
+                dashboard: activeArtifact
+              }
+            }
+          : {}),
         history: messages.slice(-8).map(({ role, content }) => ({ role, content }))
       })
       if (response.events?.some((event) => event.type === 'error' && event.recoverable)) {
         setQuestion(text)
       }
-      setMessages([
+      if (response.dashboard) onDashboardUpdate(response.dashboard)
+      const completedMessages: ChatMessage[] = [
         ...next,
         {
           id: crypto.randomUUID(),
@@ -791,7 +1433,9 @@ function ChatPage({
           expertId: response.expertId,
           createdAt: new Date().toISOString()
         }
-      ])
+      ]
+      setMessages(completedMessages)
+      void persistSession(completedMessages)
     } catch (error) {
       const rawMessage = error instanceof Error ? error.message : String(error)
       const userMessage = rawMessage.replace(
@@ -799,7 +1443,7 @@ function ChatPage({
         ''
       )
       setQuestion(text)
-      setMessages([
+      const failedMessages: ChatMessage[] = [
         ...next,
         {
           id: crypto.randomUUID(),
@@ -807,7 +1451,9 @@ function ChatPage({
           content: `请求失败：${userMessage}`,
           createdAt: new Date().toISOString()
         }
-      ])
+      ]
+      setMessages(failedMessages)
+      void persistSession(failedMessages)
     } finally {
       setLoading(false)
     }
@@ -836,6 +1482,76 @@ function ChatPage({
 
   return (
     <div className="chat-page">
+      <aside className="chat-history-panel" aria-label="历史会话">
+        <div className="chat-history-panel-header">
+          <div className="chat-history-title">
+            <HistoryOutlined />
+            <span>历史会话</span>
+          </div>
+          <Button
+            type="text"
+            icon={<ReloadOutlined />}
+            loading={historyRefreshing}
+            aria-label="刷新历史会话"
+            onClick={() => void refreshHistory()}
+          />
+        </div>
+        <div className="chat-history-panel-body">
+          <Text type="secondary" className="chat-history-hint">
+            点击会话可继续提问
+          </Text>
+          {historyLoading ? (
+            <div className="chat-history-loading"><Spin /></div>
+          ) : historySessions.length ? (
+            <div className="chat-history-list">
+              {historySessions.map((session) => (
+                <div
+                  role="button"
+                  tabIndex={loading || historyLoading ? -1 : 0}
+                  aria-disabled={loading || historyLoading}
+                  className={`chat-history-item ${session.id === activeConversationId ? 'active' : ''}`}
+                  key={session.id}
+                  onClick={() => requestLoadSession(session)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                      event.preventDefault()
+                      requestLoadSession(session)
+                    }
+                  }}
+                >
+                  <span className="chat-history-item-main">
+                    <strong>{session.title}</strong>
+                    <small>{session.preview || '暂无消息预览'}</small>
+                  </span>
+                  <span className="chat-history-item-meta">
+                    <span>{session.messageCount} 条</span>
+                    <time>{formatChatSessionTime(session.updatedAt)}</time>
+                  </span>
+                  <Button
+                    className="chat-history-delete"
+                    type="text"
+                    danger
+                    icon={<DeleteOutlined />}
+                    disabled={loading || historyLoading}
+                    aria-label={`删除历史会话：${session.title}`}
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      requestDeleteSession(session)
+                    }}
+                    onKeyDown={(event) => event.stopPropagation()}
+                  />
+                </div>
+              ))}
+            </div>
+          ) : (
+            <Empty
+              className="chat-history-empty"
+              image={Empty.PRESENTED_IMAGE_SIMPLE}
+              description="暂无历史会话"
+            />
+          )}
+        </div>
+      </aside>
       <Card className="chat-card">
         <div className="chat-toolbar">
           <div className="chat-session-label">
@@ -937,6 +1653,39 @@ function ChatPage({
                         </Text>
                       </div>
                     ) : null}
+                    {message.role === 'assistant' && message.sources?.length ? (
+                      <div className="source-list">
+                        <div className="source-list-title">
+                          <BulbOutlined />
+                          <Text strong>回答依据</Text>
+                          <Text type="secondary">{message.sources.length} 条</Text>
+                        </div>
+                        <div className="source-chips">
+                          {message.sources.map((source, index) => (
+                            <Button
+                              type="text"
+                              className="source-chip"
+                              key={`${source.chunkId ?? source.uid}-${index}`}
+                              onClick={() => source.sourceType === 'document' && source.documentId
+                                ? void openKnowledgeDetail(source.documentId)
+                                : void openRecordDetail({
+                                    uid: source.uid,
+                                    name: source.name,
+                                    nodeType: source.nodeType,
+                                    itemId: source.itemId,
+                                    values: {}
+                                  })}
+                            >
+                              {source.sourceType === 'document' ? <FileTextOutlined /> : <DatabaseOutlined />}
+                              <span>
+                                <strong>[{index + 1}] {source.name}</strong>
+                                <small>{source.location || source.nodeType}{source.snippet ? ` · ${source.snippet.slice(0, 80)}` : ''}</small>
+                              </span>
+                            </Button>
+                          ))}
+                        </div>
+                      </div>
+                    ) : null}
                   </div>
                 </div>
               </div>
@@ -953,24 +1702,114 @@ function ChatPage({
                   <Text type="secondary">正在思考</Text>
                 </div>
                 <div className="message-bubble thinking">
-                  <span className="thinking-dots">
-                    <i />
-                    <i />
-                    <i />
-                  </span>
-                  <span>正在检索知识库并组织回答</span>
+                  {agentProgress.length ? (
+                    <div className="agent-stage-progress">
+                      <div className="agent-stage-current">
+                        <span className="thinking-dots"><i /><i /><i /></span>
+                        <span>{agentProgress.at(-1)?.message}</span>
+                      </div>
+                      <div className="agent-stage-list">
+                        {visualizationStages.map((stage) => {
+                          const latestStage = agentProgress.at(-1)?.stage === 'repair'
+                            ? 'plan'
+                            : agentProgress.at(-1)?.stage
+                          const latestIndex = visualizationStages.findIndex((item) => item.id === latestStage)
+                          const stageIndex = visualizationStages.findIndex((item) => item.id === stage.id)
+                          return (
+                            <span
+                              className={
+                                stageIndex < latestIndex
+                                  ? 'complete'
+                                  : stageIndex === latestIndex
+                                    ? 'active'
+                                    : ''
+                              }
+                              key={stage.id}
+                            >
+                              <i />{stage.label}
+                            </span>
+                          )
+                        })}
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      <span className="thinking-dots"><i /><i /><i /></span>
+                      <span>正在检索知识库并组织回答</span>
+                    </>
+                  )}
                 </div>
               </div>
             </div>
           )}
         </div>
         <div className="composer">
+          {dataScope && (
+            <div className="chat-data-scope">
+              <span>
+                <DatabaseOutlined />
+                <strong>可视化数据范围</strong>
+                <Text type="secondary">{dataScopeSummary}</Text>
+              </span>
+              <Button type="text" size="small" onClick={onClearDataScope}>
+                清除范围
+              </Button>
+            </div>
+          )}
           <div className="composer-input">
+            {mentionOpen && (
+              <div className="expert-mention-menu" role="listbox" aria-label="选择专家">
+                {mentionCandidates.length ? mentionCandidates.map((expert, index) => (
+                  <button
+                    type="button"
+                    role="option"
+                    aria-selected={index === mentionIndex}
+                    className={index === mentionIndex ? 'selected' : ''}
+                    key={expert.id}
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() => selectExpert(expert)}
+                  >
+                    <span className="expert-mention-icon">
+                      {expert.id === 'visualization'
+                        ? <FundProjectionScreenOutlined />
+                        : <MessageOutlined />}
+                    </span>
+                    <span>
+                      <strong>{expert.name}</strong>
+                      <small>{expert.description}</small>
+                    </span>
+                    <Tag>{expert.mention}</Tag>
+                  </button>
+                )) : (
+                  <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="没有匹配的专家" />
+                )}
+              </div>
+            )}
             <Input.TextArea
               value={question}
-              onChange={(event) => setQuestion(event.target.value)}
-              onPressEnter={(event) => {
-                if (!event.shiftKey) {
+              onChange={(event) => updateQuestion(event.target.value)}
+              onKeyDown={(event) => {
+                if (mentionOpen && mentionCandidates.length) {
+                  if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+                    event.preventDefault()
+                    const direction = event.key === 'ArrowDown' ? 1 : -1
+                    setMentionIndex((index) =>
+                      (index + direction + mentionCandidates.length) % mentionCandidates.length
+                    )
+                    return
+                  }
+                  if (event.key === 'Enter' || event.key === 'Tab') {
+                    event.preventDefault()
+                    selectExpert(mentionCandidates[mentionIndex] ?? mentionCandidates[0])
+                    return
+                  }
+                  if (event.key === 'Escape') {
+                    event.preventDefault()
+                    setMentionOpen(false)
+                    return
+                  }
+                }
+                if (event.key === 'Enter' && !event.shiftKey) {
                   event.preventDefault()
                   void send()
                 }
@@ -989,12 +1828,11 @@ function ChatPage({
                 size="small"
                 icon={<FundProjectionScreenOutlined />}
                 onClick={() => {
-                  if (!question.includes('@数据可视化专家')) {
-                    setQuestion(`@数据可视化专家 ${question}`)
-                  }
+                  const prefix = question && !question.endsWith(' ') ? `${question} ` : question
+                  updateQuestion(`${prefix}@`)
                 }}
               >
-                @数据可视化专家
+                选择专家
               </Button>
               <Button
                 className="chat-send-button"
@@ -1013,6 +1851,31 @@ function ChatPage({
           </Text>
         </div>
       </Card>
+      <Drawer
+        title={activeKnowledgeDetail?.fileName ?? '知识库文档'}
+        size={720}
+        open={Boolean(activeKnowledgeDetail)}
+        onClose={() => setActiveKnowledgeDetail(null)}
+      >
+        {activeKnowledgeDetail && (
+          <div className="knowledge-detail-stack">
+            <Descriptions bordered size="small" column={2}>
+              <Descriptions.Item label="格式">{activeKnowledgeDetail.extension.toUpperCase()}</Descriptions.Item>
+              <Descriptions.Item label="分块">{activeKnowledgeDetail.chunkCount}</Descriptions.Item>
+              <Descriptions.Item label="标签" span={2}>
+                {activeKnowledgeDetail.tags.length ? activeKnowledgeDetail.tags.map((tag) => <Tag key={tag}>{tag}</Tag>) : '未设置'}
+              </Descriptions.Item>
+            </Descriptions>
+            <Divider titlePlacement="start">匹配分块</Divider>
+            {activeKnowledgeDetail.chunks.slice(0, 20).map((chunk) => (
+              <div className="knowledge-chunk-item" key={chunk.id}>
+                <div className="knowledge-chunk-meta"><Tag>{chunk.location || `分块 ${chunk.chunkIndex + 1}`}</Tag></div>
+                <Paragraph>{chunk.content}</Paragraph>
+              </div>
+            ))}
+          </div>
+        )}
+      </Drawer>
       <Modal
         className="chat-data-modal"
         width="min(1120px, calc(100vw - 48px))"
@@ -1109,7 +1972,7 @@ function ChatPage({
                         value: group.name,
                         label: `${group.name}（${group.count} 条）`
                       }))}
-                      style={{ minWidth: 280 }}
+                      style={{ width: 280 }}
                     />
                   </div>
                 )}
@@ -1122,11 +1985,12 @@ function ChatPage({
                         {selectedDataGroup.rows.length} 条
                       </Text>
                     </div>
-                    <Table<ChatDataRow>
+                    <ResizableTable<ChatDataRow>
+                      tableKey="chat-data-results"
                       rowKey="uid"
                       size="small"
                       dataSource={selectedDataGroup.rows}
-                      scroll={{ x: 960, y: 'calc(100vh - 390px)' }}
+                      scroll={{ x: 960, y: appTableScrollY }}
                       pagination={{
                         pageSize: 20,
                         showSizeChanger: true,
@@ -1295,6 +2159,21 @@ function SyncPage({
     }))
   }
 
+  const returnPropertiesFor = (nodeType: string): string[] =>
+    [...new Set(
+      returnPropertyFor(nodeType)
+        .split(/[,，]/g)
+        .map((field) => field.trim())
+        .filter(Boolean)
+    )]
+
+  const updateReturnProperties = (nodeType: string, properties: string[]): void => {
+    updateReturnProperty(
+      nodeType,
+      [...new Set(properties.map((field) => field.trim()).filter(Boolean))].join(',')
+    )
+  }
+
   const addType = (): void => {
     const nodeType = typeInput.trim()
     if (!nodeType) {
@@ -1431,6 +2310,18 @@ function SyncPage({
     { label: '小于等于', value: 'lessThanOrEqual' }
   ]
 
+  const commonReturnPropertyOptions = [
+    '_valm_Name',
+    '_valm_Description',
+    '_valm_Status',
+    'Priority',
+    'IssueType',
+    'Source',
+    '_valm_AssignedTo',
+    '_valm_Release',
+    '_valm_CreateBy'
+  ].map((field) => ({ label: field, value: field }))
+
   const collapseItems = config.selectedTypes.map((nodeType) => {
     const filters = filtersFor(nodeType)
     return {
@@ -1456,17 +2347,33 @@ function SyncPage({
       children: (
         <div className="type-scope-content">
           <div className="return-property-config">
-            <div>
-              <Text strong>ReturnProperty</Text>
-              <Text type="secondary">
-                输入需要采集的字段 Key，多个字段使用英文逗号分隔；系统会自动补充必要字段
-              </Text>
+            <div className="return-property-heading">
+              <div>
+                <Text strong>ReturnProperty</Text>
+                <Text type="secondary">
+                  选择或输入需要采集的字段 Key；系统会自动补充必要字段
+                </Text>
+              </div>
+              <Tag color="blue">已选 {returnPropertiesFor(nodeType).length} 个字段</Tag>
             </div>
-            <Input
-              value={returnPropertyFor(nodeType)}
-              placeholder="例如：_valm_Description,_valm_Status"
-              onChange={(event) => updateReturnProperty(nodeType, event.target.value)}
+            <Select
+              className="return-property-editor"
+              mode="tags"
+              value={returnPropertiesFor(nodeType)}
+              options={commonReturnPropertyOptions}
+              tokenSeparators={[',', '，']}
+              optionFilterProp="label"
+              allowClear
+              maxTagCount="responsive"
+              placeholder="输入字段 Key，按 Enter 或逗号添加"
+              notFoundContent="按 Enter 添加自定义字段"
+              onChange={(values) =>
+                updateReturnProperties(nodeType, Array.isArray(values) ? values : [values])
+              }
             />
+            <Text className="return-property-hint" type="secondary">
+              支持一次粘贴多个逗号分隔的字段；下拉菜单提供常用字段建议，也可以直接输入自定义字段
+            </Text>
           </div>
           <div className="scope-subheading">
             <div>
@@ -1481,14 +2388,15 @@ function SyncPage({
             </Button>
           </div>
 
-          <Table<SyncFieldFilter>
+          <ResizableTable<SyncFieldFilter>
+            tableKey="data-sync-filter-config"
             className="filter-config-table"
             rowKey="id"
             size="small"
             pagination={false}
             dataSource={filters}
             locale={{ emptyText: '尚未添加过滤条件，将采集该类型的全部数据' }}
-            scroll={{ x: 760 }}
+            scroll={{ x: 760, y: compactTableScrollY }}
             columns={[
               {
                 title: '字段 Key',
@@ -1618,7 +2526,7 @@ function SyncPage({
           </Space>
         }
       >
-        <Spin spinning={loadingConfig} tip="正在读取采集配置">
+        <Spin spinning={loadingConfig} description="正在读取采集配置">
           <div className="sync-scope-form">
             <div className="manual-type-entry">
               <div>
@@ -1691,13 +2599,14 @@ function SyncPage({
               <Text type="secondary">当前条件未命中数据</Text>
             )}
           </div>
-          <Table<SyncPreviewResult['samples'][number]>
+          <ResizableTable<SyncPreviewResult['samples'][number]>
+            tableKey="data-sync-preview"
             className="sync-preview-table"
             rowKey="uid"
             size="small"
             pagination={false}
             dataSource={preview.samples}
-            scroll={{ x: 1120, y: 280 }}
+            scroll={{ x: 1120, y: compactTableScrollY }}
             locale={{ emptyText: '没有匹配的样例记录' }}
             columns={[
               { title: '名称', dataIndex: 'name', width: 240, ellipsis: true },
@@ -1772,10 +2681,12 @@ function SyncPage({
             title="这里只记录点击“开始采集”后实际发送的接口请求；测试预览不会写入日志"
             style={{ marginBottom: 16 }}
           />
-          <Table<CollectionRequestLogRow>
+          <ResizableTable<CollectionRequestLogRow>
+            tableKey="data-collection-request-logs"
             rowKey="id"
             loading={requestLogsLoading}
             dataSource={requestLogs}
+            scroll={{ y: appTableScrollY }}
             pagination={false}
             locale={{ emptyText: '暂无真实数据采集请求日志' }}
             expandable={{
@@ -1879,7 +2790,7 @@ function SyncPage({
       {activeTab === 'config' && <Alert
         showIcon
         type="info"
-        message="安全说明"
+        title="安全说明"
         description="数据采集只读访问 VISSLM，不会修改平台数据。图片会转换为 Base64 并按内容哈希去重；平台当前使用 HTTP，正式环境建议启用 HTTPS。"
       />}
     </div>
@@ -2182,11 +3093,13 @@ function PushPage({
             </Button>
           </div>
           {fieldMappings.length ? (
-            <Table<PushFieldMapping>
+            <ResizableTable<PushFieldMapping>
+              tableKey="push-field-mappings"
               className="push-mapping-table"
               rowKey="id"
               pagination={false}
               dataSource={fieldMappings}
+              scroll={{ y: compactTableScrollY }}
               columns={[
                 {
                   title: '当前数据属性 Key',
@@ -2267,10 +3180,12 @@ function PushPage({
           />
         }
       >
-        <Table<RecordRow>
+        <ResizableTable<RecordRow>
+          tableKey="push-record-selection"
           rowKey="uid"
           loading={loading}
           dataSource={records}
+          scroll={{ y: appTableScrollY }}
           rowSelection={{
             selectedRowKeys,
             preserveSelectedRowKeys: true,
@@ -2366,10 +3281,12 @@ function PushPage({
           description="日志保留接口、脱敏参数、请求属性、HTTP 状态、平台返回值及错误信息；为控制数据量，请求日志不保存 _valm_Description 字段。"
           style={{ marginBottom: 16 }}
         />
-        <Table<PushLogRow>
+        <ResizableTable<PushLogRow>
+          tableKey="push-request-logs"
           rowKey="id"
           loading={logsLoading}
           dataSource={pushLogs}
+          scroll={{ y: appTableScrollY }}
           pagination={false}
           locale={{ emptyText: '暂无真实推送请求日志' }}
           expandable={{
@@ -2461,18 +3378,63 @@ function SettingsPage({
   const { message } = AntApp.useApp()
   const [platformForm] = Form.useForm<PlatformSettingsInput>()
   const [modelForm] = Form.useForm<ModelSettings>()
+  const [settingsTab, setSettingsTab] = useState<'platform' | 'model' | 'features'>('platform')
   const [platformTesting, setPlatformTesting] = useState(false)
   const [modelTesting, setModelTesting] = useState(false)
+  const [modelSource, setModelSource] = useState<ModelSource>('local')
+  const [modelProvider, setModelProvider] = useState<ModelProvider>('ollama')
+  const [featureSettings, setFeatureSettings] = useState<FeatureModuleSettings>(
+    DEFAULT_FEATURE_MODULE_SETTINGS
+  )
+  const [featureSaving, setFeatureSaving] = useState<FeatureModuleKey | null>(null)
+  const [navigationOrder, setNavigationOrder] = useState<FeatureNavigationOrder>(
+    DEFAULT_FEATURE_NAVIGATION_ORDER
+  )
+  const [navigationSaving, setNavigationSaving] = useState(false)
+  const [draggingFeature, setDraggingFeature] = useState<FeatureModuleKey | null>(null)
+  const [dragOverFeature, setDragOverFeature] = useState<FeatureDropTarget | null>(null)
+  const selectedProvider = onlineModelProviders.find((item) => item.value === modelProvider)
+  const hasSavedModelApiKey = Boolean(
+    settings?.model.provider === modelProvider && settings.model.hasApiKey
+  )
+  const modelThinkingHint = modelSource === 'local'
+    ? 'Ollama 使用原生 think 参数；开启后会增加响应时间。'
+    : modelProvider === 'qwen'
+      ? '通义千问通过 enable_thinking 传递；具体模型仍需支持混合思考模式。'
+      : modelProvider === 'deepseek' || modelProvider === 'zhipu'
+        ? '当前服务商通过 thinking.type 传递；具体模型不支持时可能忽略或返回接口错误。'
+        : modelProvider === 'openai'
+          ? '仅对支持 reasoning_effort 的 OpenAI 推理模型生效，普通模型不会额外启用思考。'
+          : modelProvider === 'anthropic'
+            ? '按 Anthropic 模型能力发送 thinking 配置；请使用支持思考模式的模型。'
+            : modelProvider === 'minimax'
+              ? 'MiniMax M 系列为模型内置思考模型，当前兼容接口不提供通用的关闭参数。'
+            : '在线接口会尽量按标准推理参数传递；是否生效取决于具体服务商和模型。'
 
   useEffect(() => {
     if (!settings) return
-    platformForm.setFieldsValue({
-      baseUrl: settings.platform.baseUrl,
-      username: settings.platform.username,
-      token: ''
-    })
-    modelForm.setFieldsValue(settings.model)
-  }, [settings, platformForm, modelForm])
+    if (settingsTab === 'platform') {
+      platformForm.setFieldsValue({
+        baseUrl: settings.platform.baseUrl,
+        username: settings.platform.username,
+        token: ''
+      })
+    }
+    if (settingsTab === 'model') {
+      modelForm.setFieldsValue({ ...settings.model, apiKey: '' })
+    }
+    setModelSource(settings.model.source)
+    setModelProvider(settings.model.provider)
+    setFeatureSettings({ ...DEFAULT_FEATURE_MODULE_SETTINGS, ...settings.features })
+    setNavigationOrder(normalizeFeatureNavigationOrder(settings.navigationOrder))
+  }, [settings, settingsTab, platformForm, modelForm])
+
+  const orderedFeatureDefinitions = useMemo(() => {
+    const order = normalizeFeatureNavigationOrder(navigationOrder)
+    return [...featureDefinitions].sort(
+      (left, right) => order.indexOf(left.key) - order.indexOf(right.key)
+    )
+  }, [navigationOrder])
 
   const testPlatform = async (): Promise<void> => {
     const values = await platformForm.validateFields()
@@ -2506,86 +3468,339 @@ function SettingsPage({
   const saveModel = async (values: ModelSettings): Promise<void> => {
     const next = await window.visslm.saveModelSettings(values)
     onChanged(next)
+    modelForm.setFieldValue('apiKey', '')
     message.success('模型配置已保存')
   }
 
+  const saveFeature = async (key: FeatureModuleKey, enabled: boolean): Promise<void> => {
+    const previousFeatures = featureSettings
+    const nextFeatures: FeatureModuleSettings = { ...previousFeatures, [key]: enabled }
+    setFeatureSettings(nextFeatures)
+    setFeatureSaving(key)
+    try {
+      const next = await window.visslm.saveFeatureSettings(nextFeatures)
+      setFeatureSettings(next.features)
+      onChanged(next)
+      const definition = featureDefinitions.find((item) => item.key === key)
+      message.success([definition?.label ?? '功能模块', enabled ? '开启' : '关闭'].join('已'))
+    } catch (error) {
+      setFeatureSettings(previousFeatures)
+      message.error(error instanceof Error ? error.message : '功能开关保存失败，请稍后重试')
+    } finally {
+      setFeatureSaving(null)
+    }
+  }
+
+  const saveNavigationOrder = async (nextOrder: FeatureNavigationOrder): Promise<void> => {
+    if (navigationSaving) return
+    const previousOrder = navigationOrder
+    const normalizedOrder = normalizeFeatureNavigationOrder(nextOrder)
+    setNavigationOrder(normalizedOrder)
+    setNavigationSaving(true)
+    try {
+      const next = await window.visslm.saveNavigationOrder(normalizedOrder)
+      setNavigationOrder(normalizeFeatureNavigationOrder(next.navigationOrder))
+      onChanged(next)
+      message.success('导航顺序已保存')
+    } catch (error) {
+      setNavigationOrder(previousOrder)
+      message.error(error instanceof Error ? error.message : '导航顺序保存失败，请稍后重试')
+    } finally {
+      setNavigationSaving(false)
+    }
+  }
+
+  const handleFeatureDragStart = (
+    event: React.DragEvent<HTMLButtonElement>,
+    key: FeatureModuleKey
+  ): void => {
+    if (navigationSaving) {
+      event.preventDefault()
+      return
+    }
+    setDraggingFeature(key)
+    event.dataTransfer.effectAllowed = 'move'
+    event.dataTransfer.setData('text/plain', key)
+  }
+
+  const handleFeatureDragOver = (
+    event: React.DragEvent<HTMLDivElement>,
+    key: FeatureModuleKey
+  ): void => {
+    if (!draggingFeature || navigationSaving || draggingFeature === key) {
+      if (draggingFeature === key) setDragOverFeature(null)
+      return
+    }
+    event.preventDefault()
+    event.dataTransfer.dropEffect = 'move'
+    const rect = event.currentTarget.getBoundingClientRect()
+    const position: FeatureDropPosition = event.clientY < rect.top + rect.height / 2
+      ? 'before'
+      : 'after'
+    setDragOverFeature((current) => (
+      current?.key === key && current.position === position
+        ? current
+        : { key, position }
+    ))
+  }
+
+  const handleFeatureDrop = (
+    event: React.DragEvent<HTMLDivElement>,
+    targetKey: FeatureModuleKey
+  ): void => {
+    event.preventDefault()
+    const rawSourceKey = draggingFeature ?? event.dataTransfer.getData('text/plain')
+    const targetRect = event.currentTarget.getBoundingClientRect()
+    const position: FeatureDropPosition = dragOverFeature?.key === targetKey
+      ? dragOverFeature.position
+      : event.clientY < targetRect.top + targetRect.height / 2
+        ? 'before'
+        : 'after'
+    setDraggingFeature(null)
+    setDragOverFeature(null)
+    if (
+      navigationSaving ||
+      !DEFAULT_FEATURE_NAVIGATION_ORDER.includes(rawSourceKey as FeatureModuleKey)
+    ) {
+      return
+    }
+
+    const sourceKey = rawSourceKey as FeatureModuleKey
+    const currentOrder = normalizeFeatureNavigationOrder(navigationOrder)
+    const sourceIndex = currentOrder.indexOf(sourceKey)
+    if (sourceIndex < 0 || sourceKey === targetKey) return
+
+    const nextOrder = currentOrder.filter((key) => key !== sourceKey)
+    const targetIndex = nextOrder.indexOf(targetKey)
+    if (targetIndex < 0) return
+    nextOrder.splice(targetIndex + (position === 'after' ? 1 : 0), 0, sourceKey)
+    void saveNavigationOrder(nextOrder)
+  }
+
+  const changeModelSource = (source: string | number): void => {
+    const thinking = Boolean(modelForm.getFieldValue('thinking'))
+    if (source === 'local') {
+      setModelSource('local')
+      setModelProvider('ollama')
+      modelForm.setFieldsValue({
+        source: 'local',
+        provider: 'ollama',
+        baseUrl: 'http://127.0.0.1:11434',
+        model: 'qwen3:8b',
+        thinking
+      })
+      return
+    }
+    const provider = onlineModelProviders.find((item) => item.value === modelProvider && item.value !== 'ollama')
+      ?? onlineModelProviders[0]
+    setModelSource('online')
+    setModelProvider(provider.value)
+    modelForm.setFieldsValue({
+      source: 'online',
+      provider: provider.value,
+      baseUrl: provider.baseUrl,
+      model: provider.models[0] ?? '',
+      thinking
+    })
+  }
+
+  const changeOnlineProvider = (provider: ModelProvider): void => {
+    const preset = onlineModelProviders.find((item) => item.value === provider)
+    if (!preset) return
+    const thinking = Boolean(modelForm.getFieldValue('thinking'))
+    setModelProvider(provider)
+    modelForm.setFieldsValue({
+      provider,
+      baseUrl: preset.baseUrl,
+      model: preset.models[0] ?? '',
+      thinking
+    })
+  }
+
   return (
-    <div className="page-stack settings-width">
-      <Card title="VISSLM 平台">
-        <Form form={platformForm} layout="vertical" onFinish={(values) => void savePlatform(values)}>
-          <Form.Item
-            label="平台地址"
-            name="baseUrl"
-            rules={[{ required: true, message: '请输入平台地址' }]}
-          >
-            <Input placeholder="http://server/alm" />
-          </Form.Item>
-          <Form.Item
-            label="用户名"
-            name="username"
-            rules={[{ required: true, message: '请输入用户名' }]}
-          >
-            <Input autoComplete="off" />
-          </Form.Item>
-          <Form.Item
-            label="API Token"
-            name="token"
-            extra={settings?.platform.hasToken ? '已保存 Token；留空表示继续使用原 Token' : 'Token 将使用操作系统安全存储加密'}
-            rules={[
-              {
-                validator: async (_, value) => {
-                  if (!value && !settings?.platform.hasToken) throw new Error('请输入 API Token')
-                }
-              }
-            ]}
-          >
-            <Input.Password autoComplete="new-password" placeholder={settings?.platform.hasToken ? '••••••••' : ''} />
-          </Form.Item>
-          <Space>
-            <Button type="primary" htmlType="submit">
-              保存平台配置
-            </Button>
-            <Button loading={platformTesting} onClick={() => void testPlatform()}>
-              测试连接
-            </Button>
-          </Space>
-        </Form>
-      </Card>
-      <Card title="Ollama 模型">
-        <Form form={modelForm} layout="vertical" onFinish={(values) => void saveModel(values)}>
-          <Form.Item
-            label="Ollama 地址"
-            name="baseUrl"
-            rules={[{ required: true, message: '请输入 Ollama 地址' }]}
-          >
-            <Input placeholder="http://127.0.0.1:11434" />
-          </Form.Item>
-          <Form.Item
-            label="模型名称"
-            name="model"
-            rules={[{ required: true, message: '请输入模型名称' }]}
-          >
-            <Input placeholder="qwen3:8b" />
-          </Form.Item>
-          <Form.Item label="思考模式" name="thinking" valuePropName="checked">
-            <Switch checkedChildren="开启" unCheckedChildren="关闭" />
-          </Form.Item>
-          <Alert
-            type="info"
-            showIcon
-            message="Agent 工具调用建议关闭思考模式"
-            description="qwen3:8b 开启思考后会增加响应时间，并可能在较小输出预算下无法及时生成工具调用。"
-            style={{ marginBottom: 20 }}
-          />
-          <Space>
-            <Button type="primary" htmlType="submit">
-              保存模型配置
-            </Button>
-            <Button loading={modelTesting} onClick={() => void testModel()}>
-              测试模型
-            </Button>
-          </Space>
-        </Form>
+    <div className="settings-width">
+      <Card className="settings-card">
+        <Tabs
+          className="settings-tabs"
+          activeKey={settingsTab}
+          onChange={(key) => setSettingsTab(key as typeof settingsTab)}
+          items={[
+            {
+              key: 'platform',
+              label: '平台配置',
+              children: (
+                <div className="settings-panel">
+                  <div className="settings-panel-heading">
+                    <Title level={4}>VISSLM 平台</Title>
+                    <Text type="secondary">配置业务平台的数据采集与推送连接</Text>
+                  </div>
+                  <Form form={platformForm} layout="vertical" onFinish={(values) => void savePlatform(values)}>
+                    <Form.Item label="平台地址" name="baseUrl" rules={[{ required: true, message: '请输入平台地址' }]}>
+                      <Input placeholder="http://server/alm" />
+                    </Form.Item>
+                    <Form.Item label="用户名" name="username" rules={[{ required: true, message: '请输入用户名' }]}>
+                      <Input autoComplete="off" />
+                    </Form.Item>
+                    <Form.Item
+                      label="API Token"
+                      name="token"
+                      extra={settings?.platform.hasToken ? '已安全保存；留空将继续使用原 Token' : 'Token 将使用操作系统安全存储加密'}
+                      rules={[{
+                        validator: async (_, value) => {
+                          if (!value && !settings?.platform.hasToken) throw new Error('请输入 API Token')
+                        }
+                      }]}
+                    >
+                      <Input.Password autoComplete="new-password" placeholder={settings?.platform.hasToken ? '••••••••' : '输入平台 Token'} />
+                    </Form.Item>
+                    <Space>
+                      <Button type="primary" htmlType="submit">保存平台配置</Button>
+                      <Button loading={platformTesting} onClick={() => void testPlatform()}>测试连接</Button>
+                    </Space>
+                  </Form>
+                </div>
+              )
+            },
+            {
+              key: 'model',
+              label: '大模型配置',
+              children: (
+                <div className="settings-panel">
+                  <div className="settings-panel-heading model-settings-heading">
+                    <div>
+                      <Title level={4}>大模型连接</Title>
+                      <Text type="secondary">选择 Agent 使用的本地或在线模型服务</Text>
+                    </div>
+                    <Segmented
+                      value={modelSource}
+                      options={[
+                        { label: '本地大模型', value: 'local' },
+                        { label: '在线大模型', value: 'online' }
+                      ]}
+                      onChange={changeModelSource}
+                    />
+                  </div>
+                  <Form form={modelForm} layout="vertical" onFinish={(values) => void saveModel(values)}>
+                    <Form.Item name="source" hidden><Input /></Form.Item>
+                    <Form.Item name="provider" hidden={modelSource === 'local'} label="模型服务商">
+                      <Select
+                        options={onlineModelProviders.map((provider) => ({ label: provider.label, value: provider.value }))}
+                        onChange={(value) => changeOnlineProvider(value as ModelProvider)}
+                      />
+                    </Form.Item>
+                    <Form.Item
+                      label={modelSource === 'local' ? 'Ollama 地址' : 'API 地址'}
+                      name="baseUrl"
+                      extra={modelProvider === 'openai-compatible' ? '填写兼容 OpenAI Chat Completions API 的基础地址，通常以 /v1 结尾' : undefined}
+                      rules={[{ required: true, message: '请输入服务地址' }]}
+                    >
+                      <Input placeholder={modelSource === 'local' ? 'http://127.0.0.1:11434' : selectedProvider?.baseUrl || 'https://example.com/v1'} />
+                    </Form.Item>
+                    {modelSource === 'online' && (
+                      <Form.Item
+                        label="API Key"
+                        name="apiKey"
+                        extra={hasSavedModelApiKey ? '已安全保存；留空将继续使用原 API Key' : 'API Key 将使用操作系统安全存储加密'}
+                        rules={[{
+                          validator: async (_, value) => {
+                            if (!value && !hasSavedModelApiKey) throw new Error('请输入 API Key')
+                          }
+                        }]}
+                      >
+                        <Input.Password autoComplete="new-password" placeholder={hasSavedModelApiKey ? '••••••••' : '输入 API Key'} />
+                      </Form.Item>
+                    )}
+                    <Form.Item label="模型名称" name="model" rules={[{ required: true, message: '请输入模型名称' }]}>
+                      <Input list="model-name-options" placeholder={modelSource === 'local' ? 'qwen3:8b' : selectedProvider?.models[0] || '输入模型 ID'} />
+                    </Form.Item>
+                    <datalist id="model-name-options">
+                      {(selectedProvider?.models ?? []).map((model) => <option key={model} value={model} />)}
+                    </datalist>
+                    <Form.Item label="思考模式" name="thinking" valuePropName="checked" extra={modelThinkingHint}>
+                      <Switch checkedChildren="开启" unCheckedChildren="关闭" />
+                    </Form.Item>
+                    <Alert
+                      type="info"
+                      showIcon
+                      title={modelSource === 'local' ? 'Agent 工具调用建议关闭思考模式' : '在线模型思考模式'}
+                      description={modelSource === 'local'
+                        ? '开启后会增加响应时间，并可能在较小输出预算下无法及时生成工具调用。'
+                        : '开关会随模型配置保存，并应用到在线模型请求；思考模式通常会增加响应时间和 Token 消耗。'}
+                      className="model-settings-alert"
+                    />
+                    <Space>
+                      <Button type="primary" htmlType="submit">保存模型配置</Button>
+                      <Button loading={modelTesting} onClick={() => void testModel()}>测试模型</Button>
+                    </Space>
+                  </Form>
+                </div>
+              )
+            },
+            {
+              key: 'features',
+              label: '功能模块',
+              children: (
+                <div className="settings-panel feature-settings-panel">
+                  <div className="settings-panel-heading">
+                    <Title level={4}>导航功能</Title>
+                    <Text type="secondary">按需开放工作台功能，关闭后对应入口不会出现在左侧导航栏。</Text>
+                  </div>
+                  <Alert
+                    className="feature-settings-notice"
+                    type="warning"
+                    showIcon
+                    title="数据推送默认关闭"
+                    description="数据推送会将本地处理后的数据写回业务平台，不会执行数据采集。确认平台连接和推送范围后，再开启该功能。"
+                  />
+                  <div className="feature-module-sort-hint">
+                    拖动每项左侧手柄即可调整导航栏顺序
+                  </div>
+                  <div className="feature-module-list">
+                    {orderedFeatureDefinitions.map((definition) => (
+                      <div
+                        className={`feature-module-row ${draggingFeature === definition.key ? 'is-dragging' : ''} ${dragOverFeature?.key === definition.key ? `is-drop-target-${dragOverFeature.position}` : ''}`}
+                        key={definition.key}
+                        onDragOver={(event) => handleFeatureDragOver(event, definition.key)}
+                        onDragLeave={() => setDragOverFeature(null)}
+                        onDrop={(event) => handleFeatureDrop(event, definition.key)}
+                      >
+                        <button
+                          type="button"
+                          className="feature-module-drag-handle"
+                          draggable={!navigationSaving}
+                          aria-label={`拖动${definition.label}调整导航顺序`}
+                          title="拖动调整导航顺序"
+                          onDragStart={(event) => handleFeatureDragStart(event, definition.key)}
+                          onDragEnd={() => {
+                            setDraggingFeature(null)
+                            setDragOverFeature(null)
+                          }}
+                        >
+                          <HolderOutlined />
+                        </button>
+                        <div className="feature-module-icon">{definition.icon}</div>
+                        <div className="feature-module-copy">
+                          <div className="feature-module-title">
+                            <Text strong>{definition.label}</Text>
+                            {definition.defaultDisabled && <Tag color="warning">默认关闭</Tag>}
+                          </div>
+                          <Text type="secondary">{definition.description}</Text>
+                        </div>
+                        <Switch
+                          checked={featureSettings[definition.key]}
+                          loading={featureSaving === definition.key}
+                          checkedChildren="开启"
+                          unCheckedChildren="关闭"
+                          onChange={(checked) => void saveFeature(definition.key, checked)}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )
+            }
+          ]}
+        />
       </Card>
     </div>
   )
@@ -2606,7 +3821,6 @@ function WindowTitleBar(): React.JSX.Element {
   return (
     <div className="window-titlebar">
       <div className="window-drag-region" onDoubleClick={() => void toggleMaximize()}>
-        <img src={appIcon} alt="" className="window-app-icon" />
         <Text strong>VISSLM Agent</Text>
       </div>
       <div className="window-controls">
@@ -2639,6 +3853,45 @@ function WindowTitleBar(): React.JSX.Element {
   )
 }
 
+function AssetCenterPage({
+  refreshKey,
+  onDataChanged,
+  onVisualize
+}: {
+  refreshKey: number
+  onDataChanged: () => void
+  onVisualize: (scope: DataScope, summary: string) => void
+}): React.JSX.Element {
+  const [activeTab, setActiveTab] = useState('data')
+  return (
+    <div className="asset-center-page page-stack">
+      <Tabs
+        className="page-inner-tabs asset-center-tabs"
+        activeKey={activeTab}
+        onChange={setActiveTab}
+        items={[
+          {
+            key: 'data',
+            label: <span><DatabaseOutlined />数据中心</span>,
+            children: (
+              <DataPage
+                refreshKey={refreshKey}
+                onDataChanged={onDataChanged}
+                onVisualize={onVisualize}
+              />
+            )
+          },
+          {
+            key: 'knowledge',
+            label: <span><BulbOutlined />知识库</span>,
+            children: <KnowledgeBasePage refreshKey={refreshKey} />
+          }
+        ]}
+      />
+    </div>
+  )
+}
+
 function AppShell(): React.JSX.Element {
   const { message } = AntApp.useApp()
   const [page, setPage] = useState<PageKey>('dashboard')
@@ -2651,6 +3904,8 @@ function AppShell(): React.JSX.Element {
   const [chatQuestion, setChatQuestion] = useState('')
   const [chatLoading, setChatLoading] = useState(false)
   const [generatedDashboard, setGeneratedDashboard] = useState<DashboardSpec | null>(null)
+  const [chatDataScope, setChatDataScope] = useState<DataScope | null>(null)
+  const [chatDataScopeSummary, setChatDataScopeSummary] = useState('')
 
   useEffect(() => {
     void window.visslm.getSettings().then(setSettings)
@@ -2665,6 +3920,23 @@ function AppShell(): React.JSX.Element {
       .then((result) => setModelOnline(result.ok))
       .catch(() => setModelOnline(false))
   }, [settings])
+
+  const enabledFeatures = settings?.features ?? DEFAULT_FEATURE_MODULE_SETTINGS
+  const navigationOrder = settings?.navigationOrder ?? DEFAULT_FEATURE_NAVIGATION_ORDER
+  const visibleNavigationItems = useMemo(
+    () => {
+      const order = normalizeFeatureNavigationOrder(navigationOrder)
+      return [...featureNavigationItems]
+        .sort((left, right) => order.indexOf(left.feature) - order.indexOf(right.feature))
+        .filter((item) => enabledFeatures[item.feature])
+    },
+    [enabledFeatures, navigationOrder]
+  )
+
+  useEffect(() => {
+    if (page === 'settings' || enabledFeatures[page]) return
+    setPage(visibleNavigationItems[0]?.key ?? 'settings')
+  }, [enabledFeatures, page, visibleNavigationItems])
 
   const startSync = async (config?: SyncScopeConfig): Promise<void> => {
     setSyncing(true)
@@ -2684,26 +3956,48 @@ function AppShell(): React.JSX.Element {
     }
   }
 
-  const titleMap: Record<PageKey, string> = {
-    dashboard: '数据概览',
-    visualization: '可视化大屏',
-    data: '数据中心',
-    chat: 'AI 助手',
-    sync: '数据采集',
-    push: '数据推送',
-    settings: '连接设置'
+  const pageMeta: Record<PageKey, { title: string; description: string }> = {
+    dashboard: { title: '数据概览', description: '掌握本地数据规模、类型构成与发布状态' },
+    visualization: { title: '可视化大屏', description: '编辑可追溯的数据大屏并输出运营视图' },
+    projects: { title: '项目管理', description: '管理项目进度、需求匹配与交付风险' },
+    data: { title: '资产中心', description: '浏览、筛选和复用已同步的数据资产' },
+    chat: { title: 'AI 助手', description: '用自然语言检索、统计和解释本地数据' },
+    sync: { title: '数据采集', description: '定义采集范围、预览请求并执行同步' },
+    push: { title: '数据推送', description: '配置字段映射并将数据安全推送回平台' },
+    settings: { title: '系统配置', description: '配置平台连接、模型服务与功能模块' }
   }
 
   const currentPage = useMemo(() => {
     if (page === 'dashboard') return <DashboardPage refreshKey={refreshKey} />
     if (page === 'visualization') {
-      return <DashboardStudio generatedDashboard={generatedDashboard} />
+      return (
+        <DashboardStudio
+          generatedDashboard={generatedDashboard}
+          onDashboardChange={setGeneratedDashboard}
+        />
+      )
+    }
+    if (page === 'projects') {
+      return <ProjectManagementPage refreshKey={refreshKey} onChanged={() => setRefreshKey((key) => key + 1)} />
     }
     if (page === 'data') {
       return (
-        <DataPage
+        <AssetCenterPage
           refreshKey={refreshKey}
           onDataChanged={() => setRefreshKey((key) => key + 1)}
+           onVisualize={(scope, summary) => {
+             setChatDataScope(scope)
+             setChatDataScopeSummary(summary)
+             setChatQuestion(
+               '@数据可视化专家 基于当前数据范围生成一个可视化大屏，请先分析可用字段并规划核心指标。'
+             )
+              if (!enabledFeatures.chat) {
+                message.info('请先在系统配置的功能模块中开启 AI 助手')
+                setPage('settings')
+                return
+              }
+              setPage('chat')
+            }}
         />
       )
     }
@@ -2716,6 +4010,14 @@ function AppShell(): React.JSX.Element {
           setQuestion={setChatQuestion}
           loading={chatLoading}
           setLoading={setChatLoading}
+          activeArtifact={generatedDashboard}
+          onDashboardUpdate={setGeneratedDashboard}
+          dataScope={chatDataScope}
+          dataScopeSummary={chatDataScopeSummary}
+          onClearDataScope={() => {
+            setChatDataScope(null)
+            setChatDataScopeSummary('')
+          }}
           onOpenDashboard={(dashboard) => {
             setGeneratedDashboard(dashboard)
             setPage('visualization')
@@ -2745,6 +4047,8 @@ function AppShell(): React.JSX.Element {
     chatLoading,
     chatMessages,
     chatQuestion,
+    chatDataScope,
+    chatDataScopeSummary,
     generatedDashboard,
     page,
     progress,
@@ -2769,21 +4073,12 @@ function AppShell(): React.JSX.Element {
           </div>
           <Menu
             mode="inline"
-            selectedKeys={[page]}
+           selectedKeys={[page]}
             onClick={({ key }) => setPage(key as PageKey)}
             items={[
-              { key: 'dashboard', icon: <BarChartOutlined />, label: '数据概览' },
-              {
-                key: 'visualization',
-                icon: <FundProjectionScreenOutlined />,
-                label: '可视化大屏'
-              },
-              { key: 'data', icon: <DatabaseOutlined />, label: '数据中心' },
-              { key: 'chat', icon: <MessageOutlined />, label: 'AI 助手' },
-              { key: 'sync', icon: <SyncOutlined />, label: '数据采集' },
-              { key: 'push', icon: <SendOutlined />, label: '数据推送' },
+              ...visibleNavigationItems.map(({ key, icon, label }) => ({ key, icon, label })),
               { type: 'divider' },
-              { key: 'settings', icon: <SettingOutlined />, label: '连接设置' }
+              { key: 'settings', icon: <SettingOutlined />, label: '系统配置' }
             ]}
           />
           <div className={`model-status ${modelOnline === true ? 'online' : modelOnline === false ? 'offline' : 'checking'}`}>
@@ -2792,9 +4087,9 @@ function AppShell(): React.JSX.Element {
               <Text strong ellipsis>{settings?.model.model ?? 'qwen3:8b'}</Text>
               <Text type="secondary">
                 {modelOnline === true
-                  ? '本地模型在线'
+                  ? settings?.model.source === 'online' ? '在线模型可用' : '本地模型在线'
                   : modelOnline === false
-                    ? '本地模型离线'
+                    ? settings?.model.source === 'online' ? '在线模型不可用' : '本地模型离线'
                     : '正在检测模型'}
               </Text>
             </div>
@@ -2802,7 +4097,10 @@ function AppShell(): React.JSX.Element {
         </Sider>
         <Layout className="app-main-layout">
           <Content className="app-content">
-            <div className="content-page-title">{titleMap[page]}</div>
+            <div className="content-page-heading">
+              <div className="content-page-title">{pageMeta[page].title}</div>
+              <div className="content-page-subtitle">{pageMeta[page].description}</div>
+            </div>
             {currentPage}
           </Content>
         </Layout>

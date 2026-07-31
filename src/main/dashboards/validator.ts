@@ -3,7 +3,14 @@ import { dashboardLayoutProfiles } from '../../shared/dashboard-layout'
 import type { QueryEngine } from '../analytics/query-engine'
 
 const componentTypes = new Set(['kpi', 'bar', 'line', 'pie', 'ranking', 'table', 'progress', 'insight'])
-const themes = new Set(['technology-dark', 'business-light'])
+const themes = new Set([
+  'technology-dark',
+  'business-light',
+  'charcoal-dark',
+  'minimal-light'
+])
+const filterOperators = new Set(['equals', 'in'])
+const safeAccent = /^#(?:[0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i
 
 export const validateDashboardSpec = (
   input: unknown,
@@ -18,6 +25,33 @@ export const validateDashboardSpec = (
   if (!spec.id?.trim()) errors.push('id 不能为空')
   if (!spec.title?.trim()) errors.push('title 不能为空')
   if (!themes.has(String(spec.theme))) errors.push(`不支持的主题: ${String(spec.theme)}`)
+  if (spec.globalFilters !== undefined) {
+    if (!Array.isArray(spec.globalFilters)) {
+      errors.push('globalFilters 必须是数组')
+    } else if (spec.globalFilters.length > 8) {
+      errors.push('大屏最多配置 8 个全局筛选器')
+    } else {
+      const filterIds = new Set<string>()
+      for (const filter of spec.globalFilters) {
+        if (!filter || typeof filter !== 'object' || Array.isArray(filter)) {
+          errors.push('全局筛选器必须是对象')
+          continue
+        }
+        const item = filter as NonNullable<DashboardSpec['globalFilters']>[number]
+        if (!item.id?.trim()) errors.push('全局筛选器 id 不能为空')
+        if (filterIds.has(item.id)) errors.push(`全局筛选器 id 重复: ${item.id}`)
+        filterIds.add(item.id)
+        if (!item.field?.trim()) errors.push(`全局筛选器 ${item.id} 缺少字段`)
+        if (!item.label?.trim()) errors.push(`全局筛选器 ${item.id} 缺少显示名`)
+        if (!filterOperators.has(item.operator)) {
+          errors.push(`全局筛选器 ${item.id} 的操作符不受支持`)
+        }
+        if (!Array.isArray(item.options) || item.options.length > 50) {
+          errors.push(`全局筛选器 ${item.id} 的选项最多 50 个`)
+        }
+      }
+    }
+  }
   if (!Array.isArray(spec.components) || !spec.components.length) {
     errors.push('components 至少包含一个组件')
     return errors
@@ -31,6 +65,9 @@ export const validateDashboardSpec = (
     ids.add(component.id)
     if (!componentTypes.has(component.type)) errors.push(`不支持的组件类型: ${component.type}`)
     if (!component.title?.trim()) errors.push(`组件 ${component.id} 的 title 不能为空`)
+    if (component.accent !== undefined && !safeAccent.test(component.accent)) {
+      errors.push(`组件 ${component.id} 的 accent 必须是十六进制颜色`)
+    }
     const { x, y, w, h } = component.layout ?? {}
     if (![x, y, w, h].every(Number.isInteger)) {
       errors.push(`组件 ${component.id} 的 layout 必须使用整数`)
@@ -76,6 +113,17 @@ export const validateDashboardSpec = (
       if (['bar', 'line', 'pie', 'ranking'].includes(component.type) &&
           dimensionFields.size === 0) {
         errors.push(`组件 ${component.id} 至少需要一个维度`)
+      }
+    }
+  }
+  if (queryEngine && spec.globalFilters?.length) {
+    const scope = spec.components.find((component) => component.query)?.query?.scope
+    if (scope) {
+      const catalog = new Set(queryEngine.profile(scope).map((profile) => profile.field.toLocaleLowerCase()))
+      for (const filter of spec.globalFilters) {
+        if (!catalog.has(filter.field.toLocaleLowerCase())) {
+          errors.push(`全局筛选器 ${filter.id} 引用了不存在的字段: ${filter.field}`)
+        }
       }
     }
   }

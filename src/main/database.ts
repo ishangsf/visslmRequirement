@@ -3,6 +3,11 @@ import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import type {
+  ChatMessage,
+  ChatSession,
+  ChatSessionDeleteResult,
+  ChatSessionSaveInput,
+  ChatSessionSummary,
   ChatSource,
   CollectionRequestLogPage,
   CollectionRequestLogRow,
@@ -11,6 +16,14 @@ import type {
   DataImportResult,
   DashboardStats,
   ImageAsset,
+  KnowledgeChunk,
+  KnowledgeDocument,
+  KnowledgeDocumentDetail,
+  KnowledgeDocumentPage,
+  KnowledgeDocumentQuery,
+  KnowledgeDocumentStatus,
+  KnowledgeIndexProgress,
+  KnowledgeStats,
   ProjectRow,
   PushLogPage,
   PushLogRow,
@@ -21,8 +34,48 @@ import type {
   RecordRow,
   SyncRun
 } from '../shared/types'
-import type { DataScope } from '../shared/query-spec'
 import type {
+  ManagedProject,
+  ManagedProjectInput,
+  ManagedProjectListQuery,
+  ManagedProjectPage,
+  OrganizationPerson,
+  OrganizationPersonInput,
+  OrganizationPersonListQuery,
+  OrganizationPersonPage,
+  ProjectAsset,
+  ProjectCostEntry,
+  ProjectCostEntryInput,
+  ProjectDataSnapshot,
+  ProjectDocumentSnapshot,
+  ProjectParticipant,
+  ProjectParticipantInput,
+  ProjectPlanTask,
+  ProjectPlanTaskInput,
+  ProjectPlanTaskMoveInput,
+  ProjectRequirement,
+  ProjectRequirementMatch,
+  ProjectRequirementMatchPage,
+  ProjectRequirementMatchQuery,
+  ProjectRequirementPage,
+  ProjectRequirementQuery,
+  ProjectRequirementStatus,
+  ProjectRequirementStatusSource
+} from '../shared/project-types'
+import { normalizeProjectRequirementText } from '../shared/project-requirement-utils'
+import type {
+  DataScope,
+  FieldProfile,
+  FieldProfileRole,
+  FieldProfileSemanticPatch,
+  FieldSensitivity,
+  QueryDataset
+} from '../shared/query-spec'
+import type {
+  DashboardAuditAction,
+  DashboardAuditLog,
+  DashboardAuditLogInput,
+  DashboardAuditStatus,
   DashboardSaveInput,
   DashboardSpec,
   DashboardSummary,
@@ -54,6 +107,98 @@ export interface ImageInput {
 type SqlRow = Record<string, unknown>
 
 const nowIso = (): string => new Date().toISOString()
+
+export interface KnowledgeDocumentInput {
+  id: string
+  fileName: string
+  filePath: string
+  extension: string
+  mimeType: string
+  byteSize: number
+  sha256: string
+  tags?: string[]
+  status?: KnowledgeDocumentStatus
+  modelVersion?: string
+}
+
+export interface KnowledgeChunkInput {
+  id: string
+  documentId?: string
+  recordUid?: string
+  sourceType: 'document' | 'record'
+  sourceName: string
+  sourceHash: string
+  content: string
+  chunkIndex: number
+  pageNumber?: number
+  sheetName?: string
+  location?: string
+  charStart?: number
+  charEnd?: number
+}
+
+export interface KnowledgeVectorInput {
+  chunkId: string
+  vector: Float32Array
+  modelVersion: string
+}
+
+export interface KnowledgeRecordIndexRow {
+  uid: string
+  name: string
+  nodeType: string
+  itemId: string
+  content: string
+  contentHash: string
+}
+
+export interface KnowledgeVectorRow {
+  chunk: KnowledgeChunk
+  vector: Float32Array
+}
+
+const fieldProfileRoles = new Set<FieldProfileRole>([
+  'dimension',
+  'measure',
+  'time',
+  'identifier'
+])
+
+const fieldSensitivities = new Set<FieldSensitivity>(['normal', 'internal', 'sensitive'])
+
+const parseJsonArray = (value: unknown): string[] => {
+  try {
+    const parsed = JSON.parse(String(value ?? '[]'))
+    return Array.isArray(parsed)
+      ? parsed.map((item) => String(item).trim()).filter(Boolean).slice(0, 12)
+      : []
+  } catch {
+    return []
+  }
+}
+
+const mapFieldProfileRow = (row: SqlRow): FieldProfile => {
+  const role = String(row.role ?? '')
+  const sensitivity = String(row.sensitivity ?? 'normal')
+  const displayName = String(row.display_name ?? '').trim()
+  const profiledAt = String(row.profiled_at ?? '').trim()
+  return {
+    field: String(row.field),
+    inferredType: String(row.inferred_type) as FieldProfile['inferredType'],
+    sensitivity: fieldSensitivities.has(sensitivity as FieldSensitivity)
+      ? sensitivity as FieldSensitivity
+      : 'normal',
+    nonNullRate: Number(row.non_null_rate),
+    distinctCount: Number(row.distinct_count),
+    samples: parseJsonArray(row.samples_json),
+    ...(displayName ? { displayName } : {}),
+    ...(fieldProfileRoles.has(role as FieldProfileRole)
+      ? { role: role as FieldProfileRole }
+      : {}),
+    synonyms: parseJsonArray(row.synonyms_json),
+    ...(profiledAt ? { profiledAt } : {})
+  }
+}
 
 export interface FieldAggregateOptions {
   field: string
@@ -316,6 +461,19 @@ export class AppDatabase {
         value TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS chat_sessions (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        preview TEXT NOT NULL DEFAULT '',
+        messages_json TEXT NOT NULL DEFAULT '[]',
+        message_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_chat_sessions_updated
+        ON chat_sessions(updated_at DESC);
+
       CREATE TABLE IF NOT EXISTS projects (
         uid TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -459,13 +617,329 @@ export class AppDatabase {
 
       CREATE INDEX IF NOT EXISTS idx_visualization_runs_created
         ON visualization_runs(created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS dashboard_audit_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        dashboard_id TEXT NOT NULL DEFAULT '',
+        action TEXT NOT NULL,
+        status TEXT NOT NULL,
+        version INTEGER,
+        format TEXT NOT NULL DEFAULT '',
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        error_message TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_dashboard_audit_created
+        ON dashboard_audit_logs(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_dashboard_audit_dashboard
+        ON dashboard_audit_logs(dashboard_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS field_profiles (
+        scope_key TEXT NOT NULL,
+        field TEXT NOT NULL,
+        inferred_type TEXT NOT NULL,
+        non_null_rate REAL NOT NULL,
+        distinct_count INTEGER NOT NULL,
+        samples_json TEXT NOT NULL DEFAULT '[]',
+        display_name TEXT NOT NULL DEFAULT '',
+        role TEXT NOT NULL DEFAULT '',
+        synonyms_json TEXT NOT NULL DEFAULT '[]',
+        sensitivity TEXT NOT NULL DEFAULT 'normal',
+        profiled_at TEXT NOT NULL,
+        data_revision INTEGER NOT NULL,
+        PRIMARY KEY(scope_key, field)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_field_profiles_revision
+        ON field_profiles(data_revision);
+
+      CREATE TABLE IF NOT EXISTS query_cache (
+        cache_key TEXT PRIMARY KEY,
+        data_revision INTEGER NOT NULL,
+        result_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_query_cache_revision
+        ON query_cache(data_revision);
+
+      CREATE TABLE IF NOT EXISTS knowledge_documents (
+        id TEXT PRIMARY KEY,
+        file_name TEXT NOT NULL,
+        file_path TEXT NOT NULL,
+        extension TEXT NOT NULL,
+        mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+        byte_size INTEGER NOT NULL DEFAULT 0,
+        sha256 TEXT NOT NULL UNIQUE,
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        status TEXT NOT NULL DEFAULT 'queued',
+        error_message TEXT NOT NULL DEFAULT '',
+        chunk_count INTEGER NOT NULL DEFAULT 0,
+        page_count INTEGER NOT NULL DEFAULT 0,
+        model_version TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        processed_at TEXT NOT NULL DEFAULT ''
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_knowledge_documents_status
+        ON knowledge_documents(status, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_knowledge_documents_extension
+        ON knowledge_documents(extension);
+
+      CREATE TABLE IF NOT EXISTS knowledge_chunks (
+        id TEXT PRIMARY KEY,
+        document_id TEXT,
+        record_uid TEXT,
+        source_type TEXT NOT NULL,
+        source_name TEXT NOT NULL DEFAULT '',
+        source_hash TEXT NOT NULL DEFAULT '',
+        content TEXT NOT NULL,
+        chunk_index INTEGER NOT NULL,
+        page_number INTEGER,
+        sheet_name TEXT NOT NULL DEFAULT '',
+        location TEXT NOT NULL DEFAULT '',
+        char_start INTEGER NOT NULL DEFAULT 0,
+        char_end INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        UNIQUE(document_id, chunk_index),
+        UNIQUE(record_uid, chunk_index),
+        FOREIGN KEY(document_id) REFERENCES knowledge_documents(id) ON DELETE CASCADE,
+        FOREIGN KEY(record_uid) REFERENCES records(uid) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_document
+        ON knowledge_chunks(document_id, chunk_index);
+      CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_record
+        ON knowledge_chunks(record_uid, chunk_index);
+
+      CREATE TABLE IF NOT EXISTS knowledge_vectors (
+        chunk_id TEXT PRIMARY KEY,
+        vector_blob BLOB NOT NULL,
+        dimension INTEGER NOT NULL,
+        model_version TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(chunk_id) REFERENCES knowledge_chunks(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_knowledge_vectors_model
+        ON knowledge_vectors(model_version);
+
+      CREATE TABLE IF NOT EXISTS knowledge_index_tasks (
+        id TEXT PRIMARY KEY,
+        phase TEXT NOT NULL,
+        status TEXT NOT NULL,
+        current_count INTEGER NOT NULL DEFAULT 0,
+        total_count INTEGER NOT NULL DEFAULT 0,
+        message TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS org_people (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        employee_no TEXT NOT NULL DEFAULT '',
+        department TEXT NOT NULL DEFAULT '',
+        role TEXT NOT NULL DEFAULT '',
+        hourly_rate REAL NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'active',
+        notes TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_org_people_name
+        ON org_people(name COLLATE NOCASE, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_org_people_status
+        ON org_people(status, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS pm_projects (
+        id TEXT PRIMARY KEY,
+        project_name TEXT NOT NULL,
+        customer_name TEXT NOT NULL DEFAULT '',
+        contract_amount REAL NOT NULL DEFAULT 0,
+        risk_factor REAL NOT NULL DEFAULT 0,
+        delivery_reminder_days INTEGER NOT NULL DEFAULT 0,
+        planned_delivery_date TEXT NOT NULL DEFAULT '',
+        sales_owner TEXT NOT NULL DEFAULT '',
+        technical_owner TEXT NOT NULL DEFAULT '',
+        development_owner TEXT NOT NULL DEFAULT '',
+        estimated_cost REAL NOT NULL DEFAULT 0,
+        actual_cost REAL NOT NULL DEFAULT 0,
+        estimated_duration_days INTEGER NOT NULL DEFAULT 0,
+        lifecycle TEXT NOT NULL DEFAULT 'draft',
+        source TEXT NOT NULL DEFAULT 'manual',
+        analysis_status TEXT NOT NULL DEFAULT 'idle',
+        analysis_message TEXT NOT NULL DEFAULT '',
+        match_status TEXT NOT NULL DEFAULT 'idle',
+        match_message TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_pm_projects_updated
+        ON pm_projects(updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_pm_projects_analysis
+        ON pm_projects(analysis_status, match_status);
+
+      CREATE TABLE IF NOT EXISTS pm_cost_entries (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        cost_type TEXT NOT NULL,
+        category TEXT NOT NULL DEFAULT '',
+        description TEXT NOT NULL DEFAULT '',
+        amount REAL NOT NULL DEFAULT 0,
+        occurred_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        asset_record_uid TEXT,
+        responsible_participant_id TEXT,
+        responsible_person_name TEXT NOT NULL DEFAULT '',
+        FOREIGN KEY(project_id) REFERENCES pm_projects(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_pm_cost_entries_project
+        ON pm_cost_entries(project_id, cost_type, occurred_at DESC);
+
+      CREATE TABLE IF NOT EXISTS pm_project_documents (
+        project_id TEXT NOT NULL,
+        document_id TEXT NOT NULL,
+        version INTEGER NOT NULL DEFAULT 1,
+        is_current INTEGER NOT NULL DEFAULT 1,
+        linked_at TEXT NOT NULL,
+        PRIMARY KEY(project_id, document_id),
+        FOREIGN KEY(project_id) REFERENCES pm_projects(id) ON DELETE CASCADE,
+        FOREIGN KEY(document_id) REFERENCES knowledge_documents(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_pm_project_documents_current
+        ON pm_project_documents(project_id, is_current, version DESC);
+
+      CREATE TABLE IF NOT EXISTS pm_project_assets (
+        project_id TEXT NOT NULL,
+        record_uid TEXT NOT NULL,
+        linked_at TEXT NOT NULL,
+        PRIMARY KEY(project_id, record_uid),
+        FOREIGN KEY(project_id) REFERENCES pm_projects(id) ON DELETE CASCADE,
+        FOREIGN KEY(record_uid) REFERENCES records(uid) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_pm_project_assets_record
+        ON pm_project_assets(record_uid);
+
+      CREATE TABLE IF NOT EXISTS pm_project_participants (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        person_id TEXT NOT NULL,
+        hourly_rate REAL NOT NULL DEFAULT 0,
+        start_date TEXT NOT NULL,
+        end_date TEXT NOT NULL,
+        duration_days INTEGER NOT NULL DEFAULT 0,
+        estimated_cost REAL NOT NULL DEFAULT 0,
+        notes TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(project_id, person_id),
+        FOREIGN KEY(project_id) REFERENCES pm_projects(id) ON DELETE CASCADE,
+        FOREIGN KEY(person_id) REFERENCES org_people(id) ON DELETE RESTRICT
+      );
+      CREATE INDEX IF NOT EXISTS idx_pm_project_participants_project
+        ON pm_project_participants(project_id, start_date, end_date);
+
+      CREATE TABLE IF NOT EXISTS pm_project_tasks (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        task_type TEXT NOT NULL DEFAULT 'task',
+        title TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        parent_task_id TEXT,
+        start_date TEXT NOT NULL,
+        end_date TEXT NOT NULL,
+        owner_person_id TEXT,
+        status TEXT NOT NULL DEFAULT 'not_started',
+        progress_percent REAL NOT NULL DEFAULT 0,
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(project_id) REFERENCES pm_projects(id) ON DELETE CASCADE,
+        FOREIGN KEY(parent_task_id) REFERENCES pm_project_tasks(id) ON DELETE SET NULL,
+        FOREIGN KEY(owner_person_id) REFERENCES org_people(id) ON DELETE SET NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_pm_project_tasks_project
+        ON pm_project_tasks(project_id, start_date, sort_order, created_at);
+
+      CREATE TABLE IF NOT EXISTS pm_requirements (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        document_id TEXT NOT NULL,
+        requirement_no INTEGER NOT NULL,
+        module TEXT NOT NULL DEFAULT '',
+        title TEXT NOT NULL,
+        content TEXT NOT NULL,
+        key_info_terms_json TEXT NOT NULL DEFAULT '[]',
+        key_info_terms_source TEXT NOT NULL DEFAULT 'ai',
+        source_location TEXT NOT NULL DEFAULT '',
+        source_chunk_id TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'unmarked',
+        status_source TEXT NOT NULL DEFAULT 'ai',
+        status_reason TEXT NOT NULL DEFAULT '',
+        highest_match_score REAL NOT NULL DEFAULT 0,
+        match_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(project_id) REFERENCES pm_projects(id) ON DELETE CASCADE,
+        FOREIGN KEY(document_id) REFERENCES knowledge_documents(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_pm_requirements_project
+        ON pm_requirements(project_id, requirement_no);
+      CREATE INDEX IF NOT EXISTS idx_pm_requirements_status
+        ON pm_requirements(project_id, status);
+
+      CREATE TABLE IF NOT EXISTS pm_requirement_matches (
+        requirement_id TEXT NOT NULL,
+        record_uid TEXT NOT NULL,
+        vector_score REAL NOT NULL DEFAULT 0,
+        ai_score REAL,
+        final_score REAL NOT NULL DEFAULT 0,
+        score_source TEXT NOT NULL DEFAULT 'vector',
+        reason TEXT NOT NULL DEFAULT '',
+        best_chunk_id TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(requirement_id, record_uid),
+        FOREIGN KEY(requirement_id) REFERENCES pm_requirements(id) ON DELETE CASCADE,
+        FOREIGN KEY(record_uid) REFERENCES records(uid) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_pm_requirement_matches_rank
+        ON pm_requirement_matches(requirement_id, final_score DESC, record_uid);
+
+      CREATE TABLE IF NOT EXISTS pm_analysis_runs (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        task_type TEXT NOT NULL,
+        phase TEXT NOT NULL,
+        status TEXT NOT NULL,
+        current_count INTEGER NOT NULL DEFAULT 0,
+        total_count INTEGER NOT NULL DEFAULT 0,
+        message TEXT NOT NULL DEFAULT '',
+        output_json TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(project_id) REFERENCES pm_projects(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_pm_analysis_runs_project
+        ON pm_analysis_runs(project_id, updated_at DESC);
     `)
 
     for (const statement of [
       "ALTER TABLE records ADD COLUMN push_status TEXT NOT NULL DEFAULT 'pending'",
       "ALTER TABLE records ADD COLUMN push_message TEXT NOT NULL DEFAULT ''",
       "ALTER TABLE records ADD COLUMN pushed_at TEXT NOT NULL DEFAULT ''",
-      "ALTER TABLE records ADD COLUMN pushed_uid TEXT NOT NULL DEFAULT ''"
+      "ALTER TABLE records ADD COLUMN pushed_uid TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE field_profiles ADD COLUMN sensitivity TEXT NOT NULL DEFAULT 'normal'",
+      "ALTER TABLE pm_requirements ADD COLUMN key_info_terms_json TEXT NOT NULL DEFAULT '[]'",
+      "ALTER TABLE pm_requirements ADD COLUMN key_info_terms_source TEXT NOT NULL DEFAULT 'ai'",
+      "ALTER TABLE pm_requirements ADD COLUMN module TEXT NOT NULL DEFAULT ''",
+      "UPDATE pm_requirements SET status = 'unmarked', status_reason = '待人工标记' WHERE status_source = 'ai' AND status <> 'satisfied'",
+      "ALTER TABLE pm_cost_entries ADD COLUMN responsible_participant_id TEXT",
+      "ALTER TABLE pm_cost_entries ADD COLUMN responsible_person_name TEXT NOT NULL DEFAULT ''"
     ]) {
       try {
         this.db.exec(statement)
@@ -474,6 +948,7 @@ export class AppDatabase {
       }
     }
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_records_push_status ON records(push_status)')
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_pm_cost_entries_responsible ON pm_cost_entries(responsible_participant_id)')
 
     try {
       this.db.exec(`
@@ -520,6 +995,2226 @@ export class AppDatabase {
 
   close(): void {
     this.db.close()
+  }
+
+  private parseChatMessages(value: unknown): ChatMessage[] {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(String(value ?? '[]'))
+    } catch {
+      return []
+    }
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter((item): item is ChatMessage => {
+      if (!item || typeof item !== 'object') return false
+      const message = item as Partial<ChatMessage>
+      return (
+        (message.role === 'user' || message.role === 'assistant') &&
+        typeof message.content === 'string' &&
+        typeof message.id === 'string' &&
+        typeof message.createdAt === 'string'
+      )
+    })
+  }
+
+  private mapChatSessionSummary(row: SqlRow): ChatSessionSummary {
+    return {
+      id: String(row.id),
+      title: String(row.title || '新会话'),
+      preview: String(row.preview || ''),
+      messageCount: Number(row.message_count || 0),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at)
+    }
+  }
+
+  listChatSessions(limit = 50): ChatSessionSummary[] {
+    const safeLimit = Math.min(100, Math.max(1, Math.floor(limit)))
+    return (this.db.prepare(`
+      SELECT id, title, preview, message_count, created_at, updated_at
+      FROM chat_sessions
+      ORDER BY updated_at DESC
+      LIMIT ?
+    `).all(safeLimit) as SqlRow[]).map((row) => this.mapChatSessionSummary(row))
+  }
+
+  getChatSession(id: string): ChatSession | null {
+    const row = this.db.prepare('SELECT * FROM chat_sessions WHERE id = ?').get(id) as SqlRow | undefined
+    if (!row) return null
+    return {
+      ...this.mapChatSessionSummary(row),
+      messages: this.parseChatMessages(row.messages_json)
+    }
+  }
+
+  saveChatSession(input: ChatSessionSaveInput): ChatSession {
+    const id = input.id.trim()
+    if (!id) throw new Error('会话标识不能为空')
+    const messages = this.parseChatMessages(JSON.stringify(input.messages))
+    if (!messages.length) throw new Error('至少需要一条消息才能保存会话')
+    const firstUserMessage = messages.find((message) => message.role === 'user')
+    const lastMessage = messages.at(-1)
+    const title = (input.title?.trim() || firstUserMessage?.content.trim() || '新会话')
+      .replace(/\s+/g, ' ')
+      .slice(0, 80)
+    const preview = (lastMessage?.content || '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 180)
+    const timestamp = nowIso()
+    const existing = this.db
+      .prepare('SELECT created_at FROM chat_sessions WHERE id = ?')
+      .get(id) as SqlRow | undefined
+    this.db.prepare(`
+      INSERT INTO chat_sessions(
+        id, title, preview, messages_json, message_count, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        title = excluded.title,
+        preview = excluded.preview,
+        messages_json = excluded.messages_json,
+        message_count = excluded.message_count,
+        updated_at = excluded.updated_at
+    `).run(
+      id,
+      title,
+      preview,
+      JSON.stringify(messages),
+      messages.length,
+      existing ? String(existing.created_at) : timestamp,
+      timestamp
+    )
+    return this.getChatSession(id)!
+  }
+
+  deleteChatSession(id: string): ChatSessionDeleteResult {
+    const normalizedId = id.trim()
+    if (!normalizedId) return { ok: false, message: '会话标识不能为空' }
+    const result = this.db.prepare('DELETE FROM chat_sessions WHERE id = ?').run(normalizedId)
+    return Number(result.changes) > 0
+      ? { ok: true, message: '历史会话已删除' }
+      : { ok: false, message: '历史会话不存在' }
+  }
+
+  private mapKnowledgeDocument(row: SqlRow): KnowledgeDocument {
+    let tags: string[] = []
+    try {
+      const parsed = JSON.parse(String(row.tags_json ?? '[]')) as unknown
+      if (Array.isArray(parsed)) tags = parsed.map(String).filter(Boolean)
+    } catch {
+      tags = []
+    }
+    return {
+      id: String(row.id),
+      fileName: String(row.file_name),
+      filePath: String(row.file_path),
+      extension: String(row.extension),
+      mimeType: String(row.mime_type),
+      byteSize: Number(row.byte_size),
+      sha256: String(row.sha256),
+      tags,
+      status: String(row.status) as KnowledgeDocumentStatus,
+      errorMessage: String(row.error_message ?? ''),
+      chunkCount: Number(row.chunk_count ?? 0),
+      pageCount: Number(row.page_count ?? 0),
+      modelVersion: String(row.model_version ?? ''),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+      processedAt: String(row.processed_at ?? '')
+    }
+  }
+
+  private mapKnowledgeChunk(row: SqlRow): KnowledgeChunk {
+    const pageNumber = row.page_number === null || row.page_number === undefined
+      ? undefined
+      : Number(row.page_number)
+    const sheetName = String(row.sheet_name ?? '')
+    return {
+      id: String(row.id),
+      ...(row.document_id ? { documentId: String(row.document_id) } : {}),
+      ...(row.record_uid ? { recordUid: String(row.record_uid) } : {}),
+      sourceType: String(row.source_type) as KnowledgeChunk['sourceType'],
+      sourceName: String(row.source_name ?? ''),
+      content: String(row.content ?? ''),
+      chunkIndex: Number(row.chunk_index ?? 0),
+      ...(pageNumber === undefined ? {} : { pageNumber }),
+      ...(sheetName ? { sheetName } : {}),
+      location: String(row.location ?? ''),
+      charStart: Number(row.char_start ?? 0),
+      charEnd: Number(row.char_end ?? 0)
+    }
+  }
+
+  findKnowledgeDocumentByHash(sha256: string): KnowledgeDocument | null {
+    const row = this.db
+      .prepare('SELECT * FROM knowledge_documents WHERE sha256 = ?')
+      .get(sha256) as SqlRow | undefined
+    return row ? this.mapKnowledgeDocument(row) : null
+  }
+
+  insertKnowledgeDocument(input: KnowledgeDocumentInput): KnowledgeDocument {
+    const timestamp = nowIso()
+    this.db.prepare(`
+      INSERT INTO knowledge_documents(
+        id, file_name, file_path, extension, mime_type, byte_size, sha256,
+        tags_json, status, model_version, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      input.id,
+      input.fileName,
+      input.filePath,
+      input.extension,
+      input.mimeType,
+      input.byteSize,
+      input.sha256,
+      JSON.stringify(input.tags ?? []),
+      input.status ?? 'queued',
+      input.modelVersion ?? '',
+      timestamp,
+      timestamp
+    )
+    return this.getKnowledgeDocument(input.id) as KnowledgeDocument
+  }
+
+  updateKnowledgeDocument(
+    id: string,
+    patch: Partial<Pick<KnowledgeDocument, 'status' | 'errorMessage' | 'chunkCount' | 'pageCount' | 'modelVersion' | 'processedAt' | 'tags'>>
+  ): KnowledgeDocument | null {
+    const fields: string[] = []
+    const values: Array<string | number | null> = []
+    const add = (column: string, value: string | number | null): void => {
+      fields.push(`${column} = ?`)
+      values.push(value)
+    }
+    if (patch.status !== undefined) add('status', patch.status)
+    if (patch.errorMessage !== undefined) add('error_message', patch.errorMessage)
+    if (patch.chunkCount !== undefined) add('chunk_count', patch.chunkCount)
+    if (patch.pageCount !== undefined) add('page_count', patch.pageCount)
+    if (patch.modelVersion !== undefined) add('model_version', patch.modelVersion)
+    if (patch.processedAt !== undefined) add('processed_at', patch.processedAt)
+    if (patch.tags !== undefined) add('tags_json', JSON.stringify(patch.tags))
+    if (fields.length) {
+      fields.push('updated_at = ?')
+      values.push(nowIso())
+      values.push(id)
+      this.db.prepare(`UPDATE knowledge_documents SET ${fields.join(', ')} WHERE id = ?`).run(...values)
+    }
+    return this.getKnowledgeDocument(id)
+  }
+
+  listKnowledgeDocuments(query: KnowledgeDocumentQuery): KnowledgeDocumentPage {
+    const clauses: string[] = []
+    const params: Array<string | number | null> = []
+    const search = query.search?.trim()
+    if (search) {
+      clauses.push('(file_name LIKE ? OR extension LIKE ? OR error_message LIKE ?)')
+      const pattern = `%${search}%`
+      params.push(pattern, pattern, pattern)
+    }
+    if (query.status) {
+      clauses.push('status = ?')
+      params.push(query.status)
+    }
+    if (query.extension) {
+      clauses.push('extension = ?')
+      params.push(query.extension.toLowerCase())
+    }
+    if (query.tag?.trim()) {
+      clauses.push('tags_json LIKE ?')
+      params.push(`%${JSON.stringify(query.tag.trim()).slice(1, -1)}%`)
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''
+    const total = Number((this.db.prepare(`SELECT COUNT(*) AS count FROM knowledge_documents ${where}`).get(...params) as SqlRow).count)
+    const page = Math.max(1, Math.floor(query.page || 1))
+    const pageSize = Math.min(100, Math.max(1, Math.floor(query.pageSize || 20)))
+    const rows = this.db.prepare(`
+      SELECT * FROM knowledge_documents
+      ${where}
+      ORDER BY updated_at DESC, file_name COLLATE NOCASE ASC
+      LIMIT ? OFFSET ?
+    `).all(...params, pageSize, (page - 1) * pageSize) as SqlRow[]
+    return { rows: rows.map((row) => this.mapKnowledgeDocument(row)), total }
+  }
+
+  getKnowledgeDocument(id: string): KnowledgeDocumentDetail | null {
+    const row = this.db.prepare('SELECT * FROM knowledge_documents WHERE id = ?').get(id) as SqlRow | undefined
+    if (!row) return null
+    const chunks = this.db.prepare(`
+      SELECT * FROM knowledge_chunks
+      WHERE document_id = ?
+      ORDER BY chunk_index ASC
+    `).all(id) as SqlRow[]
+    return { ...this.mapKnowledgeDocument(row), chunks: chunks.map((item) => this.mapKnowledgeChunk(item)) }
+  }
+
+  deleteKnowledgeDocument(id: string): { filePath: string; deleted: boolean } {
+    const row = this.db.prepare('SELECT file_path FROM knowledge_documents WHERE id = ?').get(id) as SqlRow | undefined
+    if (!row) return { filePath: '', deleted: false }
+    this.db.prepare('DELETE FROM knowledge_documents WHERE id = ?').run(id)
+    return { filePath: String(row.file_path), deleted: true }
+  }
+
+  replaceKnowledgeDocumentChunks(
+    documentId: string,
+    chunks: KnowledgeChunkInput[],
+    vectors: KnowledgeVectorInput[]
+  ): void {
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      this.db.prepare('DELETE FROM knowledge_chunks WHERE document_id = ?').run(documentId)
+      this.insertKnowledgeChunks(chunks)
+      this.insertKnowledgeVectors(vectors)
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  clearKnowledgeDocumentChunks(documentId: string): void {
+    this.db.prepare('DELETE FROM knowledge_chunks WHERE document_id = ?').run(documentId)
+  }
+
+  replaceKnowledgeRecordChunks(
+    recordUid: string,
+    chunks: KnowledgeChunkInput[],
+    vectors: KnowledgeVectorInput[]
+  ): void {
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      this.db.prepare('DELETE FROM knowledge_chunks WHERE record_uid = ?').run(recordUid)
+      this.insertKnowledgeChunks(chunks)
+      this.insertKnowledgeVectors(vectors)
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  private insertKnowledgeChunks(chunks: KnowledgeChunkInput[]): void {
+    const insert = this.db.prepare(`
+      INSERT INTO knowledge_chunks(
+        id, document_id, record_uid, source_type, source_name, source_hash,
+        content, chunk_index, page_number, sheet_name, location,
+        char_start, char_end, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    const timestamp = nowIso()
+    for (const chunk of chunks) {
+      insert.run(
+        chunk.id,
+        chunk.documentId ?? null,
+        chunk.recordUid ?? null,
+        chunk.sourceType,
+        chunk.sourceName,
+        chunk.sourceHash,
+        chunk.content,
+        chunk.chunkIndex,
+        chunk.pageNumber ?? null,
+        chunk.sheetName ?? '',
+        chunk.location ?? '',
+        chunk.charStart ?? 0,
+        chunk.charEnd ?? chunk.content.length,
+        timestamp
+      )
+    }
+  }
+
+  private insertKnowledgeVectors(vectors: KnowledgeVectorInput[]): void {
+    const insert = this.db.prepare(`
+      INSERT INTO knowledge_vectors(chunk_id, vector_blob, dimension, model_version, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    `)
+    const timestamp = nowIso()
+    for (const item of vectors) {
+      const bytes = Buffer.from(item.vector.buffer, item.vector.byteOffset, item.vector.byteLength)
+      insert.run(item.chunkId, bytes, item.vector.length, item.modelVersion, timestamp)
+    }
+  }
+
+  saveKnowledgeVectors(vectors: KnowledgeVectorInput[]): void {
+    this.insertKnowledgeVectors(vectors)
+  }
+
+  getKnowledgeRecordIndexHash(recordUid: string): string | null {
+    const row = this.db.prepare(`
+      SELECT source_hash FROM knowledge_chunks
+      WHERE record_uid = ?
+      ORDER BY chunk_index ASC LIMIT 1
+    `).get(recordUid) as SqlRow | undefined
+    return row ? String(row.source_hash) : null
+  }
+
+  getKnowledgeRecordIndexModelVersion(recordUid: string): string | null {
+    const row = this.db.prepare(`
+      SELECT v.model_version
+      FROM knowledge_chunks c
+      JOIN knowledge_vectors v ON v.chunk_id = c.id
+      WHERE c.record_uid = ?
+      ORDER BY c.chunk_index ASC LIMIT 1
+    `).get(recordUid) as SqlRow | undefined
+    return row ? String(row.model_version) : null
+  }
+
+  listKnowledgeRecordIndexRows(): KnowledgeRecordIndexRow[] {
+    return (this.db.prepare(`
+      SELECT uid, name, node_type, item_id, normalized_text, content_hash
+      FROM records ORDER BY uid
+    `).all() as SqlRow[]).map((row) => ({
+      uid: String(row.uid),
+      name: String(row.name),
+      nodeType: String(row.node_type),
+      itemId: String(row.item_id),
+      content: String(row.normalized_text ?? ''),
+      contentHash: String(row.content_hash ?? '')
+    }))
+  }
+
+  deleteKnowledgeRecordIndex(recordUid: string): void {
+    this.db.prepare('DELETE FROM knowledge_chunks WHERE record_uid = ?').run(recordUid)
+  }
+
+  listKnowledgeIndexedRecordUids(): string[] {
+    return (this.db.prepare(`
+      SELECT DISTINCT record_uid FROM knowledge_chunks
+      WHERE source_type = 'record' AND record_uid IS NOT NULL
+      ORDER BY record_uid
+    `).all() as SqlRow[]).map((row) => String(row.record_uid))
+  }
+
+  deleteKnowledgeVectors(): void {
+    this.db.prepare('DELETE FROM knowledge_vectors').run()
+  }
+
+  listKnowledgeChunksForRebuild(): KnowledgeChunk[] {
+    return (this.db.prepare(`
+      SELECT c.* FROM knowledge_chunks c
+      LEFT JOIN knowledge_documents d ON d.id = c.document_id
+      WHERE c.source_type = 'record' OR d.status = 'ready'
+      ORDER BY c.source_type, c.source_name, c.chunk_index
+    `).all() as SqlRow[]).map((row) => this.mapKnowledgeChunk(row))
+  }
+
+  knowledgeDocumentsNeedReindex(modelVersion: string): boolean {
+    const row = this.db.prepare(`
+      SELECT EXISTS(
+        SELECT 1
+        FROM knowledge_documents d
+        WHERE d.status = 'ready'
+          AND (
+            d.model_version <> ?
+            OR EXISTS(
+              SELECT 1
+              FROM knowledge_chunks c
+              LEFT JOIN knowledge_vectors v ON v.chunk_id = c.id
+              WHERE c.document_id = d.id
+                AND (v.chunk_id IS NULL OR v.model_version <> ?)
+            )
+          )
+      ) AS needs_reindex
+    `).get(modelVersion, modelVersion) as SqlRow | undefined
+    return Number(row?.needs_reindex ?? 0) === 1
+  }
+
+  markKnowledgeDocumentsModelVersion(modelVersion: string): void {
+    this.db.prepare(`
+      UPDATE knowledge_documents
+      SET model_version = ?, updated_at = ?
+      WHERE status = 'ready'
+    `).run(modelVersion, nowIso())
+  }
+
+  listKnowledgeVectorRows(modelVersion: string): KnowledgeVectorRow[] {
+    const rows = this.db.prepare(`
+      SELECT c.*, v.vector_blob
+      FROM knowledge_chunks c
+      JOIN knowledge_vectors v ON v.chunk_id = c.id
+      LEFT JOIN knowledge_documents d ON d.id = c.document_id
+      WHERE v.model_version = ?
+        AND (c.source_type = 'record' OR d.status = 'ready')
+      ORDER BY c.source_name, c.chunk_index
+    `).all(modelVersion) as SqlRow[]
+    return rows.map((row) => {
+      const bytes = Uint8Array.from(row.vector_blob as Uint8Array)
+      return {
+        chunk: this.mapKnowledgeChunk(row),
+        vector: new Float32Array(bytes.buffer)
+      }
+    })
+  }
+
+  getKnowledgeStats(modelVersion: string): KnowledgeStats {
+    const scalar = (sql: string, ...params: Array<string | number | null>): number =>
+      Number((this.db.prepare(sql).get(...params) as SqlRow).count ?? 0)
+    const documentCount = scalar('SELECT COUNT(*) AS count FROM knowledge_documents')
+    return {
+      documentCount,
+      readyCount: scalar("SELECT COUNT(*) AS count FROM knowledge_documents WHERE status = 'ready'"),
+      processingCount: scalar("SELECT COUNT(*) AS count FROM knowledge_documents WHERE status IN ('queued', 'processing')"),
+      failedCount: scalar("SELECT COUNT(*) AS count FROM knowledge_documents WHERE status = 'failed'"),
+      chunkCount: scalar('SELECT COUNT(*) AS count FROM knowledge_chunks'),
+      indexedChunkCount: scalar('SELECT COUNT(*) AS count FROM knowledge_vectors WHERE model_version = ?', modelVersion),
+      recordCount: scalar("SELECT COUNT(*) AS count FROM knowledge_chunks WHERE source_type = 'record'"),
+      modelVersion
+    }
+  }
+
+  saveKnowledgeIndexProgress(progress: KnowledgeIndexProgress): void {
+    const timestamp = nowIso()
+    this.db.prepare(`
+      INSERT INTO knowledge_index_tasks(
+        id, phase, status, current_count, total_count, message, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        phase = excluded.phase,
+        status = excluded.status,
+        current_count = excluded.current_count,
+        total_count = excluded.total_count,
+        message = excluded.message,
+        updated_at = excluded.updated_at
+    `).run(
+      progress.taskId,
+      progress.phase,
+      progress.status,
+      progress.current,
+      progress.total,
+      progress.message,
+      timestamp,
+      timestamp
+    )
+  }
+
+  private mapManagedProject(row: SqlRow): ManagedProject {
+    const plannedDeliveryDate = String(row.planned_delivery_date ?? '')
+    const contractAmount = Number(row.contract_amount ?? 0)
+    const baseEstimatedCost = Number(row.estimated_cost ?? 0)
+    const laborEstimatedCost = Number(row.labor_estimated_cost ?? 0)
+    const estimatedCost = baseEstimatedCost + laborEstimatedCost
+    return {
+      id: String(row.id),
+      projectName: String(row.project_name ?? ''),
+      customerName: String(row.customer_name ?? ''),
+      contractAmount,
+      riskFactor: Number(row.risk_factor ?? 0),
+      deliveryReminderDays: Number(row.delivery_reminder_days ?? 0),
+      plannedDeliveryDate,
+      salesOwner: String(row.sales_owner ?? ''),
+      technicalOwner: String(row.technical_owner ?? ''),
+      developmentOwner: String(row.development_owner ?? ''),
+      estimatedCost,
+      laborEstimatedCost,
+      actualCost: Number(row.actual_cost ?? 0),
+      remainingQuota: contractAmount - estimatedCost,
+      estimatedDurationDays: Number(row.estimated_duration_days ?? 0),
+      lifecycle: String(row.lifecycle ?? 'draft') as ManagedProject['lifecycle'],
+      source: String(row.source ?? 'manual') as ManagedProject['source'],
+      analysisStatus: String(row.analysis_status ?? 'idle') as ManagedProject['analysisStatus'],
+      analysisMessage: String(row.analysis_message ?? ''),
+      matchStatus: String(row.match_status ?? 'idle') as ManagedProject['matchStatus'],
+      matchMessage: String(row.match_message ?? ''),
+      requirementCount: Number(row.requirement_count ?? 0),
+      satisfiedCount: Number(row.satisfied_count ?? 0),
+      toDevelopCount: Number(row.to_develop_count ?? 0),
+      toNegotiateCount: Number(row.to_negotiate_count ?? 0),
+      unmarkedCount: Number(row.unmarked_count ?? 0),
+      assetCount: Number(row.asset_count ?? 0),
+      participantCount: Number(row.participant_count ?? 0),
+      taskCount: Number(row.task_count ?? 0),
+      ...(row.current_document_id ? { currentDocumentId: String(row.current_document_id) } : {}),
+      ...(row.current_document_name ? { currentDocumentName: String(row.current_document_name) } : {}),
+      createdAt: String(row.created_at ?? ''),
+      updatedAt: String(row.updated_at ?? '')
+    }
+  }
+
+  private managedProjectSelect(): string {
+    return `
+      SELECT p.*,
+        (SELECT COUNT(*) FROM pm_requirements q WHERE q.project_id = p.id) AS requirement_count,
+        (SELECT COUNT(*) FROM pm_requirements q WHERE q.project_id = p.id AND q.status = 'satisfied') AS satisfied_count,
+        (SELECT COUNT(*) FROM pm_requirements q WHERE q.project_id = p.id AND q.status = 'to_develop') AS to_develop_count,
+        (SELECT COUNT(*) FROM pm_requirements q WHERE q.project_id = p.id AND q.status = 'to_negotiate') AS to_negotiate_count,
+        (SELECT COUNT(*) FROM pm_requirements q WHERE q.project_id = p.id AND q.status = 'unmarked') AS unmarked_count,
+        (SELECT COUNT(*) FROM pm_project_assets a WHERE a.project_id = p.id) AS asset_count,
+        (SELECT COUNT(*) FROM pm_project_participants pp WHERE pp.project_id = p.id) AS participant_count,
+        (SELECT COALESCE(SUM(pp.estimated_cost), 0) FROM pm_project_participants pp WHERE pp.project_id = p.id) AS labor_estimated_cost,
+        (SELECT COUNT(*) FROM pm_project_tasks pt WHERE pt.project_id = p.id) AS task_count,
+        (SELECT d.id FROM pm_project_documents pd JOIN knowledge_documents d ON d.id = pd.document_id
+          WHERE pd.project_id = p.id AND pd.is_current = 1 ORDER BY pd.version DESC LIMIT 1) AS current_document_id,
+        (SELECT d.file_name FROM pm_project_documents pd JOIN knowledge_documents d ON d.id = pd.document_id
+          WHERE pd.project_id = p.id AND pd.is_current = 1 ORDER BY pd.version DESC LIMIT 1) AS current_document_name
+      FROM pm_projects p`
+  }
+
+  createManagedProject(
+    id: string,
+    input: ManagedProjectInput,
+    source: ManagedProject['source'] = 'manual',
+    lifecycle: ManagedProject['lifecycle'] = 'active'
+  ): ManagedProject {
+    const timestamp = nowIso()
+    this.db.prepare(`
+      INSERT INTO pm_projects(
+        id, project_name, customer_name, contract_amount, risk_factor,
+        delivery_reminder_days, planned_delivery_date, sales_owner,
+        technical_owner, development_owner, estimated_cost,
+        estimated_duration_days, lifecycle, source, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      input.projectName.trim(),
+      input.customerName?.trim() ?? '',
+      Number(input.contractAmount ?? 0),
+      Number(input.riskFactor ?? 0),
+      Math.max(0, Math.trunc(input.deliveryReminderDays ?? 0)),
+      input.plannedDeliveryDate?.trim() ?? '',
+      input.salesOwner?.trim() ?? '',
+      input.technicalOwner?.trim() ?? '',
+      input.developmentOwner?.trim() ?? '',
+      Math.max(0, Number(input.estimatedCost ?? 0)),
+      Math.max(0, Math.trunc(input.estimatedDurationDays ?? 0)),
+      lifecycle,
+      source,
+      timestamp,
+      timestamp
+    )
+    const estimatedCost = Number(input.estimatedCost ?? 0)
+    if (estimatedCost > 0) {
+      this.insertProjectCostEntry(id, {
+        type: 'estimated',
+        category: '项目预估',
+        description: '项目创建时的预计成本',
+        amount: estimatedCost,
+        occurredAt: timestamp
+      })
+    }
+    return this.getManagedProject(id) as ManagedProject
+  }
+
+  updateManagedProject(id: string, input: ManagedProjectInput): ManagedProject | null {
+    const timestamp = nowIso()
+    const result = this.db.prepare(`
+      UPDATE pm_projects SET
+        project_name = ?, customer_name = ?, contract_amount = ?, risk_factor = ?,
+        delivery_reminder_days = ?, planned_delivery_date = ?, sales_owner = ?,
+        technical_owner = ?, development_owner = ?, estimated_duration_days = ?,
+        updated_at = ?
+      WHERE id = ?
+    `).run(
+      input.projectName.trim(),
+      input.customerName?.trim() ?? '',
+      Number(input.contractAmount ?? 0),
+      Number(input.riskFactor ?? 0),
+      Math.max(0, Math.trunc(input.deliveryReminderDays ?? 0)),
+      input.plannedDeliveryDate?.trim() ?? '',
+      input.salesOwner?.trim() ?? '',
+      input.technicalOwner?.trim() ?? '',
+      input.developmentOwner?.trim() ?? '',
+      Math.max(0, Math.trunc(input.estimatedDurationDays ?? 0)),
+      timestamp,
+      id
+    )
+    return Number(result.changes) ? this.getManagedProject(id) : null
+  }
+
+  listManagedProjects(query: ManagedProjectListQuery): ManagedProjectPage {
+    const page = Math.max(1, Math.floor(query.page || 1))
+    const pageSize = Math.min(100, Math.max(1, Math.floor(query.pageSize || 20)))
+    const search = query.search?.trim() ?? ''
+    const where = search ? 'WHERE p.project_name LIKE ? OR p.customer_name LIKE ?' : ''
+    const params = search ? [`%${search}%`, `%${search}%`] : []
+    const total = Number((this.db.prepare(`SELECT COUNT(*) AS count FROM pm_projects p ${where}`).get(...params) as SqlRow).count)
+    const rows = this.db.prepare(`
+      ${this.managedProjectSelect()}
+      ${where}
+      ORDER BY p.updated_at DESC, p.project_name COLLATE NOCASE ASC
+      LIMIT ? OFFSET ?
+    `).all(...params, pageSize, (page - 1) * pageSize) as SqlRow[]
+    return { rows: rows.map((row) => this.mapManagedProject(row)), total }
+  }
+
+  getManagedProject(id: string): ManagedProject | null {
+    const row = this.db.prepare(`${this.managedProjectSelect()} WHERE p.id = ?`).get(id) as SqlRow | undefined
+    return row ? this.mapManagedProject(row) : null
+  }
+
+  listOrganizationPeople(query: OrganizationPersonListQuery): OrganizationPersonPage {
+    const page = Math.max(1, Math.floor(query.page || 1))
+    const pageSize = Math.min(100, Math.max(1, Math.floor(query.pageSize || 20)))
+    const search = query.search?.trim() ?? ''
+    const conditions: string[] = []
+    const params: Array<string | number> = []
+    if (search) {
+      conditions.push('(name LIKE ? OR employee_no LIKE ? OR department LIKE ? OR role LIKE ?)')
+      params.push(`%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`)
+    }
+    if (query.status) {
+      conditions.push('status = ?')
+      params.push(query.status)
+    }
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
+    const total = Number((this.db.prepare(`SELECT COUNT(*) AS count FROM org_people ${where}`).get(...params) as SqlRow).count)
+    const rows = this.db.prepare(`
+      SELECT * FROM org_people
+      ${where}
+      ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, updated_at DESC, name COLLATE NOCASE ASC
+      LIMIT ? OFFSET ?
+    `).all(...params, pageSize, (page - 1) * pageSize) as SqlRow[]
+    return { rows: rows.map((row) => this.mapOrganizationPerson(row)), total }
+  }
+
+  getOrganizationPerson(id: string): OrganizationPerson | null {
+    const row = this.db.prepare('SELECT * FROM org_people WHERE id = ?').get(id) as SqlRow | undefined
+    return row ? this.mapOrganizationPerson(row) : null
+  }
+
+  createOrganizationPerson(input: OrganizationPersonInput, id = randomUUID()): OrganizationPerson {
+    const timestamp = nowIso()
+    this.db.prepare(`
+      INSERT INTO org_people(
+        id, name, employee_no, department, role, hourly_rate, status, notes, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      input.name.trim(),
+      input.employeeNo?.trim() ?? '',
+      input.department?.trim() ?? '',
+      input.role?.trim() ?? '',
+      Math.max(0, Number(input.hourlyRate ?? 0)),
+      input.status ?? 'active',
+      input.notes?.trim() ?? '',
+      timestamp,
+      timestamp
+    )
+    return this.getOrganizationPerson(id) as OrganizationPerson
+  }
+
+  updateOrganizationPerson(id: string, input: OrganizationPersonInput): OrganizationPerson | null {
+    const result = this.db.prepare(`
+      UPDATE org_people SET
+        name = ?, employee_no = ?, department = ?, role = ?, hourly_rate = ?,
+        status = ?, notes = ?, updated_at = ?
+      WHERE id = ?
+    `).run(
+      input.name.trim(),
+      input.employeeNo?.trim() ?? '',
+      input.department?.trim() ?? '',
+      input.role?.trim() ?? '',
+      Math.max(0, Number(input.hourlyRate ?? 0)),
+      input.status ?? 'active',
+      input.notes?.trim() ?? '',
+      nowIso(),
+      id
+    )
+    return Number(result.changes) ? this.getOrganizationPerson(id) : null
+  }
+
+  deleteOrganizationPerson(id: string): { ok: boolean; message: string } {
+    const participantCount = Number((this.db.prepare(
+      'SELECT COUNT(*) AS count FROM pm_project_participants WHERE person_id = ?'
+    ).get(id) as SqlRow).count)
+    if (participantCount > 0) return { ok: false, message: '该人员已绑定项目，请先解除项目参与关系' }
+    const result = this.db.prepare('DELETE FROM org_people WHERE id = ?').run(id)
+    return Number(result.changes)
+      ? { ok: true, message: '组织人员已删除' }
+      : { ok: false, message: '组织人员不存在' }
+  }
+
+  private mapOrganizationPerson(row: SqlRow): OrganizationPerson {
+    return {
+      id: String(row.id),
+      name: String(row.name ?? ''),
+      employeeNo: String(row.employee_no ?? ''),
+      department: String(row.department ?? ''),
+      role: String(row.role ?? ''),
+      hourlyRate: Number(row.hourly_rate ?? 0),
+      status: String(row.status ?? 'active') as OrganizationPerson['status'],
+      notes: String(row.notes ?? ''),
+      createdAt: String(row.created_at ?? ''),
+      updatedAt: String(row.updated_at ?? '')
+    }
+  }
+
+  updateManagedProjectState(
+    id: string,
+    patch: Partial<Pick<ManagedProject, 'lifecycle' | 'analysisStatus' | 'analysisMessage' | 'matchStatus' | 'matchMessage'>>
+  ): ManagedProject | null {
+    const fields: string[] = []
+    const values: Array<string | number> = []
+    const add = (field: string, value: string): void => {
+      fields.push(`${field} = ?`)
+      values.push(value)
+    }
+    if (patch.lifecycle !== undefined) add('lifecycle', patch.lifecycle)
+    if (patch.analysisStatus !== undefined) add('analysis_status', patch.analysisStatus)
+    if (patch.analysisMessage !== undefined) add('analysis_message', patch.analysisMessage)
+    if (patch.matchStatus !== undefined) add('match_status', patch.matchStatus)
+    if (patch.matchMessage !== undefined) add('match_message', patch.matchMessage)
+    if (!fields.length) return this.getManagedProject(id)
+    fields.push('updated_at = ?')
+    values.push(nowIso(), id)
+    this.db.prepare(`UPDATE pm_projects SET ${fields.join(', ')} WHERE id = ?`).run(...values)
+    return this.getManagedProject(id)
+  }
+
+  deleteManagedProject(id: string): { ok: boolean; message: string } {
+    const normalizedId = id.trim()
+    if (!normalizedId) return { ok: false, message: '项目标识不能为空' }
+    const exists = this.db.prepare('SELECT id FROM pm_projects WHERE id = ?').get(normalizedId) as SqlRow | undefined
+    if (!exists) return { ok: false, message: '项目不存在' }
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      // Project-owned tables use ON DELETE CASCADE. The linked knowledge document
+      // and data-center records are shared resources, so only their project links
+      // and project-scoped analysis rows are removed here.
+      const result = this.db.prepare('DELETE FROM pm_projects WHERE id = ?').run(normalizedId)
+      if (!Number(result.changes)) {
+        this.db.exec('ROLLBACK')
+        return { ok: false, message: '项目不存在' }
+      }
+      this.db.exec('COMMIT')
+      return { ok: true, message: '项目及其项目数据已删除' }
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  exportManagedProjectSnapshot(projectId: string): ProjectDataSnapshot | null {
+    const project = this.getManagedProject(projectId)
+    if (!project) return null
+    const rawProject = this.db.prepare('SELECT estimated_cost FROM pm_projects WHERE id = ?').get(projectId) as SqlRow | undefined
+    const documents = (this.db.prepare(`
+      SELECT d.*, pd.version, pd.is_current, pd.linked_at
+      FROM pm_project_documents pd
+      JOIN knowledge_documents d ON d.id = pd.document_id
+      WHERE pd.project_id = ?
+      ORDER BY pd.version ASC, d.created_at ASC
+    `).all(projectId) as SqlRow[]).map((row): ProjectDocumentSnapshot => ({
+      id: String(row.id),
+      fileName: String(row.file_name ?? ''),
+      filePath: String(row.file_path ?? ''),
+      extension: String(row.extension ?? ''),
+      mimeType: String(row.mime_type ?? 'application/octet-stream'),
+      byteSize: Number(row.byte_size ?? 0),
+      sha256: String(row.sha256 ?? ''),
+      tags: parseJsonArray(row.tags_json),
+      status: String(row.status ?? 'queued'),
+      errorMessage: String(row.error_message ?? ''),
+      chunkCount: Number(row.chunk_count ?? 0),
+      pageCount: Number(row.page_count ?? 0),
+      modelVersion: String(row.model_version ?? ''),
+      createdAt: String(row.created_at ?? ''),
+      updatedAt: String(row.updated_at ?? ''),
+      processedAt: String(row.processed_at ?? ''),
+      version: Number(row.version ?? 1),
+      isCurrent: Number(row.is_current ?? 0) === 1,
+      linkedAt: String(row.linked_at ?? '')
+    }))
+    const people = (this.db.prepare(`
+      SELECT op.*
+      FROM org_people op
+      JOIN pm_project_participants pp ON pp.person_id = op.id
+      WHERE pp.project_id = ?
+      GROUP BY op.id
+      ORDER BY op.name COLLATE NOCASE ASC
+    `).all(projectId) as SqlRow[]).map((row) => this.mapOrganizationPerson(row))
+    const matches = (this.db.prepare(`
+      SELECT m.*, r.name AS record_name, r.node_type, r.item_id, r.normalized_text,
+             CASE WHEN a.record_uid IS NULL THEN 0 ELSE 1 END AS asset_linked
+      FROM pm_requirement_matches m
+      JOIN pm_requirements q ON q.id = m.requirement_id
+      LEFT JOIN records r ON r.uid = m.record_uid
+      LEFT JOIN pm_project_assets a ON a.project_id = ? AND a.record_uid = m.record_uid
+      WHERE q.project_id = ?
+      ORDER BY q.requirement_no ASC, m.final_score DESC, m.record_uid ASC
+    `).all(projectId, projectId) as SqlRow[]).map((row): ProjectRequirementMatch => ({
+      requirementId: String(row.requirement_id),
+      recordUid: String(row.record_uid),
+      recordName: String(row.record_name ?? ''),
+      nodeType: String(row.node_type ?? ''),
+      itemId: String(row.item_id ?? ''),
+      description: String(row.normalized_text ?? ''),
+      vectorScore: Number(row.vector_score ?? 0),
+      ...(row.ai_score === null || row.ai_score === undefined ? {} : { aiScore: Number(row.ai_score) }),
+      finalScore: Number(row.final_score ?? 0),
+      scoreSource: String(row.score_source ?? 'vector') === 'ai' ? 'ai' : 'vector',
+      reason: String(row.reason ?? ''),
+      bestChunkId: String(row.best_chunk_id ?? ''),
+      assetLinked: Number(row.asset_linked ?? 0) === 1
+    }))
+    return {
+      format: 'visslm-project',
+      version: 1,
+      exportedAt: nowIso(),
+      project: {
+        ...project,
+        baseEstimatedCost: Number(rawProject?.estimated_cost ?? 0)
+      },
+      documents,
+      people,
+      participants: this.listProjectParticipants(projectId),
+      costs: this.listProjectCostEntries(projectId),
+      assets: this.listProjectAssets(projectId),
+      tasks: this.listProjectTasks(projectId),
+      requirements: this.listAllProjectRequirements(projectId),
+      matches
+    }
+  }
+
+  importManagedProjectSnapshot(snapshot: ProjectDataSnapshot): { projectId: string; warnings: string[] } {
+    if (snapshot.format !== 'visslm-project' || snapshot.version !== 1) {
+      throw new Error('项目数据文件格式或版本不受支持')
+    }
+    const sourceProject = snapshot.project
+    if (!sourceProject || !String(sourceProject.projectName ?? '').trim()) {
+      throw new Error('项目数据文件缺少项目名称')
+    }
+    const warnings: string[] = []
+    const projectId = randomUUID()
+    const timestamp = nowIso()
+    const peopleMap = new Map<string, string>()
+    const documentMap = new Map<string, string>()
+    const requirementMap = new Map<string, string>()
+    const participantMap = new Map<string, string>()
+    const taskMap = new Map<string, string>()
+    const validValue = <T extends string>(value: unknown, values: readonly T[], fallback: T): T => {
+      const normalized = String(value ?? '') as T
+      return values.includes(normalized) ? normalized : fallback
+    }
+    const sourceTimestamp = (value: string | undefined): string => value?.trim() || timestamp
+    const recordExists = (recordUid: string): boolean => Boolean(
+      this.db.prepare('SELECT uid FROM records WHERE uid = ?').get(recordUid)
+    )
+
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      this.db.prepare(`
+        INSERT INTO pm_projects(
+          id, project_name, customer_name, contract_amount, risk_factor,
+          delivery_reminder_days, planned_delivery_date, sales_owner,
+          technical_owner, development_owner, estimated_cost, actual_cost,
+          estimated_duration_days, lifecycle, source, analysis_status,
+          analysis_message, match_status, match_message, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        projectId,
+        String(sourceProject.projectName).trim(),
+        String(sourceProject.customerName ?? '').trim(),
+        Number(sourceProject.contractAmount ?? 0),
+        Number(sourceProject.riskFactor ?? 0),
+        Math.max(0, Math.trunc(Number(sourceProject.deliveryReminderDays ?? 0))),
+        String(sourceProject.plannedDeliveryDate ?? '').trim(),
+        String(sourceProject.salesOwner ?? '').trim(),
+        String(sourceProject.technicalOwner ?? '').trim(),
+        String(sourceProject.developmentOwner ?? '').trim(),
+        Math.max(0, Number(sourceProject.baseEstimatedCost ?? 0)),
+        Math.max(0, Number(sourceProject.actualCost ?? 0)),
+        Math.max(0, Math.trunc(Number(sourceProject.estimatedDurationDays ?? 0))),
+        validValue(sourceProject.lifecycle, ['draft', 'active'] as const, 'draft'),
+        validValue(sourceProject.source, ['manual', 'technical_agreement'] as const, 'manual'),
+        validValue(sourceProject.analysisStatus, ['idle', 'processing', 'ready', 'failed'] as const, 'idle'),
+        String(sourceProject.analysisMessage ?? ''),
+        validValue(sourceProject.matchStatus, ['idle', 'processing', 'ready', 'stale', 'failed'] as const, 'idle'),
+        String(sourceProject.matchMessage ?? ''),
+        sourceTimestamp(sourceProject.createdAt),
+        timestamp
+      )
+
+      for (const person of snapshot.people ?? []) {
+        const sourcePersonId = String(person.id ?? '').trim()
+        const name = String(person.name ?? '').trim()
+        if (!sourcePersonId || !name) {
+          warnings.push('跳过一条缺少人员标识或姓名的组织人员')
+          continue
+        }
+        if (peopleMap.has(sourcePersonId)) continue
+        const existing = this.db.prepare('SELECT name, employee_no FROM org_people WHERE id = ?').get(sourcePersonId) as SqlRow | undefined
+        const targetPersonId = existing && (String(existing.name) !== name || String(existing.employee_no ?? '') !== String(person.employeeNo ?? ''))
+          ? randomUUID()
+          : sourcePersonId
+        if (!existing || targetPersonId !== sourcePersonId) {
+          this.db.prepare(`
+            INSERT INTO org_people(
+              id, name, employee_no, department, role, hourly_rate, status, notes, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            targetPersonId,
+            name,
+            String(person.employeeNo ?? '').trim(),
+            String(person.department ?? '').trim(),
+            String(person.role ?? '').trim(),
+            Math.max(0, Number(person.hourlyRate ?? 0)),
+            validValue(person.status, ['active', 'inactive'] as const, 'active'),
+            String(person.notes ?? '').trim(),
+            sourceTimestamp(person.createdAt),
+            timestamp
+          )
+        }
+        peopleMap.set(sourcePersonId, targetPersonId)
+      }
+
+      const insertImportedDocument = (document: ProjectDocumentSnapshot, forcedId?: string): string => {
+        const sourceDocumentId = String(document.id ?? '').trim()
+        if (sourceDocumentId && documentMap.has(sourceDocumentId)) return documentMap.get(sourceDocumentId) as string
+        const existingById = sourceDocumentId
+          ? this.db.prepare('SELECT id FROM knowledge_documents WHERE id = ?').get(sourceDocumentId) as SqlRow | undefined
+          : undefined
+        const existingByHash = document.sha256
+          ? this.db.prepare('SELECT id FROM knowledge_documents WHERE sha256 = ?').get(document.sha256) as SqlRow | undefined
+          : undefined
+        const targetDocumentId = String(existingById?.id ?? existingByHash?.id ?? forcedId ?? randomUUID())
+        if (!existingById && !existingByHash) {
+          const sha256 = String(document.sha256 ?? '').trim() || randomUUID()
+          this.db.prepare(`
+            INSERT INTO knowledge_documents(
+              id, file_name, file_path, extension, mime_type, byte_size, sha256,
+              tags_json, status, error_message, chunk_count, page_count,
+              model_version, created_at, updated_at, processed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            targetDocumentId,
+            String(document.fileName ?? '').trim() || '导入的技术协议',
+            String(document.filePath ?? ''),
+            String(document.extension ?? '').trim(),
+            String(document.mimeType ?? 'application/octet-stream'),
+            Math.max(0, Number(document.byteSize ?? 0)),
+            sha256,
+            JSON.stringify(Array.isArray(document.tags) ? document.tags.map(String).filter(Boolean) : []),
+            validValue(document.status, ['queued', 'processing', 'ready', 'failed'] as const, 'failed'),
+            String(document.errorMessage ?? ''),
+            Math.max(0, Math.trunc(Number(document.chunkCount ?? 0))),
+            Math.max(0, Math.trunc(Number(document.pageCount ?? 0))),
+            String(document.modelVersion ?? ''),
+            sourceTimestamp(document.createdAt),
+            timestamp,
+            String(document.processedAt ?? '')
+          )
+          warnings.push(`已恢复协议“${String(document.fileName ?? '未命名协议')}”的索引元数据，原始附件未随 JSON 快照复制`)
+        }
+        if (sourceDocumentId) documentMap.set(sourceDocumentId, targetDocumentId)
+        return targetDocumentId
+      }
+
+      for (const document of snapshot.documents ?? []) insertImportedDocument(document)
+      let fallbackDocumentId: string | null = null
+      const getFallbackDocumentId = (): string => {
+        if (fallbackDocumentId) return fallbackDocumentId
+        fallbackDocumentId = insertImportedDocument({
+          id: '__imported-missing-document__',
+          fileName: `${String(sourceProject.projectName).trim()}（协议元数据）`,
+          filePath: '',
+          extension: '',
+          mimeType: 'application/octet-stream',
+          byteSize: 0,
+          sha256: randomUUID(),
+          tags: ['project-import'],
+          status: 'failed',
+          errorMessage: '导入快照未提供原始协议文件',
+          chunkCount: 0,
+          pageCount: 0,
+          modelVersion: '',
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          processedAt: '',
+          version: 1,
+          isCurrent: true,
+          linkedAt: timestamp
+        })
+        return fallbackDocumentId
+      }
+      for (const document of snapshot.documents ?? []) {
+        const targetDocumentId = documentMap.get(String(document.id ?? '').trim())
+        if (!targetDocumentId) continue
+        this.db.prepare(`
+          INSERT INTO pm_project_documents(project_id, document_id, version, is_current, linked_at)
+          VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT(project_id, document_id) DO UPDATE SET
+            version = excluded.version, is_current = excluded.is_current, linked_at = excluded.linked_at
+        `).run(projectId, targetDocumentId, Math.max(1, Number(document.version ?? 1)), document.isCurrent ? 1 : 0, sourceTimestamp(document.linkedAt))
+      }
+      const hasLinkedDocument = (snapshot.documents ?? []).some((document) => documentMap.has(String(document.id ?? '').trim()))
+      if (!hasLinkedDocument) {
+        this.db.prepare(`
+          INSERT INTO pm_project_documents(project_id, document_id, version, is_current, linked_at)
+          VALUES (?, ?, 1, 1, ?)
+        `).run(projectId, getFallbackDocumentId(), timestamp)
+      }
+
+      for (const requirement of snapshot.requirements ?? []) {
+        const sourceRequirementId = String(requirement.id ?? '').trim()
+        const targetRequirementId = randomUUID()
+        const targetDocumentId = documentMap.get(String(requirement.documentId ?? '').trim()) ?? getFallbackDocumentId()
+        if (!documentMap.has(String(requirement.documentId ?? '').trim())) {
+          warnings.push(`需求“${String(requirement.title ?? '未命名需求')}”未找到协议引用，已挂载到导入协议元数据`)
+        }
+        this.db.prepare(`
+          INSERT INTO pm_requirements(
+            id, project_id, document_id, requirement_no, module, title, content,
+            key_info_terms_json, key_info_terms_source, source_location, source_chunk_id,
+            status, status_source, status_reason, highest_match_score, match_count,
+            created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          targetRequirementId,
+          projectId,
+          targetDocumentId,
+          Math.max(1, Math.trunc(Number(requirement.requirementNo ?? 0))),
+          String(requirement.module ?? '').trim(),
+          String(requirement.title ?? '').trim() || '未命名需求',
+          String(requirement.content ?? '').trim(),
+          JSON.stringify(Array.isArray(requirement.keyInfoTerms) ? requirement.keyInfoTerms.map(String).filter(Boolean) : []),
+          validValue(requirement.keyInfoTermsSource, ['ai', 'manual'] as const, 'ai'),
+          String(requirement.sourceLocation ?? ''),
+          String(requirement.sourceChunkId ?? ''),
+          validValue(requirement.status, ['unmarked', 'satisfied', 'to_develop', 'to_negotiate'] as const, 'unmarked'),
+          validValue(requirement.statusSource, ['ai', 'manual'] as const, 'ai'),
+          String(requirement.statusReason ?? ''),
+          Math.max(0, Number(requirement.highestMatchScore ?? 0)),
+          Math.max(0, Math.trunc(Number(requirement.matchCount ?? 0))),
+          sourceTimestamp(requirement.createdAt),
+          timestamp
+        )
+        if (sourceRequirementId) requirementMap.set(sourceRequirementId, targetRequirementId)
+      }
+
+      for (const participant of snapshot.participants ?? []) {
+        const targetPersonId = peopleMap.get(String(participant.personId ?? '').trim())
+        if (!targetPersonId) {
+          warnings.push(`跳过参与人“${String(participant.personName ?? '未命名人员')}”：未找到组织人员`)
+          continue
+        }
+        const sourceParticipantId = String(participant.id ?? '').trim()
+        const targetParticipantId = randomUUID()
+        try {
+          this.db.prepare(`
+            INSERT INTO pm_project_participants(
+              id, project_id, person_id, hourly_rate, start_date, end_date,
+              duration_days, estimated_cost, notes, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            targetParticipantId,
+            projectId,
+            targetPersonId,
+            Math.max(0, Number(participant.hourlyRate ?? 0)),
+            String(participant.startDate ?? ''),
+            String(participant.endDate ?? ''),
+            Math.max(0, Math.trunc(Number(participant.durationDays ?? 0))),
+            Math.max(0, Number(participant.estimatedCost ?? 0)),
+            String(participant.notes ?? ''),
+            sourceTimestamp(participant.createdAt),
+            timestamp
+          )
+          if (sourceParticipantId) participantMap.set(sourceParticipantId, targetParticipantId)
+        } catch (error) {
+          if (String(error).includes('UNIQUE')) warnings.push(`跳过重复项目参与人“${String(participant.personName ?? '未命名人员')}”`)
+          else throw error
+        }
+      }
+
+      for (const task of snapshot.tasks ?? []) {
+        const sourceTaskId = String(task.id ?? '').trim()
+        if (sourceTaskId && !taskMap.has(sourceTaskId)) taskMap.set(sourceTaskId, randomUUID())
+      }
+      for (const task of snapshot.tasks ?? []) {
+        const targetTaskId = taskMap.get(String(task.id ?? '').trim()) ?? randomUUID()
+        const sourceParentId = String(task.parentTaskId ?? '').trim()
+        const targetParentId = sourceParentId ? taskMap.get(sourceParentId) : undefined
+        if (sourceParentId && !targetParentId) warnings.push(`任务“${String(task.title ?? '未命名任务')}”的父任务不存在，已移动到顶层`)
+        const targetOwnerId = task.ownerPersonId ? peopleMap.get(String(task.ownerPersonId).trim()) : undefined
+        if (task.ownerPersonId && !targetOwnerId) warnings.push(`任务“${String(task.title ?? '未命名任务')}”的负责人不存在，已清空负责人`)
+        this.db.prepare(`
+          INSERT INTO pm_project_tasks(
+            id, project_id, task_type, title, description, parent_task_id,
+            start_date, end_date, owner_person_id, status, progress_percent,
+            sort_order, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          targetTaskId,
+          projectId,
+          validValue(task.taskType, ['milestone', 'phase', 'task'] as const, 'task'),
+          String(task.title ?? '').trim() || '未命名任务',
+          String(task.description ?? ''),
+          targetParentId ?? null,
+          String(task.startDate ?? ''),
+          String(task.endDate ?? ''),
+          targetOwnerId ?? null,
+          validValue(task.status, ['not_started', 'in_progress', 'completed', 'blocked'] as const, 'not_started'),
+          Math.min(100, Math.max(0, Number(task.progressPercent ?? 0))),
+          Math.max(0, Math.trunc(Number(task.sortOrder ?? 0))),
+          sourceTimestamp(task.createdAt),
+          timestamp
+        )
+      }
+
+      const linkedRecordIds = new Set<string>()
+      for (const asset of snapshot.assets ?? []) {
+        const recordUid = String(asset.recordUid ?? '').trim()
+        if (!recordUid || linkedRecordIds.has(recordUid)) continue
+        if (!recordExists(recordUid)) {
+          warnings.push(`项目资产“${String(asset.name ?? recordUid)}”未找到数据中心记录，已跳过关联`)
+          continue
+        }
+        this.db.prepare(`
+          INSERT INTO pm_project_assets(project_id, record_uid, linked_at)
+          VALUES (?, ?, ?)
+        `).run(projectId, recordUid, sourceTimestamp(asset.linkedAt))
+        linkedRecordIds.add(recordUid)
+      }
+
+      for (const cost of snapshot.costs ?? []) {
+        const targetParticipantId = cost.responsibleParticipantId
+          ? participantMap.get(String(cost.responsibleParticipantId).trim())
+          : undefined
+        const assetRecordUid = cost.assetRecordUid && recordExists(String(cost.assetRecordUid).trim())
+          ? String(cost.assetRecordUid).trim()
+          : null
+        if (cost.assetRecordUid && !assetRecordUid) warnings.push(`成本“${String(cost.description ?? cost.category ?? '未命名成本')}”的资产不存在，已清空资产关联`)
+        this.db.prepare(`
+          INSERT INTO pm_cost_entries(
+            id, project_id, cost_type, category, description, amount,
+            occurred_at, created_at, updated_at, asset_record_uid,
+            responsible_participant_id, responsible_person_name
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          randomUUID(),
+          projectId,
+          validValue(cost.type, ['estimated', 'actual'] as const, 'estimated'),
+          String(cost.category ?? ''),
+          String(cost.description ?? ''),
+          Math.max(0, Number(cost.amount ?? 0)),
+          String(cost.occurredAt ?? timestamp),
+          sourceTimestamp(cost.createdAt),
+          timestamp,
+          assetRecordUid,
+          targetParticipantId ?? null,
+          targetParticipantId ? String(cost.responsiblePersonName ?? '') : ''
+        )
+      }
+
+      for (const match of snapshot.matches ?? []) {
+        const targetRequirementId = requirementMap.get(String(match.requirementId ?? '').trim())
+        const recordUid = String(match.recordUid ?? '').trim()
+        if (!targetRequirementId || !recordUid || !recordExists(recordUid)) {
+          if (recordUid && !recordExists(recordUid)) warnings.push(`需求匹配记录“${String(match.recordName ?? recordUid)}”未找到数据中心数据，已跳过`)
+          continue
+        }
+        this.db.prepare(`
+          INSERT INTO pm_requirement_matches(
+            requirement_id, record_uid, vector_score, ai_score, final_score,
+            score_source, reason, best_chunk_id, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          targetRequirementId,
+          recordUid,
+          Number(match.vectorScore ?? 0),
+          match.aiScore === undefined ? null : Number(match.aiScore),
+          Number(match.finalScore ?? 0),
+          match.scoreSource === 'ai' ? 'ai' : 'vector',
+          String(match.reason ?? ''),
+          String(match.bestChunkId ?? ''),
+          timestamp
+        )
+      }
+      this.db.prepare(`
+        UPDATE pm_requirements
+        SET highest_match_score = COALESCE((SELECT MAX(m.final_score) FROM pm_requirement_matches m WHERE m.requirement_id = pm_requirements.id), 0),
+            match_count = (SELECT COUNT(*) FROM pm_requirement_matches m WHERE m.requirement_id = pm_requirements.id)
+        WHERE project_id = ?
+      `).run(projectId)
+      this.refreshProjectCostTotals(projectId)
+      for (const task of snapshot.tasks ?? []) {
+        const targetTaskId = taskMap.get(String(task.id ?? '').trim())
+        if (targetTaskId) this.refreshProjectTaskDates(projectId, targetTaskId)
+      }
+      this.db.exec('COMMIT')
+      return { projectId, warnings }
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  discardManagedProjectDraft(id: string): { ok: boolean; message: string } {
+    const result = this.db.prepare("DELETE FROM pm_projects WHERE id = ? AND lifecycle = 'draft'").run(id)
+    return Number(result.changes)
+      ? { ok: true, message: '已放弃项目草稿' }
+      : { ok: false, message: '项目不存在或已经确认' }
+  }
+
+  clearProjectRequirements(projectId: string): number {
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      this.db.prepare(`
+        DELETE FROM pm_requirement_matches
+        WHERE requirement_id IN (
+          SELECT id FROM pm_requirements WHERE project_id = ?
+        )
+      `).run(projectId)
+      const result = this.db.prepare('DELETE FROM pm_requirements WHERE project_id = ?').run(projectId)
+      this.db.exec('COMMIT')
+      return Number(result.changes)
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  confirmManagedProject(id: string): ManagedProject | null {
+    return this.updateManagedProjectState(id, { lifecycle: 'active' })
+  }
+
+  linkProjectDocument(projectId: string, documentId: string): void {
+    const versionRow = this.db.prepare(
+      'SELECT COALESCE(MAX(version), 0) AS version FROM pm_project_documents WHERE project_id = ?'
+    ).get(projectId) as SqlRow
+    this.db.prepare('UPDATE pm_project_documents SET is_current = 0 WHERE project_id = ?').run(projectId)
+    this.db.prepare(`
+      INSERT INTO pm_project_documents(project_id, document_id, version, is_current, linked_at)
+      VALUES (?, ?, ?, 1, ?)
+      ON CONFLICT(project_id, document_id) DO UPDATE SET
+        version = excluded.version, is_current = 1, linked_at = excluded.linked_at
+    `).run(projectId, documentId, Number(versionRow.version) + 1, nowIso())
+  }
+
+  replaceProjectRequirements(
+    projectId: string,
+    documentId: string,
+    requirements: Array<{
+      id: string
+      requirementNo: number
+      module?: string
+      title: string
+      content: string
+      keyInfoTerms?: string[]
+      sourceLocation: string
+      sourceChunkId: string
+      status?: ProjectRequirementStatus
+      statusReason?: string
+    }>
+  ): void {
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      this.db.prepare('DELETE FROM pm_requirements WHERE project_id = ?').run(projectId)
+      const insert = this.db.prepare(`
+        INSERT INTO pm_requirements(
+          id, project_id, document_id, requirement_no, module, title, content,
+          key_info_terms_json, key_info_terms_source, source_location, source_chunk_id,
+          status, status_source, status_reason,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ai', ?, ?, ?, 'ai', ?, ?, ?)
+      `)
+      const timestamp = nowIso()
+      for (const item of requirements) {
+        insert.run(
+          item.id,
+          projectId,
+          documentId,
+          item.requirementNo,
+          item.module ?? '',
+          item.title,
+          item.content,
+          JSON.stringify(item.keyInfoTerms ?? []),
+          item.sourceLocation,
+          item.sourceChunkId,
+          item.status ?? 'unmarked',
+          item.statusReason ?? '',
+          timestamp,
+          timestamp
+        )
+      }
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  listProjectRequirements(query: ProjectRequirementQuery): ProjectRequirementPage {
+    const page = Math.max(1, Math.floor(query.page || 1))
+    const pageSize = Math.min(200, Math.max(1, Math.floor(query.pageSize || 20)))
+    const total = Number((this.db.prepare(
+      'SELECT COUNT(*) AS count FROM pm_requirements WHERE project_id = ?'
+    ).get(query.projectId) as SqlRow).count)
+    const rows = this.db.prepare(`
+      SELECT * FROM pm_requirements
+      WHERE project_id = ?
+      ORDER BY requirement_no ASC, id ASC
+      LIMIT ? OFFSET ?
+    `).all(query.projectId, pageSize, (page - 1) * pageSize) as SqlRow[]
+    return { rows: rows.map((row) => this.mapProjectRequirement(row)), total }
+  }
+
+  listAllProjectRequirements(projectId: string): ProjectRequirement[] {
+    const rows = this.db.prepare(
+      'SELECT * FROM pm_requirements WHERE project_id = ? ORDER BY requirement_no ASC, id ASC'
+    ).all(projectId) as SqlRow[]
+    return rows.map((row) => this.mapProjectRequirement(row))
+  }
+
+  deleteProjectRequirement(id: string): { ok: boolean; message: string } {
+    const current = this.db.prepare('SELECT id FROM pm_requirements WHERE id = ?').get(id) as SqlRow | undefined
+    if (!current) return { ok: false, message: '功能需求不存在' }
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      this.db.prepare('DELETE FROM pm_requirement_matches WHERE requirement_id = ?').run(id)
+      const result = this.db.prepare('DELETE FROM pm_requirements WHERE id = ?').run(id)
+      if (!Number(result.changes)) {
+        this.db.exec('ROLLBACK')
+        return { ok: false, message: '功能需求不存在' }
+      }
+      this.db.exec('COMMIT')
+      return { ok: true, message: '功能需求已删除，匹配结果已清除' }
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  private mapProjectRequirement(row: SqlRow): ProjectRequirement {
+    const normalizedText = normalizeProjectRequirementText({
+      module: row.module,
+      title: row.title,
+      content: row.content
+    })
+    const rawStatus = String(row.status ?? 'unmarked')
+    const status: ProjectRequirementStatus = ['unmarked', 'satisfied', 'to_develop', 'to_negotiate'].includes(rawStatus)
+      ? rawStatus as ProjectRequirementStatus
+      : 'unmarked'
+    return {
+      id: String(row.id),
+      projectId: String(row.project_id),
+      documentId: String(row.document_id),
+      requirementNo: Number(row.requirement_no ?? 0),
+      module: normalizedText.module,
+      title: normalizedText.title,
+      content: normalizedText.content,
+      keyInfoTerms: parseJsonArray(row.key_info_terms_json),
+      keyInfoTermsSource: String(row.key_info_terms_source ?? 'ai') === 'manual' ? 'manual' : 'ai',
+      sourceLocation: String(row.source_location ?? ''),
+      sourceChunkId: String(row.source_chunk_id ?? ''),
+      status,
+      statusSource: String(row.status_source ?? 'ai') as ProjectRequirementStatusSource,
+      statusReason: String(row.status_reason ?? ''),
+      highestMatchScore: Number(row.highest_match_score ?? 0),
+      matchCount: Number(row.match_count ?? 0),
+      createdAt: String(row.created_at ?? ''),
+      updatedAt: String(row.updated_at ?? '')
+    }
+  }
+
+  updateProjectRequirementStatus(id: string, status: ProjectRequirementStatus): ProjectRequirement | null {
+    const result = this.db.prepare(`
+      UPDATE pm_requirements
+      SET status = ?, status_source = 'manual', updated_at = ?
+      WHERE id = ?
+    `).run(status, nowIso(), id)
+    if (!Number(result.changes)) return null
+    const row = this.db.prepare('SELECT * FROM pm_requirements WHERE id = ?').get(id) as SqlRow | undefined
+    return row ? this.mapProjectRequirement(row) : null
+  }
+
+  getProjectRequirement(id: string): ProjectRequirement | null {
+    const row = this.db.prepare('SELECT * FROM pm_requirements WHERE id = ?').get(id) as SqlRow | undefined
+    return row ? this.mapProjectRequirement(row) : null
+  }
+
+  updateProjectRequirementKeyInfoTerms(id: string, terms: string[]): ProjectRequirement | null {
+    const current = this.db.prepare('SELECT project_id FROM pm_requirements WHERE id = ?').get(id) as SqlRow | undefined
+    if (!current) return null
+    const projectId = String(current.project_id)
+    const timestamp = nowIso()
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      this.db.prepare('DELETE FROM pm_requirement_matches WHERE requirement_id = ?').run(id)
+      this.db.prepare(`
+        UPDATE pm_requirements
+        SET key_info_terms_json = ?, key_info_terms_source = 'manual',
+            highest_match_score = 0, match_count = 0, updated_at = ?
+        WHERE id = ?
+      `).run(JSON.stringify(terms), timestamp, id)
+      this.db.prepare(`
+        UPDATE pm_projects
+        SET match_status = 'stale', match_message = '关键功能信息词已修改，请重新匹配', updated_at = ?
+        WHERE id = ?
+      `).run(timestamp, projectId)
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+    return this.getProjectRequirement(id)
+  }
+
+  updateProjectRequirementAiStatus(
+    id: string,
+    status: ProjectRequirementStatus,
+    reason: string
+  ): ProjectRequirement | null {
+    const result = this.db.prepare(`
+      UPDATE pm_requirements
+      SET status = ?, status_source = 'ai', status_reason = ?, updated_at = ?
+      WHERE id = ? AND status_source <> 'manual'
+    `).run(status, reason, nowIso(), id)
+    if (!Number(result.changes)) {
+      const current = this.db.prepare('SELECT * FROM pm_requirements WHERE id = ?').get(id) as SqlRow | undefined
+      return current ? this.mapProjectRequirement(current) : null
+    }
+    const row = this.db.prepare('SELECT * FROM pm_requirements WHERE id = ?').get(id) as SqlRow | undefined
+    return row ? this.mapProjectRequirement(row) : null
+  }
+
+  replaceRequirementMatches(
+    requirementId: string,
+    matches: Array<{
+      recordUid: string
+      vectorScore: number
+      aiScore?: number
+      finalScore: number
+      scoreSource: 'vector' | 'ai'
+      reason: string
+      bestChunkId: string
+    }>
+  ): void {
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      this.db.prepare('DELETE FROM pm_requirement_matches WHERE requirement_id = ?').run(requirementId)
+      const insert = this.db.prepare(`
+        INSERT INTO pm_requirement_matches(
+          requirement_id, record_uid, vector_score, ai_score, final_score,
+          score_source, reason, best_chunk_id, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      const timestamp = nowIso()
+      for (const match of matches) {
+        insert.run(
+          requirementId,
+          match.recordUid,
+          match.vectorScore,
+          match.aiScore ?? null,
+          match.finalScore,
+          match.scoreSource,
+          match.reason,
+          match.bestChunkId,
+          timestamp
+        )
+      }
+      const highest = matches.reduce((value, item) => Math.max(value, item.finalScore), 0)
+      this.db.prepare(`
+        UPDATE pm_requirements
+        SET highest_match_score = ?, match_count = ?, updated_at = ?
+        WHERE id = ?
+      `).run(highest, matches.length, timestamp, requirementId)
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  listProjectRequirementMatches(query: ProjectRequirementMatchQuery): ProjectRequirementMatchPage {
+    const page = Math.max(1, Math.floor(query.page || 1))
+    const pageSize = Math.min(200, Math.max(1, Math.floor(query.pageSize || 20)))
+    const total = Number((this.db.prepare(
+      'SELECT COUNT(*) AS count FROM pm_requirement_matches WHERE requirement_id = ?'
+    ).get(query.requirementId) as SqlRow).count)
+    const rows = this.db.prepare(`
+      SELECT m.*, r.uid AS uid, r.name, r.node_type, r.item_id, r.raw_json, r.normalized_text,
+             r.last_modify_time, r.project_id, r.parent_id, r.synced_at,
+             r.content_hash, r.push_status, r.push_message, r.pushed_at, r.pushed_uid,
+             COUNT(i.id) AS image_count,
+             CASE WHEN a.record_uid IS NULL THEN 0 ELSE 1 END AS asset_linked
+      FROM pm_requirement_matches m
+      JOIN records r ON r.uid = m.record_uid
+      LEFT JOIN images i ON i.record_uid = r.uid
+      LEFT JOIN pm_project_assets a ON a.record_uid = r.uid
+      WHERE m.requirement_id = ?
+      GROUP BY r.uid, m.requirement_id
+      ORDER BY m.final_score DESC, m.record_uid ASC
+      LIMIT ? OFFSET ?
+    `).all(query.requirementId, pageSize, (page - 1) * pageSize) as SqlRow[]
+    return {
+      total,
+      rows: rows.map((row) => {
+        const record = this.mapRecord(row)
+        return {
+          requirementId: query.requirementId,
+          recordUid: record.uid,
+          recordName: record.name,
+          nodeType: record.nodeType,
+          itemId: record.itemId,
+          description: record.description,
+          vectorScore: Number(row.vector_score ?? 0),
+          ...(row.ai_score === null || row.ai_score === undefined ? {} : { aiScore: Number(row.ai_score) }),
+          finalScore: Number(row.final_score ?? 0),
+          scoreSource: String(row.score_source ?? 'vector') as ProjectRequirementMatch['scoreSource'],
+          reason: String(row.reason ?? ''),
+          bestChunkId: String(row.best_chunk_id ?? ''),
+          assetLinked: Number(row.asset_linked ?? 0) === 1
+        }
+      })
+    }
+  }
+
+  listProjectParticipants(projectId: string): ProjectParticipant[] {
+    const rows = this.db.prepare(`
+      SELECT pp.*, op.name AS person_name, op.employee_no, op.department, op.role
+      FROM pm_project_participants pp
+      JOIN org_people op ON op.id = pp.person_id
+      WHERE pp.project_id = ?
+      ORDER BY pp.start_date ASC, op.name COLLATE NOCASE ASC
+    `).all(projectId) as SqlRow[]
+    return rows.map((row) => this.mapProjectParticipant(row))
+  }
+
+  insertProjectParticipant(projectId: string, input: ProjectParticipantInput, id = randomUUID()): ProjectParticipant {
+    const person = this.getOrganizationPerson(input.personId)
+    if (!person) throw new Error('组织人员不存在')
+    const durationDays = this.calculateCalendarDays(input.startDate, input.endDate)
+    if (durationDays < 1) throw new Error('参与人员结束时间不能早于开始时间')
+    const timestamp = nowIso()
+    this.db.prepare(`
+      INSERT INTO pm_project_participants(
+        id, project_id, person_id, hourly_rate, start_date, end_date,
+        duration_days, estimated_cost, notes, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      projectId,
+      person.id,
+      person.hourlyRate,
+      input.startDate.trim(),
+      input.endDate.trim(),
+      durationDays,
+      durationDays * 8 * person.hourlyRate,
+      input.notes?.trim() ?? '',
+      timestamp,
+      timestamp
+    )
+    return this.listProjectParticipants(projectId).find((item) => item.id === id) as ProjectParticipant
+  }
+
+  updateProjectParticipant(id: string, input: ProjectParticipantInput): ProjectParticipant | null {
+    const current = this.db.prepare('SELECT project_id FROM pm_project_participants WHERE id = ?').get(id) as SqlRow | undefined
+    if (!current) return null
+    const person = this.getOrganizationPerson(input.personId)
+    if (!person) throw new Error('组织人员不存在')
+    const durationDays = this.calculateCalendarDays(input.startDate, input.endDate)
+    if (durationDays < 1) throw new Error('参与人员结束时间不能早于开始时间')
+    const projectId = String(current.project_id)
+    const result = this.db.prepare(`
+      UPDATE pm_project_participants SET
+        person_id = ?, hourly_rate = ?, start_date = ?, end_date = ?,
+        duration_days = ?, estimated_cost = ?, notes = ?, updated_at = ?
+      WHERE id = ?
+    `).run(
+      person.id,
+      person.hourlyRate,
+      input.startDate.trim(),
+      input.endDate.trim(),
+      durationDays,
+      durationDays * 8 * person.hourlyRate,
+      input.notes?.trim() ?? '',
+      nowIso(),
+      id
+    )
+    if (!Number(result.changes)) return null
+    return this.listProjectParticipants(projectId).find((item) => item.id === id) ?? null
+  }
+
+  deleteProjectParticipant(id: string): { ok: boolean; message: string } {
+    const result = this.db.prepare('DELETE FROM pm_project_participants WHERE id = ?').run(id)
+    return Number(result.changes)
+      ? { ok: true, message: '项目参与人员已移除' }
+      : { ok: false, message: '项目参与人员不存在' }
+  }
+
+  private mapProjectParticipant(row: SqlRow): ProjectParticipant {
+    return {
+      id: String(row.id),
+      projectId: String(row.project_id),
+      personId: String(row.person_id),
+      personName: String(row.person_name ?? ''),
+      employeeNo: String(row.employee_no ?? ''),
+      department: String(row.department ?? ''),
+      role: String(row.role ?? ''),
+      hourlyRate: Number(row.hourly_rate ?? 0),
+      startDate: String(row.start_date ?? ''),
+      endDate: String(row.end_date ?? ''),
+      durationDays: Number(row.duration_days ?? 0),
+      estimatedCost: Number(row.estimated_cost ?? 0),
+      notes: String(row.notes ?? ''),
+      createdAt: String(row.created_at ?? ''),
+      updatedAt: String(row.updated_at ?? '')
+    }
+  }
+
+  listProjectTasks(projectId: string): ProjectPlanTask[] {
+    const rows = this.db.prepare(`
+      SELECT pt.*, op.name AS owner_name
+      FROM pm_project_tasks pt
+      LEFT JOIN org_people op ON op.id = pt.owner_person_id
+      WHERE pt.project_id = ?
+      ORDER BY pt.sort_order ASC, pt.start_date ASC, pt.created_at ASC
+    `).all(projectId) as SqlRow[]
+    const tasks = rows.map((row) => this.mapProjectPlanTask(row))
+    const taskMap = new Map(tasks.map((task) => [task.id, task]))
+    const childrenMap = new Map<string, ProjectPlanTask[]>()
+    for (const task of tasks) {
+      if (!task.parentTaskId || !taskMap.has(task.parentTaskId)) continue
+      const children = childrenMap.get(task.parentTaskId) ?? []
+      children.push(task)
+      childrenMap.set(task.parentTaskId, children)
+    }
+    const ordered: ProjectPlanTask[] = []
+    const visited = new Set<string>()
+    const visit = (task: ProjectPlanTask, depth: number): void => {
+      if (visited.has(task.id)) return
+      visited.add(task.id)
+      const children = childrenMap.get(task.id) ?? []
+      ordered.push({ ...task, depth, hasChildren: children.length > 0 })
+      for (const child of children) visit(child, depth + 1)
+    }
+    for (const task of tasks) {
+      if (!task.parentTaskId || !taskMap.has(task.parentTaskId)) visit(task, 0)
+    }
+    for (const task of tasks) visit(task, 0)
+    return ordered
+  }
+
+  getProjectTask(id: string): ProjectPlanTask | null {
+    const row = this.db.prepare('SELECT project_id FROM pm_project_tasks WHERE id = ?').get(id) as SqlRow | undefined
+    if (!row) return null
+    return this.listProjectTasks(String(row.project_id)).find((task) => task.id === id) ?? null
+  }
+
+  insertProjectTask(projectId: string, input: ProjectPlanTaskInput, id = randomUUID()): ProjectPlanTask {
+    const durationDays = this.calculateCalendarDays(input.startDate, input.endDate)
+    if (durationDays < 1) throw new Error('任务结束时间不能早于开始时间')
+    const parentTaskId = input.parentTaskId?.trim() || null
+    const timestamp = nowIso()
+    this.db.prepare(`
+      INSERT INTO pm_project_tasks(
+        id, project_id, task_type, title, description, parent_task_id,
+        start_date, end_date, owner_person_id, status, progress_percent,
+        sort_order, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      projectId,
+      input.taskType,
+      input.title.trim(),
+      input.description?.trim() ?? '',
+      parentTaskId,
+      input.startDate.trim(),
+      input.endDate.trim(),
+      input.ownerPersonId?.trim() || null,
+      input.status ?? 'not_started',
+      Math.min(100, Math.max(0, Number(input.progressPercent ?? 0))),
+      Math.max(0, Math.trunc(Number(input.sortOrder ?? 0))),
+      timestamp,
+      timestamp
+    )
+    this.refreshProjectTaskDates(projectId, parentTaskId)
+    return this.listProjectTasks(projectId).find((item) => item.id === id) as ProjectPlanTask
+  }
+
+  updateProjectTask(id: string, input: ProjectPlanTaskInput): ProjectPlanTask | null {
+    const current = this.db.prepare('SELECT project_id, parent_task_id FROM pm_project_tasks WHERE id = ?').get(id) as SqlRow | undefined
+    if (!current) return null
+    const durationDays = this.calculateCalendarDays(input.startDate, input.endDate)
+    if (durationDays < 1) throw new Error('任务结束时间不能早于开始时间')
+    const projectId = String(current.project_id)
+    const previousParentTaskId = current.parent_task_id ? String(current.parent_task_id) : null
+    const parentTaskId = input.parentTaskId?.trim() || null
+    const result = this.db.prepare(`
+      UPDATE pm_project_tasks SET
+        task_type = ?, title = ?, description = ?, parent_task_id = ?,
+        start_date = ?, end_date = ?, owner_person_id = ?, status = ?,
+        progress_percent = ?, sort_order = ?, updated_at = ?
+      WHERE id = ?
+    `).run(
+      input.taskType,
+      input.title.trim(),
+      input.description?.trim() ?? '',
+      parentTaskId,
+      input.startDate.trim(),
+      input.endDate.trim(),
+      input.ownerPersonId?.trim() || null,
+      input.status ?? 'not_started',
+      Math.min(100, Math.max(0, Number(input.progressPercent ?? 0))),
+      Math.max(0, Math.trunc(Number(input.sortOrder ?? 0))),
+      nowIso(),
+      id
+    )
+    if (!Number(result.changes)) return null
+    this.refreshProjectTaskDates(projectId, id)
+    this.refreshProjectTaskDates(projectId, previousParentTaskId)
+    return this.listProjectTasks(projectId).find((item) => item.id === id) ?? null
+  }
+
+  moveProjectTask(id: string, input: ProjectPlanTaskMoveInput): ProjectPlanTask | null {
+    const current = this.db.prepare('SELECT project_id, parent_task_id FROM pm_project_tasks WHERE id = ?').get(id) as SqlRow | undefined
+    if (!current) return null
+    const projectId = String(current.project_id)
+    const previousParentTaskId = current.parent_task_id ? String(current.parent_task_id) : null
+    const parentTaskId = input.parentTaskId?.trim() || null
+    const sortOrder = Math.max(0, Math.trunc(Number(input.sortOrder ?? 0)))
+    const listSiblingIds = (parentId: string | null): string[] => {
+      const rows = parentId
+        ? this.db.prepare(`SELECT id FROM pm_project_tasks WHERE project_id = ? AND parent_task_id = ? ORDER BY sort_order ASC, start_date ASC, created_at ASC`).all(projectId, parentId) as SqlRow[]
+        : this.db.prepare(`SELECT id FROM pm_project_tasks WHERE project_id = ? AND parent_task_id IS NULL ORDER BY sort_order ASC, start_date ASC, created_at ASC`).all(projectId) as SqlRow[]
+      return rows.map((row) => String(row.id)).filter((taskId) => taskId !== id)
+    }
+    const destinationSiblings = listSiblingIds(parentTaskId)
+    const destinationOrder = [...destinationSiblings]
+    destinationOrder.splice(Math.min(sortOrder, destinationOrder.length), 0, id)
+    const previousOrder = listSiblingIds(previousParentTaskId)
+    const timestamp = nowIso()
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      if (previousParentTaskId !== parentTaskId) {
+        this.db.prepare(`
+          UPDATE pm_project_tasks
+          SET parent_task_id = ?, sort_order = ?, updated_at = ?
+          WHERE id = ? AND project_id = ?
+        `).run(parentTaskId, destinationOrder.indexOf(id), timestamp, id, projectId)
+        previousOrder.forEach((taskId, index) => {
+          this.db.prepare('UPDATE pm_project_tasks SET sort_order = ? WHERE id = ? AND project_id = ?').run(index, taskId, projectId)
+        })
+      }
+      destinationOrder.forEach((taskId, index) => {
+        this.db.prepare('UPDATE pm_project_tasks SET sort_order = ?, updated_at = ? WHERE id = ? AND project_id = ?').run(index, timestamp, taskId, projectId)
+      })
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+    this.refreshProjectTaskDates(projectId, id)
+    this.refreshProjectTaskDates(projectId, previousParentTaskId)
+    return this.listProjectTasks(projectId).find((item) => item.id === id) ?? null
+  }
+
+  deleteProjectTask(id: string): { ok: boolean; message: string } {
+    const current = this.db.prepare('SELECT project_id, parent_task_id FROM pm_project_tasks WHERE id = ?').get(id) as SqlRow | undefined
+    if (!current) return { ok: false, message: '项目计划任务不存在' }
+    const projectId = String(current.project_id)
+    const parentTaskId = current.parent_task_id ? String(current.parent_task_id) : null
+    const result = this.db.prepare('DELETE FROM pm_project_tasks WHERE id = ?').run(id)
+    this.refreshProjectTaskDates(projectId, parentTaskId)
+    return Number(result.changes)
+      ? { ok: true, message: '项目计划任务已删除' }
+      : { ok: false, message: '项目计划任务不存在' }
+  }
+
+  private mapProjectPlanTask(row: SqlRow): ProjectPlanTask {
+    return {
+      id: String(row.id),
+      projectId: String(row.project_id),
+      taskType: String(row.task_type ?? 'task') as ProjectPlanTask['taskType'],
+      title: String(row.title ?? ''),
+      description: String(row.description ?? ''),
+      ...(row.parent_task_id ? { parentTaskId: String(row.parent_task_id) } : {}),
+      startDate: String(row.start_date ?? ''),
+      endDate: String(row.end_date ?? ''),
+      ...(row.owner_person_id ? { ownerPersonId: String(row.owner_person_id) } : {}),
+      ...(row.owner_name ? { ownerName: String(row.owner_name) } : {}),
+      status: String(row.status ?? 'not_started') as ProjectPlanTask['status'],
+      progressPercent: Number(row.progress_percent ?? 0),
+      sortOrder: Number(row.sort_order ?? 0),
+      depth: 0,
+      hasChildren: false,
+      createdAt: String(row.created_at ?? ''),
+      updatedAt: String(row.updated_at ?? '')
+    }
+  }
+
+  private refreshProjectTaskDates(projectId: string, taskId: string | null): void {
+    if (!taskId) return
+    const visited = new Set<string>()
+    let currentTaskId: string | null = taskId
+    while (currentTaskId && !visited.has(currentTaskId)) {
+      visited.add(currentTaskId)
+      const aggregate = this.db.prepare(`
+        SELECT COUNT(*) AS count, MIN(start_date) AS start_date, MAX(end_date) AS end_date
+        FROM pm_project_tasks
+        WHERE parent_task_id = ? AND project_id = ?
+      `).get(currentTaskId, projectId) as SqlRow
+      if (Number(aggregate.count ?? 0) > 0 && aggregate.start_date && aggregate.end_date) {
+        this.db.prepare(`
+          UPDATE pm_project_tasks
+          SET start_date = ?, end_date = ?, updated_at = ?
+          WHERE id = ? AND project_id = ?
+        `).run(String(aggregate.start_date), String(aggregate.end_date), nowIso(), currentTaskId, projectId)
+      }
+      const parent = this.db.prepare('SELECT parent_task_id FROM pm_project_tasks WHERE id = ? AND project_id = ?').get(currentTaskId, projectId) as SqlRow | undefined
+      currentTaskId = parent?.parent_task_id ? String(parent.parent_task_id) : null
+    }
+  }
+
+  private calculateCalendarDays(startDate: string, endDate: string): number {
+    const start = Date.parse(`${startDate.trim()}T00:00:00Z`)
+    const end = Date.parse(`${endDate.trim()}T00:00:00Z`)
+    if (!Number.isFinite(start) || !Number.isFinite(end)) return 0
+    return Math.floor((end - start) / 86_400_000) + 1
+  }
+
+  listProjectCostEntries(projectId: string): ProjectCostEntry[] {
+    const rows = this.db.prepare(`
+      SELECT * FROM pm_cost_entries
+      WHERE project_id = ?
+      ORDER BY occurred_at DESC, created_at DESC
+    `).all(projectId) as SqlRow[]
+    return rows.map((row) => this.mapProjectCostEntry(row))
+  }
+
+  getProjectCostEntry(id: string): ProjectCostEntry | null {
+    const row = this.db.prepare('SELECT * FROM pm_cost_entries WHERE id = ?').get(id) as SqlRow | undefined
+    return row ? this.mapProjectCostEntry(row) : null
+  }
+
+  private mapProjectCostEntry(row: SqlRow): ProjectCostEntry {
+    return {
+      id: String(row.id),
+      projectId: String(row.project_id),
+      type: String(row.cost_type) as ProjectCostEntry['type'],
+      category: String(row.category ?? ''),
+      description: String(row.description ?? ''),
+      amount: Number(row.amount ?? 0),
+      occurredAt: String(row.occurred_at ?? ''),
+      ...(row.asset_record_uid ? { assetRecordUid: String(row.asset_record_uid) } : {}),
+      ...(row.responsible_participant_id ? { responsibleParticipantId: String(row.responsible_participant_id) } : {}),
+      ...(row.responsible_person_name ? { responsiblePersonName: String(row.responsible_person_name) } : {}),
+      createdAt: String(row.created_at ?? ''),
+      updatedAt: String(row.updated_at ?? '')
+    }
+  }
+
+  insertProjectCostEntry(projectId: string, input: ProjectCostEntryInput, id = randomUUID()): ProjectCostEntry {
+    const timestamp = nowIso()
+    const responsible = this.resolveProjectCostResponsible(projectId, input.responsibleParticipantId)
+    this.db.prepare(`
+      INSERT INTO pm_cost_entries(
+        id, project_id, cost_type, category, description, amount,
+        occurred_at, created_at, updated_at, asset_record_uid,
+        responsible_participant_id, responsible_person_name
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      projectId,
+      input.type,
+      input.category.trim(),
+      input.description?.trim() ?? '',
+      Math.max(0, Number(input.amount ?? 0)),
+      input.occurredAt?.trim() || timestamp,
+      timestamp,
+      timestamp,
+      input.assetRecordUid?.trim() || null,
+      responsible.participantId,
+      responsible.personName
+    )
+    this.refreshProjectCostTotals(projectId)
+    return this.getProjectCostEntry(id) ?? this.mapProjectCostEntry({ id, project_id: projectId, ...input, cost_type: input.type, occurred_at: timestamp, created_at: timestamp, updated_at: timestamp, responsible_participant_id: responsible.participantId, responsible_person_name: responsible.personName })
+  }
+
+  updateProjectCostEntry(id: string, input: ProjectCostEntryInput): ProjectCostEntry | null {
+    const current = this.db.prepare('SELECT project_id FROM pm_cost_entries WHERE id = ?').get(id) as SqlRow | undefined
+    if (!current) return null
+    const projectId = String(current.project_id)
+    const responsible = this.resolveProjectCostResponsible(projectId, input.responsibleParticipantId)
+    const result = this.db.prepare(`
+      UPDATE pm_cost_entries SET
+        cost_type = ?, category = ?, description = ?, amount = ?,
+        occurred_at = ?, updated_at = ?, asset_record_uid = ?,
+        responsible_participant_id = ?, responsible_person_name = ?
+      WHERE id = ?
+    `).run(
+      input.type,
+      input.category.trim(),
+      input.description?.trim() ?? '',
+      Math.max(0, Number(input.amount ?? 0)),
+      input.occurredAt?.trim() || nowIso(),
+      nowIso(),
+      input.assetRecordUid?.trim() || null,
+      responsible.participantId,
+      responsible.personName,
+      id
+    )
+    if (!Number(result.changes)) return null
+    this.refreshProjectCostTotals(projectId)
+    return this.mapProjectCostEntry(this.db.prepare('SELECT * FROM pm_cost_entries WHERE id = ?').get(id) as SqlRow)
+  }
+
+  private resolveProjectCostResponsible(projectId: string, participantId?: string): { participantId: string | null; personName: string } {
+    const normalizedId = participantId?.trim()
+    if (!normalizedId) return { participantId: null, personName: '' }
+    const row = this.db.prepare(`
+      SELECT pp.id, op.name
+      FROM pm_project_participants pp
+      JOIN org_people op ON op.id = pp.person_id
+      WHERE pp.id = ? AND pp.project_id = ?
+    `).get(normalizedId, projectId) as SqlRow | undefined
+    if (!row) return { participantId: null, personName: '' }
+    return { participantId: String(row.id), personName: String(row.name ?? '') }
+  }
+
+  deleteProjectCostEntry(id: string): { ok: boolean; message: string } {
+    const current = this.db.prepare('SELECT project_id FROM pm_cost_entries WHERE id = ?').get(id) as SqlRow | undefined
+    if (!current) return { ok: false, message: '成本明细不存在' }
+    const projectId = String(current.project_id)
+    this.db.prepare('DELETE FROM pm_cost_entries WHERE id = ?').run(id)
+    this.refreshProjectCostTotals(projectId)
+    return { ok: true, message: '成本明细已删除' }
+  }
+
+  private refreshProjectCostTotals(projectId: string): void {
+    this.db.prepare(`
+      UPDATE pm_projects SET
+        estimated_cost = COALESCE((SELECT SUM(amount) FROM pm_cost_entries WHERE project_id = ? AND cost_type = 'estimated'), 0),
+        actual_cost = COALESCE((SELECT SUM(amount) FROM pm_cost_entries WHERE project_id = ? AND cost_type = 'actual'), 0),
+        updated_at = ?
+      WHERE id = ?
+    `).run(projectId, projectId, nowIso(), projectId)
+  }
+
+  listProjectAssets(projectId: string): ProjectAsset[] {
+    const rows = this.db.prepare(`
+      SELECT a.project_id, a.record_uid, a.linked_at, r.uid AS uid, r.name, r.node_type, r.item_id,
+             r.raw_json, r.normalized_text, r.last_modify_time, r.project_id AS source_project_id,
+             r.parent_id, r.synced_at, r.content_hash, r.push_status, r.push_message,
+             r.pushed_at, r.pushed_uid, COUNT(i.id) AS image_count
+      FROM pm_project_assets a
+      JOIN records r ON r.uid = a.record_uid
+      LEFT JOIN images i ON i.record_uid = r.uid
+      WHERE a.project_id = ?
+      GROUP BY r.uid
+      ORDER BY a.linked_at DESC, r.name ASC
+    `).all(projectId) as SqlRow[]
+    return rows.map((row) => {
+      const record = this.mapRecord(row)
+      return {
+        projectId,
+        recordUid: record.uid,
+        name: record.name,
+        nodeType: record.nodeType,
+        itemId: record.itemId,
+        description: record.description,
+        linkedAt: String(row.linked_at ?? '')
+      }
+    })
+  }
+
+  linkProjectAsset(projectId: string, recordUid: string): ProjectAsset | null {
+    const exists = this.db.prepare('SELECT uid FROM records WHERE uid = ?').get(recordUid)
+    if (!exists) return null
+    this.db.prepare(`
+      INSERT INTO pm_project_assets(project_id, record_uid, linked_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(project_id, record_uid) DO NOTHING
+    `).run(projectId, recordUid, nowIso())
+    return this.listProjectAssets(projectId).find((asset) => asset.recordUid === recordUid) ?? null
+  }
+
+  unlinkProjectAsset(projectId: string, recordUid: string): { ok: boolean; message: string } {
+    const result = this.db.prepare(
+      'DELETE FROM pm_project_assets WHERE project_id = ? AND record_uid = ?'
+    ).run(projectId, recordUid)
+    return Number(result.changes)
+      ? { ok: true, message: '项目资产已取消关联' }
+      : { ok: false, message: '项目资产关联不存在' }
+  }
+
+  markManagedProjectMatchesStale(): void {
+    this.db.prepare(`
+      UPDATE pm_projects
+      SET match_status = CASE WHEN match_status = 'processing' THEN match_status ELSE 'stale' END,
+          match_message = '数据中心已更新，请重新匹配',
+          updated_at = ?
+      WHERE EXISTS (SELECT 1 FROM pm_requirements q WHERE q.project_id = pm_projects.id)
+    `).run(nowIso())
+  }
+
+  getAnalyticsRevision(): number {
+    const value = Number(this.getSetting('analytics:data-revision') ?? 0)
+    return Number.isSafeInteger(value) && value >= 0 ? value : 0
+  }
+
+  bumpAnalyticsRevision(): number {
+    const next = this.getAnalyticsRevision() + 1
+    this.setSetting('analytics:data-revision', String(next))
+    this.db.prepare('DELETE FROM query_cache WHERE data_revision < ?').run(next)
+    return next
+  }
+
+  getFieldProfiles(scopeKey: string, dataRevision: number): FieldProfile[] | null {
+    const rows = this.db.prepare(`
+      SELECT field, inferred_type, non_null_rate, distinct_count, samples_json,
+             display_name, role, synonyms_json, sensitivity, profiled_at
+      FROM field_profiles
+      WHERE scope_key = ? AND data_revision = ?
+      ORDER BY non_null_rate DESC, field ASC
+    `).all(scopeKey, dataRevision) as SqlRow[]
+    return rows.length ? rows.map(mapFieldProfileRow) : null
+  }
+
+  saveFieldProfiles(
+    scopeKey: string,
+    dataRevision: number,
+    profiles: FieldProfile[]
+  ): void {
+    const profiledAt = nowIso()
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const upsert = this.db.prepare(`
+        INSERT INTO field_profiles(
+          scope_key, field, inferred_type, non_null_rate, distinct_count,
+          samples_json, display_name, role, synonyms_json, sensitivity, profiled_at, data_revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(scope_key, field) DO UPDATE SET
+          inferred_type = excluded.inferred_type,
+          non_null_rate = excluded.non_null_rate,
+          distinct_count = excluded.distinct_count,
+          samples_json = excluded.samples_json,
+          display_name = CASE
+            WHEN field_profiles.display_name <> '' THEN field_profiles.display_name
+            ELSE excluded.display_name
+          END,
+          role = CASE
+            WHEN field_profiles.role <> '' THEN field_profiles.role
+            ELSE excluded.role
+          END,
+          synonyms_json = CASE
+            WHEN field_profiles.synonyms_json <> '[]' THEN field_profiles.synonyms_json
+            ELSE excluded.synonyms_json
+          END,
+          sensitivity = CASE
+            WHEN field_profiles.sensitivity <> 'normal' THEN field_profiles.sensitivity
+            ELSE excluded.sensitivity
+          END,
+          profiled_at = excluded.profiled_at,
+          data_revision = excluded.data_revision
+      `)
+      for (const profile of profiles) {
+        upsert.run(
+          scopeKey,
+          profile.field,
+          profile.inferredType,
+          profile.nonNullRate,
+          profile.distinctCount,
+          JSON.stringify(profile.samples.slice(0, 5)),
+          profile.displayName ?? '',
+          profile.role ?? '',
+          JSON.stringify((profile.synonyms ?? []).slice(0, 12)),
+          profile.sensitivity ?? 'normal',
+          profiledAt,
+          dataRevision
+        )
+      }
+      this.db.prepare(
+        'DELETE FROM field_profiles WHERE scope_key = ? AND data_revision <> ?'
+      ).run(scopeKey, dataRevision)
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  updateFieldProfileSemantics(
+    scopeKey: string,
+    field: string,
+    patch: FieldProfileSemanticPatch
+  ): FieldProfile | null {
+    const normalizedField = field.trim()
+    const row = this.db.prepare(`
+      SELECT field, inferred_type, non_null_rate, distinct_count, samples_json,
+             display_name, role, synonyms_json, sensitivity, profiled_at
+      FROM field_profiles
+      WHERE scope_key = ? AND field = ?
+    `).get(scopeKey, normalizedField) as SqlRow | undefined
+    if (!row) return null
+
+    const updates: string[] = []
+    const params: Array<string | number> = []
+    if (patch.displayName !== undefined) {
+      if (typeof patch.displayName !== 'string') throw new Error('字段显示名必须是文本')
+      updates.push('display_name = ?')
+      params.push(patch.displayName.trim().slice(0, 80))
+    }
+    if (patch.role !== undefined) {
+      if (!fieldProfileRoles.has(patch.role)) throw new Error('字段语义角色无效')
+      updates.push('role = ?')
+      params.push(patch.role)
+    }
+    if (patch.synonyms !== undefined) {
+      if (!Array.isArray(patch.synonyms)) throw new Error('字段语义别名必须是数组')
+      updates.push('synonyms_json = ?')
+      params.push(JSON.stringify([...new Set(
+        patch.synonyms
+          .filter((item): item is string => typeof item === 'string')
+          .map((item) => item.trim())
+          .filter(Boolean)
+      )].slice(0, 12)))
+    }
+    if (patch.sensitivity !== undefined) {
+      if (!fieldSensitivities.has(patch.sensitivity)) throw new Error('字段敏感级别无效')
+      updates.push('sensitivity = ?')
+      params.push(patch.sensitivity)
+    }
+    if (updates.length) {
+      this.db.prepare(`
+        UPDATE field_profiles
+        SET ${updates.join(', ')}, profiled_at = ?
+        WHERE scope_key = ? AND field = ?
+      `).run(...params, nowIso(), scopeKey, normalizedField)
+    }
+    const updated = this.db.prepare(`
+      SELECT field, inferred_type, non_null_rate, distinct_count, samples_json,
+             display_name, role, synonyms_json, sensitivity, profiled_at
+      FROM field_profiles
+      WHERE scope_key = ? AND field = ?
+    `).get(scopeKey, normalizedField) as SqlRow | undefined
+    return updated ? mapFieldProfileRow(updated) : null
+  }
+
+  getQueryCache(cacheKey: string, dataRevision: number): QueryDataset | null {
+    const row = this.db.prepare(`
+      SELECT result_json, expires_at
+      FROM query_cache
+      WHERE cache_key = ? AND data_revision = ?
+    `).get(cacheKey, dataRevision) as SqlRow | undefined
+    if (!row) return null
+    if (Date.parse(String(row.expires_at)) <= Date.now()) {
+      this.db.prepare('DELETE FROM query_cache WHERE cache_key = ?').run(cacheKey)
+      return null
+    }
+    try {
+      return JSON.parse(String(row.result_json)) as QueryDataset
+    } catch {
+      this.db.prepare('DELETE FROM query_cache WHERE cache_key = ?').run(cacheKey)
+      return null
+    }
+  }
+
+  saveQueryCache(
+    cacheKey: string,
+    dataRevision: number,
+    dataset: QueryDataset,
+    ttlMs = 5 * 60 * 1000
+  ): void {
+    const createdAt = nowIso()
+    const expiresAt = new Date(Date.now() + Math.max(1_000, ttlMs)).toISOString()
+    this.db.prepare(`
+      INSERT INTO query_cache(cache_key, data_revision, result_json, created_at, expires_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(cache_key) DO UPDATE SET
+        data_revision = excluded.data_revision,
+        result_json = excluded.result_json,
+        created_at = excluded.created_at,
+        expires_at = excluded.expires_at
+    `).run(cacheKey, dataRevision, JSON.stringify(dataset), createdAt, expiresAt)
   }
 
   listDashboards(): DashboardSummary[] {
@@ -693,6 +3388,95 @@ export class AppDatabase {
         durationMs: Number(value.duration_ms),
         errorMessage: String(value.error_message) || undefined,
         createdAt: String(value.created_at)
+      }
+    })
+  }
+
+  recordDashboardAuditLog(input: DashboardAuditLogInput): DashboardAuditLog {
+    const actions = new Set<DashboardAuditAction>([
+      'save',
+      'restore',
+      'diagnose',
+      'export-json',
+      'export-pdf',
+      'export-png',
+      'export-data'
+    ])
+    const statuses = new Set<DashboardAuditStatus>(['success', 'canceled', 'failed'])
+    if (!actions.has(input.action)) throw new Error(`审计动作无效: ${String(input.action)}`)
+    if (!statuses.has(input.status)) throw new Error(`审计状态无效: ${String(input.status)}`)
+    const metadata = Object.fromEntries(
+      Object.entries(input.metadata ?? {})
+        .filter(([, value]) => value === null || ['string', 'number', 'boolean'].includes(typeof value))
+        .map(([key, value]) => [key.slice(0, 80), typeof value === 'string' ? value.slice(0, 500) : value])
+    )
+    const createdAt = nowIso()
+    const result = this.db.prepare(`
+      INSERT INTO dashboard_audit_logs (
+        dashboard_id, action, status, version, format, metadata_json, error_message, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      input.dashboardId ?? '',
+      input.action,
+      input.status,
+      input.version ?? null,
+      input.format ?? '',
+      JSON.stringify(metadata),
+      (input.errorMessage ?? '').slice(0, 1000),
+      createdAt
+    )
+    return {
+      id: Number(result.lastInsertRowid),
+      dashboardId: input.dashboardId,
+      action: input.action,
+      status: input.status,
+      ...(input.version === undefined ? {} : { version: input.version }),
+      ...(input.format === undefined ? {} : { format: input.format }),
+      ...(Object.keys(metadata).length ? { metadata } : {}),
+      ...((input.errorMessage ?? '').trim() ? { errorMessage: input.errorMessage!.slice(0, 1000) } : {}),
+      createdAt
+    }
+  }
+
+  listDashboardAuditLogs(dashboardId?: string, limit = 100): DashboardAuditLog[] {
+    const normalizedLimit = Math.min(200, Math.max(1, Math.floor(limit || 100)))
+    const rows = dashboardId?.trim()
+      ? this.db.prepare(`
+          SELECT id, dashboard_id, action, status, version, format, metadata_json, error_message, created_at
+          FROM dashboard_audit_logs
+          WHERE dashboard_id = ?
+          ORDER BY created_at DESC, id DESC
+          LIMIT ?
+        `).all(dashboardId.trim(), normalizedLimit)
+      : this.db.prepare(`
+          SELECT id, dashboard_id, action, status, version, format, metadata_json, error_message, created_at
+          FROM dashboard_audit_logs
+          ORDER BY created_at DESC, id DESC
+          LIMIT ?
+        `).all(normalizedLimit)
+    return (rows as SqlRow[]).map((row) => {
+      let metadata: Record<string, string | number | boolean | null> | undefined
+      try {
+        const parsed = JSON.parse(String(row.metadata_json ?? '{}')) as unknown
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          metadata = parsed as Record<string, string | number | boolean | null>
+        }
+      } catch {
+        metadata = undefined
+      }
+      const version = row.version === null || row.version === undefined ? undefined : Number(row.version)
+      const format = String(row.format ?? '')
+      const errorMessage = String(row.error_message ?? '')
+      return {
+        id: Number(row.id),
+        dashboardId: String(row.dashboard_id) || undefined,
+        action: String(row.action) as DashboardAuditAction,
+        status: String(row.status) as DashboardAuditStatus,
+        ...(version === undefined ? {} : { version }),
+        ...(format ? { format: format as DashboardAuditLog['format'] } : {}),
+        ...(metadata && Object.keys(metadata).length ? { metadata } : {}),
+        ...(errorMessage ? { errorMessage } : {}),
+        createdAt: String(row.created_at)
       }
     })
   }
@@ -1675,6 +4459,7 @@ export class AppDatabase {
         errorMessage,
         id
       )
+    if (status === 'success' || counts.records > 0) this.bumpAnalyticsRevision()
   }
 
   listSyncRuns(): SyncRun[] {
@@ -1840,6 +4625,7 @@ export class AppDatabase {
       }
     })
 
+    if (recordCount > 0) this.bumpAnalyticsRevision()
     return {
       ok: recordCount > 0 || (rows.length === 0 && skippedCount === 0),
       recordCount,
@@ -1902,6 +4688,8 @@ export class AppDatabase {
         // A missing Base64 file is already effectively deleted.
       }
     }
+
+    if (recordCount > 0) this.bumpAnalyticsRevision()
 
     return {
       ok: true,

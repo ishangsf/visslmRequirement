@@ -11,6 +11,9 @@ interface LayoutProfile {
   preferredHeight: number
 }
 
+export const dashboardGridColumns = 24
+export const dashboardGridRows = 20
+
 export const dashboardLayoutProfiles: Record<DashboardComponentType, LayoutProfile> = {
   kpi: { minimumWidth: 4, preferredWidth: 6, minimumHeight: 2, preferredHeight: 3 },
   line: { minimumWidth: 8, preferredWidth: 10, minimumHeight: 4, preferredHeight: 5 },
@@ -102,3 +105,104 @@ export const arrangeDashboardComponents = (
 
 export const dashboardRowCount = (components: DashboardComponentSpec[]): number =>
   Math.max(1, ...components.map((component) => component.layout.y + component.layout.h))
+
+const overlaps = (
+  left: DashboardLayout,
+  right: DashboardLayout
+): boolean =>
+  left.x < right.x + right.w &&
+  left.x + left.w > right.x &&
+  left.y < right.y + right.h &&
+  left.y + left.h > right.y
+
+export interface DashboardLayoutSwapResult {
+  targetId: string
+  draggedLayout: DashboardLayout
+  targetLayout: DashboardLayout
+  errors: string[]
+}
+
+const containsPoint = (
+  layout: DashboardLayout,
+  point: { x: number; y: number }
+): boolean =>
+  point.x >= layout.x &&
+  point.x < layout.x + layout.w &&
+  point.y >= layout.y &&
+  point.y < layout.y + layout.h
+
+export const validateDashboardLayout = (
+  components: DashboardComponentSpec[],
+  componentId: string,
+  layout: DashboardLayout
+): string[] => {
+  const component = components.find((item) => item.id === componentId)
+  if (!component) return [`组件 ${componentId} 不存在`]
+  const errors: string[] = []
+  const profile = dashboardLayoutProfiles[component.type]
+  if (![layout.x, layout.y, layout.w, layout.h].every(Number.isInteger)) {
+    errors.push('布局必须使用整数')
+  } else {
+    if (layout.x < 0 || layout.y < 0 || layout.x + layout.w > dashboardGridColumns || layout.y + layout.h > dashboardGridRows) {
+      errors.push(`布局必须位于 ${dashboardGridColumns} 列、${dashboardGridRows} 行网格内`)
+    }
+    if (layout.w < profile.minimumWidth || layout.h < profile.minimumHeight) {
+      errors.push(`组件 ${component.title} 至少需要 ${profile.minimumWidth}×${profile.minimumHeight}`)
+    }
+  }
+  for (const other of components) {
+    if (other.id !== componentId && overlaps(layout, other.layout)) {
+      errors.push(`组件 ${component.title} 与 ${other.title} 重叠`)
+      break
+    }
+  }
+  return errors
+}
+
+/**
+ * Builds a position-only swap when a dragged component's center enters another component.
+ * Dimensions stay attached to their original components so a swap cannot silently resize them.
+ */
+export const swapDashboardComponentLayouts = (
+  components: DashboardComponentSpec[],
+  componentId: string,
+  candidate: DashboardLayout
+): DashboardLayoutSwapResult | null => {
+  const dragged = components.find((component) => component.id === componentId)
+  if (!dragged) return null
+  const center = {
+    x: candidate.x + candidate.w / 2,
+    y: candidate.y + candidate.h / 2
+  }
+  const target = components.find((component) =>
+    component.id !== componentId && containsPoint(component.layout, center)
+  )
+  if (!target) return null
+
+  const draggedLayout: DashboardLayout = {
+    ...candidate,
+    x: target.layout.x,
+    y: target.layout.y
+  }
+  const targetLayout: DashboardLayout = {
+    ...target.layout,
+    x: dragged.layout.x,
+    y: dragged.layout.y
+  }
+  const nextComponents = components.map((component) =>
+    component.id === componentId
+      ? { ...component, layout: draggedLayout }
+      : component.id === target.id
+        ? { ...component, layout: targetLayout }
+        : component
+  )
+  return {
+    targetId: target.id,
+    draggedLayout,
+    targetLayout,
+    errors: [
+      ...validateDashboardLayout(nextComponents, componentId, draggedLayout),
+      ...validateDashboardLayout(nextComponents, target.id, targetLayout)
+    ]
+  }
+}

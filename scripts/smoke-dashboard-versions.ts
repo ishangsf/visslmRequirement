@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { AppDatabase } from '../src/main/database'
+import { compareDashboardSpecs } from '../src/shared/dashboard'
 import type { DashboardSpec } from '../src/shared/dashboard'
 
 const directory = mkdtempSync(join(tmpdir(), 'visslm-dashboard-'))
@@ -35,10 +36,14 @@ try {
   assert.equal(version1.version, 1)
 
   const version2 = db.saveDashboard({
-    spec: { ...version1.spec, title: '研发质量周报' },
-    changeSummary: '修改标题'
+    spec: { ...version1.spec, title: '研发质量周报', theme: 'minimal-light' },
+    changeSummary: '修改标题与主题'
   })
   assert.equal(version2.version, 2)
+  const diff = compareDashboardSpecs(version1, version2)
+  assert.deepEqual(diff.changedFields.sort(), ['theme', 'title'])
+  assert.deepEqual(diff.updatedComponents, [])
+  assert.deepEqual(diff.queryChanges, [])
   assert.equal(db.listDashboards()[0].currentVersion, 2)
   assert.equal(db.listDashboardVersions(spec.id).length, 2)
 
@@ -51,7 +56,11 @@ try {
     ok: true,
     dashboardId: restored.dashboardId,
     currentVersion: restored.version,
-    versions: db.listDashboardVersions(spec.id).map((item) => item.version)
+    versions: db.listDashboardVersions(spec.id).map((item) => item.version),
+    diff: {
+      changedFields: diff.changedFields,
+      updatedComponents: diff.updatedComponents
+    }
   }, null, 2))
 } finally {
   db.close()

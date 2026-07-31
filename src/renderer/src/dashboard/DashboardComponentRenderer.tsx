@@ -1,27 +1,97 @@
 import { ArrowUpOutlined, BulbOutlined } from '@ant-design/icons'
 import { Empty, Progress } from 'antd'
 import ReactECharts from 'echarts-for-react'
-import type { DashboardComponentSpec } from '../../../shared/dashboard'
+import { memo, useMemo } from 'react'
+import type { DashboardComponentSpec, DashboardThemeId } from '../../../shared/dashboard'
 
-const chartTextColor = '#8fa2bf'
-const chartGridColor = 'rgba(139, 164, 198, 0.12)'
-const palette = ['#64dbff', '#8d7cff', '#50dda4', '#ffc568', '#ff7f9d', '#6c9cff']
+type ChartThemeTokens = {
+  textColor: string
+  gridColor: string
+  tooltipBackground: string
+  tooltipBorder: string
+  tooltipTextColor: string
+  pieBorderColor: string
+  palette: string[]
+}
+
+const chartThemeTokens: Record<DashboardThemeId, ChartThemeTokens> = {
+  'technology-dark': {
+    textColor: '#8fa2bf',
+    gridColor: 'rgba(139, 164, 198, 0.12)',
+    tooltipBackground: 'rgba(8, 19, 38, 0.94)',
+    tooltipBorder: 'rgba(104, 218, 255, 0.35)',
+    tooltipTextColor: '#e9f4ff',
+    pieBorderColor: '#111c30',
+    palette: ['#64dbff', '#8d7cff', '#50dda4', '#ffc568', '#ff7f9d', '#6c9cff']
+  },
+  'business-light': {
+    textColor: '#667b91',
+    gridColor: 'rgba(74, 111, 147, 0.16)',
+    tooltipBackground: 'rgba(27, 46, 68, 0.96)',
+    tooltipBorder: 'rgba(91, 151, 204, 0.55)',
+    tooltipTextColor: '#f5f9fd',
+    pieBorderColor: '#f4f8fc',
+    palette: ['#3479b9', '#3ba29c', '#d99545', '#7187d3', '#d1667c', '#6e9b69']
+  },
+  'charcoal-dark': {
+    textColor: '#aaa49a',
+    gridColor: 'rgba(202, 190, 166, 0.14)',
+    tooltipBackground: 'rgba(34, 32, 29, 0.96)',
+    tooltipBorder: 'rgba(224, 179, 111, 0.48)',
+    tooltipTextColor: '#f5efe5',
+    pieBorderColor: '#232323',
+    palette: ['#e0b36f', '#9bbd9a', '#d68a7e', '#9a9ed6', '#c7a4c7', '#7da9b1']
+  },
+  'minimal-light': {
+    textColor: '#718086',
+    gridColor: 'rgba(86, 125, 123, 0.14)',
+    tooltipBackground: 'rgba(35, 54, 56, 0.96)',
+    tooltipBorder: 'rgba(97, 181, 169, 0.52)',
+    tooltipTextColor: '#f4fffd',
+    pieBorderColor: '#ffffff',
+    palette: ['#2e9b90', '#e0a15b', '#7089d3', '#cf7184', '#82aa76', '#4a9cbb']
+  }
+}
+
+const hexToRgba = (color: string, alpha: number): string => {
+  const normalized = color.replace('#', '')
+  if (![3, 6].includes(normalized.length) || !/^[0-9a-f]+$/i.test(normalized)) {
+    return `rgba(100, 219, 255, ${alpha})`
+  }
+  const value = normalized.length === 3
+    ? normalized.split('').map((item) => `${item}${item}`).join('')
+    : normalized
+  const red = Number.parseInt(value.slice(0, 2), 16)
+  const green = Number.parseInt(value.slice(2, 4), 16)
+  const blue = Number.parseInt(value.slice(4, 6), 16)
+  return `rgba(${red}, ${green}, ${blue}, ${alpha})`
+}
 
 const formatNumber = (value: number): string =>
   new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 1 }).format(value)
 
-const buildChartOption = (component: DashboardComponentSpec): Record<string, unknown> => {
+const buildChartOption = (
+  component: DashboardComponentSpec,
+  themeId: DashboardThemeId
+): Record<string, unknown> => {
+  const theme = chartThemeTokens[themeId]
   const names = component.data.map((item) => item.name)
   const values = component.data.map((item) => item.value)
+  const secondaryValues = component.data.some((item) => item.secondaryValue !== undefined)
+    ? component.data.map((item) => item.secondaryValue ?? 0)
+    : undefined
+  const accent = component.accent ?? theme.palette[0]
   const common = {
     animationDuration: 500,
-    color: palette,
+    color: component.accent
+      ? [component.accent, ...theme.palette.filter((item) => item !== component.accent)]
+      : theme.palette,
     tooltip: {
       trigger: component.type === 'pie' ? 'item' : 'axis',
       confine: true,
-      backgroundColor: 'rgba(8, 19, 38, 0.94)',
-      borderColor: 'rgba(104, 218, 255, 0.35)',
-      textStyle: { color: '#e9f4ff' }
+      backgroundColor: theme.tooltipBackground,
+      borderColor: theme.tooltipBorder,
+      textStyle: { color: theme.tooltipTextColor }
     }
   }
 
@@ -38,7 +108,7 @@ const buildChartOption = (component: DashboardComponentSpec): Record<string, unk
         icon: 'circle',
         itemWidth: 8,
         itemHeight: 8,
-        textStyle: { color: chartTextColor, fontSize: 10 }
+        textStyle: { color: theme.textColor, fontSize: 10 }
       },
       series: [
         {
@@ -49,7 +119,7 @@ const buildChartOption = (component: DashboardComponentSpec): Record<string, unk
           label: { show: false },
           itemStyle: {
             borderWidth: 3,
-            borderColor: '#111c30',
+            borderColor: theme.pieBorderColor,
             borderRadius: 5
           }
         }
@@ -59,22 +129,30 @@ const buildChartOption = (component: DashboardComponentSpec): Record<string, unk
 
   return {
     ...common,
+    ...(secondaryValues ? {
+      legend: {
+        top: 0,
+        right: 4,
+        textStyle: { color: theme.textColor, fontSize: 10 },
+        data: [component.encoding?.value ?? '指标', component.encoding?.secondaryValue ?? '对比指标']
+      }
+    } : {}),
     grid: { left: 8, right: 10, top: 18, bottom: 2, containLabel: true },
     xAxis: component.type === 'bar'
       ? {
           type: 'value',
           axisLine: { show: false },
           axisTick: { show: false },
-          splitLine: { lineStyle: { color: chartGridColor } },
-          axisLabel: { color: chartTextColor, fontSize: 10 }
+          splitLine: { lineStyle: { color: theme.gridColor } },
+          axisLabel: { color: theme.textColor, fontSize: 10 }
         }
       : {
           type: 'category',
           data: names,
           boundaryGap: false,
-          axisLine: { lineStyle: { color: chartGridColor } },
+          axisLine: { lineStyle: { color: theme.gridColor } },
           axisTick: { show: false },
-          axisLabel: { color: chartTextColor, fontSize: 10 }
+          axisLabel: { color: theme.textColor, fontSize: 10 }
         },
     yAxis: component.type === 'bar'
       ? {
@@ -82,34 +160,42 @@ const buildChartOption = (component: DashboardComponentSpec): Record<string, unk
           data: names,
           axisLine: { show: false },
           axisTick: { show: false },
-          axisLabel: { color: chartTextColor, fontSize: 10, width: 78, overflow: 'truncate' }
+          axisLabel: { color: theme.textColor, fontSize: 10, width: 78, overflow: 'truncate' }
         }
       : {
           type: 'value',
           axisLine: { show: false },
           axisTick: { show: false },
-          splitLine: { lineStyle: { color: chartGridColor } },
-          axisLabel: { color: chartTextColor, fontSize: 10 }
+          splitLine: { lineStyle: { color: theme.gridColor } },
+          axisLabel: { color: theme.textColor, fontSize: 10 }
         },
-    series: [
-      component.type === 'bar'
-        ? {
+    series: (component.type === 'bar'
+      ? [
+          {
+            name: component.encoding?.value ?? '指标',
             type: 'bar',
             data: values,
             barMaxWidth: 16,
-            itemStyle: {
-              color: component.accent ?? palette[0],
-              borderRadius: [0, 5, 5, 0]
-            }
-          }
-        : {
+            itemStyle: { color: accent, borderRadius: [0, 5, 5, 0] }
+          },
+          ...(secondaryValues ? [{
+            name: component.encoding?.secondaryValue ?? '对比指标',
+            type: 'bar',
+            data: secondaryValues,
+            barMaxWidth: 16,
+            itemStyle: { color: theme.palette[1], borderRadius: [0, 5, 5, 0] }
+          }] : [])
+        ]
+      : [
+          {
+            name: component.encoding?.value ?? '指标',
             type: 'line',
             data: values,
             smooth: true,
             symbol: 'circle',
             symbolSize: 6,
-            lineStyle: { width: 3, color: component.accent ?? palette[0] },
-            itemStyle: { color: component.accent ?? palette[0] },
+            lineStyle: { width: 3, color: accent },
+            itemStyle: { color: accent },
             areaStyle: {
               color: {
                 type: 'linear',
@@ -118,22 +204,38 @@ const buildChartOption = (component: DashboardComponentSpec): Record<string, unk
                 x2: 0,
                 y2: 1,
                 colorStops: [
-                  { offset: 0, color: 'rgba(100, 219, 255, 0.3)' },
-                  { offset: 1, color: 'rgba(100, 219, 255, 0.01)' }
+                  { offset: 0, color: hexToRgba(accent, 0.3) },
+                  { offset: 1, color: hexToRgba(accent, 0.01) }
                 ]
               }
             }
-          }
-    ]
+          },
+          ...(secondaryValues ? [{
+            name: component.encoding?.secondaryValue ?? '对比指标',
+            type: 'line',
+            data: secondaryValues,
+            smooth: true,
+            symbol: 'circle',
+            symbolSize: 5,
+            lineStyle: { width: 2, color: theme.palette[1] },
+            itemStyle: { color: theme.palette[1] }
+          }] : [])
+        ])
   }
 }
 
-export function DashboardComponentRenderer({
-  component
+function DashboardComponentRendererView({
+  component,
+  theme = 'technology-dark'
 }: {
   component: DashboardComponentSpec
+  theme?: DashboardThemeId
 }): React.JSX.Element {
   const first = component.data[0]
+  const chartOption = useMemo(
+    () => buildChartOption(component, theme),
+    [component, theme]
+  )
 
   if (!component.data.length) {
     return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无数据" />
@@ -160,7 +262,7 @@ export function DashboardComponentRenderer({
         <Progress
           percent={Math.max(0, Math.min(100, first.value))}
           strokeColor={component.accent ?? '#54dfa6'}
-          trailColor="rgba(126, 151, 185, 0.15)"
+          railColor="rgba(126, 151, 185, 0.15)"
           format={(value) => <span>{value}%</span>}
         />
         <div className="viz-progress-labels">
@@ -180,7 +282,12 @@ export function DashboardComponentRenderer({
             <span className={`viz-ranking-index rank-${index + 1}`}>{index + 1}</span>
             <span className="viz-ranking-name" title={item.name}>{item.name}</span>
             <span className="viz-ranking-track">
-              <i style={{ width: `${(item.value / max) * 100}%` }} />
+            <i
+              style={{
+                width: `${(item.value / max) * 100}%`,
+                background: component.accent ?? undefined
+              }}
+            />
             </span>
             <strong>{formatNumber(item.value)}</strong>
           </div>
@@ -214,10 +321,12 @@ export function DashboardComponentRenderer({
   return (
     <ReactECharts
       key={`${component.id}-${component.layout.w}-${component.layout.h}`}
-      option={buildChartOption(component)}
+      option={chartOption}
       notMerge
       lazyUpdate
       style={{ width: '100%', height: '100%' }}
     />
   )
 }
+
+export const DashboardComponentRenderer = memo(DashboardComponentRendererView)

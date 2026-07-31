@@ -268,9 +268,7 @@ const manualConfigLayout = await evaluate(`(async () => {
         .find((element) => element.textContent?.includes('新增类型'))
     ),
     typeSelectCount: document.querySelectorAll('.manual-type-entry .ant-select').length,
-    returnPropertyInput: Boolean(
-      document.querySelector('input[placeholder="例如：_valm_Description,_valm_Status"]')
-    ),
+    returnPropertyInput: Boolean(document.querySelector('.return-property-config .ant-select')),
     fieldKeyInput: Boolean(document.querySelector('input[placeholder="例如：_valm_Name"]')),
     headers,
     removedColumnsAbsent: !headers.includes('字段名称') && !headers.includes('属性类型')

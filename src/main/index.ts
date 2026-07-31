@@ -4,6 +4,12 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type {
   ChatRequest,
+  ChatSessionDeleteResult,
+  ChatSessionSaveInput,
+  FeatureNavigationOrder,
+  FeatureModuleSettings,
+  KnowledgeDocumentPreview,
+  KnowledgeDocumentQuery,
   ModelSettings,
   PlatformSettingsInput,
   PushConfig,
@@ -11,8 +17,29 @@ import type {
   SyncProgress,
   SyncScopeConfig
 } from '../shared/types'
-import type { DataScope, QuerySpec } from '../shared/query-spec'
-import type { DashboardSaveInput, DashboardSpec } from '../shared/dashboard'
+import type {
+  ManagedProjectInput,
+  ManagedProjectListQuery,
+  OrganizationPersonInput,
+  OrganizationPersonListQuery,
+  ProjectParticipantInput,
+  ProjectPlanTaskInput,
+  ProjectPlanTaskMoveInput,
+  ProjectCostEntryInput,
+  ProjectRequirementMatchQuery,
+  ProjectRequirementQuery,
+  ProjectRequirementStatus
+} from '../shared/project-types'
+import type {
+  DataScope,
+  FieldProfileSemanticPatch,
+  QuerySpec
+} from '../shared/query-spec'
+import type {
+  DashboardAuditLogInput,
+  DashboardSaveInput,
+  DashboardSpec
+} from '../shared/dashboard'
 import { QueryEngine } from './analytics/query-engine'
 import { AppDatabase } from './database'
 import { validateDashboardSpec } from './dashboards/validator'
@@ -22,6 +49,8 @@ import { VisualizationAgent } from './experts/visualization-agent'
 import { OllamaAgent } from './ollama'
 import { SettingsService } from './settings'
 import { PushService, SyncService, VisslmClient } from './visslm'
+import { KnowledgeService } from './knowledge'
+import { ProjectManagementService } from './project-management'
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url))
 let mainWindow: BrowserWindow | null = null
@@ -29,7 +58,18 @@ let db: AppDatabase
 let settings: SettingsService
 let syncService: SyncService
 let pushService: PushService
+let knowledgeService: KnowledgeService
+let projectManagementService: ProjectManagementService
 const expertRouter = new ExpertRouter()
+const maxKnowledgeDocumentPreviewBytes = 50 * 1024 * 1024
+
+const recordDashboardAudit = (input: DashboardAuditLogInput): void => {
+  try {
+    db.recordDashboardAuditLog(input)
+  } catch (error) {
+    console.error('[dashboard-audit] failed to record', error)
+  }
+}
 
 const createWindow = (): void => {
   mainWindow = new BrowserWindow({
@@ -91,6 +131,12 @@ const registerIpc = (): void => {
   ipcMain.handle('settings:save-model', (_event, input: ModelSettings) =>
     settings.saveModel(input)
   )
+  ipcMain.handle('settings:save-features', (_event, input: FeatureModuleSettings) =>
+    settings.saveFeatures(input)
+  )
+  ipcMain.handle('settings:save-navigation-order', (_event, input: FeatureNavigationOrder) =>
+    settings.saveNavigationOrder(input)
+  )
 
   ipcMain.handle(
     'connections:test-platform',
@@ -98,7 +144,7 @@ const registerIpc = (): void => {
       new VisslmClient(settings.getPlatformCredentials(input)).test()
   )
   ipcMain.handle('connections:test-model', async (_event, input?: ModelSettings) => {
-    const model = input ?? settings.getAll().model
+    const model = settings.getModelCredentials(input)
     return new OllamaAgent(db, model).test()
   })
 
@@ -116,26 +162,51 @@ const registerIpc = (): void => {
     if (!effectiveConfig) throw new Error('请先保存采集范围配置')
     return new VisslmClient(settings.getPlatformCredentials()).previewScope(effectiveConfig)
   })
-  ipcMain.handle('sync:start', (_event, config?: SyncScopeConfig) => {
+  ipcMain.handle('sync:start', async (_event, config?: SyncScopeConfig) => {
     if (config) settings.saveSyncConfig(config)
-    return syncService.run(config ?? settings.getSyncConfig() ?? undefined)
+    const result = await syncService.run(config ?? settings.getSyncConfig() ?? undefined)
+    if (result.ok) {
+      await knowledgeService.syncRecordIndex()
+      projectManagementService.markMatchesStale()
+    }
+    return result
   })
   ipcMain.handle('sync:request-logs', (_event, page?: number, pageSize?: number) =>
     db.listCollectionRequestLogs(page, pageSize)
   )
-  ipcMain.handle('agent:ask', (_event, request: ChatRequest) => {
+  ipcMain.handle('chat:sessions', (_event, limit?: number) => db.listChatSessions(limit))
+  ipcMain.handle('chat:session', (_event, id: string) => db.getChatSession(id))
+  ipcMain.handle('chat:save-session', (_event, input: ChatSessionSaveInput) =>
+    db.saveChatSession(input)
+  )
+  ipcMain.handle('chat:delete-session', (_event, id: string): ChatSessionDeleteResult =>
+    db.deleteChatSession(id)
+  )
+  ipcMain.handle('agent:ask', (ipcEvent, request: ChatRequest) => {
     const route = expertRouter.route(request)
     if (route.expert.id === 'visualization') {
-      const scope = request.dataScope ?? {
+      const activeArtifact = request.activeArtifact
+      if (activeArtifact && activeArtifact.artifactId !== activeArtifact.dashboard.id) {
+        throw new Error('活动大屏标识与 DashboardSpec 不一致，无法执行修改')
+      }
+      const scope = request.dataScope ?? activeArtifact?.dashboard.components
+        .find((component) => component.query?.scope)?.query?.scope ?? {
         ...(request.projectId ? { projectIds: [request.projectId] } : {})
       }
       const queryEngine = new QueryEngine(db)
       const agent = new VisualizationAgent(
         queryEngine,
-        settings.getAll().model,
-        (run) => db.recordVisualizationRun(run)
+        settings.getModelCredentials(),
+        (run) => db.recordVisualizationRun(run),
+        (event) => ipcEvent.sender.send('agent:event', {
+          conversationId: request.conversationId,
+          event
+        })
       )
-      return agent.generate(route.question, scope)
+      const task = activeArtifact
+        ? agent.patch(route.question, activeArtifact.dashboard, scope)
+        : agent.generate(route.question, scope)
+      return task
         .then((dashboard) => ({
           answer: `已生成“${dashboard.title}”，共 ${dashboard.components.length} 个组件。所有指标均由 QuerySpec 在本地数据范围内计算。`,
           sources: [],
@@ -151,11 +222,17 @@ const registerIpc = (): void => {
             {
               type: 'artifact' as const,
               artifactId: dashboard.id,
-              version: 1,
+              version: activeArtifact?.version ? activeArtifact.version + 1 : 1,
               dashboard
             }
           ]
         }))
+        .then((response) => activeArtifact
+          ? {
+              ...response,
+              answer: `已完成对“${response.dashboard?.title ?? '当前大屏'}”的修改，结果已通过校验，等待保存为新版本。`
+            }
+          : response)
         .catch((error: unknown) => {
           const message = error instanceof Error ? error.message : String(error)
           if (message === '当前数据范围没有可用字段，请先采集数据') {
@@ -175,7 +252,7 @@ const registerIpc = (): void => {
           throw error
         })
     }
-    const agent = new OllamaAgent(db, settings.getAll().model)
+    const agent = new OllamaAgent(db, settings.getModelCredentials(), knowledgeService)
     return agent.ask({ ...request, question: route.question }).then((response) => ({
       ...response,
       expertId: route.expert.id
@@ -183,6 +260,11 @@ const registerIpc = (): void => {
   })
   ipcMain.handle('analytics:field-profiles', (_event, scope?: DataScope) =>
     new QueryEngine(db).profile(scope ?? {})
+  )
+  ipcMain.handle(
+    'analytics:field-profile-semantics',
+    (_event, scope: DataScope, field: string, patch: FieldProfileSemanticPatch) =>
+      new QueryEngine(db).updateFieldProfileSemantics(scope ?? {}, field, patch)
   )
   ipcMain.handle('analytics:execute-query', (_event, spec: QuerySpec) =>
     new QueryEngine(db).execute(spec)
@@ -195,74 +277,276 @@ const registerIpc = (): void => {
     db.listDashboardVersions(id)
   )
   ipcMain.handle('dashboards:save', (_event, input: DashboardSaveInput) => {
-    const errors = validateDashboardSpec(input.spec, new QueryEngine(db))
-    if (errors.length) throw new Error(`大屏校验失败：${errors.join('；')}`)
-    return db.saveDashboard(input)
+    try {
+      const errors = validateDashboardSpec(input.spec, new QueryEngine(db))
+      if (errors.length) throw new Error(`大屏校验失败：${errors.join('；')}`)
+      const saved = db.saveDashboard(input)
+      recordDashboardAudit({
+        dashboardId: saved.dashboardId,
+        action: 'save',
+        status: 'success',
+        version: saved.version,
+        metadata: {
+          componentCount: saved.spec.components.length,
+          changeSummary: input.changeSummary.trim().slice(0, 200)
+        }
+      })
+      return saved
+    } catch (error) {
+      recordDashboardAudit({
+        dashboardId: input?.spec?.id,
+        action: 'save',
+        status: 'failed',
+        errorMessage: error instanceof Error ? error.message : String(error)
+      })
+      throw error
+    }
   })
-  ipcMain.handle('dashboards:restore', (_event, id: string, version: number) =>
-    db.restoreDashboard(id, version)
-  )
-  ipcMain.handle('dashboards:diagnose', (_event, spec: DashboardSpec) =>
-    diagnoseDashboard(spec, new QueryEngine(db))
-  )
+  ipcMain.handle('dashboards:restore', (_event, id: string, version: number) => {
+    try {
+      const restored = db.restoreDashboard(id, version)
+      recordDashboardAudit({
+        dashboardId: restored.dashboardId,
+        action: 'restore',
+        status: 'success',
+        version: restored.version,
+        metadata: { sourceVersion: version }
+      })
+      return restored
+    } catch (error) {
+      recordDashboardAudit({
+        dashboardId: id,
+        action: 'restore',
+        status: 'failed',
+        metadata: { sourceVersion: version },
+        errorMessage: error instanceof Error ? error.message : String(error)
+      })
+      throw error
+    }
+  })
+  ipcMain.handle('dashboards:diagnose', (_event, spec: DashboardSpec) => {
+    try {
+      const report = diagnoseDashboard(spec, new QueryEngine(db))
+      recordDashboardAudit({
+        dashboardId: spec.id,
+        action: 'diagnose',
+        status: 'success',
+        metadata: {
+          score: report.score,
+          issueCount: report.issues.length,
+          queryCount: report.queryCount
+        }
+      })
+      return report
+    } catch (error) {
+      recordDashboardAudit({
+        dashboardId: spec?.id,
+        action: 'diagnose',
+        status: 'failed',
+        errorMessage: error instanceof Error ? error.message : String(error)
+      })
+      throw error
+    }
+  })
   ipcMain.handle('dashboards:runs', (_event, limit?: number) =>
     db.listVisualizationRuns(limit)
   )
-  ipcMain.handle('dashboards:export-json', async (_event, spec: DashboardSpec) => {
-    const errors = validateDashboardSpec(spec, new QueryEngine(db))
-    if (errors.length) throw new Error(`导出前校验失败：${errors.join('；')}`)
-    const safeTitle = spec.title.replace(/[<>:"/\\|?*\u0000-\u001F]/g, '-').slice(0, 80)
-    const result = await dialog.showSaveDialog(mainWindow!, {
-      title: '导出 DashboardSpec JSON',
-      defaultPath: `${safeTitle || 'dashboard'}.json`,
-      filters: [{ name: 'DashboardSpec JSON', extensions: ['json'] }]
-    })
-    if (result.canceled || !result.filePath) {
-      return { ok: false, canceled: true, message: '已取消导出' }
+  ipcMain.handle('dashboards:audit-logs', (_event, dashboardId?: string, limit?: number) =>
+    db.listDashboardAuditLogs(dashboardId, limit)
+  )
+  ipcMain.handle('dashboards:export-json', async (_event, spec: DashboardSpec, version?: number) => {
+    try {
+      const errors = validateDashboardSpec(spec, new QueryEngine(db))
+      if (errors.length) throw new Error(`导出前校验失败：${errors.join('；')}`)
+      const safeTitle = spec.title.replace(/[<>:"/\\|?*\u0000-\u001F]/g, '-').slice(0, 80)
+      const result = await dialog.showSaveDialog(mainWindow!, {
+        title: '导出 DashboardSpec JSON',
+        defaultPath: `${safeTitle || 'dashboard'}.json`,
+        filters: [{ name: 'DashboardSpec JSON', extensions: ['json'] }]
+      })
+      if (result.canceled || !result.filePath) {
+        recordDashboardAudit({
+          dashboardId: spec.id,
+          action: 'export-json',
+          status: 'canceled',
+          format: 'json',
+          version,
+          metadata: { componentCount: spec.components.length }
+        })
+        return { ok: false, canceled: true, message: '已取消导出' }
+      }
+      writeFileSync(result.filePath, `${JSON.stringify(spec, null, 2)}\n`, 'utf8')
+      recordDashboardAudit({
+        dashboardId: spec.id,
+        action: 'export-json',
+        status: 'success',
+        format: 'json',
+        version,
+        metadata: { componentCount: spec.components.length }
+      })
+      return { ok: true, path: result.filePath, message: 'DashboardSpec 已导出' }
+    } catch (error) {
+      recordDashboardAudit({
+        dashboardId: spec?.id,
+        action: 'export-json',
+        status: 'failed',
+        format: 'json',
+        version,
+        errorMessage: error instanceof Error ? error.message : String(error)
+      })
+      throw error
     }
-    writeFileSync(result.filePath, `${JSON.stringify(spec, null, 2)}\n`, 'utf8')
-    return { ok: true, path: result.filePath, message: 'DashboardSpec 已导出' }
   })
-  ipcMain.handle('dashboards:export-pdf', async (_event, spec: DashboardSpec) => {
-    const errors = validateDashboardSpec(spec, new QueryEngine(db))
-    if (errors.length) throw new Error(`导出前校验失败：${errors.join('；')}`)
-    if (!mainWindow) throw new Error('主窗口尚未就绪')
-    const safeTitle = spec.title.replace(/[<>:"/\\|?*\u0000-\u001F]/g, '-').slice(0, 80)
-    const result = await dialog.showSaveDialog(mainWindow, {
-      title: '导出大屏 PDF',
-      defaultPath: `${safeTitle || 'dashboard'}.pdf`,
-      filters: [{ name: 'PDF 文档', extensions: ['pdf'] }]
-    })
-    if (result.canceled || !result.filePath) {
-      return { ok: false, canceled: true, message: '已取消导出' }
+  ipcMain.handle('dashboards:export-pdf', async (_event, spec: DashboardSpec, version?: number) => {
+    try {
+      const errors = validateDashboardSpec(spec, new QueryEngine(db))
+      if (errors.length) throw new Error(`导出前校验失败：${errors.join('；')}`)
+      if (!mainWindow) throw new Error('主窗口尚未就绪')
+      const safeTitle = spec.title.replace(/[<>:"/\\|?*\u0000-\u001F]/g, '-').slice(0, 80)
+      const result = await dialog.showSaveDialog(mainWindow, {
+        title: '导出大屏 PDF',
+        defaultPath: `${safeTitle || 'dashboard'}.pdf`,
+        filters: [{ name: 'PDF 文档', extensions: ['pdf'] }]
+      })
+      if (result.canceled || !result.filePath) {
+        recordDashboardAudit({
+          dashboardId: spec.id,
+          action: 'export-pdf',
+          status: 'canceled',
+          format: 'pdf',
+          version,
+          metadata: { componentCount: spec.components.length }
+        })
+        return { ok: false, canceled: true, message: '已取消导出' }
+      }
+      const pdf = await mainWindow.webContents.printToPDF({
+        landscape: true,
+        printBackground: true,
+        pageSize: 'A4',
+        margins: { marginType: 'none' }
+      })
+      writeFileSync(result.filePath, pdf)
+      recordDashboardAudit({
+        dashboardId: spec.id,
+        action: 'export-pdf',
+        status: 'success',
+        format: 'pdf',
+        version,
+        metadata: { componentCount: spec.components.length }
+      })
+      return { ok: true, path: result.filePath, message: '大屏 PDF 已导出' }
+    } catch (error) {
+      recordDashboardAudit({
+        dashboardId: spec?.id,
+        action: 'export-pdf',
+        status: 'failed',
+        format: 'pdf',
+        version,
+        errorMessage: error instanceof Error ? error.message : String(error)
+      })
+      throw error
     }
-    const pdf = await mainWindow.webContents.printToPDF({
-      landscape: true,
-      printBackground: true,
-      pageSize: 'A4',
-      margins: { marginType: 'none' }
-    })
-    writeFileSync(result.filePath, pdf)
-    return { ok: true, path: result.filePath, message: '大屏 PDF 已导出' }
+  })
+  ipcMain.handle('dashboards:export-png', async (
+    _event,
+    spec: DashboardSpec,
+    dataUrl: string,
+    version?: number
+  ) => {
+    try {
+      const errors = validateDashboardSpec(spec, new QueryEngine(db))
+      if (errors.length) throw new Error(`导出前校验失败：${errors.join('；')}`)
+      const prefix = 'data:image/png;base64,'
+      if (typeof dataUrl !== 'string' || !dataUrl.startsWith(prefix)) {
+        throw new Error('PNG 数据格式无效')
+      }
+      const image = Buffer.from(dataUrl.slice(prefix.length), 'base64')
+      if (!image.length || image.length > 50 * 1024 * 1024) {
+        throw new Error('PNG 文件为空或超过 50 MB 限制')
+      }
+      const pngSignature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+      if (image.length < pngSignature.length || !image.subarray(0, 8).equals(pngSignature)) {
+        throw new Error('PNG 文件签名无效')
+      }
+      if (!mainWindow) throw new Error('主窗口尚未就绪')
+      const safeTitle = spec.title.replace(/[<>:"/\\|?*\u0000-\u001F]/g, '-').slice(0, 80)
+      const result = await dialog.showSaveDialog(mainWindow, {
+        title: '导出大屏 PNG',
+        defaultPath: `${safeTitle || 'dashboard'}.png`,
+        filters: [{ name: 'PNG 图片', extensions: ['png'] }]
+      })
+      if (result.canceled || !result.filePath) {
+        recordDashboardAudit({
+          dashboardId: spec.id,
+          action: 'export-png',
+          status: 'canceled',
+          format: 'png',
+          version,
+          metadata: { componentCount: spec.components.length }
+        })
+        return { ok: false, canceled: true, message: '已取消导出' }
+      }
+      writeFileSync(result.filePath, image)
+      recordDashboardAudit({
+        dashboardId: spec.id,
+        action: 'export-png',
+        status: 'success',
+        format: 'png',
+        version,
+        metadata: { componentCount: spec.components.length, byteSize: image.length }
+      })
+      return { ok: true, path: result.filePath, message: '大屏 PNG 已导出' }
+    } catch (error) {
+      recordDashboardAudit({
+        dashboardId: spec?.id,
+        action: 'export-png',
+        status: 'failed',
+        format: 'png',
+        version,
+        errorMessage: error instanceof Error ? error.message : String(error)
+      })
+      throw error
+    }
   })
 
   ipcMain.handle('data:export', async () => {
-    const result = await dialog.showSaveDialog(mainWindow!, {
-      title: '导出数据 JSONL',
-      defaultPath: `visslm-data-${new Date().toISOString().slice(0, 10)}.jsonl`,
-      filters: [{ name: 'JSON Lines', extensions: ['jsonl'] }]
-    })
-    if (result.canceled || !result.filePath) {
-      return { ok: false, canceled: true, recordCount: 0, message: '已取消导出' }
-    }
-    const rows = db.exportRows()
-    const lines = rows.map((row) => JSON.stringify(row)).join('\n')
-    writeFileSync(result.filePath, lines, 'utf8')
-    return {
-      ok: true,
-      path: result.filePath,
-      recordCount: rows.length,
-      message: `已导出 ${rows.length} 条数据`
+    try {
+      const result = await dialog.showSaveDialog(mainWindow!, {
+        title: '导出数据 JSONL',
+        defaultPath: `visslm-data-${new Date().toISOString().slice(0, 10)}.jsonl`,
+        filters: [{ name: 'JSON Lines', extensions: ['jsonl'] }]
+      })
+      if (result.canceled || !result.filePath) {
+        recordDashboardAudit({
+          action: 'export-data',
+          status: 'canceled',
+          format: 'jsonl'
+        })
+        return { ok: false, canceled: true, recordCount: 0, message: '已取消导出' }
+      }
+      const rows = db.exportRows()
+      const lines = rows.map((row) => JSON.stringify(row)).join('\n')
+      writeFileSync(result.filePath, lines, 'utf8')
+      recordDashboardAudit({
+        action: 'export-data',
+        status: 'success',
+        format: 'jsonl',
+        metadata: { recordCount: rows.length }
+      })
+      return {
+        ok: true,
+        path: result.filePath,
+        recordCount: rows.length,
+        message: `已导出 ${rows.length} 条数据`
+      }
+    } catch (error) {
+      recordDashboardAudit({
+        action: 'export-data',
+        status: 'failed',
+        format: 'jsonl',
+        errorMessage: error instanceof Error ? error.message : String(error)
+      })
+      throw error
     }
   })
 
@@ -313,6 +597,8 @@ const registerIpc = (): void => {
       }
     }
     const imported = db.importRows(rows)
+    await knowledgeService.syncRecordIndex()
+    projectManagementService.markMatchesStale()
     imported.path = filePath
     imported.skippedCount += parseErrors.length
     imported.errors = [...parseErrors, ...imported.errors].slice(0, 50)
@@ -323,7 +609,208 @@ const registerIpc = (): void => {
     return imported
   })
 
-  ipcMain.handle('data:delete', (_event, uids?: string[]) => db.deleteData(uids))
+  ipcMain.handle('data:delete', async (_event, uids?: string[]) => {
+    const result = db.deleteData(uids)
+    await knowledgeService.syncRecordIndex()
+    projectManagementService.markMatchesStale()
+    return result
+  })
+  ipcMain.handle('knowledge:documents', (_event, query: KnowledgeDocumentQuery) =>
+    db.listKnowledgeDocuments(query)
+  )
+  ipcMain.handle('knowledge:document', (_event, id: string) => db.getKnowledgeDocument(id))
+  ipcMain.handle('knowledge:document-preview', (_event, id: string): KnowledgeDocumentPreview | null => {
+    const document = db.getKnowledgeDocument(id)
+    if (!document) return null
+    if (document.extension !== '.pdf') return { document }
+    try {
+      const stats = statSync(document.filePath)
+      if (!stats.isFile()) return { document, errorMessage: '原始 PDF 文件不可用，请重新上传协议附件' }
+      if (stats.size === 0) return { document, errorMessage: 'PDF 文件为空，请重新上传协议附件' }
+      if (stats.size > maxKnowledgeDocumentPreviewBytes) {
+        return { document, errorMessage: 'PDF 文件超过 50 MB，暂不支持在线预览，请下载后查看' }
+      }
+      return { document, contentBase64: readFileSync(document.filePath).toString('base64') }
+    } catch {
+      return { document, errorMessage: '原始 PDF 文件不可用，请重新上传协议附件' }
+    }
+  })
+  ipcMain.handle('knowledge:upload', async () => {
+    const result = await dialog.showOpenDialog(mainWindow!, {
+      title: '上传知识库文档',
+      properties: ['openFile', 'multiSelections'],
+      filters: [{
+        name: '知识库文档',
+        extensions: ['docx', 'pdf', 'xlsx', 'xls', 'txt']
+      }]
+    })
+    if (result.canceled || !result.filePaths.length) {
+      return {
+        ok: false,
+        canceled: true,
+        acceptedCount: 0,
+        skippedCount: 0,
+        failedCount: 0,
+        documents: [],
+        skipped: [],
+        message: '已取消上传'
+      }
+    }
+    return knowledgeService.processFiles(result.filePaths)
+  })
+  ipcMain.handle('knowledge:retry', (_event, id: string) => knowledgeService.retryDocument(id))
+  ipcMain.handle('knowledge:tags', (_event, id: string, tags: string[]) =>
+    knowledgeService.updateDocumentTags(id, tags)
+  )
+  ipcMain.handle('knowledge:delete', (_event, id: string) => knowledgeService.deleteDocument(id))
+  ipcMain.handle('knowledge:rebuild', () => knowledgeService.rebuildIndex())
+  ipcMain.handle('knowledge:stats', () => db.getKnowledgeStats(knowledgeService.modelVersion))
+  ipcMain.handle('projects:list', (_event, query: ManagedProjectListQuery) =>
+    projectManagementService.listProjects(query)
+  )
+  ipcMain.handle('projects:get', (_event, id: string) => projectManagementService.getProject(id))
+  ipcMain.handle('projects:create', (_event, input: ManagedProjectInput) =>
+    projectManagementService.createProject(input)
+  )
+  ipcMain.handle('projects:update', (_event, id: string, input: ManagedProjectInput) =>
+    projectManagementService.updateProject(id, input)
+  )
+  ipcMain.handle('projects:delete', (_event, id: string) => projectManagementService.deleteProject(id))
+  ipcMain.handle('projects:export-data', async (_event, id: string) => {
+    try {
+      const snapshot = projectManagementService.exportProjectData(id)
+      if (!snapshot) return { ok: false, message: '项目不存在，无法导出' }
+      const safeName = snapshot.project.projectName.replace(/[<>:"/\\|?*\x00-\x1F]/g, '_').trim() || '项目'
+      const result = await dialog.showSaveDialog(mainWindow!, {
+        title: '导出项目完整数据',
+        defaultPath: `${safeName}-项目数据.json`,
+        filters: [{ name: 'VISSLM 项目数据', extensions: ['json'] }]
+      })
+      if (result.canceled || !result.filePath) {
+        return { ok: false, canceled: true, message: '已取消导出' }
+      }
+      writeFileSync(result.filePath, JSON.stringify(snapshot, null, 2), 'utf8')
+      return {
+        ok: true,
+        path: result.filePath,
+        projectId: snapshot.project.id,
+        message: '项目完整数据已导出'
+      }
+    } catch (error) {
+      return { ok: false, message: error instanceof Error ? error.message : String(error) }
+    }
+  })
+  ipcMain.handle('projects:import-data', async () => {
+    try {
+      const result = await dialog.showOpenDialog(mainWindow!, {
+        title: '导入项目完整数据',
+        properties: ['openFile'],
+        filters: [{ name: 'VISSLM 项目数据', extensions: ['json'] }]
+      })
+      if (result.canceled || !result.filePaths[0]) {
+        return { ok: false, canceled: true, message: '已取消导入' }
+      }
+      const filePath = result.filePaths[0]
+      if (statSync(filePath).size > 512 * 1024 * 1024) {
+        return { ok: false, message: '项目数据文件不能超过 512 MB' }
+      }
+      const content = readFileSync(filePath, 'utf8').replace(/^\uFEFF/, '').trim()
+      if (!content) return { ok: false, message: '项目数据文件为空' }
+      const payload = JSON.parse(content) as unknown
+      return projectManagementService.importProjectData(payload)
+    } catch (error) {
+      return { ok: false, message: error instanceof Error ? error.message : String(error) }
+    }
+  })
+  ipcMain.handle('projects:discard-draft', (_event, id: string) =>
+    projectManagementService.discardProjectDraft(id)
+  )
+  ipcMain.handle('projects:confirm', (_event, id: string) => projectManagementService.confirmProject(id))
+  ipcMain.handle('projects:upload-agreement', async (_event, projectId?: string) => {
+    const result = await dialog.showOpenDialog(mainWindow!, {
+      title: projectId ? '上传技术协议' : '通过技术协议创建项目',
+      properties: ['openFile'],
+      filters: [{ name: '技术协议', extensions: ['docx', 'pdf', 'xlsx', 'xls', 'txt'] }]
+    })
+    if (result.canceled || !result.filePaths[0]) {
+      return { ok: false, canceled: true, message: '已取消上传' }
+    }
+    return projectManagementService.startTechnicalAgreement(result.filePaths[0], projectId)
+  })
+  ipcMain.handle('projects:retry-analysis', (_event, id: string) => projectManagementService.retryAnalysis(id))
+  ipcMain.handle('projects:start-matching', (_event, id: string) => projectManagementService.startMatching(id))
+  ipcMain.handle('projects:requirements', (_event, query: ProjectRequirementQuery) =>
+    projectManagementService.listRequirements(query)
+  )
+  ipcMain.handle('projects:requirement-delete', (_event, id: string) =>
+    projectManagementService.deleteRequirement(id)
+  )
+  ipcMain.handle('projects:requirement-status', (_event, id: string, status: ProjectRequirementStatus) =>
+    projectManagementService.updateRequirementStatus(id, status)
+  )
+  ipcMain.handle('projects:requirement-key-info-terms', (_event, id: string, terms: string[]) =>
+    projectManagementService.updateRequirementKeyInfoTerms(id, terms)
+  )
+  ipcMain.handle('projects:start-requirement-matching', (_event, id: string) =>
+    projectManagementService.startRequirementMatching(id)
+  )
+  ipcMain.handle('projects:matches', (_event, query: ProjectRequirementMatchQuery) =>
+    projectManagementService.listMatches(query)
+  )
+  ipcMain.handle('projects:costs', (_event, projectId: string) => projectManagementService.listCostEntries(projectId))
+  ipcMain.handle('projects:cost-add', (_event, projectId: string, input: ProjectCostEntryInput) =>
+    projectManagementService.addCostEntry(projectId, input)
+  )
+  ipcMain.handle('projects:cost-update', (_event, id: string, input: ProjectCostEntryInput) =>
+    projectManagementService.updateCostEntry(id, input)
+  )
+  ipcMain.handle('projects:cost-delete', (_event, id: string) => projectManagementService.deleteCostEntry(id))
+  ipcMain.handle('projects:assets', (_event, projectId: string) => projectManagementService.listAssets(projectId))
+  ipcMain.handle('projects:asset-link', (_event, projectId: string, recordUid: string) =>
+    projectManagementService.linkAsset(projectId, recordUid)
+  )
+  ipcMain.handle('projects:asset-unlink', (_event, projectId: string, recordUid: string) =>
+    projectManagementService.unlinkAsset(projectId, recordUid)
+  )
+  ipcMain.handle('organization:people', (_event, query: OrganizationPersonListQuery) =>
+    projectManagementService.listOrganizationPeople(query)
+  )
+  ipcMain.handle('organization:person-create', (_event, input: OrganizationPersonInput) =>
+    projectManagementService.createOrganizationPerson(input)
+  )
+  ipcMain.handle('organization:person-update', (_event, id: string, input: OrganizationPersonInput) =>
+    projectManagementService.updateOrganizationPerson(id, input)
+  )
+  ipcMain.handle('organization:person-delete', (_event, id: string) =>
+    projectManagementService.deleteOrganizationPerson(id)
+  )
+  ipcMain.handle('projects:participants', (_event, projectId: string) =>
+    projectManagementService.listProjectParticipants(projectId)
+  )
+  ipcMain.handle('projects:participant-add', (_event, projectId: string, input: ProjectParticipantInput) =>
+    projectManagementService.addProjectParticipant(projectId, input)
+  )
+  ipcMain.handle('projects:participant-update', (_event, id: string, input: ProjectParticipantInput) =>
+    projectManagementService.updateProjectParticipant(id, input)
+  )
+  ipcMain.handle('projects:participant-delete', (_event, id: string) =>
+    projectManagementService.deleteProjectParticipant(id)
+  )
+  ipcMain.handle('projects:tasks', (_event, projectId: string) =>
+    projectManagementService.listProjectTasks(projectId)
+  )
+  ipcMain.handle('projects:task-add', (_event, projectId: string, input: ProjectPlanTaskInput) =>
+    projectManagementService.addProjectTask(projectId, input)
+  )
+  ipcMain.handle('projects:task-update', (_event, id: string, input: ProjectPlanTaskInput) =>
+    projectManagementService.updateProjectTask(id, input)
+  )
+  ipcMain.handle('projects:task-move', (_event, id: string, input: ProjectPlanTaskMoveInput) =>
+    projectManagementService.moveProjectTask(id, input)
+  )
+  ipcMain.handle('projects:task-delete', (_event, id: string) =>
+    projectManagementService.deleteProjectTask(id)
+  )
   ipcMain.handle('push:preview', (_event, config: PushConfig) => pushService.preview(config))
   ipcMain.handle('push:start', (_event, config: PushConfig) => pushService.push(config))
   ipcMain.handle('push:logs', (_event, page?: number, pageSize?: number) =>
@@ -348,6 +835,16 @@ if (!hasSingleInstanceLock) {
     mkdirSync(dataDir, { recursive: true })
     db = new AppDatabase(join(dataDir, 'visslm-agent.db'), join(dataDir, 'assets', 'base64'))
     settings = new SettingsService(db)
+    knowledgeService = new KnowledgeService(
+      db,
+      (progress) => mainWindow?.webContents.send('knowledge:progress', progress)
+    )
+    projectManagementService = new ProjectManagementService(
+      db,
+      knowledgeService,
+      () => settings.getModelCredentials(),
+      (progress) => mainWindow?.webContents.send('project:progress', progress)
+    )
     syncService = new SyncService(
       db,
       () => new VisslmClient(settings.getPlatformCredentials()),
@@ -358,6 +855,9 @@ if (!hasSingleInstanceLock) {
       () => new VisslmClient(settings.getPlatformCredentials())
     )
     registerIpc()
+    void knowledgeService.initialize().catch((error) => {
+      console.error('[knowledge] initialization failed', error)
+    })
     createWindow()
 
     app.on('activate', () => {

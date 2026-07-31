@@ -91,6 +91,10 @@ const visualizationChecks = await evaluate(`({
   componentTypes: document.querySelectorAll('.dashboard-component-list button').length,
   widgets: document.querySelectorAll('.dashboard-widget').length,
   dashboardTitle: document.querySelector('.dashboard-preview-header h2')?.textContent?.trim(),
+  dashboardTitleEditor: Boolean(document.querySelector('#dashboard-title-editor')),
+  dashboardTitleEditorSynced:
+    document.querySelector('#dashboard-title-editor')?.value ===
+    document.querySelector('.dashboard-preview-header h2')?.textContent?.trim(),
   gridColumns: getComputedStyle(document.querySelector('.dashboard-grid')).gridTemplateColumns.split(' ').length,
   previewFits: document.querySelector('.dashboard-preview')?.getBoundingClientRect().right <=
     document.querySelector('.dashboard-preview-shell')?.scrollWidth +
@@ -162,7 +166,7 @@ const pushChecks = await evaluate(`(() => {
 })()`)
 const pushScreenshot = await capture('visslm-redesign-push.png')
 
-await openPage('连接设置', '.settings-width .ant-card')
+await openPage('系统配置', '.settings-width .ant-card')
 const settingsChecks = await evaluate(`({
   cards: document.querySelectorAll('.settings-width .ant-card').length,
   title: document.querySelector('.content-page-title')?.textContent?.trim()

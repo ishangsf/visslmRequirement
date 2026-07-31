@@ -64,6 +64,7 @@ const checks = await evaluate(`(async () => {
     sendButton: Boolean(document.querySelector('.chat-send-button')),
     newConversationButton:
       document.querySelector('.new-conversation-button')?.textContent?.trim() === '新建会话',
+    historyPanel: Boolean(document.querySelector('.chat-history-panel')),
     pageFitsViewport:
       Boolean(chatPage && chatPage.getBoundingClientRect().bottom <= window.innerHeight),
     composerVisible:
@@ -76,6 +77,24 @@ await call('Page.enable')
 const shot = await call('Page.captureScreenshot', { format: 'png', fromSurface: true })
 const screenshot = join(process.env.TEMP, 'visslm-chat-redesign.png')
 writeFileSync(screenshot, Buffer.from(shot.result.data, 'base64'))
+const historyChecks = await evaluate(`(async () => {
+  const panel = document.querySelector('.chat-history-panel');
+  const historyItem = panel?.querySelector('.chat-history-item');
+  const historyDeleteButton = panel?.querySelector('.chat-history-delete');
+  const listOrEmpty = Boolean(
+    panel?.querySelector('.chat-history-item, .chat-history-empty')
+  );
+  const historyItemCount = panel?.querySelectorAll('.chat-history-item').length ?? 0;
+  historyItem?.click();
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  return {
+    historyPanelWidth: panel ? Math.round(panel.getBoundingClientRect().width) : 0,
+    historyListOrEmpty: listOrEmpty,
+    historyItemCount,
+    historyDeleteButton: Boolean(historyDeleteButton),
+    historyLoadedMessages: Boolean(document.querySelector('.message-row'))
+  };
+})()`)
 const newConversationChecks = await evaluate(`(async () => {
   const input = document.querySelector('.composer textarea');
   const valueSetter = Object.getOwnPropertyDescriptor(
@@ -91,13 +110,17 @@ const newConversationChecks = await evaluate(`(async () => {
     .find((element) => element.textContent?.trim() === '开始新会话');
   const confirmationVisible = Boolean(confirmation);
   confirmation?.click();
-  await new Promise((resolve) => setTimeout(resolve, 500));
+  await new Promise((resolve) => setTimeout(resolve, 700));
   return {
     newConversationConfirmation: confirmationVisible,
     draftCleared: input?.value === '',
     emptyStateRestored: Boolean(document.querySelector('.chat-empty')),
-    confirmationClosed:
-      !document.querySelector('.ant-modal-confirm')?.getClientRects().length
+    confirmationClosed: (() => {
+      const button = document.querySelector('.ant-modal-confirm-btns button');
+      if (!button) return true;
+      const style = getComputedStyle(button);
+      return style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0';
+    })()
   };
 })()`)
 const focusChecks = await evaluate(`(() => {
@@ -131,6 +154,7 @@ const conversationScreenshot = join(process.env.TEMP, 'visslm-chat-conversation.
 writeFileSync(conversationScreenshot, Buffer.from(conversationShot.result.data, 'base64'))
 console.log(JSON.stringify({
   ...checks,
+  ...historyChecks,
   ...newConversationChecks,
   ...focusChecks,
   ...conversationChecks,

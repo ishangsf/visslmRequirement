@@ -1,5 +1,6 @@
 import type {
   DashboardExportResult,
+  DashboardAuditLog,
   DashboardQualityReport,
   DashboardSaveInput,
   DashboardSpec,
@@ -7,8 +8,41 @@ import type {
   DashboardVersion,
   VisualizationRun
 } from './dashboard'
-import type { AgentEvent, ExpertId } from './expert-types'
-import type { DataScope, FieldProfile, QueryDataset, QuerySpec } from './query-spec'
+import type { AgentEvent, AgentProgressUpdate, ExpertId } from './expert-types'
+import type {
+  DataScope,
+  FieldProfile,
+  FieldProfileSemanticPatch,
+  QueryDataset,
+  QuerySpec
+} from './query-spec'
+import type {
+  ManagedProject,
+  ManagedProjectInput,
+  ManagedProjectListQuery,
+  OrganizationPerson,
+  OrganizationPersonInput,
+  OrganizationPersonListQuery,
+  OrganizationPersonPage,
+  ManagedProjectPage,
+  ProjectAnalysisProgress,
+  ProjectAnalysisStartResult,
+  ProjectAsset,
+  ProjectCostEntry,
+  ProjectCostEntryInput,
+  ProjectDataTransferResult,
+  ProjectParticipant,
+  ProjectParticipantInput,
+  ProjectPlanTask,
+  ProjectPlanTaskInput,
+  ProjectPlanTaskMoveInput,
+  ProjectRequirement,
+  ProjectRequirementMatchPage,
+  ProjectRequirementMatchQuery,
+  ProjectRequirementPage,
+  ProjectRequirementQuery,
+  ProjectRequirementStatus
+} from './project-types'
 
 export interface PlatformSettings {
   baseUrl: string
@@ -22,15 +56,67 @@ export interface PlatformSettingsInput {
   token?: string
 }
 
+export type ModelSource = 'local' | 'online'
+
+export type ModelProvider =
+  | 'ollama'
+  | 'openai'
+  | 'anthropic'
+  | 'deepseek'
+  | 'qwen'
+  | 'zhipu'
+  | 'moonshot'
+  | 'minimax'
+  | 'openai-compatible'
+
 export interface ModelSettings {
+  source: ModelSource
+  provider: ModelProvider
   baseUrl: string
   model: string
   thinking: boolean
+  apiKey?: string
+  hasApiKey?: boolean
 }
+
+export type FeatureModuleKey =
+  | 'dashboard'
+  | 'visualization'
+  | 'projects'
+  | 'data'
+  | 'chat'
+  | 'sync'
+  | 'push'
+
+export type FeatureModuleSettings = Record<FeatureModuleKey, boolean>
+
+export type FeatureNavigationOrder = FeatureModuleKey[]
+
+export const DEFAULT_FEATURE_MODULE_SETTINGS: FeatureModuleSettings = {
+  dashboard: true,
+  visualization: true,
+  projects: true,
+  data: true,
+  chat: true,
+  sync: true,
+  push: false
+}
+
+export const DEFAULT_FEATURE_NAVIGATION_ORDER: FeatureNavigationOrder = [
+  'dashboard',
+  'visualization',
+  'projects',
+  'data',
+  'chat',
+  'sync',
+  'push'
+]
 
 export interface AppSettings {
   platform: PlatformSettings
   model: ModelSettings
+  features: FeatureModuleSettings
+  navigationOrder: FeatureNavigationOrder
 }
 
 export interface ConnectionResult {
@@ -307,11 +393,146 @@ export interface ChatMessage {
   expertId?: ExpertId
 }
 
+export interface ChatSessionSummary {
+  id: string
+  title: string
+  preview: string
+  messageCount: number
+  createdAt: string
+  updatedAt: string
+}
+
+export interface ChatSession extends ChatSessionSummary {
+  messages: ChatMessage[]
+}
+
+export interface ChatSessionSaveInput {
+  id: string
+  title?: string
+  messages: ChatMessage[]
+}
+
+export interface ChatSessionDeleteResult {
+  ok: boolean
+  message: string
+}
+
 export interface ChatSource {
   uid: string
   name: string
   nodeType: string
   itemId: string
+  sourceType?: 'record' | 'document'
+  documentId?: string
+  chunkId?: string
+  fileName?: string
+  location?: string
+  pageNumber?: number
+  sheetName?: string
+  snippet?: string
+  score?: number
+}
+
+export type KnowledgeDocumentStatus = 'queued' | 'processing' | 'ready' | 'failed'
+
+export interface KnowledgeDocument {
+  id: string
+  fileName: string
+  filePath: string
+  extension: string
+  mimeType: string
+  byteSize: number
+  sha256: string
+  tags: string[]
+  status: KnowledgeDocumentStatus
+  errorMessage: string
+  chunkCount: number
+  pageCount: number
+  modelVersion: string
+  createdAt: string
+  updatedAt: string
+  processedAt: string
+}
+
+export interface KnowledgeChunk {
+  id: string
+  documentId?: string
+  recordUid?: string
+  sourceType: 'document' | 'record'
+  sourceName: string
+  content: string
+  chunkIndex: number
+  pageNumber?: number
+  sheetName?: string
+  location: string
+  charStart: number
+  charEnd: number
+}
+
+export interface KnowledgeDocumentDetail extends KnowledgeDocument {
+  chunks: KnowledgeChunk[]
+}
+
+export interface KnowledgeDocumentPreview {
+  document: KnowledgeDocumentDetail
+  contentBase64?: string
+  errorMessage?: string
+}
+
+export interface KnowledgeDocumentQuery {
+  page: number
+  pageSize: number
+  search?: string
+  status?: KnowledgeDocumentStatus
+  extension?: string
+  tag?: string
+}
+
+export interface KnowledgeDocumentPage {
+  rows: KnowledgeDocument[]
+  total: number
+}
+
+export interface KnowledgeUploadResult {
+  ok: boolean
+  canceled?: boolean
+  acceptedCount: number
+  skippedCount: number
+  failedCount: number
+  documents: KnowledgeDocument[]
+  skipped: Array<{ fileName: string; reason: string }>
+  message: string
+}
+
+export interface KnowledgeIndexProgress {
+  taskId: string
+  phase: 'queued' | 'parsing' | 'embedding' | 'records' | 'done' | 'error'
+  documentId?: string
+  fileName?: string
+  message: string
+  current: number
+  total: number
+  status: 'running' | 'success' | 'failed'
+}
+
+export interface KnowledgeStats {
+  documentCount: number
+  readyCount: number
+  processingCount: number
+  failedCount: number
+  chunkCount: number
+  indexedChunkCount: number
+  recordCount: number
+  modelVersion: string
+}
+
+export interface KnowledgeRebuildResult {
+  ok: boolean
+  taskId: string
+  documentCount: number
+  recordCount: number
+  chunkCount: number
+  message: string
 }
 
 export interface ChatDataRow {
@@ -344,6 +565,11 @@ export interface ChatRequest {
   expertId?: ExpertId
   entrypoint?: 'chat' | 'dashboard'
   dataScope?: DataScope
+  activeArtifact?: {
+    artifactId: string
+    version?: number
+    dashboard: DashboardSpec
+  }
   history?: Array<{ role: 'user' | 'assistant'; content: string }>
 }
 
@@ -365,6 +591,8 @@ export interface AppApi {
   getSettings(): Promise<AppSettings>
   savePlatformSettings(input: PlatformSettingsInput): Promise<AppSettings>
   saveModelSettings(input: ModelSettings): Promise<AppSettings>
+  saveFeatureSettings(input: FeatureModuleSettings): Promise<AppSettings>
+  saveNavigationOrder(input: FeatureNavigationOrder): Promise<AppSettings>
   testPlatform(input?: PlatformSettingsInput): Promise<ConnectionResult>
   testModel(input?: ModelSettings): Promise<ConnectionResult>
   listProjects(): Promise<ProjectRow[]>
@@ -378,17 +606,29 @@ export interface AppApi {
   startSync(config?: SyncScopeConfig): Promise<SyncResult>
   listCollectionRequestLogs(page?: number, pageSize?: number): Promise<CollectionRequestLogPage>
   askAgent(request: ChatRequest): Promise<ChatResponse>
+  listChatSessions(limit?: number): Promise<ChatSessionSummary[]>
+  getChatSession(id: string): Promise<ChatSession | null>
+  saveChatSession(input: ChatSessionSaveInput): Promise<ChatSession>
+  deleteChatSession(id: string): Promise<ChatSessionDeleteResult>
+  onAgentEvent(callback: (update: AgentProgressUpdate) => void): () => void
   listFieldProfiles(scope?: DataScope): Promise<FieldProfile[]>
+  saveFieldProfileSemantics(
+    scope: DataScope,
+    field: string,
+    patch: FieldProfileSemanticPatch
+  ): Promise<FieldProfile>
   executeQuery(spec: QuerySpec): Promise<QueryDataset>
   listDashboards(): Promise<DashboardSummary[]>
   getDashboard(id: string, version?: number): Promise<DashboardVersion | null>
   listDashboardVersions(id: string): Promise<DashboardVersion[]>
   saveDashboard(input: DashboardSaveInput): Promise<DashboardVersion>
   restoreDashboard(id: string, version: number): Promise<DashboardVersion>
-  exportDashboardJson(spec: DashboardSpec): Promise<DashboardExportResult>
-  exportDashboardPdf(spec: DashboardSpec): Promise<DashboardExportResult>
+  exportDashboardJson(spec: DashboardSpec, version?: number): Promise<DashboardExportResult>
+  exportDashboardPdf(spec: DashboardSpec, version?: number): Promise<DashboardExportResult>
+  exportDashboardPng(spec: DashboardSpec, dataUrl: string, version?: number): Promise<DashboardExportResult>
   diagnoseDashboard(spec: DashboardSpec): Promise<DashboardQualityReport>
   listVisualizationRuns(limit?: number): Promise<VisualizationRun[]>
+  listDashboardAuditLogs(dashboardId?: string, limit?: number): Promise<DashboardAuditLog[]>
   importData(): Promise<DataImportResult>
   exportData(): Promise<DataExportResult>
   deleteData(uids?: string[]): Promise<DataDeleteResult>
@@ -396,4 +636,53 @@ export interface AppApi {
   startPush(config: PushConfig): Promise<PushResult>
   listPushLogs(page?: number, pageSize?: number): Promise<PushLogPage>
   onSyncProgress(callback: (progress: SyncProgress) => void): () => void
+  listKnowledgeDocuments(query: KnowledgeDocumentQuery): Promise<KnowledgeDocumentPage>
+  getKnowledgeDocument(id: string): Promise<KnowledgeDocumentDetail | null>
+  getKnowledgeDocumentPreview(id: string): Promise<KnowledgeDocumentPreview | null>
+  uploadKnowledgeDocuments(): Promise<KnowledgeUploadResult>
+  retryKnowledgeDocument(id: string): Promise<KnowledgeDocument | null>
+  updateKnowledgeDocumentTags(id: string, tags: string[]): Promise<KnowledgeDocument | null>
+  deleteKnowledgeDocument(id: string): Promise<{ ok: boolean; message: string }>
+  rebuildKnowledgeIndex(): Promise<KnowledgeRebuildResult>
+  getKnowledgeStats(): Promise<KnowledgeStats>
+  onKnowledgeProgress(callback: (progress: KnowledgeIndexProgress) => void): () => void
+  listManagedProjects(query: ManagedProjectListQuery): Promise<ManagedProjectPage>
+  getManagedProject(id: string): Promise<ManagedProject | null>
+  createManagedProject(input: ManagedProjectInput): Promise<ManagedProject>
+  updateManagedProject(id: string, input: ManagedProjectInput): Promise<ManagedProject | null>
+  deleteManagedProject(id: string): Promise<{ ok: boolean; message: string }>
+  exportManagedProjectData(id: string): Promise<ProjectDataTransferResult>
+  importManagedProjectData(): Promise<ProjectDataTransferResult>
+  discardManagedProjectDraft(id: string): Promise<{ ok: boolean; message: string }>
+  startProjectTechnicalAgreementUpload(projectId?: string): Promise<ProjectAnalysisStartResult>
+  confirmManagedProject(id: string): Promise<ManagedProject | null>
+  retryProjectAnalysis(id: string): Promise<ProjectAnalysisStartResult>
+  startProjectMatching(id: string): Promise<ProjectAnalysisStartResult>
+  listProjectRequirements(query: ProjectRequirementQuery): Promise<ProjectRequirementPage>
+  deleteProjectRequirement(id: string): Promise<{ ok: boolean; message: string }>
+  updateProjectRequirementStatus(id: string, status: ProjectRequirementStatus): Promise<ProjectRequirement | null>
+  updateProjectRequirementKeyInfoTerms(id: string, terms: string[]): Promise<ProjectRequirement | null>
+  startProjectRequirementMatching(id: string): Promise<ProjectAnalysisStartResult>
+  listProjectRequirementMatches(query: ProjectRequirementMatchQuery): Promise<ProjectRequirementMatchPage>
+  listProjectCostEntries(projectId: string): Promise<ProjectCostEntry[]>
+  addProjectCostEntry(projectId: string, input: ProjectCostEntryInput): Promise<ProjectCostEntry>
+  updateProjectCostEntry(id: string, input: ProjectCostEntryInput): Promise<ProjectCostEntry | null>
+  deleteProjectCostEntry(id: string): Promise<{ ok: boolean; message: string }>
+  listProjectAssets(projectId: string): Promise<ProjectAsset[]>
+  linkProjectAsset(projectId: string, recordUid: string): Promise<ProjectAsset | null>
+  unlinkProjectAsset(projectId: string, recordUid: string): Promise<{ ok: boolean; message: string }>
+  onProjectProgress(callback: (progress: ProjectAnalysisProgress) => void): () => void
+  listOrganizationPeople(query: OrganizationPersonListQuery): Promise<OrganizationPersonPage>
+  createOrganizationPerson(input: OrganizationPersonInput): Promise<OrganizationPerson>
+  updateOrganizationPerson(id: string, input: OrganizationPersonInput): Promise<OrganizationPerson | null>
+  deleteOrganizationPerson(id: string): Promise<{ ok: boolean; message: string }>
+  listProjectParticipants(projectId: string): Promise<ProjectParticipant[]>
+  addProjectParticipant(projectId: string, input: ProjectParticipantInput): Promise<ProjectParticipant>
+  updateProjectParticipant(id: string, input: ProjectParticipantInput): Promise<ProjectParticipant | null>
+  deleteProjectParticipant(id: string): Promise<{ ok: boolean; message: string }>
+  listProjectTasks(projectId: string): Promise<ProjectPlanTask[]>
+  addProjectTask(projectId: string, input: ProjectPlanTaskInput): Promise<ProjectPlanTask>
+  updateProjectTask(id: string, input: ProjectPlanTaskInput): Promise<ProjectPlanTask | null>
+  moveProjectTask(id: string, input: ProjectPlanTaskMoveInput): Promise<ProjectPlanTask | null>
+  deleteProjectTask(id: string): Promise<{ ok: boolean; message: string }>
 }
