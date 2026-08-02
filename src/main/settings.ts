@@ -18,6 +18,18 @@ const DEFAULT_PLATFORM_URL = 'http://visionmc.vicp.net:889/alm'
 const DEFAULT_MODEL_URL = 'http://127.0.0.1:11434'
 const FEATURE_MODULE_KEYS = Object.keys(DEFAULT_FEATURE_MODULE_SETTINGS) as FeatureModuleKey[]
 const NAVIGATION_ORDER_VERSION = 1
+const USER_PROPERTY_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_.]*$/
+const USER_PROPERTY_KEYS_SETTING = 'platform.userPropertyKeys'
+
+const normalizeUserPropertyKeys = (input: unknown): string[] => {
+  if (!Array.isArray(input)) return []
+  return [...new Set(
+    input
+      .filter((value): value is string => typeof value === 'string')
+      .map((value) => value.trim())
+      .filter((value) => USER_PROPERTY_KEY_PATTERN.test(value))
+  )].slice(0, 100)
+}
 
 const normalizeNavigationOrder = (input: unknown): FeatureNavigationOrder => {
   const seen = new Set<FeatureModuleKey>()
@@ -49,7 +61,8 @@ export class SettingsService {
       platform: {
         baseUrl: this.db.getSetting('platform.baseUrl') ?? DEFAULT_PLATFORM_URL,
         username: this.db.getSetting('platform.username') ?? '',
-        hasToken: Boolean(this.db.getSetting('platform.token'))
+        hasToken: Boolean(this.db.getSetting('platform.token')),
+        userPropertyKeys: this.getUserPropertyKeys()
       },
       model: {
         source: (this.db.getSetting('model.source') ?? 'local') as ModelSettings['source'],
@@ -78,20 +91,40 @@ export class SettingsService {
     baseUrl: string
     username: string
     token: string
+    userPropertyKeys: string[]
   } {
     const settings = this.getAll().platform
     return {
       baseUrl: override?.baseUrl?.trim() || settings.baseUrl,
       username: override?.username?.trim() || settings.username,
-      token: override?.token?.trim() || this.readSecret('platform.token')
+      token: override?.token?.trim() || this.readSecret('platform.token'),
+      userPropertyKeys: settings.userPropertyKeys
     }
   }
 
   savePlatform(input: PlatformSettingsInput): AppSettings {
     this.db.setSetting('platform.baseUrl', input.baseUrl.trim().replace(/\/+$/, ''))
     this.db.setSetting('platform.username', input.username.trim())
+    this.db.setSetting(
+      USER_PROPERTY_KEYS_SETTING,
+      JSON.stringify(
+        input.userPropertyKeys === undefined
+          ? this.getUserPropertyKeys()
+          : normalizeUserPropertyKeys(input.userPropertyKeys)
+      )
+    )
     if (input.token?.trim()) this.writeSecret('platform.token', input.token.trim())
     return this.getAll()
+  }
+
+  private getUserPropertyKeys(): string[] {
+    const raw = this.db.getSetting(USER_PROPERTY_KEYS_SETTING)
+    if (!raw) return []
+    try {
+      return normalizeUserPropertyKeys(JSON.parse(raw))
+    } catch {
+      return []
+    }
   }
 
   saveModel(input: ModelSettings): AppSettings {

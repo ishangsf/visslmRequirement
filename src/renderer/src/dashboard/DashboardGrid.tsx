@@ -5,12 +5,12 @@ import ReactGridLayout, {
   type LayoutItem,
   type ResizeHandleAxis
 } from 'react-grid-layout'
-import { noOverlapCompactor } from 'react-grid-layout/core'
+import { getCompactor } from 'react-grid-layout/core'
 import { InfoCircleOutlined } from '@ant-design/icons'
 import 'react-grid-layout/css/styles.css'
 import 'react-resizable/css/styles.css'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { Ref } from 'react'
+import type { CSSProperties, Ref } from 'react'
 import type {
   DashboardComponentSpec,
   DashboardLayout,
@@ -31,7 +31,7 @@ type DashboardGridProps = {
   theme: DashboardThemeId
   preview: boolean
   selectedId: string | null
-  onSelect: (id: string) => void
+  onSelect: (id: string | null) => void
   onProvenance: (component: DashboardComponentSpec) => void
   onLayoutCommit: (layouts: Record<string, DashboardLayout>) => void
   onInteractionError: (message: string) => void
@@ -44,6 +44,8 @@ type GridInteraction = {
   accepted: Record<string, DashboardLayout>
   rejected: boolean
 }
+
+const swapCompactor = getCompactor(null, true, false)
 
 const toDashboardLayout = (item: LayoutItem): DashboardLayout => ({
   x: item.x,
@@ -126,6 +128,8 @@ export function DashboardGrid({
   const [swapTargetId, setSwapTargetId] = useState<string | null>(null)
   const [layoutResetKey, setLayoutResetKey] = useState(0)
   const interactionRef = useRef<GridInteraction | null>(null)
+  const pendingLayoutRef = useRef<GridLayout | null>(null)
+  const interactionFrameRef = useRef<number | null>(null)
   const rowCount = dashboardRowCount(components)
   const initialGridLayout = useMemo(() => toGridLayout(components), [components])
   const gridSpacing = theme === 'business-light'
@@ -152,6 +156,12 @@ export function DashboardGrid({
     return () => observer.disconnect()
   }, [containerRef])
 
+  useEffect(() => () => {
+    if (interactionFrameRef.current !== null) {
+      window.cancelAnimationFrame(interactionFrameRef.current)
+    }
+  }, [])
+
   const setError = (message: string): void => {
     onInteractionError(message)
   }
@@ -177,10 +187,10 @@ export function DashboardGrid({
     const nextItem = nextLayout.find((item) => item.i === interaction.id)
     if (!nextItem) return
     const candidate = toDashboardLayout(nextItem)
-    const acceptedComponents = toLayoutComponents(components, interaction.accepted)
+    const originComponents = toLayoutComponents(components, interaction.origin)
 
     if (interaction.mode === 'move') {
-      const swap = swapDashboardComponentLayouts(acceptedComponents, interaction.id, candidate)
+      const swap = swapDashboardComponentLayouts(originComponents, interaction.id, candidate)
       if (swap) {
         if (swap.errors.length) {
           interaction.rejected = true
@@ -200,7 +210,7 @@ export function DashboardGrid({
       }
     }
 
-    const errors = validateDashboardLayout(acceptedComponents, interaction.id, candidate)
+    const errors = validateDashboardLayout(originComponents, interaction.id, candidate)
     if (errors.length) {
       interaction.rejected = true
       setSwapTargetId(null)
@@ -217,6 +227,11 @@ export function DashboardGrid({
   }
 
   const finishInteraction = (finalLayout: GridLayout): void => {
+    if (interactionFrameRef.current !== null) {
+      window.cancelAnimationFrame(interactionFrameRef.current)
+      interactionFrameRef.current = null
+      pendingLayoutRef.current = null
+    }
     const interaction = interactionRef.current
     if (!interaction) return
     evaluateLayout(finalLayout)
@@ -237,7 +252,15 @@ export function DashboardGrid({
   }
 
   const handleDrag: EventCallback = (layout) => {
-    if (!preview && interactionRef.current?.mode === 'move') evaluateLayout(layout)
+    if (preview || interactionRef.current?.mode !== 'move') return
+    pendingLayoutRef.current = layout
+    if (interactionFrameRef.current !== null) return
+    interactionFrameRef.current = window.requestAnimationFrame(() => {
+      interactionFrameRef.current = null
+      const pending = pendingLayoutRef.current
+      pendingLayoutRef.current = null
+      if (pending) evaluateLayout(pending)
+    })
   }
 
   const handleDragStop: EventCallback = (layout) => {
@@ -280,6 +303,10 @@ export function DashboardGrid({
     <div
       className="dashboard-grid-shell"
       ref={containerRef}
+      onPointerDown={(event) => {
+        if (preview || !(event.target instanceof HTMLElement)) return
+        if (!event.target.closest('.dashboard-widget')) onSelect(null)
+      }}
     >
       {mounted && containerHeight > 0 && (
         <ReactGridLayout
@@ -289,7 +316,7 @@ export function DashboardGrid({
           gridConfig={gridConfig}
           dragConfig={dragConfig}
           resizeConfig={resizeConfig}
-          compactor={noOverlapCompactor}
+          compactor={swapCompactor}
           autoSize={false}
           className="dashboard-grid"
           style={{ height: '100%' }}
@@ -313,6 +340,13 @@ export function DashboardGrid({
                   isSwapTarget ? 'is-swap-target' : ''
                 ].filter(Boolean).join(' ')}
                 key={component.id}
+                style={{
+                  '--dashboard-widget-title-size': `${component.style?.titleFontSize ?? 11}px`,
+                  '--dashboard-widget-subtitle-size': `${component.style?.subtitleFontSize ?? 8}px`,
+                  '--dashboard-widget-body-size': `${component.style?.bodyFontSize ?? 9}px`,
+                  '--dashboard-widget-padding': `${component.style?.padding ?? 9}px`,
+                  borderRadius: component.style?.borderRadius
+                } as CSSProperties}
                 onClick={() => !preview && onSelect(component.id)}
               >
                 <header>

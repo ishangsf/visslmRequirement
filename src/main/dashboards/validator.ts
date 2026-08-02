@@ -2,7 +2,10 @@ import type { DashboardComponentSpec, DashboardSpec } from '../../shared/dashboa
 import { dashboardLayoutProfiles } from '../../shared/dashboard-layout'
 import type { QueryEngine } from '../analytics/query-engine'
 
-const componentTypes = new Set(['kpi', 'bar', 'line', 'pie', 'ranking', 'table', 'progress', 'insight'])
+const componentTypes = new Set([
+  'kpi', 'bar', 'line', 'pie', 'ranking', 'table', 'progress', 'insight',
+  'gauge', 'funnel', 'radar', 'scatter'
+])
 const themes = new Set([
   'technology-dark',
   'business-light',
@@ -11,6 +14,15 @@ const themes = new Set([
 ])
 const filterOperators = new Set(['equals', 'in'])
 const safeAccent = /^#(?:[0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i
+const styleRanges = {
+  titleFontSize: [9, 24],
+  subtitleFontSize: [8, 18],
+  valueFontSize: [14, 48],
+  bodyFontSize: [9, 20],
+  borderRadius: [0, 12],
+  padding: [4, 20],
+  lineWidth: [1, 8]
+} as const
 
 export const validateDashboardSpec = (
   input: unknown,
@@ -68,6 +80,18 @@ export const validateDashboardSpec = (
     if (component.accent !== undefined && !safeAccent.test(component.accent)) {
       errors.push(`组件 ${component.id} 的 accent 必须是十六进制颜色`)
     }
+    if (component.style) {
+      for (const [field, [minimum, maximum]] of Object.entries(styleRanges)) {
+        const value = component.style[field as keyof typeof styleRanges]
+        if (value !== undefined && (!Number.isFinite(value) || value < minimum || value > maximum)) {
+          errors.push(`组件 ${component.id} 的 style.${field} 必须位于 ${minimum}-${maximum}`)
+        }
+      }
+      if (component.style.orientation !== undefined &&
+          !['horizontal', 'vertical'].includes(component.style.orientation)) {
+        errors.push(`组件 ${component.id} 的 style.orientation 不受支持`)
+      }
+    }
     const { x, y, w, h } = component.layout ?? {}
     if (![x, y, w, h].every(Number.isInteger)) {
       errors.push(`组件 ${component.id} 的 layout 必须使用整数`)
@@ -107,10 +131,10 @@ export const validateDashboardSpec = (
       if (component.encoding.label && !dimensionFields.has(component.encoding.label)) {
         errors.push(`组件 ${component.id} 的 encoding.label 必须引用 dimension.field`)
       }
-      if (['kpi', 'progress'].includes(component.type) && dimensionFields.size > 0) {
+      if (['kpi', 'progress', 'gauge'].includes(component.type) && dimensionFields.size > 0) {
         errors.push(`组件 ${component.id} 是单值组件，不能包含维度`)
       }
-      if (['bar', 'line', 'pie', 'ranking'].includes(component.type) &&
+      if (['bar', 'line', 'pie', 'ranking', 'funnel', 'radar', 'scatter'].includes(component.type) &&
           dimensionFields.size === 0) {
         errors.push(`组件 ${component.id} 至少需要一个维度`)
       }

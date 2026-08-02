@@ -8,9 +8,11 @@ import type {
   OrganizationPersonInput,
   OrganizationPersonListQuery,
   OrganizationPersonPage,
+  ProjectAnalysisLogEntry,
   ManagedProjectPage,
   ProjectAnalysisProgress,
   ProjectAnalysisStartResult,
+  ProjectAgreementUploadOptions,
   ProjectAsset,
   ProjectCostEntry,
   ProjectCostEntryInput,
@@ -20,21 +22,34 @@ import type {
   ProjectPlanTaskInput,
   ProjectPlanTaskMoveInput,
   ProjectRequirement,
+  ProjectRequirementCategory,
+  ProjectRequirementInput,
+  ProjectRequirementMergeInput,
   ProjectRequirementMatchPage,
   ProjectRequirementMatchQuery,
   ProjectRequirementPage,
   ProjectRequirementQuery,
+  ProjectRequirementReviewStatus,
+  ProjectRequirementSetSummary,
+  ProjectRequirementSplitInput,
   ProjectRequirementStatus,
   ProjectDataSnapshot,
-  ProjectDataTransferResult
+  ProjectDataTransferResult,
+  ProjectDocumentSnapshot
 } from '../shared/project-types'
-import type { ModelSettings } from '../shared/types'
+import type { KnowledgeIndexProgress, ModelSettings } from '../shared/types'
 import { normalizeProjectRequirementText } from '../shared/project-requirement-utils'
 import { AppDatabase } from './database'
 import { KnowledgeService, type KnowledgeRecordMatch } from './knowledge'
 import { ModelClient } from './model-client'
 
 const supportedAgreementExtensions = new Set(['.docx', '.pdf', '.xlsx', '.xls', '.txt'])
+const extractionBatchMaxChars = 9_000
+const extractionSplitChunkMaxChars = 4_500
+const requirementCategories = new Set<ProjectRequirementCategory>([
+  'functional', 'interface', 'data', 'performance', 'security',
+  'deployment', 'operations', 'acceptance', 'business'
+])
 
 interface ExtractedProject {
   projectName?: string
@@ -51,17 +66,27 @@ interface ExtractedProject {
 }
 
 interface ExtractedRequirement {
+  category?: ProjectRequirementCategory
   module?: string
   title?: string
   content?: string
   keyInfoTerms?: string[]
   sourceLocation?: string
   sourceChunkId?: string
+  sourceDocumentId?: string
+  evidenceQuote?: string
+  confidence?: number
 }
 
 interface ExtractedAgreement {
   project?: ExtractedProject
   requirements?: ExtractedRequirement[]
+}
+
+interface AgreementExtractionResult {
+  agreement: ExtractedAgreement
+  warnings: string[]
+  analyzedChunks: number
 }
 
 interface MatchReview {
@@ -75,14 +100,16 @@ interface MatchReview {
 }
 
 export class ProjectManagementService {
-  private readonly runningTasks = new Set<string>()
+  private readonly runningProjectIds = new Set<string>()
 
   constructor(
     private readonly db: AppDatabase,
     private readonly knowledge: KnowledgeService,
     private readonly modelSettings: () => ModelSettings,
     private readonly progress?: (progress: ProjectAnalysisProgress) => void
-  ) {}
+  ) {
+    this.db.reconcileInterruptedProjectAnalysis()
+  }
 
   listProjects(query: ManagedProjectListQuery): ManagedProjectPage {
     return this.db.listManagedProjects(query)
@@ -90,6 +117,14 @@ export class ProjectManagementService {
 
   getProject(id: string): ManagedProject | null {
     return this.db.getManagedProject(id)
+  }
+
+  listProjectDocuments(id: string): ProjectDocumentSnapshot[] {
+    return this.db.listManagedProjectDocuments(id)
+  }
+
+  listAnalysisLogs(id: string, limit = 160): ProjectAnalysisLogEntry[] {
+    return this.db.listProjectAnalysisLogs(id, limit)
   }
 
   markMatchesStale(): void {
@@ -148,30 +183,46 @@ export class ProjectManagementService {
   }
 
   async startTechnicalAgreement(
-    filePath: string,
-    projectId?: string
+    filePaths: string | string[],
+    projectId?: string,
+    options: ProjectAgreementUploadOptions = {}
   ): Promise<ProjectAnalysisStartResult> {
-    const extension = extname(filePath).toLocaleLowerCase()
-    if (!supportedAgreementExtensions.has(extension)) {
-      return { ok: false, message: `不支持的技术协议格式: ${extension || '无扩展名'}` }
+    const paths = [...new Set((Array.isArray(filePaths) ? filePaths : [filePaths])
+      .map((filePath) => String(filePath ?? '').trim())
+      .filter(Boolean))]
+    if (!paths.length) return { ok: false, message: '请选择技术协议文件' }
+    for (const filePath of paths) {
+      const extension = extname(filePath).toLocaleLowerCase()
+      if (!supportedAgreementExtensions.has(extension)) {
+        return { ok: false, message: `不支持的技术协议格式: ${extension || '无扩展名'}` }
+      }
+    }
+    const settings = this.modelSettings()
+    if (settings.source === 'online' && !options.allowExternalProcessing) {
+      return { ok: false, message: '当前配置为在线模型，必须确认协议外发后才能解析' }
     }
     let targetProject = projectId ? this.db.getManagedProject(projectId) : null
     if (projectId && !targetProject) return { ok: false, message: '项目不存在' }
     if (!targetProject) {
-      const fileName = basename(filePath, extension).trim() || '未命名项目'
+      const extension = extname(paths[0]).toLocaleLowerCase()
+      const fileName = basename(paths[0], extension).trim() || '未命名项目'
       targetProject = this.db.createManagedProject(randomUUID(), {
         projectName: fileName
       }, 'technical_agreement', 'draft')
     }
+    if (this.runningProjectIds.has(targetProject.id) || targetProject.analysisStatus === 'processing') {
+      return { ok: false, projectId: targetProject.id, message: '该项目已有协议解析任务正在运行' }
+    }
 
     const taskId = randomUUID()
+    this.runningProjectIds.add(targetProject.id)
     this.db.updateManagedProjectState(targetProject.id, {
       analysisStatus: 'processing',
       analysisMessage: '技术协议已加入处理队列',
       matchStatus: 'idle',
       matchMessage: ''
     })
-    void this.runTechnicalAgreement(taskId, targetProject.id, filePath)
+    void this.runTechnicalAgreement(taskId, targetProject.id, paths, settings.source === 'online')
     return {
       ok: true,
       projectId: targetProject.id,
@@ -191,14 +242,23 @@ export class ProjectManagementService {
     const document = this.db.getKnowledgeDocument(project.currentDocumentId)
     if (!document) return { ok: false, message: '技术协议索引不存在' }
     const taskId = randomUUID()
-    this.db.clearProjectRequirements(id)
+    if (this.runningProjectIds.has(id)) return { ok: false, projectId: id, message: '该项目已有任务正在运行' }
+    const settings = this.modelSettings()
+    if (settings.source === 'online') {
+      return { ok: false, projectId: id, message: '在线模型重试需要重新上传并确认本次协议外发' }
+    }
     this.db.updateManagedProjectState(id, {
       analysisStatus: 'processing',
-      analysisMessage: '正在重新识别技术协议，旧功能需求已清除',
+      analysisMessage: document.status === 'ready'
+        ? '正在重新识别技术协议，已发布需求将继续保留'
+        : '正在重新建立协议索引，已发布需求将继续保留',
       matchStatus: 'idle',
       matchMessage: ''
     })
-    void this.runDocumentAnalysis(taskId, id, document.id)
+    this.runningProjectIds.add(id)
+    void (document.status === 'ready'
+      ? this.runDocumentAnalysis(taskId, id, [document.id], false)
+      : this.runDocumentRetry(taskId, id, document.id))
     return { ok: true, projectId: id, taskId, message: '技术协议已重新加入分析队列' }
   }
 
@@ -206,7 +266,10 @@ export class ProjectManagementService {
     const project = this.db.getManagedProject(id)
     if (!project) return { ok: false, message: '项目不存在' }
     if (!project.requirementCount) return { ok: false, message: '当前项目没有可匹配的需求条目' }
+    if (project.reviewSetId) return { ok: false, message: '存在未发布的需求审核版本，请先完成审核并发布' }
+    if (this.runningProjectIds.has(id)) return { ok: false, projectId: id, message: '该项目已有任务正在运行' }
     const taskId = randomUUID()
+    this.runningProjectIds.add(id)
     this.db.updateManagedProjectState(id, {
       matchStatus: 'processing',
       matchMessage: '正在准备数据中心匹配'
@@ -219,7 +282,59 @@ export class ProjectManagementService {
     return this.db.listProjectRequirements(query)
   }
 
+  getRequirementSet(projectId: string): ProjectRequirementSetSummary | null {
+    return this.db.getReviewProjectRequirementSet(projectId)
+  }
+
+  createRequirement(projectId: string, input: ProjectRequirementInput): ProjectRequirement {
+    this.assertProject(projectId)
+    return this.db.createReviewProjectRequirement(projectId, this.normalizeRequirementInput(input))
+  }
+
+  updateRequirement(id: string, input: ProjectRequirementInput): ProjectRequirement | null {
+    return this.db.updateReviewProjectRequirement(id, this.normalizeRequirementInput(input))
+  }
+
+  splitRequirement(id: string, input: ProjectRequirementSplitInput): ProjectRequirement[] {
+    if (!Array.isArray(input.parts) || input.parts.length < 2) throw new Error('拆分后至少需要两条需求')
+    return this.db.splitReviewProjectRequirement(id, {
+      parts: input.parts.map((part) => this.normalizeRequirementInput(part))
+    })
+  }
+
+  mergeRequirements(input: ProjectRequirementMergeInput): ProjectRequirement | null {
+    return this.db.mergeReviewProjectRequirements({
+      ...this.normalizeRequirementInput(input),
+      requirementIds: input.requirementIds
+    })
+  }
+
+  reviewRequirements(ids: string[], status: ProjectRequirementReviewStatus): { ok: boolean; message: string } {
+    if (!['pending', 'approved', 'rejected'].includes(status)) return { ok: false, message: '审核状态无效' }
+    const count = this.db.reviewProjectRequirements(ids, status)
+    return count
+      ? { ok: true, message: `已更新 ${count} 条需求的审核状态` }
+      : { ok: false, message: '没有可更新的待审核需求' }
+  }
+
+  publishRequirements(projectId: string): ProjectAnalysisStartResult {
+    const set = this.db.publishReviewProjectRequirementSet(projectId)
+    const project = this.db.getManagedProject(projectId)
+    if (project?.lifecycle === 'active') {
+      const matching = this.startMatching(projectId)
+      return matching.ok
+        ? { ...matching, message: `需求 V${set.version} 已发布，匹配任务已启动` }
+        : matching
+    }
+    return { ok: true, projectId, message: `需求 V${set.version} 已发布，确认项目后将开始匹配` }
+  }
+
   deleteRequirement(id: string): { ok: boolean; message: string } {
+    const requirement = this.db.getProjectRequirement(id)
+    const reviewSet = requirement ? this.db.getReviewProjectRequirementSet(requirement.projectId) : null
+    if (!requirement || !reviewSet || requirement.setId !== reviewSet.id) {
+      return { ok: false, message: '已发布需求不能直接删除，请通过新协议版本变更' }
+    }
     return this.db.deleteProjectRequirement(id)
   }
 
@@ -234,7 +349,11 @@ export class ProjectManagementService {
   startRequirementMatching(id: string): ProjectAnalysisStartResult {
     const requirement = this.db.getProjectRequirement(id)
     if (!requirement) return { ok: false, message: '功能需求不存在' }
+    const project = this.db.getManagedProject(requirement.projectId)
+    if (project?.reviewSetId) return { ok: false, message: '待审核需求不能启动匹配' }
+    if (this.runningProjectIds.has(requirement.projectId)) return { ok: false, message: '该项目已有任务正在运行' }
     const taskId = randomUUID()
+    this.runningProjectIds.add(requirement.projectId)
     this.db.updateManagedProjectState(requirement.projectId, {
       matchStatus: 'processing',
       matchMessage: `正在重新匹配：${requirement.title}`
@@ -376,6 +495,26 @@ export class ProjectManagementService {
     }
   }
 
+  private normalizeRequirementInput(input: ProjectRequirementInput): ProjectRequirementInput {
+    const normalized = normalizeProjectRequirementText(input)
+    const title = normalized.title.trim()
+    const content = normalized.content.trim()
+    if (!title) throw new Error('需求标题不能为空')
+    if (!content) throw new Error('需求内容不能为空')
+    return {
+      category: requirementCategories.has(input.category) ? input.category : 'functional',
+      module: normalized.module,
+      title,
+      content,
+      keyInfoTerms: this.normalizeKeyInfoTerms(input.keyInfoTerms, title, content),
+      sourceLocation: String(input.sourceLocation ?? '').trim(),
+      sourceChunkId: String(input.sourceChunkId ?? '').trim(),
+      evidenceQuote: String(input.evidenceQuote ?? '').trim().slice(0, 1000),
+      confidence: Math.max(0, Math.min(1, Number(input.confidence ?? 1))),
+      reviewNote: String(input.reviewNote ?? '').trim().slice(0, 500)
+    }
+  }
+
   private assertProject(id: string): void {
     if (!this.db.getManagedProject(id)) throw new Error('项目不存在')
   }
@@ -478,36 +617,200 @@ export class ProjectManagementService {
     }
   }
 
-  private async runTechnicalAgreement(taskId: string, projectId: string, filePath: string): Promise<void> {
-    if (this.runningTasks.has(taskId)) return
-    this.runningTasks.add(taskId)
+  private async runTechnicalAgreement(
+    taskId: string,
+    projectId: string,
+    filePaths: string[],
+    externalProcessing: boolean
+  ): Promise<void> {
+    const totalFiles = filePaths.length
+    const fileNames = filePaths.map((filePath) => basename(filePath))
+    let currentFile = 0
     try {
-      this.emit({ taskId, projectId, phase: 'queued', message: '正在处理技术协议', current: 0, total: 1, status: 'running' })
-      this.emit({ taskId, projectId, phase: 'embedding', message: '正在解析并建立项目知识库索引', current: 0, total: 1, status: 'running' })
-      const result = await this.knowledge.processFiles([filePath])
-      const document = result.documents[0]
-      if (!document || document.status !== 'ready') {
-        throw new Error(document?.errorMessage || result.skipped[0]?.reason || '技术协议索引失败')
+      this.emit({
+        taskId,
+        projectId,
+        phase: 'queued',
+        message: `已接收 ${totalFiles} 个技术协议文件`,
+        detail: `文件：${fileNames.join('、')}`,
+        current: 0,
+        total: totalFiles,
+        status: 'running'
+      })
+      this.emit({
+        taskId,
+        projectId,
+        phase: 'parsing',
+        message: '正在读取并校验协议文件',
+        detail: '文件会先保存到本地知识库，再开始需求抽取；抽取失败不会丢失协议关联',
+        current: 0,
+        total: totalFiles,
+        status: 'running'
+      })
+      const result = await this.knowledge.processFiles(filePaths, (progress) => {
+        if (progress.fileName && progress.status !== 'failed' && ['queued', 'parsing', 'done'].includes(progress.phase)) {
+          currentFile = Math.max(currentFile, progress.current)
+        }
+        const phase: ProjectAnalysisProgress['phase'] = progress.phase === 'parsing'
+          ? 'parsing'
+          : progress.phase === 'error'
+            ? 'error'
+            : 'embedding'
+        this.emit({
+          taskId,
+          projectId,
+          phase,
+          message: `知识库：${progress.message}`,
+          detail: progress.fileName
+            ? `文件 ${Math.min(progress.current, progress.total || totalFiles)}/${progress.total || totalFiles} · ${progress.fileName}`
+            : undefined,
+          ...(progress.documentId ? { documentId: progress.documentId } : {}),
+          ...(progress.fileName ? { fileName: progress.fileName } : {}),
+          current: progress.current,
+          total: progress.total || totalFiles,
+          status: progress.status === 'failed' ? 'failed' : 'running'
+        })
+      })
+      const documents = result.documents
+      if (documents.length) {
+        // Persist the project/document relationship before extraction. This keeps
+        // the uploaded agreement visible and retryable when model extraction fails.
+        documents.forEach((document) => this.db.linkProjectDocument(projectId, document.id))
+        this.db.updateManagedProjectState(projectId, {
+          analysisMessage: documents.every((document) => document.status === 'ready')
+            ? `已上传并建立 ${documents.length} 个协议索引，准备抽取需求`
+            : `已保存协议附件，但有 ${documents.filter((document) => document.status !== 'ready').length} 个文件索引失败`
+        })
+        this.emit({
+          taskId,
+          projectId,
+          phase: 'embedding',
+          message: documents.every((document) => document.status === 'ready')
+            ? '协议已上传并完成知识库索引，准备需求抽取'
+            : '协议附件已保存，索引阶段存在失败文件',
+          detail: `${result.message}${result.skipped.length ? `；${result.skipped.map((item) => `${item.fileName}: ${item.reason}`).join('；').slice(0, 500)}` : ''}`,
+          current: totalFiles,
+          total: totalFiles,
+          status: 'running'
+        })
       }
-      this.db.linkProjectDocument(projectId, document.id)
-      await this.runDocumentAnalysis(taskId, projectId, document.id)
+      const readyDocuments = documents.filter((document) => document.status === 'ready')
+      if (readyDocuments.length !== totalFiles) {
+        const failed = documents.find((document) => document.status === 'failed')
+        throw new Error(failed?.errorMessage || result.skipped[0]?.reason || '部分技术协议未完成索引')
+      }
+      const documentIds = [...new Set(readyDocuments.map((document) => document.id))]
+      await this.runDocumentAnalysis(taskId, projectId, documentIds, externalProcessing)
     } catch (error) {
-      this.failProject(taskId, projectId, error)
+      this.failProject(taskId, projectId, error, {
+        current: currentFile,
+        total: totalFiles,
+        detail: '协议附件关联已保留；可查看执行日志后重试分析'
+      })
     } finally {
-      this.runningTasks.delete(taskId)
+      this.runningProjectIds.delete(projectId)
     }
   }
 
-  private async runDocumentAnalysis(taskId: string, projectId: string, documentId: string): Promise<void> {
+  private async runDocumentRetry(taskId: string, projectId: string, documentId: string): Promise<void> {
     try {
-      const detail = this.db.getKnowledgeDocument(documentId)
-      if (!detail || detail.status !== 'ready') throw new Error('技术协议尚未完成知识库索引')
-      this.emit({ taskId, projectId, phase: 'extracting', message: '正在识别项目基本信息和功能需求', current: 0, total: 1, status: 'running' })
-      const extracted = await this.extractAgreement(detail.chunks.map((chunk) => ({
+      const document = this.db.getKnowledgeDocument(documentId)
+      if (!document) throw new Error('技术协议索引记录不存在')
+      this.emit({
+        taskId,
+        projectId,
+        phase: 'parsing',
+        message: `正在重新建立 ${document.fileName} 的协议索引`,
+        detail: '原协议附件已关联到当前项目，将复用本地文件重新解析',
+        documentId: document.id,
+        fileName: document.fileName,
+        current: 0,
+        total: 1,
+        status: 'running'
+      })
+      const retried = await this.knowledge.retryDocument(document.id)
+      if (!retried || retried.status !== 'ready') {
+        throw new Error(retried?.errorMessage || '协议索引重试失败')
+      }
+      this.db.linkProjectDocument(projectId, retried.id)
+      this.emit({
+        taskId,
+        projectId,
+        phase: 'embedding',
+        message: `${retried.fileName} 已重新完成索引`,
+        detail: '索引已恢复，正在进入需求抽取',
+        documentId: retried.id,
+        fileName: retried.fileName,
+        current: 1,
+        total: 1,
+        status: 'running'
+      })
+      await this.runDocumentAnalysis(taskId, projectId, [retried.id], false)
+    } catch (error) {
+      this.failProject(taskId, projectId, error, {
+        detail: '协议附件仍保留在项目中，可查看日志定位索引失败原因'
+      })
+    } finally {
+      this.runningProjectIds.delete(projectId)
+    }
+  }
+
+  private async runDocumentAnalysis(
+    taskId: string,
+    projectId: string,
+    documentIds: string[],
+    externalProcessing: boolean
+  ): Promise<void> {
+    let analyzedCurrent = 0
+    let analyzedTotal = 0
+    try {
+      const details = documentIds.map((documentId) => this.db.getKnowledgeDocument(documentId))
+      if (!details.length || details.some((detail) => !detail || detail.status !== 'ready')) {
+        throw new Error('技术协议尚未完成知识库索引')
+      }
+      const chunks = details.flatMap((detail) => detail!.chunks.map((chunk) => ({
         id: chunk.id,
-        location: chunk.location,
+        documentId: detail!.id,
+        location: `${detail!.fileName} · ${chunk.location}`,
         content: chunk.content
       })))
+      analyzedTotal = chunks.length
+      this.emit({
+        taskId,
+        projectId,
+        phase: 'extracting',
+        message: `开始抽取 ${chunks.length} 个正文分块中的可交付需求`,
+        detail: `协议：${details.map((detail) => detail!.fileName).join('、')}；模型会按小批次调用并自动拆分过长结果`,
+        current: 0,
+        total: analyzedTotal,
+        status: 'running'
+      })
+      const extraction = await this.extractAgreement(chunks, (current, total, message, detail) => {
+        analyzedCurrent = current
+        analyzedTotal = total
+        this.emit({
+          taskId,
+          projectId,
+          phase: 'extracting',
+          message: message || `已分析 ${current}/${total} 个正文分块`,
+          detail,
+          current,
+          total,
+          status: 'running'
+        })
+      })
+      const extracted = extraction.agreement
+      analyzedCurrent = analyzedTotal
+      this.emit({
+        taskId,
+        projectId,
+        phase: 'extracting',
+        message: `正文抽取完成，正在保存 ${extracted.requirements?.length ?? 0} 条候选需求`,
+        detail: extraction.warnings.length ? `发现 ${extraction.warnings.length} 条可追溯性提示，将随待审核版本保留` : '未发现来源追溯异常',
+        current: analyzedCurrent,
+        total: analyzedTotal,
+        status: 'running'
+      })
       const project = this.db.getManagedProject(projectId)
       if (!project) throw new Error('项目不存在')
       if (project.lifecycle === 'draft') {
@@ -536,17 +839,43 @@ export class ProjectManagementService {
           })
         }
       }
-      const requirements = this.normalizeRequirements(projectId, documentId, extracted.requirements ?? [])
-      this.db.replaceProjectRequirements(projectId, documentId, requirements)
+      const primaryDocumentId = documentIds[documentIds.length - 1]
+      const requirements = this.normalizeRequirements(projectId, primaryDocumentId, extracted.requirements ?? [])
+      const settings = this.modelSettings()
+      const set = this.db.createProjectRequirementSet({
+        projectId,
+        documentId: primaryDocumentId,
+        totalChunks: chunks.length,
+        analyzedChunks: extraction.analyzedChunks,
+        warnings: extraction.warnings,
+        externalProcessing,
+        modelName: `${settings.provider}:${settings.model}`
+      })
+      this.db.replaceReviewProjectRequirements(set.id, projectId, primaryDocumentId, requirements)
       this.db.updateManagedProjectState(projectId, {
         analysisStatus: 'ready',
-        analysisMessage: `已识别 ${requirements.length} 条功能需求`,
+        analysisMessage: `已生成待审核版本 V${set.version}，共 ${requirements.length} 条分类需求`,
         matchStatus: 'idle',
-        matchMessage: '等待确认后开始匹配'
+        matchMessage: '需完成人工审核并发布后才能匹配'
       })
-      this.emit({ taskId, projectId, phase: 'done', message: `已识别 ${requirements.length} 条功能需求`, current: 1, total: 1, status: 'success' })
+      this.emit({
+        taskId,
+        projectId,
+        phase: 'done',
+        message: `待审核版本 V${set.version} 已生成`,
+        detail: `共 ${requirements.length} 条需求；协议附件已关联，可进入“需求清单”审核后发布`,
+        current: chunks.length,
+        total: chunks.length,
+        status: 'success'
+      })
     } catch (error) {
-      this.failProject(taskId, projectId, error)
+      this.failProject(taskId, projectId, error, {
+        current: analyzedCurrent,
+        total: analyzedTotal,
+        detail: '协议附件和已建立的索引不会被删除；请根据日志中的失败阶段重试'
+      })
+    } finally {
+      this.runningProjectIds.delete(projectId)
     }
   }
 
@@ -557,12 +886,16 @@ export class ProjectManagementService {
   ): Array<{
     id: string
     requirementNo: number
+    category: ProjectRequirementCategory
     module: string
     title: string
     content: string
     keyInfoTerms: string[]
     sourceLocation: string
     sourceChunkId: string
+    documentId: string
+    evidenceQuote: string
+    confidence: number
   }> {
     const seen = new Set<string>()
     const preparedRequirements = requirements.map((item) => {
@@ -585,15 +918,18 @@ export class ProjectManagementService {
       return [{
         id: randomUUID(),
         requirementNo: index + 1,
+        category: requirementCategories.has(item.category ?? 'functional') ? item.category ?? 'functional' : 'functional',
         module,
         title: finalTitle,
         content: content || finalTitle,
         keyInfoTerms: this.normalizeKeyInfoTerms(item.keyInfoTerms, finalTitle, content),
         sourceLocation: String(item.sourceLocation ?? '').trim(),
-        sourceChunkId: String(item.sourceChunkId ?? '').trim()
+        sourceChunkId: String(item.sourceChunkId ?? '').trim(),
+        documentId: String(item.sourceDocumentId ?? documentId).trim() || documentId,
+        evidenceQuote: String(item.evidenceQuote ?? '').trim().slice(0, 1000),
+        confidence: Math.max(0, Math.min(1, Number(item.confidence ?? 0.7)))
       }]
-    }).map((item, index) => ({ ...item, requirementNo: index + 1, projectId, documentId }))
-      .map(({ projectId: _projectId, documentId: _documentId, ...item }) => item)
+    }).map((item, index) => ({ ...item, requirementNo: index + 1 }))
   }
 
   private splitNumberedRequirement(item: ExtractedRequirement): ExtractedRequirement[] {
@@ -614,9 +950,13 @@ export class ProjectManagementService {
         : []
       const childTitle = this.titleFromNumberedRequirement(childContent, title, index)
       const child: ExtractedRequirement = {
+        category: item.category,
         module: item.module,
         sourceLocation: item.sourceLocation,
         sourceChunkId: item.sourceChunkId,
+        sourceDocumentId: item.sourceDocumentId,
+        evidenceQuote: item.evidenceQuote,
+        confidence: item.confidence,
         title: childTitle,
         content: childContent
       }
@@ -634,24 +974,107 @@ export class ProjectManagementService {
   }
 
   private async extractAgreement(
-    chunks: Array<{ id: string; location: string; content: string }>
+    chunks: Array<{ id: string; documentId: string; location: string; content: string }>,
+    onProgress?: (current: number, total: number, message?: string, detail?: string) => void
+  ): Promise<AgreementExtractionResult> {
+    const batches: Array<Array<{ id: string; documentId: string; location: string; content: string }>> = []
+    let currentBatch: Array<{ id: string; documentId: string; location: string; content: string }> = []
+    let currentLength = 0
+    for (const chunk of chunks) {
+      const size = chunk.content.length + chunk.location.length + 80
+      if (currentBatch.length && currentLength + size > extractionBatchMaxChars) {
+        batches.push(currentBatch)
+        currentBatch = []
+        currentLength = 0
+      }
+      currentBatch.push(chunk)
+      currentLength += size
+    }
+    if (currentBatch.length) batches.push(currentBatch)
+    if (!batches.length) throw new Error('协议没有可分析的正文分块')
+
+    const merged: ExtractedAgreement = { project: {}, requirements: [] }
+    const warnings: string[] = []
+    let analyzedChunks = 0
+    for (let index = 0; index < batches.length; index += 1) {
+      const batch = batches[index]
+      onProgress?.(
+        analyzedChunks,
+        chunks.length,
+        `正在调用模型分析第 ${index + 1}/${batches.length} 批正文`,
+        `本批包含 ${batch.length} 个正文分块，输入约 ${batch.reduce((sum, item) => sum + item.content.length, 0)} 字`
+      )
+      const extracted = await this.extractAgreementBatch(batch, String(index + 1), batches.length, (message, detail) => {
+        onProgress?.(analyzedChunks, chunks.length, message, detail)
+      })
+      const fields = extracted.project ?? {}
+      const project = merged.project!
+      for (const key of Object.keys(fields) as Array<keyof ExtractedProject>) {
+        if (project[key] === undefined && fields[key] !== undefined) {
+          Object.assign(project, { [key]: fields[key] })
+        }
+      }
+      const byId = new Map(batch.map((chunk) => [chunk.id, chunk]))
+      for (const requirement of extracted.requirements ?? []) {
+        const sourceChunkId = String(requirement.sourceChunkId ?? '').trim()
+        const sourceChunk = byId.get(sourceChunkId)
+        let confidence = Math.max(0, Math.min(1, Number(requirement.confidence ?? 0.7)))
+        let evidenceQuote = String(requirement.evidenceQuote ?? '').trim().slice(0, 1000)
+        if (!sourceChunk) {
+          warnings.push(`第 ${index + 1} 批存在无法验证的需求来源：${requirement.title ?? '未命名需求'}`)
+          confidence = Math.min(confidence, 0.4)
+          evidenceQuote = ''
+        } else if (evidenceQuote) {
+          const normalizedSource = sourceChunk.content.replace(/\s+/g, '')
+          const normalizedEvidence = evidenceQuote.replace(/\s+/g, '')
+          if (!normalizedSource.includes(normalizedEvidence)) {
+            warnings.push(`证据原文未能精确回溯：${requirement.title ?? '未命名需求'}`)
+            confidence = Math.min(confidence, 0.5)
+            evidenceQuote = ''
+          }
+        } else {
+          warnings.push(`需求缺少证据摘录：${requirement.title ?? '未命名需求'}`)
+          confidence = Math.min(confidence, 0.55)
+        }
+        merged.requirements!.push({
+          ...requirement,
+          category: requirementCategories.has(requirement.category ?? 'functional')
+            ? requirement.category ?? 'functional'
+            : 'functional',
+          sourceChunkId: sourceChunk?.id ?? '',
+          sourceDocumentId: sourceChunk?.documentId ?? '',
+          sourceLocation: sourceChunk?.location ?? String(requirement.sourceLocation ?? '').trim(),
+          evidenceQuote,
+          confidence
+        })
+      }
+      analyzedChunks += batch.length
+      onProgress?.(analyzedChunks, chunks.length, `已完成第 ${index + 1}/${batches.length} 批需求抽取`, `当前累计识别 ${merged.requirements?.length ?? 0} 条候选需求`)
+    }
+    return { agreement: merged, warnings: [...new Set(warnings)].slice(0, 100), analyzedChunks }
+  }
+
+  private async extractAgreementBatch(
+    chunks: Array<{ id: string; documentId: string; location: string; content: string }>,
+    batchNumber: string,
+    batchCount: number,
+    onEvent?: (message: string, detail?: string) => void
   ): Promise<ExtractedAgreement> {
     const source = chunks
       .map((chunk) => `[分块ID:${chunk.id}][位置:${chunk.location}]\n${chunk.content}`)
       .join('\n\n')
-      .slice(0, 80_000)
     const systemPrompt = [
       '你是企业技术协议结构化分析器。只依据输入正文，不得补写正文没有出现的项目字段或需求。',
-      '提取项目基本信息和功能需求，不要提取纯背景、商务条款、付款条款或泛泛描述。',
-      '功能需求必须是可验证、可交付、可匹配的原子功能：一个需求只描述一个动作和一个业务对象。遇到同一段中的 1)、2)、3) 或多个并列动作必须拆成多条，不要把整章、整段或多个子功能合并成一条。',
+      `当前是第 ${batchNumber}/${batchCount} 批正文。提取项目基本信息以及所有可验证、可交付、可验收的技术或商务约束。`,
+      'category 必须从 functional、interface、data、performance、security、deployment、operations、acceptance、business 中选择，分别表示功能、接口、数据、性能、安全、部署、运维、验收和商务约束。不得因为内容属于非功能需求而丢弃。',
+      '每条需求必须原子化：一条只描述一个动作、对象或约束。多个并列动作、指标或序号项必须拆成多条。',
       '遇到任何同级序号标识都必须严格分条输出：包括 1.、1)、1）、1、（1）、(1)、①，以及 一、/（一）等。序号后的每一项对应 requirements 数组中的一个独立元素；即使它们共享同一个章节标题，也绝对不能合并到同一条 content 中。',
-      '单条 content 中不得同时出现两个及以上同级序号项；如果原文为“1) …；2) …；3) …”，必须输出 3 条需求记录。',
       '识别每条需求所在的最近章节或功能模块，并写入 module 字段，例如“2.1 整体要求”“2.2 项目策划”。同一章节下的多条需求必须复用相同 module；title 只写需求名称或功能动作，绝对不要把章节名称重复拼接到 title 前面。',
-      '只提取正文明确提出的系统能力、用户操作、业务处理、查询、配置、统计、集成等功能；排除项目背景、建设目标、总体架构、技术选型、实施计划、培训服务、商务付款、泛化的性能/安全口号和非功能性描述。',
-      '每条需求的 content 使用简洁的功能句，尽量不超过 160 字，不要复制无关上下文；并尽量返回对应分块ID和位置。',
+      '排除纯背景、宣传性描述和没有约束含义的泛泛目标，但保留明确的架构、技术选型、实施、培训、付款、性能、安全、验收和服务要求。',
+      '每条 content 使用简洁需求句，尽量不超过 200 字。sourceChunkId 必须从输入分块ID原样选择；evidenceQuote 必须逐字摘录该分块中的直接证据；confidence 返回 0 到 1。',
       '为每条需求提取 keyInfoTerms：3-8 个用于数据中心匹配的关键功能信息词，只保留正文中出现的业务对象、动作、模块、接口/集成对象、指标或约束词；不要返回“系统、功能、支持、实现、能够、可以”等泛词，不要编造同义词。',
       '只输出一个完整且闭合的 JSON 对象，不要输出 Markdown、解释文字或思考过程。JSON 结构必须为：',
-      '{"project":{"projectName":"","customerName":"","contractAmount":0,"riskFactor":0,"deliveryReminderDays":0,"plannedDeliveryDate":"","salesOwner":"","technicalOwner":"","developmentOwner":"","estimatedCost":0,"estimatedDurationDays":0},"requirements":[{"module":"","title":"","content":"","keyInfoTerms":[""],"sourceLocation":"","sourceChunkId":""}]}',
+      '{"project":{"projectName":"","customerName":"","contractAmount":0,"riskFactor":0,"deliveryReminderDays":0,"plannedDeliveryDate":"","salesOwner":"","technicalOwner":"","developmentOwner":"","estimatedCost":0,"estimatedDurationDays":0},"requirements":[{"category":"functional","module":"","title":"","content":"","keyInfoTerms":[""],"sourceLocation":"","sourceChunkId":"","evidenceQuote":"","confidence":0.8}]}',
       '不确定的数字、日期和负责人字段使用空字符串或 null；requirements 没有可靠功能需求时返回空数组。'
     ].join('\n')
     const model = new ModelClient(this.modelSettings())
@@ -668,7 +1091,7 @@ export class ProjectManagementService {
       format: 'json',
       think: false,
       temperature: strict ? 0 : 0.1,
-      numPredict: strict ? 12_000 : 8_192
+      numPredict: strict ? 8_000 : 6_000
     })
     let response = await request(false)
     let parsed = this.parseAgreementJson(response.message?.content ?? '')
@@ -677,8 +1100,19 @@ export class ProjectManagementService {
       parsed = this.parseAgreementJson(response.message?.content ?? '')
     }
     if (!parsed) {
+      const split = this.splitExtractionBatch(chunks)
+      if (split) {
+        onEvent?.(
+          `第 ${batchNumber}/${batchCount} 批模型结果过长，正在自动拆分重试`,
+          `原批次 ${chunks.length} 个正文分块；拆分后分别分析，避免一次输出被截断`
+        )
+        const [left, right] = split
+        const leftResult = await this.extractAgreementBatch(left, `${batchNumber}.1`, batchCount, onEvent)
+        const rightResult = await this.extractAgreementBatch(right, `${batchNumber}.2`, batchCount, onEvent)
+        return this.mergeExtractedAgreements(leftResult, rightResult)
+      }
       if (response.done_reason === 'length') {
-        throw new Error('大模型输出被截断，已自动重试仍未完成，请减少协议内容后重试')
+        throw new Error(`第 ${batchNumber}/${batchCount} 批模型输出被截断，已自动重试仍未完成`)
       }
       throw new Error('大模型返回的技术协议分析结果不是有效 JSON，已自动重试')
     }
@@ -704,6 +1138,9 @@ export class ProjectManagementService {
         estimatedDurationDays: this.optionalNumber(project.estimatedDurationDays)
       },
       requirements: requirements.map((item) => ({
+        category: requirementCategories.has(String(item.category) as ProjectRequirementCategory)
+          ? String(item.category) as ProjectRequirementCategory
+          : 'functional',
         module: this.optionalString(item.module),
         title: this.optionalString(item.title),
         content: this.optionalString(item.content),
@@ -711,8 +1148,54 @@ export class ProjectManagementService {
           ? item.keyInfoTerms.map((term) => this.optionalString(term)).filter((term): term is string => Boolean(term))
           : undefined,
         sourceLocation: this.optionalString(item.sourceLocation),
-        sourceChunkId: this.optionalString(item.sourceChunkId)
+        sourceChunkId: this.optionalString(item.sourceChunkId),
+        evidenceQuote: this.optionalString(item.evidenceQuote),
+        confidence: this.optionalNumber(item.confidence)
       }))
+    }
+  }
+
+  private splitExtractionBatch(
+    chunks: Array<{ id: string; documentId: string; location: string; content: string }>
+  ): [
+    Array<{ id: string; documentId: string; location: string; content: string }>,
+    Array<{ id: string; documentId: string; location: string; content: string }>
+  ] | null {
+    if (chunks.length > 1) {
+      const midpoint = Math.ceil(chunks.length / 2)
+      return [chunks.slice(0, midpoint), chunks.slice(midpoint)]
+    }
+    const chunk = chunks[0]
+    if (!chunk || chunk.content.length <= extractionSplitChunkMaxChars) return null
+    const midpoint = Math.floor(chunk.content.length / 2)
+    const boundaryCandidates = [
+      chunk.content.lastIndexOf('\n', midpoint),
+      chunk.content.lastIndexOf('。', midpoint),
+      chunk.content.lastIndexOf('；', midpoint),
+      chunk.content.lastIndexOf(' ', midpoint)
+    ].filter((value) => value > extractionSplitChunkMaxChars / 3)
+    const splitAt = boundaryCandidates.length ? Math.max(...boundaryCandidates) + 1 : midpoint
+    const leftContent = chunk.content.slice(0, splitAt).trim()
+    const rightContent = chunk.content.slice(splitAt).trim()
+    if (!leftContent || !rightContent) return null
+    return [
+      [{ ...chunk, location: `${chunk.location} · 前半段`, content: leftContent }],
+      [{ ...chunk, location: `${chunk.location} · 后半段`, content: rightContent }]
+    ]
+  }
+
+  private mergeExtractedAgreements(left: ExtractedAgreement, right: ExtractedAgreement): ExtractedAgreement {
+    const project: ExtractedProject = {}
+    for (const fields of [left.project ?? {}, right.project ?? {}]) {
+      for (const key of Object.keys(fields) as Array<keyof ExtractedProject>) {
+        if (project[key] === undefined && fields[key] !== undefined) {
+          Object.assign(project, { [key]: fields[key] })
+        }
+      }
+    }
+    return {
+      project,
+      requirements: [...(left.requirements ?? []), ...(right.requirements ?? [])]
     }
   }
 
@@ -749,6 +1232,11 @@ export class ProjectManagementService {
           projectId,
           phase: 'matching',
           message: `正在匹配第 ${index + 1}/${requirements.length} 条需求`,
+          detail: [
+            requirement.module,
+            requirement.title,
+            requirement.keyInfoTerms.length ? `关键功能词：${requirement.keyInfoTerms.join('、')}` : requirement.content.slice(0, 180)
+          ].filter(Boolean).join(' · '),
           current: index,
           total: requirements.length,
           status: 'running'
@@ -766,6 +1254,8 @@ export class ProjectManagementService {
         matchMessage: error instanceof Error ? error.message : String(error)
       })
       this.emit({ taskId, projectId, phase: 'error', message: error instanceof Error ? error.message : String(error), current: 0, total: 0, status: 'failed' })
+    } finally {
+      this.runningProjectIds.delete(projectId)
     }
   }
 
@@ -778,6 +1268,10 @@ export class ProjectManagementService {
         projectId,
         phase: 'matching',
         message: `正在重新匹配：${requirement.title}`,
+        detail: [
+          requirement.module,
+          requirement.keyInfoTerms.length ? `关键功能词：${requirement.keyInfoTerms.join('、')}` : requirement.content.slice(0, 180)
+        ].filter(Boolean).join(' · '),
         current: 0,
         total: 1,
         status: 'running'
@@ -787,7 +1281,16 @@ export class ProjectManagementService {
         matchStatus: 'ready',
         matchMessage: `已完成「${requirement.title}」的匹配`
       })
-      this.emit({ taskId, projectId, phase: 'done', message: '功能需求匹配完成', current: 1, total: 1, status: 'success' })
+      this.emit({
+        taskId,
+        projectId,
+        phase: 'done',
+        message: '功能需求匹配完成',
+        detail: `需求「${requirement.title}」的匹配结果已保存`,
+        current: 1,
+        total: 1,
+        status: 'success'
+      })
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       this.db.updateManagedProjectState(projectId, {
@@ -795,6 +1298,8 @@ export class ProjectManagementService {
         matchMessage: message
       })
       this.emit({ taskId, projectId, phase: 'error', message, current: 0, total: 1, status: 'failed' })
+    } finally {
+      this.runningProjectIds.delete(projectId)
     }
   }
 
@@ -882,16 +1387,31 @@ export class ProjectManagementService {
     }
   }
 
-  private failProject(taskId: string, projectId: string, error: unknown): void {
+  private failProject(
+    taskId: string,
+    projectId: string,
+    error: unknown,
+    progress: { current?: number; total?: number; detail?: string } = {}
+  ): void {
     const message = error instanceof Error ? error.message : String(error)
     this.db.updateManagedProjectState(projectId, {
       analysisStatus: 'failed',
       analysisMessage: message
     })
-    this.emit({ taskId, projectId, phase: 'error', message, current: 0, total: 0, status: 'failed' })
+    this.emit({
+      taskId,
+      projectId,
+      phase: 'error',
+      message,
+      detail: progress.detail,
+      current: Math.max(0, Math.trunc(progress.current ?? 0)),
+      total: Math.max(0, Math.trunc(progress.total ?? 0)),
+      status: 'failed'
+    })
   }
 
   private emit(progress: ProjectAnalysisProgress): void {
+    this.db.saveProjectAnalysisProgress(progress)
     this.progress?.(progress)
   }
 

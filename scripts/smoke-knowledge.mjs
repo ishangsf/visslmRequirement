@@ -153,8 +153,8 @@ const main = async () => {
     const failed = await service.processFiles([files.bad])
     assert(failed.failedCount === 1 && failed.documents[0]?.status === 'failed', 'invalid documents should retain failure reason')
     await writeFile(files.bad, makeDocx())
-    const retried = await service.retryDocument(failed.documents[0].id)
-    assert(retried?.status === 'ready' && retried.chunkCount > 0, 'failed documents should be retryable')
+    const replacement = await service.processFiles([files.bad])
+    assert(replacement.documents[0]?.status === 'ready' && replacement.documents[0]?.chunkCount > 0, 'corrected documents should be re-uploadable')
 
     await writeFile(files.empty, Buffer.alloc(0))
     const empty = await service.processFiles([files.empty])

@@ -3,7 +3,7 @@ import { QueryEngine } from '../src/main/analytics/query-engine'
 import type { AnalyticsRecord, AppDatabase } from '../src/main/database'
 import { VisualizationAgent } from '../src/main/experts/visualization-agent'
 import { validateDashboardSpec } from '../src/main/dashboards/validator'
-import type { DashboardSpec } from '../src/shared/dashboard'
+import type { DashboardSpec, VisualizationRunInput } from '../src/shared/dashboard'
 
 const records: AnalyticsRecord[] = [
   {
@@ -74,6 +74,7 @@ const settings = {
 
 const originalFetch = globalThis.fetch
 const progress: string[] = []
+const runs: VisualizationRunInput[] = []
 
 try {
   globalThis.fetch = async () => new Response(JSON.stringify({
@@ -93,7 +94,7 @@ try {
   const agent = new VisualizationAgent(
     new QueryEngine(fakeDb),
     settings,
-    undefined,
+    (run) => runs.push(run),
     (event) => progress.push(event.stage)
   )
   const patched = await agent.patch('Change the title and remove the fourth KPI', baseDashboard, {
@@ -117,6 +118,39 @@ try {
     'validate',
     'persist'
   ])
+  assert.equal(runs[0].mode, 'patch')
+  assert.equal(runs[0].status, 'success')
+  const appliedPatchCall = runs[0].toolCalls.find((call) => call.tool === 'apply-patch')
+  assert.ok(appliedPatchCall)
+  assert.equal(appliedPatchCall.metadata?.operationCount, 5)
+  assert.equal(appliedPatchCall.metadata?.affectedComponentCount, 1)
+  assert.equal(appliedPatchCall.metadata?.removedComponentCount, 1)
+  assert.equal(appliedPatchCall.metadata?.queryExecutionCount, 1)
+  assert.equal(runs[0].toolCalls.filter((call) => call.tool === 'execute-query').length, 1)
+
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    message: {
+      content: JSON.stringify({
+        operations: [
+          { op: 'set-dashboard-subtitle', value: 'Metadata-only patch' },
+          { op: 'set-theme', value: 'charcoal-dark' }
+        ]
+      })
+    }
+  }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  const metadataOnly = await agent.patch(
+    'Update the dashboard subtitle and theme',
+    patched,
+    { projectIds: ['p1'] }
+  )
+  assert.equal(metadataOnly.subtitle, 'Metadata-only patch')
+  assert.equal(metadataOnly.theme, 'charcoal-dark')
+  assert.deepEqual(metadataOnly.components, patched.components)
+  assert.equal(runs[1].status, 'success')
+  assert.equal(runs[1].toolCalls.filter((call) => call.tool === 'execute-query').length, 0)
+  const metadataPatchCall = runs[1].toolCalls.find((call) => call.tool === 'apply-patch')
+  assert.equal(metadataPatchCall?.metadata?.affectedComponentCount, 0)
+  assert.equal(metadataPatchCall?.metadata?.queryExecutionCount, 0)
 
   globalThis.fetch = async () => new Response(JSON.stringify({
     message: {
@@ -130,11 +164,20 @@ try {
     }
   }), { status: 200, headers: { 'Content-Type': 'application/json' } })
   await assert.rejects(
-    () => agent.patch('Use a monthly grain on the first KPI', baseDashboard, { projectIds: ['p1'] }),
+    () => agent.patch('Use a monthly grain on the first KPI', metadataOnly, { projectIds: ['p1'] }),
     /DashboardSpec 修改失败/
   )
+  assert.equal(runs[2].status, 'failed')
+  assert.equal(runs[2].mode, 'patch')
+  assert.ok(runs[2].toolCalls.some((call) => call.tool === 'repair-attempt'))
 
-  console.log(JSON.stringify({ ok: true, patchedTitle: patched.title, componentCount: patched.components.length, progress }, null, 2))
+  console.log(JSON.stringify({
+    ok: true,
+    patchedTitle: patched.title,
+    componentCount: patched.components.length,
+    toolCallCount: runs.map((run) => run.toolCalls.length),
+    progress
+  }, null, 2))
 } finally {
   globalThis.fetch = originalFetch
 }

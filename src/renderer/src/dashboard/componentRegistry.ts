@@ -92,6 +92,50 @@ export const dashboardComponentRegistry: DashboardComponentDefinition[] = [
       h: dashboardLayoutProfiles.insight.minimumHeight
     },
     supportedDataShapes: ['single-value', 'category-value', 'time-series']
+  },
+  {
+    type: 'gauge',
+    name: '环形仪表',
+    description: '展示目标完成率、健康度和容量利用率',
+    category: '指标',
+    minimumSize: {
+      w: dashboardLayoutProfiles.gauge.minimumWidth,
+      h: dashboardLayoutProfiles.gauge.minimumHeight
+    },
+    supportedDataShapes: ['single-value']
+  },
+  {
+    type: 'funnel',
+    name: '转化漏斗',
+    description: '展示销售、运营或流程各阶段的转化损耗',
+    category: '比较',
+    minimumSize: {
+      w: dashboardLayoutProfiles.funnel.minimumWidth,
+      h: dashboardLayoutProfiles.funnel.minimumHeight
+    },
+    supportedDataShapes: ['category-value']
+  },
+  {
+    type: 'radar',
+    name: '多维雷达',
+    description: '对比多个维度的能力、质量或健康评分',
+    category: '比较',
+    minimumSize: {
+      w: dashboardLayoutProfiles.radar.minimumWidth,
+      h: dashboardLayoutProfiles.radar.minimumHeight
+    },
+    supportedDataShapes: ['category-value']
+  },
+  {
+    type: 'scatter',
+    name: '分布散点',
+    description: '观察两个数值指标之间的分布和相关关系',
+    category: '比较',
+    minimumSize: {
+      w: dashboardLayoutProfiles.scatter.minimumWidth,
+      h: dashboardLayoutProfiles.scatter.minimumHeight
+    },
+    supportedDataShapes: ['category-value']
   }
 ]
 

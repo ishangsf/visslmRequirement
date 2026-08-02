@@ -2,10 +2,12 @@ import { app, BrowserWindow, dialog, ipcMain } from 'electron'
 import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import * as XLSX from 'xlsx'
 import type {
   ChatRequest,
   ChatSessionDeleteResult,
   ChatSessionSaveInput,
+  DataReviewApplyInput,
   FeatureNavigationOrder,
   FeatureModuleSettings,
   KnowledgeDocumentPreview,
@@ -26,8 +28,13 @@ import type {
   ProjectPlanTaskInput,
   ProjectPlanTaskMoveInput,
   ProjectCostEntryInput,
+  ProjectAgreementUploadOptions,
+  ProjectRequirementInput,
+  ProjectRequirementMergeInput,
   ProjectRequirementMatchQuery,
   ProjectRequirementQuery,
+  ProjectRequirementReviewStatus,
+  ProjectRequirementSplitInput,
   ProjectRequirementStatus
 } from '../shared/project-types'
 import type {
@@ -38,12 +45,16 @@ import type {
 import type {
   DashboardAuditLogInput,
   DashboardSaveInput,
-  DashboardSpec
+  DashboardSpec,
+  VisualizationRunInput
 } from '../shared/dashboard'
+import { compareDashboardSpecValues } from '../shared/dashboard'
 import { QueryEngine } from './analytics/query-engine'
 import { AppDatabase } from './database'
 import { validateDashboardSpec } from './dashboards/validator'
 import { diagnoseDashboard } from './dashboards/diagnostics'
+import { repairDashboardComponent } from './dashboards/component-repair'
+import { dashboardSpecHash } from './dashboards/spec-hash'
 import { ExpertRouter } from './experts/router'
 import { VisualizationAgent } from './experts/visualization-agent'
 import { OllamaAgent } from './ollama'
@@ -51,6 +62,7 @@ import { SettingsService } from './settings'
 import { PushService, SyncService, VisslmClient } from './visslm'
 import { KnowledgeService } from './knowledge'
 import { ProjectManagementService } from './project-management'
+import { createProjectWorkbook } from './project-export'
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url))
 let mainWindow: BrowserWindow | null = null
@@ -69,6 +81,24 @@ const recordDashboardAudit = (input: DashboardAuditLogInput): void => {
   } catch (error) {
     console.error('[dashboard-audit] failed to record', error)
   }
+}
+
+const specAuditMetadata = (
+  spec: DashboardSpec | undefined,
+  metadata: Record<string, string | number | boolean | null> = {}
+): Record<string, string | number | boolean | null> => ({
+  ...metadata,
+  ...(spec && typeof spec === 'object' ? { specHash: dashboardSpecHash(spec) } : {})
+})
+
+const dashboardPatchErrorCode = (run: VisualizationRunInput | undefined): string => {
+  const failedTool = [...(run?.toolCalls ?? [])].reverse().find((call) => call.status === 'failed')?.tool
+  if (failedTool === 'model-compose') return 'DASHBOARD_AI_MODEL_OUTPUT'
+  if (failedTool === 'execute-query') return 'DASHBOARD_AI_QUERY_FAILED'
+  if (failedTool === 'apply-patch' || failedTool === 'validate-dashboard') {
+    return 'DASHBOARD_AI_VALIDATION_FAILED'
+  }
+  return 'DASHBOARD_AI_PATCH_FAILED'
 }
 
 const createWindow = (): void => {
@@ -171,6 +201,19 @@ const registerIpc = (): void => {
     }
     return result
   })
+  ipcMain.handle(
+    'data:apply-review',
+    async (_event, input: DataReviewApplyInput) => {
+      const result = input.source === 'sync'
+        ? await syncService.applyDataReviews(input.batchId, input.reviewIds)
+        : db.applyImportDataReviews(input.batchId, input.reviewIds)
+      if (result.updatedCount > 0) {
+        await knowledgeService.syncRecordIndex()
+        projectManagementService.markMatchesStale()
+      }
+      return result
+    }
+  )
   ipcMain.handle('sync:request-logs', (_event, page?: number, pageSize?: number) =>
     db.listCollectionRequestLogs(page, pageSize)
   )
@@ -186,25 +229,43 @@ const registerIpc = (): void => {
     const route = expertRouter.route(request)
     if (route.expert.id === 'visualization') {
       const activeArtifact = request.activeArtifact
+      const focusComponentId = request.focusComponentId?.trim() || undefined
       if (activeArtifact && activeArtifact.artifactId !== activeArtifact.dashboard.id) {
         throw new Error('活动大屏标识与 DashboardSpec 不一致，无法执行修改')
+      }
+      if (focusComponentId && !activeArtifact) {
+        throw new Error('指定组件修改需要先打开一个活动大屏')
+      }
+      if (focusComponentId && activeArtifact &&
+          !activeArtifact.dashboard.components.some((component) => component.id === focusComponentId)) {
+        throw new Error(`指定组件 ${focusComponentId} 不存在，无法执行修改`)
       }
       const scope = request.dataScope ?? activeArtifact?.dashboard.components
         .find((component) => component.query?.scope)?.query?.scope ?? {
         ...(request.projectId ? { projectIds: [request.projectId] } : {})
       }
       const queryEngine = new QueryEngine(db)
+      let latestVisualizationRun: VisualizationRunInput | undefined
       const agent = new VisualizationAgent(
         queryEngine,
         settings.getModelCredentials(),
-        (run) => db.recordVisualizationRun(run),
+        (run) => {
+          latestVisualizationRun = run
+          db.recordVisualizationRun(run)
+        },
         (event) => ipcEvent.sender.send('agent:event', {
           conversationId: request.conversationId,
           event
         })
       )
       const task = activeArtifact
-        ? agent.patch(route.question, activeArtifact.dashboard, scope)
+        ? agent.patch(
+            route.question,
+            activeArtifact.dashboard,
+            scope,
+            focusComponentId,
+            request.history
+          )
         : agent.generate(route.question, scope)
       return task
         .then((dashboard) => ({
@@ -213,6 +274,18 @@ const registerIpc = (): void => {
           dataViews: [],
           expertId: route.expert.id,
           dashboard,
+          ...(activeArtifact && latestVisualizationRun
+            ? {
+                dashboardChange: {
+                  ...compareDashboardSpecValues(activeArtifact.dashboard, dashboard),
+                  queryExecutionCount: latestVisualizationRun.toolCalls.filter(
+                    (call) => call.tool === 'execute-query' && call.status === 'success'
+                  ).length,
+                  attemptCount: latestVisualizationRun.attemptCount,
+                  durationMs: latestVisualizationRun.durationMs
+                }
+              }
+            : {}),
           events: [
             {
               type: 'status' as const,
@@ -222,7 +295,7 @@ const registerIpc = (): void => {
             {
               type: 'artifact' as const,
               artifactId: dashboard.id,
-              version: activeArtifact?.version ? activeArtifact.version + 1 : 1,
+              version: activeArtifact?.version !== undefined ? activeArtifact.version + 1 : 1,
               dashboard
             }
           ]
@@ -246,6 +319,25 @@ const registerIpc = (): void => {
                 code: 'NO_ANALYTICS_DATA',
                 message,
                 recoverable: true
+              }]
+            }
+          }
+          if (activeArtifact) {
+            const failedTool = [...(latestVisualizationRun?.toolCalls ?? [])]
+              .reverse()
+              .find((call) => call.status === 'failed')
+            return {
+              answer: '本次大屏修改未应用，当前画布保持不变。',
+              sources: [],
+              dataViews: [],
+              expertId: route.expert.id,
+              events: [{
+                type: 'error' as const,
+                code: dashboardPatchErrorCode(latestVisualizationRun),
+                message,
+                recoverable: true,
+                stage: failedTool?.tool,
+                attemptCount: latestVisualizationRun?.attemptCount
               }]
             }
           }
@@ -286,10 +378,10 @@ const registerIpc = (): void => {
         action: 'save',
         status: 'success',
         version: saved.version,
-        metadata: {
+        metadata: specAuditMetadata(saved.spec, {
           componentCount: saved.spec.components.length,
           changeSummary: input.changeSummary.trim().slice(0, 200)
-        }
+        })
       })
       return saved
     } catch (error) {
@@ -297,6 +389,7 @@ const registerIpc = (): void => {
         dashboardId: input?.spec?.id,
         action: 'save',
         status: 'failed',
+        metadata: input?.spec ? specAuditMetadata(input.spec) : undefined,
         errorMessage: error instanceof Error ? error.message : String(error)
       })
       throw error
@@ -310,7 +403,7 @@ const registerIpc = (): void => {
         action: 'restore',
         status: 'success',
         version: restored.version,
-        metadata: { sourceVersion: version }
+        metadata: specAuditMetadata(restored.spec, { sourceVersion: version })
       })
       return restored
     } catch (error) {
@@ -331,11 +424,11 @@ const registerIpc = (): void => {
         dashboardId: spec.id,
         action: 'diagnose',
         status: 'success',
-        metadata: {
+        metadata: specAuditMetadata(spec, {
           score: report.score,
           issueCount: report.issues.length,
           queryCount: report.queryCount
-        }
+        })
       })
       return report
     } catch (error) {
@@ -343,11 +436,42 @@ const registerIpc = (): void => {
         dashboardId: spec?.id,
         action: 'diagnose',
         status: 'failed',
+        metadata: specAuditMetadata(spec),
         errorMessage: error instanceof Error ? error.message : String(error)
       })
       throw error
     }
   })
+  ipcMain.handle(
+    'dashboards:repair-component',
+    (_event, spec: DashboardSpec, componentId: string) => {
+      try {
+        const result = repairDashboardComponent(spec, componentId, new QueryEngine(db))
+        recordDashboardAudit({
+          dashboardId: spec.id,
+          action: 'repair-component',
+          status: 'success',
+          metadata: {
+            componentId,
+            actionCount: result.actions.length,
+            score: result.report.score,
+            sourceSpecHash: dashboardSpecHash(spec),
+            specHash: dashboardSpecHash(result.spec)
+          }
+        })
+        return result
+      } catch (error) {
+        recordDashboardAudit({
+          dashboardId: spec?.id,
+          action: 'repair-component',
+          status: 'failed',
+          metadata: specAuditMetadata(spec, { componentId }),
+          errorMessage: error instanceof Error ? error.message : String(error)
+        })
+        throw error
+      }
+    }
+  )
   ipcMain.handle('dashboards:runs', (_event, limit?: number) =>
     db.listVisualizationRuns(limit)
   )
@@ -371,7 +495,7 @@ const registerIpc = (): void => {
           status: 'canceled',
           format: 'json',
           version,
-          metadata: { componentCount: spec.components.length }
+          metadata: specAuditMetadata(spec, { componentCount: spec.components.length })
         })
         return { ok: false, canceled: true, message: '已取消导出' }
       }
@@ -382,7 +506,7 @@ const registerIpc = (): void => {
         status: 'success',
         format: 'json',
         version,
-        metadata: { componentCount: spec.components.length }
+        metadata: specAuditMetadata(spec, { componentCount: spec.components.length })
       })
       return { ok: true, path: result.filePath, message: 'DashboardSpec 已导出' }
     } catch (error) {
@@ -392,6 +516,7 @@ const registerIpc = (): void => {
         status: 'failed',
         format: 'json',
         version,
+        metadata: specAuditMetadata(spec),
         errorMessage: error instanceof Error ? error.message : String(error)
       })
       throw error
@@ -415,7 +540,7 @@ const registerIpc = (): void => {
           status: 'canceled',
           format: 'pdf',
           version,
-          metadata: { componentCount: spec.components.length }
+          metadata: specAuditMetadata(spec, { componentCount: spec.components.length })
         })
         return { ok: false, canceled: true, message: '已取消导出' }
       }
@@ -432,7 +557,7 @@ const registerIpc = (): void => {
         status: 'success',
         format: 'pdf',
         version,
-        metadata: { componentCount: spec.components.length }
+        metadata: specAuditMetadata(spec, { componentCount: spec.components.length })
       })
       return { ok: true, path: result.filePath, message: '大屏 PDF 已导出' }
     } catch (error) {
@@ -442,6 +567,7 @@ const registerIpc = (): void => {
         status: 'failed',
         format: 'pdf',
         version,
+        metadata: specAuditMetadata(spec),
         errorMessage: error instanceof Error ? error.message : String(error)
       })
       throw error
@@ -482,7 +608,7 @@ const registerIpc = (): void => {
           status: 'canceled',
           format: 'png',
           version,
-          metadata: { componentCount: spec.components.length }
+          metadata: specAuditMetadata(spec, { componentCount: spec.components.length })
         })
         return { ok: false, canceled: true, message: '已取消导出' }
       }
@@ -493,7 +619,7 @@ const registerIpc = (): void => {
         status: 'success',
         format: 'png',
         version,
-        metadata: { componentCount: spec.components.length, byteSize: image.length }
+        metadata: specAuditMetadata(spec, { componentCount: spec.components.length, byteSize: image.length })
       })
       return { ok: true, path: result.filePath, message: '大屏 PNG 已导出' }
     } catch (error) {
@@ -503,6 +629,7 @@ const registerIpc = (): void => {
         status: 'failed',
         format: 'png',
         version,
+        metadata: specAuditMetadata(spec),
         errorMessage: error instanceof Error ? error.message : String(error)
       })
       throw error
@@ -566,6 +693,7 @@ const registerIpc = (): void => {
         imageCount: 0,
         skippedCount: 0,
         errors: [],
+        duplicates: [],
         message: '已取消导入'
       }
     }
@@ -602,10 +730,16 @@ const registerIpc = (): void => {
     imported.path = filePath
     imported.skippedCount += parseErrors.length
     imported.errors = [...parseErrors, ...imported.errors].slice(0, 50)
-    imported.ok = imported.recordCount > 0 || (rows.length === 0 && !parseErrors.length)
+    imported.ok =
+      imported.recordCount > 0 ||
+      imported.duplicates.length > 0 ||
+      (rows.length === 0 && !parseErrors.length)
     imported.message =
       `导入完成：${imported.recordCount} 条记录，${imported.imageCount} 张图片，` +
-      `跳过 ${imported.skippedCount} 条`
+      `跳过 ${imported.skippedCount} 条` +
+      (imported.duplicates.length
+        ? `，发现 ${imported.duplicates.length} 条已有 _valm_ItemID，待审查覆盖`
+        : '')
     return imported
   })
 
@@ -669,6 +803,10 @@ const registerIpc = (): void => {
     projectManagementService.listProjects(query)
   )
   ipcMain.handle('projects:get', (_event, id: string) => projectManagementService.getProject(id))
+  ipcMain.handle('projects:documents', (_event, id: string) => projectManagementService.listProjectDocuments(id))
+  ipcMain.handle('projects:analysis-logs', (_event, id: string, limit?: number) =>
+    projectManagementService.listAnalysisLogs(id, limit)
+  )
   ipcMain.handle('projects:create', (_event, input: ManagedProjectInput) =>
     projectManagementService.createProject(input)
   )
@@ -700,6 +838,36 @@ const registerIpc = (): void => {
       return { ok: false, message: error instanceof Error ? error.message : String(error) }
     }
   })
+  ipcMain.handle('projects:export-excel', async (_event, id: string) => {
+    try {
+      const snapshot = projectManagementService.exportProjectData(id)
+      if (!snapshot) return { ok: false, message: '项目不存在，无法导出' }
+      const safeName = snapshot.project.projectName.replace(/[<>:"/\\|?*\x00-\x1F]/g, '_').trim() || '项目'
+      const result = await dialog.showSaveDialog(mainWindow!, {
+        title: '导出项目 Excel',
+        defaultPath: `${safeName}-项目数据.xlsx`,
+        filters: [{ name: 'Excel 工作簿', extensions: ['xlsx'] }]
+      })
+      if (result.canceled || !result.filePath) {
+        return { ok: false, canceled: true, message: '已取消导出' }
+      }
+      const workbook = createProjectWorkbook(snapshot)
+      const output = XLSX.write(workbook, {
+        bookType: 'xlsx',
+        type: 'buffer',
+        compression: true
+      })
+      writeFileSync(result.filePath, output)
+      return {
+        ok: true,
+        path: result.filePath,
+        projectId: snapshot.project.id,
+        message: '项目 Excel 已导出'
+      }
+    } catch (error) {
+      return { ok: false, message: error instanceof Error ? error.message : String(error) }
+    }
+  })
   ipcMain.handle('projects:import-data', async () => {
     try {
       const result = await dialog.showOpenDialog(mainWindow!, {
@@ -726,21 +894,42 @@ const registerIpc = (): void => {
     projectManagementService.discardProjectDraft(id)
   )
   ipcMain.handle('projects:confirm', (_event, id: string) => projectManagementService.confirmProject(id))
-  ipcMain.handle('projects:upload-agreement', async (_event, projectId?: string) => {
+  ipcMain.handle('projects:upload-agreement', async (_event, projectId?: string, options?: ProjectAgreementUploadOptions) => {
     const result = await dialog.showOpenDialog(mainWindow!, {
       title: projectId ? '上传技术协议' : '通过技术协议创建项目',
-      properties: ['openFile'],
+      properties: ['openFile', 'multiSelections'],
       filters: [{ name: '技术协议', extensions: ['docx', 'pdf', 'xlsx', 'xls', 'txt'] }]
     })
     if (result.canceled || !result.filePaths[0]) {
       return { ok: false, canceled: true, message: '已取消上传' }
     }
-    return projectManagementService.startTechnicalAgreement(result.filePaths[0], projectId)
+    return projectManagementService.startTechnicalAgreement(result.filePaths, projectId, options)
   })
   ipcMain.handle('projects:retry-analysis', (_event, id: string) => projectManagementService.retryAnalysis(id))
   ipcMain.handle('projects:start-matching', (_event, id: string) => projectManagementService.startMatching(id))
   ipcMain.handle('projects:requirements', (_event, query: ProjectRequirementQuery) =>
     projectManagementService.listRequirements(query)
+  )
+  ipcMain.handle('projects:requirement-set', (_event, projectId: string) =>
+    projectManagementService.getRequirementSet(projectId)
+  )
+  ipcMain.handle('projects:requirement-create', (_event, projectId: string, input: ProjectRequirementInput) =>
+    projectManagementService.createRequirement(projectId, input)
+  )
+  ipcMain.handle('projects:requirement-update', (_event, id: string, input: ProjectRequirementInput) =>
+    projectManagementService.updateRequirement(id, input)
+  )
+  ipcMain.handle('projects:requirement-split', (_event, id: string, input: ProjectRequirementSplitInput) =>
+    projectManagementService.splitRequirement(id, input)
+  )
+  ipcMain.handle('projects:requirement-merge', (_event, input: ProjectRequirementMergeInput) =>
+    projectManagementService.mergeRequirements(input)
+  )
+  ipcMain.handle('projects:requirement-review', (_event, ids: string[], status: ProjectRequirementReviewStatus) =>
+    projectManagementService.reviewRequirements(ids, status)
+  )
+  ipcMain.handle('projects:requirements-publish', (_event, projectId: string) =>
+    projectManagementService.publishRequirements(projectId)
   )
   ipcMain.handle('projects:requirement-delete', (_event, id: string) =>
     projectManagementService.deleteRequirement(id)

@@ -16,8 +16,19 @@ export const diagnoseDashboard = (
   spec: DashboardSpec,
   queryEngine: QueryEngine
 ): DashboardQualityReport => {
+  const componentIds = spec.components
+    .map((component) => component.id)
+    .sort((left, right) => right.length - left.length)
   const issues: DashboardQualityIssue[] = validateDashboardSpec(spec, queryEngine).map(
-    (message) => ({ code: 'spec-validation', severity: 'error', message })
+    (message) => {
+      const componentId = componentIds.find((id) => message.includes(`组件 ${id}`))
+      return {
+        code: 'spec-validation',
+        severity: 'error',
+        message,
+        ...(componentId ? { componentId } : {})
+      }
+    }
   )
   const components: DashboardComponentDiagnostic[] = []
 

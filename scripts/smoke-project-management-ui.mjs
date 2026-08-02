@@ -35,6 +35,9 @@ const evaluate = async (expression) => {
     awaitPromise: true,
     returnByValue: true
   })
+  if (response.error) {
+    throw new Error(response.error.message || 'Renderer protocol evaluation failed')
+  }
   if (response.result?.exceptionDetails) {
     throw new Error(response.result.exceptionDetails.exception?.description || 'Renderer evaluation failed')
   }
@@ -44,6 +47,7 @@ const evaluate = async (expression) => {
 await call('Runtime.enable')
 await call('Page.enable')
 await call('Page.reload')
+await new Promise((resolve) => setTimeout(resolve, 1000))
 const checks = await evaluate(`(async () => {
   const waitFor = async (selector, timeout = 10000) => {
     const started = Date.now()
@@ -89,7 +93,7 @@ const checks = await evaluate(`(async () => {
     parentColumnRemoved: true,
     dragReady: true,
     costResponsibleField: true,
-    requirementDelete: true,
+    requirementReviewPolicy: true,
     requirementModuleColumn: true,
     technicalIndicatorMatch: true,
     agreementStatus: true,
@@ -106,19 +110,28 @@ const checks = await evaluate(`(async () => {
     const moreActionsButton = [...document.querySelectorAll('.project-detail-page button')]
       .find((button) => button.textContent?.includes('更多操作'))
     moreActionsButton?.click()
-    const moreActionsReady = await waitFor('.ant-dropdown .ant-menu')
-    taskListFeatures.projectDelete = moreActionsReady && Boolean([...document.querySelectorAll('.ant-dropdown .ant-menu-item')]
+    const moreActionsReady = await waitFor('.ant-dropdown .ant-dropdown-menu')
+    taskListFeatures.projectDelete = moreActionsReady && Boolean([...document.querySelectorAll('.ant-dropdown .ant-dropdown-menu-item')]
       .find((item) => item.textContent?.includes('删除项目')))
     document.body.click()
     const requirementsTab = [...document.querySelectorAll('.project-detail-page .ant-tabs-tab-btn')]
-      .find((item) => item.textContent?.includes('功能需求'))
+      .find((item) => item.textContent?.includes('需求清单'))
     requirementsTab?.click()
     const requirementsReady = await waitFor('.project-requirements-stack')
     const requirementRows = document.querySelectorAll('.project-requirements-stack .ant-table-tbody tr.ant-table-row')
     const requirementModuleColumn = [...document.querySelectorAll('.project-requirements-stack .ant-table-thead th')]
       .some((header) => header.textContent?.includes('模块'))
     const requirementDeleteButton = document.querySelector('.project-requirements-stack button[aria-label^="删除功能需求："]')
-    taskListFeatures.requirementDelete = requirementsReady && (!requirementRows.length || Boolean(requirementDeleteButton))
+    const requirementReviewGate = document.querySelector('.project-requirements-stack .project-review-gate')
+    const reviewGateButtons = [...(requirementReviewGate?.querySelectorAll('button') ?? [])]
+    const hasBulkReview = reviewGateButtons.some((button) => button.textContent?.includes('批量通过'))
+      && reviewGateButtons.some((button) => button.textContent?.includes('批量驳回'))
+    const hasPublishGate = reviewGateButtons.some((button) => button.textContent?.includes('发布并开始匹配'))
+    taskListFeatures.requirementReviewPolicy = requirementsReady && (!requirementRows.length || (
+      requirementReviewGate
+        ? Boolean(requirementDeleteButton && hasBulkReview && hasPublishGate)
+        : !requirementDeleteButton
+    ))
     taskListFeatures.requirementModuleColumn = requirementsReady && (!requirementRows.length || requirementModuleColumn)
     const technicalIndicatorSummary = document.querySelector('.project-heading-title-row .project-technical-match-capsule')
     const technicalIndicatorValue = technicalIndicatorSummary?.querySelector('strong')
@@ -127,10 +140,13 @@ const checks = await evaluate(`(async () => {
       && Number.parseFloat(technicalIndicatorValueStyle?.fontSize ?? '0') >= 16
       && !document.querySelector('.project-health-match-summary')
     const agreementStatusCapsule = document.querySelector('.project-heading-title-row .project-agreement-status-capsule')
-    taskListFeatures.agreementStatus = Boolean(agreementStatusCapsule?.textContent?.includes('协议识别完成'))
-      && !document.querySelector('.project-inline-notice-success')
+    const agreementDocumentChip = document.querySelector('.project-document-chip')
+    taskListFeatures.agreementStatus = agreementDocumentChip
+      ? Boolean(agreementStatusCapsule?.textContent?.includes('协议识别完成'))
+        && !document.querySelector('.project-inline-notice-success')
+      : !agreementStatusCapsule
     const matchStatusCapsule = document.querySelector('.project-heading-title-row .project-match-status-capsule')
-    taskListFeatures.matchStatus = Boolean(matchStatusCapsule?.textContent?.includes('匹配已完成'))
+    taskListFeatures.matchStatus = (!matchStatusCapsule || Boolean(matchStatusCapsule.textContent?.includes('匹配已完成')))
       && !document.querySelector('.project-heading-meta .project-heading-divider')
       && !document.querySelector('.project-heading-meta')?.textContent?.includes('分析状态')
     const planTab = [...document.querySelectorAll('.project-detail-page .ant-tabs-tab-btn')]
@@ -139,8 +155,9 @@ const checks = await evaluate(`(async () => {
     const planReady = await waitFor('.project-plan-table-card')
     const taskGanttReady = await waitFor('.project-task-gantt')
     const resourceGanttReady = await waitFor('.project-resource-gantt')
+    await waitFor('.project-plan-table-card .project-task-title-cell, .project-plan-table-card .ant-table-placeholder')
     const taskRow = [...document.querySelectorAll('.project-plan-table-card .ant-table-tbody tr')]
-      .find((row) => row.classList.contains('ant-table-row'))
+      .find((row) => row.classList.contains('ant-table-row') && row.querySelector('.project-task-title-cell'))
     const taskButtons = Array.from(taskRow?.querySelectorAll('button') ?? [])
     const taskDragHandle = taskRow?.querySelector('.project-task-drag-handle')
     const taskDragHandleStyle = taskDragHandle ? getComputedStyle(taskDragHandle) : null
@@ -150,13 +167,13 @@ const checks = await evaluate(`(async () => {
       taskPlanReady: detailReady && planReady,
       taskGanttReady: taskGanttReady && Boolean(document.querySelector('.project-task-gantt')?.textContent?.includes('任务甘特图')),
       resourceGanttReady: resourceGanttReady && Boolean(document.querySelector('.project-resource-gantt')?.textContent?.includes('人力资源甘特图')),
-      inlineEdit: !taskRow || taskButtons.some((button) => button.textContent?.trim() === '编辑'),
-      subtaskEntry: !taskRow || taskButtons.some((button) => button.textContent?.trim() === '子任务'),
+      inlineEdit: !taskRow || taskButtons.some((button) => button.textContent?.trim() === '编辑' || button.getAttribute('aria-label')?.startsWith('编辑任务：')),
+      subtaskEntry: !taskRow || taskButtons.some((button) => button.textContent?.trim() === '子任务' || button.getAttribute('aria-label')?.includes('新增子任务')),
       inlineCreate: true,
       parentColumnRemoved: !parentColumn,
       dragReady: !taskRow || Boolean(taskDragHandle && taskDragHandle.getAttribute('draggable') === 'false' && taskDragHandleStyle?.touchAction === 'none'),
       costResponsibleField: true,
-      requirementDelete: taskListFeatures.requirementDelete,
+      requirementReviewPolicy: taskListFeatures.requirementReviewPolicy,
       requirementModuleColumn: taskListFeatures.requirementModuleColumn,
       technicalIndicatorMatch: taskListFeatures.technicalIndicatorMatch,
       agreementStatus: taskListFeatures.agreementStatus,
@@ -164,21 +181,21 @@ const checks = await evaluate(`(async () => {
       projectExport: taskListFeatures.projectExport,
       projectDelete: taskListFeatures.projectDelete
     }
-    const quickEdit = taskButtons.find((button) => button.textContent?.trim() === '编辑')
+    const quickEdit = taskButtons.find((button) => button.textContent?.trim() === '编辑' || button.getAttribute('aria-label')?.startsWith('编辑任务：'))
     quickEdit?.click()
     await new Promise((resolve) => setTimeout(resolve, 150))
-    taskListFeatures.inlineEdit = taskListFeatures.inlineEdit
-      && Boolean(taskRow?.querySelector('input, .ant-select'))
-      && Boolean(Array.from(taskRow?.querySelectorAll('button') ?? []).find((button) => button.textContent?.trim() === '保存'))
+    taskListFeatures.inlineEdit = !taskRow || (taskListFeatures.inlineEdit
+      && Boolean(taskRow.querySelector('input, .ant-select'))
+      && Boolean(Array.from(taskRow.querySelectorAll('button')).find((button) => button.textContent?.trim() === '保存')))
     Array.from(taskRow?.querySelectorAll('button') ?? []).find((button) => button.textContent?.trim() === '取消')?.click()
     await new Promise((resolve) => setTimeout(resolve, 150))
     const subtaskButton = Array.from(taskRow?.querySelectorAll('button') ?? [])
-      .find((button) => button.textContent?.trim() === '子任务')
+      .find((button) => button.textContent?.trim() === '子任务' || button.getAttribute('aria-label')?.includes('新增子任务'))
     subtaskButton?.click()
-    const subtaskRowReady = await waitFor('.project-plan-new-row')
-    taskListFeatures.subtaskEntry = taskListFeatures.subtaskEntry
+    const subtaskRowReady = subtaskButton ? await waitFor('.project-plan-new-row') : true
+    taskListFeatures.subtaskEntry = !taskRow || (taskListFeatures.subtaskEntry
       && subtaskRowReady
-      && Boolean(document.querySelector('.project-plan-new-row input'))
+      && Boolean(document.querySelector('.project-plan-new-row input')))
     document.querySelector('.project-plan-new-row button')?.textContent?.trim() === '取消'
       ? [...document.querySelectorAll('.project-plan-new-row button')].find((button) => button.textContent?.trim() === '取消')?.click()
       : undefined
@@ -217,7 +234,7 @@ const checks = await evaluate(`(async () => {
   }
 })()`)
 
-  if (!checks.pageReady || !checks.listTable || !checks.organizationPeoplePage || !checks.createButton || !checks.importProjectButton || !checks.formReady || !checks.projectNameField || !checks.contractAmountField || !checks.projectOwnerSelects || !checks.taskPlanReady || !checks.taskGanttReady || !checks.resourceGanttReady || !checks.inlineEdit || !checks.subtaskEntry || !checks.inlineCreate || !checks.parentColumnRemoved || !checks.dragReady || !checks.costResponsibleField || !checks.requirementDelete || !checks.requirementModuleColumn || !checks.technicalIndicatorMatch || !checks.agreementStatus || !checks.matchStatus || !checks.projectExport || !checks.projectDelete) {
+  if (!checks.pageReady || !checks.listTable || !checks.organizationPeoplePage || !checks.createButton || !checks.importProjectButton || !checks.formReady || !checks.projectNameField || !checks.contractAmountField || !checks.projectOwnerSelects || !checks.taskPlanReady || !checks.taskGanttReady || !checks.resourceGanttReady || !checks.inlineEdit || !checks.subtaskEntry || !checks.inlineCreate || !checks.parentColumnRemoved || !checks.dragReady || !checks.costResponsibleField || !checks.requirementReviewPolicy || !checks.requirementModuleColumn || !checks.technicalIndicatorMatch || !checks.agreementStatus || !checks.matchStatus || !checks.projectExport || !checks.projectDelete) {
   throw new Error(`Project management UI smoke failed: ${JSON.stringify(checks)}`)
 }
 

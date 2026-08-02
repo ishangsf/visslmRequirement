@@ -86,6 +86,9 @@ import type {
   ChatMessage,
   ChatSessionSummary,
   CollectionRequestLogRow,
+  DataReviewApplyResult,
+  DataReviewItem,
+  DataReviewSource,
   DashboardStats,
   FeatureNavigationOrder,
   FeatureModuleKey,
@@ -108,6 +111,7 @@ import type {
   SyncFieldFilter,
   SyncPreviewResult,
   SyncProgress,
+  SyncResult,
   SyncScopeConfig
 } from '../../shared/types'
 
@@ -120,6 +124,9 @@ type FeatureDropTarget = {
   key: FeatureModuleKey
   position: FeatureDropPosition
 }
+
+const artifactVersionOf = (events: AgentEvent[] | undefined): number | undefined =>
+  events?.find((event): event is Extract<AgentEvent, { type: 'artifact' }> => event.type === 'artifact')?.version
 
 const appTableScrollY = 'min(560px, max(260px, calc(100vh - 300px)))'
 const compactTableScrollY = 'min(360px, max(180px, calc(100vh - 420px)))'
@@ -305,48 +312,115 @@ const renderPushStatus = (record: Pick<
   return <Tag>未推送</Tag>
 }
 
+function readDashboardToken(name: string, fallback: string): string {
+  if (typeof document === 'undefined') return fallback
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback
+}
+
 function DashboardPage({ refreshKey }: { refreshKey: number }): React.JSX.Element {
   const [stats, setStats] = useState<DashboardStats | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  const loadStats = useCallback(async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      setStats(await window.visslm.getStats())
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : String(loadError))
+    } finally {
+      setLoading(false)
+    }
+  }, [])
 
   useEffect(() => {
-    void window.visslm.getStats().then(setStats)
-  }, [refreshKey])
+    void loadStats()
+  }, [loadStats, refreshKey])
 
-  if (!stats) return <Spin />
+  if (!stats && loading) {
+    return (
+      <div className="overview-state overview-loading" role="status">
+        <Spin size="small" />
+        <Text>正在加载数据概览</Text>
+      </div>
+    )
+  }
+
+  if (!stats) {
+    return (
+      <div className="overview-state">
+        <Alert
+          type="error"
+          showIcon
+          message="数据概览加载失败"
+          description={error || '暂时无法读取本地统计数据'}
+          action={<Button onClick={() => void loadStats()}>重试</Button>}
+        />
+      </div>
+    )
+  }
+
   const typeTotal = stats.byType.reduce((sum, item) => sum + item.value, 0)
   const releaseTotal = stats.byRelease.reduce((sum, item) => sum + item.value, 0)
-  const releaseColors = ['#8578ff', '#35c7ff', '#34d399', '#f59e0b', '#f472b6', '#8d96a8']
+  const pushRate = stats.collectedCount
+    ? Math.round((stats.pushedCount / stats.collectedCount) * 100)
+    : 0
+  const typeRows = stats.byType.slice(0, 8)
+  const releaseRows = stats.byRelease.slice(0, 6)
+  const releaseChartRows = stats.byRelease.slice(0, 6)
+  const releaseChartTotal = releaseChartRows.reduce((sum, item) => sum + item.value, 0)
+  if (releaseTotal > releaseChartTotal) {
+    releaseChartRows.push({ name: '其他', value: releaseTotal - releaseChartTotal })
+  }
+  const releaseColors = [
+    readDashboardToken('--accent', '#7c6cff'),
+    readDashboardToken('--state-info', '#60b9ff'),
+    readDashboardToken('--state-success', '#49d597'),
+    readDashboardToken('--state-warning', '#f2b45c'),
+    readDashboardToken('--state-error', '#ef6b73'),
+    readDashboardToken('--text-muted', '#929bad')
+  ]
+  const releaseChartColors = [
+    ...releaseColors,
+    readDashboardToken('--surface-elevated', '#1b202b')
+  ]
+  const chartSurface = readDashboardToken('--surface-raised', '#131720')
+  const chartOverlay = readDashboardToken('--surface-overlay', '#171b24')
+  const chartStroke = readDashboardToken('--stroke-strong', 'rgba(255, 255, 255, 0.13)')
+  const chartText = readDashboardToken('--text-main', '#eef1f7')
+  const chartMuted = readDashboardToken('--text-muted', '#929bad')
   const releaseOption = {
     animationDuration: 350,
-    color: releaseColors,
+    color: releaseChartColors,
     tooltip: {
       trigger: 'item',
       renderMode: 'html',
       appendToBody: false,
       confine: true,
       transitionDuration: 0,
-      backgroundColor: '#181c26',
-      borderColor: '#343a4a',
-      textStyle: { color: '#e8ecf4' },
+      backgroundColor: chartOverlay,
+      borderColor: chartStroke,
+      textStyle: { color: chartText },
       formatter: '{b}<br/><strong>{c}</strong> 条（{d}%）'
     },
     title: {
       text: String(releaseTotal),
-      subtext: '条数据',
+      subtext: '条记录',
       left: 'center',
       top: '36%',
-      textStyle: { color: '#f4f6fb', fontSize: 25, fontWeight: 650 },
-      subtextStyle: { color: '#778196', fontSize: 11, lineHeight: 18 }
+      textStyle: { color: chartText, fontSize: 25, fontWeight: 650 },
+      subtextStyle: { color: chartMuted, fontSize: 11, lineHeight: 18 }
     },
     series: [
       {
-        name: '_valm_Release',
+        name: '_valm_Release_text',
         type: 'pie',
         radius: ['62%', '82%'],
         center: ['50%', '50%'],
         avoidLabelOverlap: true,
         itemStyle: {
-          borderColor: '#151821',
+          borderColor: chartSurface,
           borderWidth: 3,
           borderRadius: 5
         },
@@ -356,113 +430,433 @@ function DashboardPage({ refreshKey }: { refreshKey: number }): React.JSX.Elemen
           scaleSize: 5,
           label: { show: false }
         },
-        data: stats.byRelease
+        data: releaseChartRows
       }
     ]
   }
+  const metrics = [
+    {
+      key: 'projects',
+      label: '采集项目',
+      value: stats.projectCount,
+      detail: '资产中心采集项目',
+      icon: <ProjectOutlined />,
+      tone: 'accent'
+    },
+    {
+      key: 'records',
+      label: '已采集数据',
+      value: stats.collectedCount,
+      detail: '本地 records 记录',
+      icon: <DatabaseOutlined />,
+      tone: 'info'
+    },
+    {
+      key: 'pushed',
+      label: '已推送数据',
+      value: stats.pushedCount,
+      detail: `成功推送率 ${pushRate}%`,
+      icon: <SendOutlined />,
+      tone: 'success'
+    },
+    {
+      key: 'images',
+      label: '图片资产',
+      value: stats.imageCount,
+      detail: '已提取 Base64 图片',
+      icon: <PictureOutlined />,
+      tone: 'warning'
+    }
+  ]
+  const moduleStats = [
+    {
+      key: 'project-management',
+      title: '项目管理',
+      subtitle: '项目、需求审核与关联资产',
+      icon: <ProjectOutlined />,
+      tone: 'accent',
+      badge: `${stats.projectManagement.projectCount} 个项目`,
+      meta: stats.projectManagement.processingProjectCount
+        ? `${stats.projectManagement.processingProjectCount} 个处理中`
+        : `${stats.projectManagement.activeProjectCount} 个已启用`,
+      items: [
+        { label: '已启用项目', value: stats.projectManagement.activeProjectCount },
+        { label: '需求条目', value: stats.projectManagement.requirementCount },
+        { label: '待审核需求', value: stats.projectManagement.pendingReviewCount },
+        { label: '关联资产', value: stats.projectManagement.linkedAssetCount }
+      ]
+    },
+    {
+      key: 'asset-center',
+      title: '资产中心',
+      subtitle: '本地记录、项目归属与媒体资源',
+      icon: <DatabaseOutlined />,
+      tone: 'info',
+      badge: `${stats.assetCenter.recordCount} 条记录`,
+      meta: `${stats.assetCenter.typeCount} 种对象类型`,
+      items: [
+        { label: '数据记录', value: stats.assetCenter.recordCount },
+        { label: '采集项目', value: stats.assetCenter.projectCount },
+        { label: '对象类型', value: stats.assetCenter.typeCount },
+        { label: '图片资产', value: stats.assetCenter.imageCount }
+      ]
+    }
+  ]
 
   return (
-    <div className="page-stack">
-      <Row gutter={[14, 14]} className="dashboard-metrics">
-        {[
-          { title: '项目', count: stats.projectCount, icon: <DatabaseOutlined />, tone: 'violet' },
-          { title: '已采集数据', count: stats.collectedCount, icon: <BarChartOutlined />, tone: 'blue' },
-          { title: '已推送数据', count: stats.pushedCount, icon: <SendOutlined />, tone: 'cyan' },
-          { title: 'Base64 图片', count: stats.imageCount, icon: <CloudDownloadOutlined />, tone: 'amber' }
-        ].map(({ title, count, icon, tone }) => (
-          <Col xs={24} sm={12} xl={6} key={title}>
-            <Card className={`metric-card metric-card-${tone}`}>
-              <div className="metric-content">
-                <div className="metric-icon">{icon}</div>
-                <Statistic title={title} value={count} />
-              </div>
-            </Card>
-          </Col>
+    <div className="page-stack overview-dashboard">
+      <div className="overview-metric-grid" aria-label="数据总量">
+        {metrics.map((metric) => (
+          <Card
+            className={`overview-metric-card overview-metric-card-${metric.tone}`}
+            key={metric.key}
+            role="group"
+            aria-label={`${metric.label} ${metric.value}`}
+          >
+            <div className="overview-metric-heading">
+              <span className="overview-metric-icon" aria-hidden="true">
+                {metric.icon}
+              </span>
+              <span className="overview-metric-label">{metric.label}</span>
+            </div>
+            <Statistic value={metric.value} />
+            <span className="overview-metric-detail">{metric.detail}</span>
+          </Card>
         ))}
-      </Row>
-      <Card className="dashboard-insights-card">
-        <div className="dashboard-insights-heading">
-          <div>
-            <Title level={4}>数据构成</Title>
-            <Text type="secondary">快速了解本地知识数据的类型与发布状态</Text>
+      </div>
+
+      <Card className="overview-analytics-card">
+        <div className="overview-analytics-heading">
+          <div className="overview-analytics-title">
+            <span className="overview-section-kicker">
+              <BarChartOutlined />
+              数据构成
+            </span>
+            <Title level={4}>本地数据分布</Title>
+            <Text type="secondary">按对象类型与发布状态查看已采集记录的结构</Text>
           </div>
-          <Tag>{stats.collectedCount} 条记录</Tag>
+          <div className="overview-analytics-actions">
+            <div className="overview-summary-strip" aria-label="数据摘要">
+              <span>{stats.byType.length} 种对象类型</span>
+              <span>{stats.byRelease.length} 个发布状态</span>
+              <span>{pushRate}% 推送率</span>
+            </div>
+            <Button
+              type="text"
+              className="overview-refresh-button"
+              icon={<ReloadOutlined />}
+              loading={loading}
+              onClick={() => void loadStats()}
+              aria-label="刷新数据概览"
+              title="刷新数据概览"
+            />
+          </div>
         </div>
-        <div className="dashboard-insights-grid">
-          <section className="dashboard-insight-section type-insight">
-            <div className="insight-section-heading">
+
+        <div className="overview-analysis-grid">
+          <section className="overview-analysis-section overview-type-section">
+            <div className="overview-section-heading">
               <div>
-                <Text strong>对象类型</Text>
-                <Text type="secondary">按已采集数据类型统计</Text>
+                <strong>对象类型</strong>
+                <Text type="secondary">按本地已采集记录统计</Text>
               </div>
               <span>{stats.byType.length} 种</span>
             </div>
-            {stats.byType.length ? (
-              <div className="type-composition-list">
-                {stats.byType.slice(0, 8).map((item, index) => {
+            {typeRows.length ? (
+              <div className="overview-type-list" role="list" aria-label="对象类型分布">
+                {typeRows.map((item, index) => {
                   const percent = typeTotal ? Math.round((item.value / typeTotal) * 100) : 0
                   return (
-                    <div className="type-composition-item" key={item.name}>
-                      <div className="composition-meta">
-                        <span className={`composition-dot dot-${index % 4}`} />
-                        <Text ellipsis>{item.name}</Text>
+                    <div
+                      className="overview-type-item"
+                      key={item.name}
+                      role="listitem"
+                      title={`${item.name}：${item.value} 条，占比 ${percent}%`}
+                      aria-label={`${item.name} ${item.value} 条，占比 ${percent}%`}
+                    >
+                      <div className="overview-type-meta">
+                        <span className={`overview-type-dot overview-type-dot-${index % 4}`} aria-hidden="true" />
+                        <span className="overview-type-name">{item.name}</span>
                         <strong>{item.value}</strong>
-                        <small>{percent}%</small>
                       </div>
-                      <div className="composition-track">
+                      <div className="overview-type-track" aria-hidden="true">
                         <span style={{ width: `${Math.max(percent, 3)}%` }} />
                       </div>
                     </div>
                   )
                 })}
+                {stats.byType.length > typeRows.length ? (
+                  <span className="overview-list-note">其余 {stats.byType.length - typeRows.length} 种类型未展开</span>
+                ) : null}
               </div>
             ) : (
               <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="采集数据后显示统计" />
             )}
           </section>
-          <section className="dashboard-insight-section release-insight">
-            <div className="insight-section-heading">
+
+          <section className="overview-analysis-section overview-release-section">
+            <div className="overview-section-heading">
               <div>
-                <Text strong>发布状态</Text>
-                <Text type="secondary">字段 _valm_Release</Text>
+                <strong>发布状态</strong>
+                <Text type="secondary">显示字段 _valm_Release_text</Text>
               </div>
               <span>{stats.byRelease.length} 项</span>
             </div>
-            {stats.byRelease.length ? (
-              <div className="release-insight-content">
+            {releaseRows.length ? (
+              <div className="overview-release-layout">
                 <ReactECharts
-                  className="release-donut"
+                  className="overview-release-chart"
                   option={releaseOption}
                   notMerge
                   lazyUpdate
                   opts={{ renderer: 'svg' }}
                 />
-                <div className="release-status-list">
-                  {stats.byRelease.slice(0, 6).map((item, index) => (
-                    <div className="release-status-row" key={item.name}>
-                      <span
-                        className="release-status-dot"
-                        style={{ backgroundColor: releaseColors[index % releaseColors.length] }}
-                      />
-                      <Text ellipsis>{item.name}</Text>
-                      <strong>{item.value}</strong>
-                      <small>
-                        {releaseTotal ? Math.round((item.value / releaseTotal) * 100) : 0}%
-                      </small>
-                    </div>
-                  ))}
+                <div className="overview-release-list" role="list" aria-label="发布状态分布">
+                  {releaseRows.map((item, index) => {
+                    const percent = releaseTotal ? Math.round((item.value / releaseTotal) * 100) : 0
+                    return (
+                      <div
+                        className="overview-release-row"
+                        key={item.name}
+                        role="listitem"
+                        title={`${item.name}：${item.value} 条，占比 ${percent}%`}
+                      >
+                        <span
+                          className="overview-release-dot"
+                          style={{ backgroundColor: releaseColors[index % releaseColors.length] }}
+                          aria-hidden="true"
+                        />
+                        <span className="overview-release-name">{item.name}</span>
+                        <strong>{item.value}</strong>
+                        <small>{percent}%</small>
+                      </div>
+                    )
+                  })}
+                  {stats.byRelease.length > releaseRows.length ? (
+                    <span className="overview-list-note">其余 {stats.byRelease.length - releaseRows.length} 项状态未展开</span>
+                  ) : null}
                 </div>
               </div>
             ) : (
-              <Empty
-                image={Empty.PRESENTED_IMAGE_SIMPLE}
-                description="采集 _valm_Release 后显示统计"
-              />
+              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="采集发布显示字段后显示统计" />
             )}
           </section>
         </div>
+
+        <div className="overview-module-grid" aria-label="业务模块统计">
+          {moduleStats.map((module) => (
+            <section className={`overview-module-section overview-module-${module.tone}`} key={module.key}>
+              <div className="overview-module-heading">
+                <div className="overview-module-title">
+                  <span className="overview-module-icon" aria-hidden="true">
+                    {module.icon}
+                  </span>
+                  <div className="overview-module-copy">
+                    <strong>{module.title}</strong>
+                    <Text type="secondary">{module.subtitle}</Text>
+                  </div>
+                </div>
+                <div className="overview-module-summary">
+                  <strong>{module.badge}</strong>
+                  <span>{module.meta}</span>
+                </div>
+              </div>
+              <div className="overview-module-stat-grid" role="list" aria-label={`${module.title}统计`}>
+                {module.items.map((item) => (
+                  <div className="overview-module-stat" key={item.label} role="listitem">
+                    <span>{item.label}</span>
+                    <strong>{item.value}</strong>
+                  </div>
+                ))}
+              </div>
+            </section>
+          ))}
+        </div>
       </Card>
     </div>
+  )
+}
+
+function DataReviewModal({
+  source,
+  batchId,
+  items,
+  onClose,
+  onApplied
+}: {
+  source: DataReviewSource
+  batchId: string
+  items: DataReviewItem[]
+  onClose: () => void
+  onApplied: (result: DataReviewApplyResult) => void
+}): React.JSX.Element {
+  const { message, modal } = AntApp.useApp()
+  const [visibleItems, setVisibleItems] = useState(items)
+  const [selectedRowKeys, setSelectedRowKeys] = useState<string[]>([])
+  const [applying, setApplying] = useState(false)
+  const sourceLabel = source === 'sync' ? '数据采集' : '数据导入'
+
+  useEffect(() => {
+    setVisibleItems(items)
+    setSelectedRowKeys([])
+  }, [batchId, items])
+
+  const apply = async (reviewIds: string[]): Promise<void> => {
+    if (!reviewIds.length) {
+      message.warning('请先选择需要覆盖的数据')
+      return
+    }
+    setApplying(true)
+    try {
+      const result = await window.visslm.applyDataReview({ source, batchId, reviewIds })
+      onApplied(result)
+      if (result.resolvedReviewIds.length) {
+        setVisibleItems((current) => current.filter((item) => !result.resolvedReviewIds.includes(item.id)))
+        setSelectedRowKeys((current) => current.filter((id) => !result.resolvedReviewIds.includes(id)))
+      }
+      if (result.errors.length) {
+        message.warning(result.message)
+      } else {
+        message.success(result.message)
+      }
+      if (result.resolvedReviewIds.length === visibleItems.length && !result.errors.length) {
+        onClose()
+      }
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : String(error))
+    } finally {
+      setApplying(false)
+    }
+  }
+
+  const confirmApply = (reviewIds: string[], all: boolean): void => {
+    if (!reviewIds.length) {
+      message.warning('请先选择需要覆盖的数据')
+      return
+    }
+    modal.confirm({
+      title: all ? `确认覆盖全部 ${reviewIds.length} 条数据？` : `确认覆盖选中的 ${reviewIds.length} 条数据？`,
+      content: '覆盖后本地记录内容、文本和图片将以待审查数据为准。',
+      okText: '确认覆盖',
+      okType: 'danger',
+      cancelText: '暂不覆盖',
+      onOk: () => apply(reviewIds)
+    })
+  }
+
+  return (
+    <Modal
+      className="data-review-modal"
+      open
+      width="min(1120px, calc(100vw - 32px))"
+      title={`${sourceLabel} · 已有数据审查`}
+      onCancel={onClose}
+      maskClosable={false}
+      footer={(
+        <Space wrap>
+          <Button onClick={onClose}>暂不覆盖</Button>
+          <Button
+            danger
+            loading={applying}
+            disabled={!selectedRowKeys.length}
+            onClick={() => confirmApply(selectedRowKeys, false)}
+          >
+            覆盖选中（{selectedRowKeys.length}）
+          </Button>
+          <Button
+            type="primary"
+            danger
+            loading={applying}
+            disabled={!visibleItems.length}
+            onClick={() => confirmApply(visibleItems.map((item) => item.id), true)}
+          >
+            覆盖全部（{visibleItems.length}）
+          </Button>
+        </Space>
+      )}
+    >
+      <Alert
+        showIcon
+        type="warning"
+        title={`检测到 ${visibleItems.length} 条数据的 _valm_ItemID 已存在，本次默认已过滤。`}
+        description="请核对已有记录和待采集/导入记录后，再决定是否覆盖更新。"
+        className="data-review-alert"
+      />
+      <ResizableTable<DataReviewItem>
+        tableKey={`data-review-${source}`}
+        rowKey="id"
+        dataSource={visibleItems}
+        rowSelection={{
+          selectedRowKeys,
+          onChange: (keys) => setSelectedRowKeys(keys.map(String))
+        }}
+        pagination={{ pageSize: 20, showSizeChanger: true, showTotal: (count) => `共 ${count} 条` }}
+        scroll={{ x: 1080, y: 'min(440px, max(220px, calc(100vh - 390px)))' }}
+        locale={{ emptyText: '暂无待审查数据' }}
+        columns={[
+          {
+            title: '_valm_ItemID',
+            dataIndex: 'itemId',
+            width: 180,
+            ellipsis: true
+          },
+          {
+            title: '已有记录',
+            key: 'existingName',
+            width: 220,
+            ellipsis: true,
+            render: (_value, item) => <span title={item.existing.name}>{item.existing.name || '—'}</span>
+          },
+          {
+            title: '待更新记录',
+            key: 'incomingName',
+            width: 220,
+            ellipsis: true,
+            render: (_value, item) => <span title={item.incoming.name}>{item.incoming.name || '—'}</span>
+          },
+          {
+            title: '已有类型',
+            key: 'existingNodeType',
+            width: 130,
+            ellipsis: true,
+            render: (_value, item) => item.existing.nodeType || '—'
+          },
+          {
+            title: '待更新类型',
+            key: 'incomingNodeType',
+            width: 130,
+            ellipsis: true,
+            render: (_value, item) => item.incoming.nodeType || '—'
+          },
+          {
+            title: '已有 UID',
+            key: 'existingUid',
+            width: 150,
+            ellipsis: true,
+            render: (_value, item) => <span title={item.existing.uid}>{item.existing.uid || '—'}</span>
+          },
+          {
+            title: '待更新 UID',
+            key: 'incomingUid',
+            width: 150,
+            ellipsis: true,
+            render: (_value, item) => <span title={item.incoming.uid}>{item.incoming.uid || '—'}</span>
+          },
+          {
+            title: '已有修改时间',
+            key: 'existingLastModifyTime',
+            width: 170,
+            render: (_value, item) => formatDate(item.existing.lastModifyTime)
+          },
+          {
+            title: '待更新修改时间',
+            key: 'incomingLastModifyTime',
+            width: 170,
+            render: (_value, item) => formatDate(item.incoming.lastModifyTime)
+          }
+        ]}
+      />
+    </Modal>
   )
 }
 
@@ -491,6 +885,7 @@ function DataPage({
   const [importing, setImporting] = useState(false)
   const [exporting, setExporting] = useState(false)
   const [deleting, setDeleting] = useState(false)
+  const [review, setReview] = useState<{ batchId: string; items: DataReviewItem[] } | null>(null)
 
   const load = useCallback(async (): Promise<void> => {
     setLoading(true)
@@ -545,6 +940,9 @@ function DataPage({
             </pre>
           )
         })
+      }
+      if (result.reviewBatchId && result.duplicates.length) {
+        setReview({ batchId: result.reviewBatchId, items: result.duplicates })
       }
       setSelectedRowKeys([])
       onDataChanged()
@@ -819,6 +1217,23 @@ function DataPage({
           </div>
         )}
       </Drawer>
+      {review && (
+        <DataReviewModal
+          source="import"
+          batchId={review.batchId}
+          items={review.items}
+          onClose={() => setReview(null)}
+          onApplied={(result) => {
+            if (result.updatedCount > 0) onDataChanged()
+            setReview((current) => {
+              if (!current) return current
+              const resolved = new Set(result.resolvedReviewIds)
+              const items = current.items.filter((item) => !resolved.has(item.id))
+              return items.length ? { ...current, items } : null
+            })
+          }}
+        />
+      )}
     </div>
   )
 }
@@ -1145,6 +1560,7 @@ function ChatPage({
   onOpenDashboard,
   onDashboardUpdate,
   activeArtifact,
+  activeArtifactVersion,
   dataScope,
   dataScopeSummary,
   onClearDataScope
@@ -1155,9 +1571,10 @@ function ChatPage({
   setQuestion: React.Dispatch<React.SetStateAction<string>>
   loading: boolean
   setLoading: React.Dispatch<React.SetStateAction<boolean>>
-  onOpenDashboard: (dashboard: DashboardSpec) => void
-  onDashboardUpdate: (dashboard: DashboardSpec) => void
+  onOpenDashboard: (dashboard: DashboardSpec, version?: number) => void
+  onDashboardUpdate: (dashboard: DashboardSpec, version?: number) => void
   activeArtifact: DashboardSpec | null
+  activeArtifactVersion?: number
   dataScope: DataScope | null
   dataScopeSummary: string
   onClearDataScope: () => void
@@ -1296,10 +1713,12 @@ function ChatPage({
       setAgentProgress([])
       onClearDataScope()
       closeDataView()
-      const latestDashboard = [...session.messages]
+      const latestDashboardMessage = [...session.messages]
         .reverse()
-        .find((item) => item.dashboard)?.dashboard
-      if (latestDashboard) onDashboardUpdate(latestDashboard)
+        .find((item) => item.dashboard)
+      if (latestDashboardMessage?.dashboard) {
+        onDashboardUpdate(latestDashboardMessage.dashboard, latestDashboardMessage.dashboardVersion)
+      }
       message.success(`已加载历史会话：${session.title}`)
     } catch (error) {
       message.error(`历史会话加载失败：${error instanceof Error ? error.message : String(error)}`)
@@ -1402,6 +1821,13 @@ function ChatPage({
     setAgentProgress([])
     setLoading(true)
     try {
+      const contextMessages = messages
+        .filter((message) => message.contextOutcome !== 'failed' && message.contextOutcome !== 'undone')
+        .map(({ role, content, contextOutcome }) => ({
+          role,
+          content,
+          ...(contextOutcome ? { outcome: contextOutcome } : {})
+        }))
       const response = await window.visslm.askAgent({
         question: text,
         conversationId: conversationId.current,
@@ -1411,18 +1837,25 @@ function ChatPage({
           ? {
               activeArtifact: {
                 artifactId: activeArtifact.id,
+                ...(activeArtifactVersion === undefined ? {} : { version: activeArtifactVersion }),
                 dashboard: activeArtifact
               }
             }
           : {}),
-        history: messages.slice(-8).map(({ role, content }) => ({ role, content }))
+        history: activeArtifact ? contextMessages : contextMessages.slice(-8)
       })
-      if (response.events?.some((event) => event.type === 'error' && event.recoverable)) {
+      const responseError = response.events?.find((event) => event.type === 'error')
+      if (responseError?.recoverable) {
         setQuestion(text)
       }
-      if (response.dashboard) onDashboardUpdate(response.dashboard)
+      if (activeArtifact && (responseError || !response.dashboard)) {
+        throw new Error(responseError?.message ?? response.answer)
+      }
+      const dashboardVersion = artifactVersionOf(response.events)
+      if (response.dashboard) onDashboardUpdate(response.dashboard, dashboardVersion)
       const completedMessages: ChatMessage[] = [
-        ...next,
+        ...messages,
+        { ...userMessage, contextOutcome: responseError ? 'failed' : 'success' },
         {
           id: crypto.randomUUID(),
           role: 'assistant',
@@ -1430,26 +1863,30 @@ function ChatPage({
           sources: response.sources,
           dataViews: response.dataViews,
           dashboard: response.dashboard,
+          dashboardVersion,
           expertId: response.expertId,
-          createdAt: new Date().toISOString()
+          createdAt: new Date().toISOString(),
+          contextOutcome: responseError ? 'failed' : 'success'
         }
       ]
       setMessages(completedMessages)
       void persistSession(completedMessages)
     } catch (error) {
       const rawMessage = error instanceof Error ? error.message : String(error)
-      const userMessage = rawMessage.replace(
+      const errorMessage = rawMessage.replace(
         /^Error invoking remote method '[^']+':\s*(?:Error:\s*)?/,
         ''
       )
       setQuestion(text)
       const failedMessages: ChatMessage[] = [
-        ...next,
+        ...messages,
+        { ...userMessage, contextOutcome: 'failed' },
         {
           id: crypto.randomUUID(),
           role: 'assistant',
-          content: `请求失败：${userMessage}`,
-          createdAt: new Date().toISOString()
+          content: `请求失败：${errorMessage}`,
+          createdAt: new Date().toISOString(),
+          contextOutcome: 'failed'
         }
       ]
       setMessages(failedMessages)
@@ -1644,7 +2081,7 @@ function ChatPage({
                         <Button
                           type="primary"
                           icon={<FundProjectionScreenOutlined />}
-                          onClick={() => onOpenDashboard(message.dashboard!)}
+                          onClick={() => onOpenDashboard(message.dashboard!, message.dashboardVersion)}
                         >
                           打开可视化大屏
                         </Button>
@@ -2056,11 +2493,13 @@ function ChatPage({
 function SyncPage({
   progress,
   syncing,
-  onSync
+  onSync,
+  onDataChanged
 }: {
   progress: SyncProgress | null
   syncing: boolean
-  onSync: (config: SyncScopeConfig) => void
+  onSync: (config: SyncScopeConfig) => Promise<SyncResult | null>
+  onDataChanged: () => void
 }): React.JSX.Element {
   const { message } = AntApp.useApp()
   const [config, setConfig] = useState<SyncScopeConfig>({ selectedTypes: [], rules: [] })
@@ -2075,6 +2514,7 @@ function SyncPage({
   const [requestLogs, setRequestLogs] = useState<CollectionRequestLogRow[]>([])
   const [requestLogTotal, setRequestLogTotal] = useState(0)
   const [requestLogsLoading, setRequestLogsLoading] = useState(false)
+  const [review, setReview] = useState<{ batchId: string; items: DataReviewItem[] } | null>(null)
 
   const configSignature = useMemo(() => JSON.stringify(config), [config])
   const isConfigSaved = Boolean(savedSignature) && savedSignature === configSignature
@@ -2291,7 +2731,10 @@ function SyncPage({
     try {
       await window.visslm.saveSyncConfig(config)
       setSavedSignature(configSignature)
-      onSync(config)
+      const result = await onSync(config)
+      if (result?.reviewBatchId && result.duplicates.length) {
+        setReview({ batchId: result.reviewBatchId, items: result.duplicates })
+      }
     } catch (error) {
       message.error(error instanceof Error ? error.message : String(error))
     }
@@ -2395,7 +2838,7 @@ function SyncPage({
             size="small"
             pagination={false}
             dataSource={filters}
-            locale={{ emptyText: '尚未添加过滤条件，将采集该类型的全部数据' }}
+            locale={{ emptyText: '尚未添加业务过滤条件，将按 _valm_ItemID 强制规则采集有效数据' }}
             scroll={{ x: 760, y: compactTableScrollY }}
             columns={[
               {
@@ -2557,6 +3000,12 @@ function SyncPage({
             ) : (
               <Empty description="尚未配置数据类型，请先手动新增" />
             )}
+            <Alert
+              showIcon
+              type="info"
+              title="_valm_ItemID 强制校验"
+              description="系统只采集 _valm_ItemID 非空的数据；本地已存在的编号会自动过滤，并在采集完成后进入审查清单。"
+            />
             <Text type="secondary">
               {isConfigSaved
                 ? '采集范围已保存，可以测试预览或开始采集。'
@@ -2580,11 +3029,14 @@ function SyncPage({
           extra={<Text type="secondary">仅预览，不写入本地知识库</Text>}
         >
           <Row gutter={[16, 16]} className="preview-metrics">
-            <Col xs={24} sm={12}>
+            <Col xs={24} sm={8}>
               <Statistic title="检查记录" value={preview.scannedCount} />
             </Col>
-            <Col xs={24} sm={12}>
+            <Col xs={24} sm={8}>
               <Statistic title="匹配记录" value={preview.matchedCount} />
+            </Col>
+            <Col xs={24} sm={8}>
+              <Statistic title="缺少 _valm_ItemID" value={preview.invalidItemIdCount} />
             </Col>
           </Row>
           <div className="preview-type-summary">
@@ -2793,6 +3245,23 @@ function SyncPage({
         title="安全说明"
         description="数据采集只读访问 VISSLM，不会修改平台数据。图片会转换为 Base64 并按内容哈希去重；平台当前使用 HTTP，正式环境建议启用 HTTPS。"
       />}
+      {review && (
+        <DataReviewModal
+          source="sync"
+          batchId={review.batchId}
+          items={review.items}
+          onClose={() => setReview(null)}
+          onApplied={(result) => {
+            if (result.updatedCount > 0) onDataChanged()
+            setReview((current) => {
+              if (!current) return current
+              const resolved = new Set(result.resolvedReviewIds)
+              const items = current.items.filter((item) => !resolved.has(item.id))
+              return items.length ? { ...current, items } : null
+            })
+          }}
+        />
+      )}
     </div>
   )
 }
@@ -3417,6 +3886,7 @@ function SettingsPage({
       platformForm.setFieldsValue({
         baseUrl: settings.platform.baseUrl,
         username: settings.platform.username,
+        userPropertyKeys: settings.platform.userPropertyKeys,
         token: ''
       })
     }
@@ -3640,6 +4110,19 @@ function SettingsPage({
                     </Form.Item>
                     <Form.Item label="用户名" name="username" rules={[{ required: true, message: '请输入用户名' }]}>
                       <Input autoComplete="off" />
+                    </Form.Item>
+                    <Form.Item
+                      label="用户属性 Key"
+                      name="userPropertyKeys"
+                      extra="仅对这些字段的非空值查询用户显示名；相同登录名只查询一次。"
+                    >
+                      <Select
+                        mode="tags"
+                        allowClear
+                        tokenSeparators={[',', '，', ';', '；', '\n']}
+                        maxTagCount="responsive"
+                        placeholder="例如：_valm_AssignedTo"
+                      />
                     </Form.Item>
                     <Form.Item
                       label="API Token"
@@ -3904,8 +4387,14 @@ function AppShell(): React.JSX.Element {
   const [chatQuestion, setChatQuestion] = useState('')
   const [chatLoading, setChatLoading] = useState(false)
   const [generatedDashboard, setGeneratedDashboard] = useState<DashboardSpec | null>(null)
+  const [generatedDashboardVersion, setGeneratedDashboardVersion] = useState<number | undefined>(undefined)
   const [chatDataScope, setChatDataScope] = useState<DataScope | null>(null)
   const [chatDataScopeSummary, setChatDataScopeSummary] = useState('')
+
+  const updateGeneratedDashboard = useCallback((dashboard: DashboardSpec, version?: number): void => {
+    setGeneratedDashboard(dashboard)
+    setGeneratedDashboardVersion(version)
+  }, [])
 
   useEffect(() => {
     void window.visslm.getSettings().then(setSettings)
@@ -3938,19 +4427,21 @@ function AppShell(): React.JSX.Element {
     setPage(visibleNavigationItems[0]?.key ?? 'settings')
   }, [enabledFeatures, page, visibleNavigationItems])
 
-  const startSync = async (config?: SyncScopeConfig): Promise<void> => {
+  const startSync = async (config?: SyncScopeConfig): Promise<SyncResult | null> => {
     setSyncing(true)
     setProgress({ phase: 'start', message: '准备采集', current: 0, total: 0 })
     try {
       const result = await window.visslm.startSync(config)
       if (result.ok) {
-        message.success(`采集完成，共 ${result.recordCount} 条记录`)
+        message.success(result.message)
         setRefreshKey((key) => key + 1)
       } else {
         message.error(result.message)
       }
+      return result
     } catch (error) {
       message.error(error instanceof Error ? error.message : String(error))
+      return null
     } finally {
       setSyncing(false)
     }
@@ -3973,12 +4464,13 @@ function AppShell(): React.JSX.Element {
       return (
         <DashboardStudio
           generatedDashboard={generatedDashboard}
-          onDashboardChange={setGeneratedDashboard}
+          generatedDashboardVersion={generatedDashboardVersion}
+          onDashboardChange={updateGeneratedDashboard}
         />
       )
     }
     if (page === 'projects') {
-      return <ProjectManagementPage refreshKey={refreshKey} onChanged={() => setRefreshKey((key) => key + 1)} />
+      return <ProjectManagementPage refreshKey={refreshKey} modelSettings={settings?.model ?? null} onChanged={() => setRefreshKey((key) => key + 1)} />
     }
     if (page === 'data') {
       return (
@@ -4011,15 +4503,16 @@ function AppShell(): React.JSX.Element {
           loading={chatLoading}
           setLoading={setChatLoading}
           activeArtifact={generatedDashboard}
-          onDashboardUpdate={setGeneratedDashboard}
+          activeArtifactVersion={generatedDashboardVersion}
+          onDashboardUpdate={updateGeneratedDashboard}
           dataScope={chatDataScope}
           dataScopeSummary={chatDataScopeSummary}
           onClearDataScope={() => {
             setChatDataScope(null)
             setChatDataScopeSummary('')
           }}
-          onOpenDashboard={(dashboard) => {
-            setGeneratedDashboard(dashboard)
+          onOpenDashboard={(dashboard, version) => {
+            updateGeneratedDashboard(dashboard, version)
             setPage('visualization')
           }}
         />
@@ -4030,7 +4523,8 @@ function AppShell(): React.JSX.Element {
         <SyncPage
           progress={progress}
           syncing={syncing}
-          onSync={(config) => void startSync(config)}
+          onSync={startSync}
+          onDataChanged={() => setRefreshKey((key) => key + 1)}
         />
       )
     }
@@ -4050,11 +4544,13 @@ function AppShell(): React.JSX.Element {
     chatDataScope,
     chatDataScopeSummary,
     generatedDashboard,
+    generatedDashboardVersion,
     page,
     progress,
     refreshKey,
     settings,
-    syncing
+    syncing,
+    updateGeneratedDashboard
   ])
 
   return (

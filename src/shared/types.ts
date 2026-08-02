@@ -1,6 +1,8 @@
 import type {
+  DashboardAiChangeSummary,
   DashboardExportResult,
   DashboardAuditLog,
+  DashboardComponentRepairResult,
   DashboardQualityReport,
   DashboardSaveInput,
   DashboardSpec,
@@ -25,22 +27,30 @@ import type {
   OrganizationPersonListQuery,
   OrganizationPersonPage,
   ManagedProjectPage,
+  ProjectAnalysisLogEntry,
   ProjectAnalysisProgress,
   ProjectAnalysisStartResult,
   ProjectAsset,
   ProjectCostEntry,
   ProjectCostEntryInput,
   ProjectDataTransferResult,
+  ProjectDocumentSnapshot,
   ProjectParticipant,
   ProjectParticipantInput,
   ProjectPlanTask,
   ProjectPlanTaskInput,
   ProjectPlanTaskMoveInput,
   ProjectRequirement,
+  ProjectRequirementInput,
+  ProjectRequirementMergeInput,
   ProjectRequirementMatchPage,
   ProjectRequirementMatchQuery,
   ProjectRequirementPage,
   ProjectRequirementQuery,
+  ProjectRequirementReviewStatus,
+  ProjectRequirementSetSummary,
+  ProjectRequirementSplitInput,
+  ProjectAgreementUploadOptions,
   ProjectRequirementStatus
 } from './project-types'
 
@@ -48,12 +58,14 @@ export interface PlatformSettings {
   baseUrl: string
   username: string
   hasToken: boolean
+  userPropertyKeys: string[]
 }
 
 export interface PlatformSettingsInput {
   baseUrl: string
   username: string
   token?: string
+  userPropertyKeys?: string[]
 }
 
 export type ModelSource = 'local' | 'online'
@@ -189,6 +201,42 @@ export interface DataImportResult {
   skippedCount: number
   errors: string[]
   message: string
+  reviewBatchId?: string
+  duplicates: DataReviewItem[]
+}
+
+export type DataReviewSource = 'sync' | 'import'
+
+export interface DataReviewSummary {
+  uid: string
+  projectId: string
+  nodeType: string
+  name: string
+  lastModifyTime: string
+}
+
+export interface DataReviewItem {
+  id: string
+  source: DataReviewSource
+  itemId: string
+  existing: DataReviewSummary
+  incoming: DataReviewSummary
+}
+
+export interface DataReviewApplyInput {
+  source: DataReviewSource
+  batchId: string
+  reviewIds?: string[]
+}
+
+export interface DataReviewApplyResult {
+  ok: boolean
+  source: DataReviewSource
+  updatedCount: number
+  imageCount: number
+  resolvedReviewIds: string[]
+  errors: string[]
+  message: string
 }
 
 export interface DataExportResult {
@@ -289,6 +337,22 @@ export interface CollectionRequestLogPage {
   total: number
 }
 
+export interface DashboardProjectManagementStats {
+  projectCount: number
+  activeProjectCount: number
+  processingProjectCount: number
+  requirementCount: number
+  pendingReviewCount: number
+  linkedAssetCount: number
+}
+
+export interface DashboardAssetCenterStats {
+  recordCount: number
+  projectCount: number
+  typeCount: number
+  imageCount: number
+}
+
 export interface DashboardStats {
   projectCount: number
   recordCount: number
@@ -298,6 +362,8 @@ export interface DashboardStats {
   byType: Array<{ name: string; value: number }>
   byProject: Array<{ name: string; value: number }>
   byRelease: Array<{ name: string; value: number }>
+  projectManagement: DashboardProjectManagementStats
+  assetCenter: DashboardAssetCenterStats
 }
 
 export interface SyncRun {
@@ -323,6 +389,10 @@ export interface SyncResult {
   projectCount: number
   recordCount: number
   imageCount: number
+  skippedCount: number
+  invalidItemIdCount: number
+  reviewBatchId?: string
+  duplicates: DataReviewItem[]
   message: string
 }
 
@@ -368,6 +438,7 @@ export interface SyncPreviewRecord {
 export interface SyncPreviewResult {
   scannedCount: number
   matchedCount: number
+  invalidItemIdCount: number
   byType: Array<{ name: string; value: number }>
   samples: SyncPreviewRecord[]
   requests: SyncPreviewRequest[]
@@ -390,7 +461,15 @@ export interface ChatMessage {
   sources?: ChatSource[]
   dataViews?: ChatDataView[]
   dashboard?: DashboardSpec
+  dashboardVersion?: number
   expertId?: ExpertId
+  contextOutcome?: 'success' | 'failed' | 'undone'
+}
+
+export interface ChatHistoryTurn {
+  role: 'user' | 'assistant'
+  content: string
+  outcome?: 'success' | 'failed' | 'undone'
 }
 
 export interface ChatSessionSummary {
@@ -497,6 +576,7 @@ export interface KnowledgeUploadResult {
   ok: boolean
   canceled?: boolean
   acceptedCount: number
+  reusedCount?: number
   skippedCount: number
   failedCount: number
   documents: KnowledgeDocument[]
@@ -565,12 +645,13 @@ export interface ChatRequest {
   expertId?: ExpertId
   entrypoint?: 'chat' | 'dashboard'
   dataScope?: DataScope
+  focusComponentId?: string
   activeArtifact?: {
     artifactId: string
     version?: number
     dashboard: DashboardSpec
   }
-  history?: Array<{ role: 'user' | 'assistant'; content: string }>
+  history?: ChatHistoryTurn[]
 }
 
 export interface ChatResponse {
@@ -579,6 +660,7 @@ export interface ChatResponse {
   dataViews: ChatDataView[]
   expertId?: ExpertId
   dashboard?: DashboardSpec
+  dashboardChange?: DashboardAiChangeSummary
   events?: AgentEvent[]
 }
 
@@ -604,6 +686,7 @@ export interface AppApi {
   saveSyncConfig(config: SyncScopeConfig): Promise<void>
   previewSync(config?: SyncScopeConfig): Promise<SyncPreviewResult>
   startSync(config?: SyncScopeConfig): Promise<SyncResult>
+  applyDataReview(input: DataReviewApplyInput): Promise<DataReviewApplyResult>
   listCollectionRequestLogs(page?: number, pageSize?: number): Promise<CollectionRequestLogPage>
   askAgent(request: ChatRequest): Promise<ChatResponse>
   listChatSessions(limit?: number): Promise<ChatSessionSummary[]>
@@ -627,6 +710,10 @@ export interface AppApi {
   exportDashboardPdf(spec: DashboardSpec, version?: number): Promise<DashboardExportResult>
   exportDashboardPng(spec: DashboardSpec, dataUrl: string, version?: number): Promise<DashboardExportResult>
   diagnoseDashboard(spec: DashboardSpec): Promise<DashboardQualityReport>
+  repairDashboardComponent(
+    spec: DashboardSpec,
+    componentId: string
+  ): Promise<DashboardComponentRepairResult>
   listVisualizationRuns(limit?: number): Promise<VisualizationRun[]>
   listDashboardAuditLogs(dashboardId?: string, limit?: number): Promise<DashboardAuditLog[]>
   importData(): Promise<DataImportResult>
@@ -648,17 +735,27 @@ export interface AppApi {
   onKnowledgeProgress(callback: (progress: KnowledgeIndexProgress) => void): () => void
   listManagedProjects(query: ManagedProjectListQuery): Promise<ManagedProjectPage>
   getManagedProject(id: string): Promise<ManagedProject | null>
+  listManagedProjectDocuments(id: string): Promise<ProjectDocumentSnapshot[]>
   createManagedProject(input: ManagedProjectInput): Promise<ManagedProject>
   updateManagedProject(id: string, input: ManagedProjectInput): Promise<ManagedProject | null>
   deleteManagedProject(id: string): Promise<{ ok: boolean; message: string }>
   exportManagedProjectData(id: string): Promise<ProjectDataTransferResult>
+  exportManagedProjectExcel(id: string): Promise<ProjectDataTransferResult>
   importManagedProjectData(): Promise<ProjectDataTransferResult>
   discardManagedProjectDraft(id: string): Promise<{ ok: boolean; message: string }>
-  startProjectTechnicalAgreementUpload(projectId?: string): Promise<ProjectAnalysisStartResult>
+  startProjectTechnicalAgreementUpload(projectId?: string, options?: ProjectAgreementUploadOptions): Promise<ProjectAnalysisStartResult>
+  listProjectAnalysisLogs(projectId: string, limit?: number): Promise<ProjectAnalysisLogEntry[]>
   confirmManagedProject(id: string): Promise<ManagedProject | null>
   retryProjectAnalysis(id: string): Promise<ProjectAnalysisStartResult>
   startProjectMatching(id: string): Promise<ProjectAnalysisStartResult>
   listProjectRequirements(query: ProjectRequirementQuery): Promise<ProjectRequirementPage>
+  getProjectRequirementSet(projectId: string): Promise<ProjectRequirementSetSummary | null>
+  createProjectRequirement(projectId: string, input: ProjectRequirementInput): Promise<ProjectRequirement>
+  updateProjectRequirement(id: string, input: ProjectRequirementInput): Promise<ProjectRequirement | null>
+  splitProjectRequirement(id: string, input: ProjectRequirementSplitInput): Promise<ProjectRequirement[]>
+  mergeProjectRequirements(input: ProjectRequirementMergeInput): Promise<ProjectRequirement | null>
+  reviewProjectRequirements(ids: string[], status: ProjectRequirementReviewStatus): Promise<{ ok: boolean; message: string }>
+  publishProjectRequirements(projectId: string): Promise<ProjectAnalysisStartResult>
   deleteProjectRequirement(id: string): Promise<{ ok: boolean; message: string }>
   updateProjectRequirementStatus(id: string, status: ProjectRequirementStatus): Promise<ProjectRequirement | null>
   updateProjectRequirementKeyInfoTerms(id: string, terms: string[]): Promise<ProjectRequirement | null>

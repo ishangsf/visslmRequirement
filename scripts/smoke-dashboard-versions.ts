@@ -37,9 +37,19 @@ try {
 
   const version2 = db.saveDashboard({
     spec: { ...version1.spec, title: '研发质量周报', theme: 'minimal-light' },
-    changeSummary: '修改标题与主题'
+    changeSummary: '修改标题与主题',
+    baseVersion: 1
   })
   assert.equal(version2.version, 2)
+  assert.throws(
+    () => db.saveDashboard({
+      spec: { ...version1.spec, title: '陈旧窗口修改' },
+      changeSummary: '不应保存',
+      baseVersion: 1
+    }),
+    /大屏版本冲突：当前已是 V2/
+  )
+  assert.equal(db.getDashboard(spec.id)?.version, 2)
   const diff = compareDashboardSpecs(version1, version2)
   assert.deepEqual(diff.changedFields.sort(), ['theme', 'title'])
   assert.deepEqual(diff.updatedComponents, [])

@@ -4,6 +4,7 @@ import type { AnalyticsRecord, AppDatabase } from '../src/main/database'
 import { VisualizationAgent } from '../src/main/experts/visualization-agent'
 import { ExpertRouter } from '../src/main/experts/router'
 import type { AgentEvent } from '../src/shared/expert-types'
+import type { VisualizationRunInput } from '../src/shared/dashboard'
 
 const records: AnalyticsRecord[] = [{
   uid: '1',
@@ -53,6 +54,7 @@ const generated = {
 
 const originalFetch = globalThis.fetch
 const progress: Array<Extract<AgentEvent, { type: 'status' }>> = []
+const runs: VisualizationRunInput[] = []
 globalThis.fetch = async () => new Response(JSON.stringify({
   message: { content: JSON.stringify(generated) }
 }), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -67,7 +69,7 @@ try {
       model: 'test-model',
       thinking: false
     },
-    undefined,
+    (run) => runs.push(run),
     (event) => progress.push(event)
   )
   const dashboard = await agent.generate('生成测试大屏', { projectIds: ['p1'] })
@@ -83,11 +85,25 @@ try {
     'validate',
     'persist'
   ])
+  assert.equal(runs.length, 1)
+  assert.equal(runs[0].mode, 'generate')
+  assert.equal(runs[0].status, 'success')
+  assert.deepEqual(
+    [...new Set(runs[0].toolCalls.map((call) => call.tool))],
+    ['profile-fields', 'model-compose', 'validate-dashboard', 'execute-query']
+  )
+  assert.equal(runs[0].toolCalls.filter((call) => call.tool === 'execute-query').length, 4)
+  assert.ok(runs[0].toolCalls.every((call, index) => call.sequence === index + 1))
   const route = new ExpertRouter().route({ question: '@通用数据助手 汇总当前数据' })
   assert.equal(route.expert.id, 'general')
   assert.equal(route.reason, 'explicit-mention')
   assert.equal(route.question, '汇总当前数据')
-  console.log(JSON.stringify({ ok: true, stages, generalRoute: route.reason }, null, 2))
+  console.log(JSON.stringify({
+    ok: true,
+    stages,
+    toolCalls: runs[0].toolCalls.map((call) => call.tool),
+    generalRoute: route.reason
+  }, null, 2))
 } finally {
   globalThis.fetch = originalFetch
 }

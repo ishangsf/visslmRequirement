@@ -9,6 +9,10 @@ export type DashboardComponentType =
   | 'table'
   | 'progress'
   | 'insight'
+  | 'gauge'
+  | 'funnel'
+  | 'radar'
+  | 'scatter'
 
 export type DashboardThemeId =
   | 'technology-dark'
@@ -54,6 +58,21 @@ export interface DashboardComponentSpec {
   unit?: string
   accent?: string
   insight?: string
+  style?: DashboardComponentStyle
+}
+
+export interface DashboardComponentStyle {
+  titleFontSize?: number
+  subtitleFontSize?: number
+  valueFontSize?: number
+  bodyFontSize?: number
+  borderRadius?: number
+  padding?: number
+  showLegend?: boolean
+  showGrid?: boolean
+  lineWidth?: number
+  orientation?: 'horizontal' | 'vertical'
+  donut?: boolean
 }
 
 export interface DashboardSpec {
@@ -102,9 +121,25 @@ export interface DashboardVersionDiff {
   queryChanges: string[]
 }
 
+export type DashboardSpecDiff = Omit<DashboardVersionDiff, 'fromVersion' | 'toVersion'>
+
+export interface DashboardAiChangeSummary extends DashboardSpecDiff {
+  queryExecutionCount: number
+  attemptCount: number
+  durationMs: number
+}
+
+export type DashboardAiEditMode = 'full' | 'presentation-only'
+
+export const dashboardAiEditMode = (spec: DashboardSpec): DashboardAiEditMode =>
+  spec.components.every((component) => Boolean(component.query && component.encoding?.value))
+    ? 'full'
+    : 'presentation-only'
+
 export interface DashboardSaveInput {
   spec: DashboardSpec
   changeSummary: string
+  baseVersion?: number
 }
 
 export interface DashboardExportResult {
@@ -118,6 +153,7 @@ export type DashboardAuditAction =
   | 'save'
   | 'restore'
   | 'diagnose'
+  | 'repair-component'
   | 'export-json'
   | 'export-pdf'
   | 'export-png'
@@ -171,17 +207,44 @@ export interface DashboardQualityReport {
   components: DashboardComponentDiagnostic[]
 }
 
+export interface DashboardComponentRepairResult {
+  spec: DashboardSpec
+  componentId: string
+  actions: string[]
+  report: DashboardQualityReport
+}
+
 export interface VisualizationRunInput {
   dashboardId?: string
   requestSummary: string
   modelName: string
   promptVersion: string
+  mode: 'generate' | 'patch'
   status: 'success' | 'failed'
   attemptCount: number
   componentCount: number
   queryCount: number
   durationMs: number
+  toolCalls: VisualizationToolCall[]
   errorMessage?: string
+}
+
+export type VisualizationToolName =
+  | 'profile-fields'
+  | 'model-compose'
+  | 'validate-dashboard'
+  | 'execute-query'
+  | 'apply-patch'
+  | 'repair-attempt'
+
+export interface VisualizationToolCall {
+  sequence: number
+  tool: VisualizationToolName
+  status: 'success' | 'failed'
+  attempt: number
+  durationMs: number
+  componentId?: string
+  metadata?: Record<string, number | boolean>
 }
 
 export interface VisualizationRun extends VisualizationRunInput {
@@ -198,10 +261,10 @@ export interface DashboardComponentDefinition {
   supportedDataShapes: Array<'single-value' | 'category-value' | 'time-series' | 'table'>
 }
 
-export const compareDashboardSpecs = (
-  from: DashboardVersion,
-  to: DashboardVersion
-): DashboardVersionDiff => {
+export const compareDashboardSpecValues = (
+  from: DashboardSpec,
+  to: DashboardSpec
+): DashboardSpecDiff => {
   const changedFields: string[] = []
   const comparableFields: Array<keyof DashboardSpec> = [
     'title',
@@ -211,16 +274,16 @@ export const compareDashboardSpecs = (
     'globalFilters'
   ]
   for (const field of comparableFields) {
-    if (JSON.stringify(from.spec[field]) !== JSON.stringify(to.spec[field])) {
+    if (JSON.stringify(from[field]) !== JSON.stringify(to[field])) {
       changedFields.push(field)
     }
   }
-  if (JSON.stringify(from.spec.viewport) !== JSON.stringify(to.spec.viewport)) {
+  if (JSON.stringify(from.viewport) !== JSON.stringify(to.viewport)) {
     changedFields.push('viewport')
   }
 
-  const fromMap = new Map(from.spec.components.map((component) => [component.id, component]))
-  const toMap = new Map(to.spec.components.map((component) => [component.id, component]))
+  const fromMap = new Map(from.components.map((component) => [component.id, component]))
+  const toMap = new Map(to.components.map((component) => [component.id, component]))
   const addedComponents = [...toMap.keys()].filter((id) => !fromMap.has(id))
   const removedComponents = [...fromMap.keys()].filter((id) => !toMap.has(id))
   const updatedComponents: string[] = []
@@ -236,8 +299,6 @@ export const compareDashboardSpecs = (
     }
   }
   return {
-    fromVersion: from.version,
-    toVersion: to.version,
     changedFields,
     addedComponents,
     removedComponents,
@@ -245,3 +306,12 @@ export const compareDashboardSpecs = (
     queryChanges
   }
 }
+
+export const compareDashboardSpecs = (
+  from: DashboardVersion,
+  to: DashboardVersion
+): DashboardVersionDiff => ({
+  fromVersion: from.version,
+  toVersion: to.version,
+  ...compareDashboardSpecValues(from.spec, to.spec)
+})

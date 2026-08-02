@@ -10,6 +10,7 @@ import {
   HistoryOutlined,
   InfoCircleOutlined,
   MinusCircleOutlined,
+  MessageOutlined,
   PlusOutlined,
   ReloadOutlined,
   RobotOutlined,
@@ -32,16 +33,23 @@ import {
   InputNumber,
   List,
   Modal,
+  Popconfirm,
   Segmented,
   Select,
   Skeleton,
   Space,
+  Switch,
   Tag,
   Tooltip,
   Typography
 } from 'antd'
 import { toPng } from 'html-to-image'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type {
+  CSSProperties,
+  KeyboardEvent as ReactKeyboardEvent,
+  PointerEvent as ReactPointerEvent
+} from 'react'
 import type {
   DashboardComponentSpec,
   DashboardComponentType,
@@ -71,6 +79,7 @@ import type {
   QuerySpec
 } from '../../../shared/query-spec'
 import {
+  dashboardLayoutProfiles,
   validateDashboardLayout
 } from '../../../shared/dashboard-layout'
 import {
@@ -78,7 +87,12 @@ import {
   analyzeDashboardExport
 } from '../../../shared/dashboard-governance'
 import { dashboardComponentRegistry } from './componentRegistry'
+import {
+  dashboardComponentDataShape,
+  planDashboardComponentTypeChange
+} from './componentTypeAdapter'
 import { DashboardGrid } from './DashboardGrid'
+import { DashboardAiDrawer } from './DashboardAiDrawer'
 import {
   dashboardDraftStorageKey,
   parseDashboardDraft,
@@ -96,7 +110,46 @@ const componentTypeIcons: Record<DashboardComponentType, string> = {
   ranking: '05',
   progress: '06',
   table: '07',
-  insight: 'AI'
+  insight: 'AI',
+  gauge: '08',
+  funnel: '09',
+  radar: '10',
+  scatter: '11'
+}
+
+const repairableQualityIssueCodes = new Set(['spec-validation', 'query-error'])
+
+const visualizationToolLabels: Record<VisualizationRun['toolCalls'][number]['tool'], string> = {
+  'profile-fields': '字段画像',
+  'model-compose': '模型编排',
+  'validate-dashboard': '结构校验',
+  'execute-query': '执行查询',
+  'apply-patch': '应用修改',
+  'repair-attempt': '自动修复'
+}
+
+const visualizationToolMetadataLabels: Record<string, string> = {
+  fieldCount: '字段',
+  errorCount: '错误',
+  componentCount: '组件',
+  resultRows: '返回',
+  scannedRows: '扫描',
+  matchedRows: '命中',
+  truncated: '截断',
+  operationCount: '操作',
+  nextAttempt: '下一轮',
+  validationIssueCount: '问题'
+}
+
+const formatComponentRepairError = (error: unknown): string => {
+  const raw = error instanceof Error ? error.message : String(error)
+  const detail = raw
+    .replace(/^Error invoking remote method '[^']+':\s*/i, '')
+    .replace(/^Error:\s*/i, '')
+  if (detail.includes('修复后整屏校验失败')) {
+    return '修复后的整屏校验仍有其他未解决问题，请先处理其余错误组件后重试。'
+  }
+  return detail.length > 240 ? `${detail.slice(0, 240)}…` : detail
 }
 
 const aggregationOptions: Array<{ label: string; value: QueryAggregation }> = [
@@ -221,12 +274,48 @@ const queryDataPoints = (
 const nextFrame = (): Promise<void> =>
   new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
 
+const dashboardInspectorWidthStorageKey = 'visslm:dashboard-inspector-width:v1'
+const dashboardInspectorDefaultWidth = 200
+const dashboardInspectorMinimumWidth = 200
+const dashboardInspectorMaximumWidth = 420
+
+const clampDashboardInspectorWidth = (value: number): number =>
+  Math.min(
+    dashboardInspectorMaximumWidth,
+    Math.max(dashboardInspectorMinimumWidth, Math.round(value))
+  )
+
+const readDashboardInspectorWidth = (): number => {
+  if (typeof window === 'undefined') return dashboardInspectorDefaultWidth
+  try {
+    const stored = Number(window.localStorage.getItem(dashboardInspectorWidthStorageKey))
+    return Number.isFinite(stored) && stored > 0
+      ? clampDashboardInspectorWidth(stored)
+      : dashboardInspectorDefaultWidth
+  } catch {
+    return dashboardInspectorDefaultWidth
+  }
+}
+
+const persistDashboardInspectorWidth = (width: number): void => {
+  try {
+    window.localStorage.setItem(
+      dashboardInspectorWidthStorageKey,
+      String(clampDashboardInspectorWidth(width))
+    )
+  } catch {
+    // The inspector remains resizable when local storage is unavailable.
+  }
+}
+
 export function DashboardStudio({
   generatedDashboard,
+  generatedDashboardVersion,
   onDashboardChange
 }: {
   generatedDashboard?: DashboardSpec | null
-  onDashboardChange?: (dashboard: DashboardSpec) => void
+  generatedDashboardVersion?: number
+  onDashboardChange?: (dashboard: DashboardSpec, version?: number) => void
 }): React.JSX.Element {
   const { message } = App.useApp()
   const [stats, setStats] = useState<DashboardStats | null>(null)
@@ -248,18 +337,96 @@ export function DashboardStudio({
   const [qualityReport, setQualityReport] = useState<DashboardQualityReport | null>(null)
   const [visualizationRuns, setVisualizationRuns] = useState<VisualizationRun[]>([])
   const [diagnosing, setDiagnosing] = useState(false)
+  const [repairingComponentId, setRepairingComponentId] = useState<string | null>(null)
+  const [repairError, setRepairError] = useState('')
   const [previewOpen, setPreviewOpen] = useState(false)
   const [saving, setSaving] = useState(false)
+  const [restoringVersion, setRestoringVersion] = useState<number | null>(null)
   const [exporting, setExporting] = useState(false)
   const [printMode, setPrintMode] = useState(false)
   const [captureMode, setCaptureMode] = useState(false)
+  const [aiOpen, setAiOpen] = useState(false)
+  const [aiArtifactVersion, setAiArtifactVersion] = useState<number | undefined>(generatedDashboardVersion)
   const [fieldProfiles, setFieldProfiles] = useState<FieldProfile[]>([])
   const [queryLoading, setQueryLoading] = useState(false)
   const generatedIdRef = useRef<string | null>(null)
   const sampleDashboardRef = useRef(false)
   const publishedDashboardSignatureRef = useRef<string | null>(null)
   const canvasRef = useRef<HTMLDivElement>(null)
+  const studioBodyRef = useRef<HTMLDivElement>(null)
+  const inspectorResizeCleanupRef = useRef<(() => void) | null>(null)
+  const [inspectorWidth, setInspectorWidth] = useState(readDashboardInspectorWidth)
+  const inspectorWidthRef = useRef(inspectorWidth)
   const [interactionError, setInteractionError] = useState('')
+
+  useEffect(() => () => {
+    inspectorResizeCleanupRef.current?.()
+  }, [])
+
+  const applyInspectorWidth = (value: number, commit: boolean): void => {
+    const nextWidth = clampDashboardInspectorWidth(value)
+    inspectorWidthRef.current = nextWidth
+    studioBodyRef.current?.style.setProperty('--dashboard-inspector-width', `${nextWidth}px`)
+    if (!commit) return
+    setInspectorWidth(nextWidth)
+    persistDashboardInspectorWidth(nextWidth)
+  }
+
+  const beginInspectorResize = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    event.preventDefault()
+    event.stopPropagation()
+    inspectorResizeCleanupRef.current?.()
+
+    const startX = event.clientX
+    const startWidth = inspectorWidthRef.current
+    const pointerId = event.pointerId
+    const previousCursor = document.body.style.cursor
+    const previousUserSelect = document.body.style.userSelect
+    document.body.style.cursor = 'col-resize'
+    document.body.style.userSelect = 'none'
+    studioBodyRef.current?.classList.add('is-inspector-resizing')
+
+    const widthAt = (clientX: number): number =>
+      clampDashboardInspectorWidth(startWidth + startX - clientX)
+    const handlePointerMove = (moveEvent: PointerEvent): void => {
+      if (moveEvent.pointerId !== pointerId) return
+      applyInspectorWidth(widthAt(moveEvent.clientX), false)
+    }
+    const handlePointerUp = (upEvent: PointerEvent): void => {
+      if (upEvent.pointerId !== pointerId) return
+      applyInspectorWidth(widthAt(upEvent.clientX), true)
+      inspectorResizeCleanupRef.current?.()
+    }
+    const handlePointerCancel = (cancelEvent: PointerEvent): void => {
+      if (cancelEvent.pointerId !== pointerId) return
+      applyInspectorWidth(inspectorWidthRef.current, true)
+      inspectorResizeCleanupRef.current?.()
+    }
+    const cleanup = (): void => {
+      window.removeEventListener('pointermove', handlePointerMove)
+      window.removeEventListener('pointerup', handlePointerUp)
+      window.removeEventListener('pointercancel', handlePointerCancel)
+      document.body.style.cursor = previousCursor
+      document.body.style.userSelect = previousUserSelect
+      studioBodyRef.current?.classList.remove('is-inspector-resizing')
+      inspectorResizeCleanupRef.current = null
+    }
+
+    inspectorResizeCleanupRef.current = cleanup
+    window.addEventListener('pointermove', handlePointerMove)
+    window.addEventListener('pointerup', handlePointerUp)
+    window.addEventListener('pointercancel', handlePointerCancel)
+  }
+
+  const adjustInspectorWidthByKeyboard = (
+    event: ReactKeyboardEvent<HTMLDivElement>
+  ): void => {
+    const delta = event.key === 'ArrowLeft' ? 12 : event.key === 'ArrowRight' ? -12 : 0
+    if (!delta) return
+    event.preventDefault()
+    event.stopPropagation()
+    applyInspectorWidth(inspectorWidthRef.current + delta, true)
+  }
 
   const restoreDraft = (spec: DashboardSpec): DashboardSpec => {
     const draft = parseDashboardDraft(
@@ -292,7 +459,8 @@ export function DashboardStudio({
     setSelectedId(nextDashboard.components[0]?.id ?? null)
     setHistory([])
     setCurrentVersion(0)
-  }, [generatedDashboard])
+    setAiArtifactVersion(generatedDashboardVersion)
+  }, [generatedDashboard, generatedDashboardVersion])
 
   useEffect(() => {
     if (!dashboard && stats) {
@@ -308,8 +476,8 @@ export function DashboardStudio({
     const signature = JSON.stringify(dashboard)
     if (publishedDashboardSignatureRef.current === signature) return
     publishedDashboardSignatureRef.current = signature
-    onDashboardChange?.(dashboard)
-  }, [dashboard, onDashboardChange])
+    onDashboardChange?.(dashboard, aiArtifactVersion)
+  }, [aiArtifactVersion, dashboard, onDashboardChange])
 
   useEffect(() => {
     if (!dashboard) return
@@ -328,10 +496,42 @@ export function DashboardStudio({
     () => dashboard?.components.find((component) => component.id === selectedId) ?? null,
     [dashboard, selectedId]
   )
-  const selectedQueryScopeKey = JSON.stringify(selectedComponent?.query?.scope ?? null)
+
+  const applyAgentDashboard = (nextDashboard: DashboardSpec, version?: number): void => {
+    if (dashboard) setHistory((items) => [...items.slice(-29), cloneSpec(dashboard)])
+    setDashboard(nextDashboard)
+    setAiArtifactVersion(version ?? aiArtifactVersion)
+    setSelectedId((current) => nextDashboard.components.some((component) => component.id === current)
+      ? current
+      : nextDashboard.components[0]?.id ?? null)
+  }
+
+  const undoAgentDashboard = (
+    previous: DashboardSpec,
+    applied: DashboardSpec,
+    previousVersion?: number
+  ): boolean => {
+    if (!dashboard || JSON.stringify(dashboard) !== JSON.stringify(applied)) return false
+    const restored = cloneSpec(previous)
+    setDashboard(restored)
+    setAiArtifactVersion(previousVersion)
+    setHistory((items) => {
+      const latest = items.at(-1)
+      return latest && JSON.stringify(latest) === JSON.stringify(previous)
+        ? items.slice(0, -1)
+        : items
+    })
+    setSelectedId((current) => restored.components.some((component) => component.id === current)
+      ? current
+      : restored.components[0]?.id ?? null)
+    return true
+  }
+  const fieldProfileScope = selectedComponent?.query?.scope
+    ?? dashboard?.components.find((component) => component.query)?.query?.scope
+  const fieldProfileScopeKey = JSON.stringify(fieldProfileScope ?? null)
 
   useEffect(() => {
-    const scope = selectedComponent?.query?.scope
+    const scope = fieldProfileScope
     if (!scope) {
       setFieldProfiles([])
       return
@@ -347,7 +547,7 @@ export function DashboardStudio({
     return () => {
       canceled = true
     }
-  }, [selectedQueryScopeKey])
+  }, [fieldProfileScopeKey])
   const exportReview = useMemo(
     () => dashboard ? analyzeDashboardExport(dashboard) : null,
     [dashboard]
@@ -480,6 +680,85 @@ export function DashboardStudio({
     mutateDashboard((draft) => {
       const index = draft.components.findIndex((component) => component.id === selectedId)
       if (index >= 0) draft.components[index] = { ...draft.components[index], ...patch }
+    })
+  }
+
+  const changeComponentType = async (type: DashboardComponentType): Promise<void> => {
+    if (!dashboard || !selectedComponent || queryLoading || selectedComponent.type === type) return
+    const componentId = selectedComponent.id
+    const plan = planDashboardComponentTypeChange(
+      dashboard.components,
+      componentId,
+      type,
+      fieldProfiles
+    )
+    if ('error' in plan) {
+      message.warning(plan.error)
+      return
+    }
+    if (!plan.refreshData || !plan.component.query) {
+      mutateDashboard((draft) => {
+        const index = draft.components.findIndex((component) => component.id === componentId)
+        if (index >= 0) draft.components[index] = plan.component
+      })
+      return
+    }
+
+    setQueryLoading(true)
+    try {
+      const dataset = await window.visslm.executeQuery(plan.component.query)
+      const nextComponent: DashboardComponentSpec = {
+        ...plan.component,
+        data: queryDataPoints(plan.component, dataset)
+      }
+      mutateDashboard((draft) => {
+        const index = draft.components.findIndex((component) => component.id === componentId)
+        if (index >= 0) draft.components[index] = nextComponent
+      })
+    } catch (error) {
+      message.error(`图表类型切换失败，已保留原组件：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setQueryLoading(false)
+    }
+  }
+
+  const updateComponentStyle = (
+    patch: NonNullable<DashboardComponentSpec['style']>
+  ): void => {
+    if (!selectedComponent) return
+    updateComponent({ style: { ...selectedComponent.style, ...patch } })
+  }
+
+  const updateInlineDataPoint = (
+    index: number,
+    patch: Partial<DashboardComponentSpec['data'][number]>
+  ): void => {
+    if (!selectedComponent || selectedComponent.query) return
+    const data = selectedComponent.data.map((item, itemIndex) =>
+      itemIndex === index ? { ...item, ...patch } : item
+    )
+    updateComponent({ data })
+  }
+
+  const addInlineDataPoint = (): void => {
+    if (!selectedComponent || selectedComponent.query || selectedComponent.data.length >= 20) return
+    const shape = dashboardComponentDataShape(selectedComponent.type)
+    updateComponent({
+      data: [
+        ...selectedComponent.data,
+        {
+          name: `数据项 ${selectedComponent.data.length + 1}`,
+          value: 0,
+          ...(shape === 'dual-measure' ? { secondaryValue: 0 } : {})
+        }
+      ]
+    })
+  }
+
+  const removeInlineDataPoint = (index: number): void => {
+    if (!selectedComponent || selectedComponent.query || selectedComponent.data.length <= 1) return
+    updateComponent({
+      data: selectedComponent.data.filter((_item, itemIndex) => itemIndex !== index)
     })
   }
 
@@ -725,11 +1004,13 @@ export function DashboardStudio({
     try {
       const saved = await window.visslm.saveDashboard({
         spec: dashboard,
-        changeSummary: currentVersion ? '画布编辑' : '创建大屏'
+        changeSummary: currentVersion ? '画布编辑' : '创建大屏',
+        baseVersion: currentVersion
       })
       sampleDashboardRef.current = false
       setDashboard(saved.spec)
       setCurrentVersion(saved.version)
+      setAiArtifactVersion(saved.version)
       setHistory([])
       await refreshDashboards()
       message.success(`已保存为 V${saved.version}`)
@@ -744,9 +1025,13 @@ export function DashboardStudio({
     const saved = await window.visslm.getDashboard(id)
     if (!saved) return
     sampleDashboardRef.current = false
+    // Keep the persisted artifact from being reclassified as a new AI result
+    // when onDashboardChange publishes the opened Spec to the parent.
+    generatedIdRef.current = saved.spec.id
     const nextDashboard = restoreDraft(saved.spec)
     setDashboard(nextDashboard)
     setCurrentVersion(saved.version)
+    setAiArtifactVersion(saved.version)
     setSelectedId(nextDashboard.components[0]?.id ?? null)
     setHistory([])
   }
@@ -777,6 +1062,7 @@ export function DashboardStudio({
   const openQuality = async (): Promise<void> => {
     if (!dashboard) return
     setQualityOpen(true)
+    setRepairError('')
     setDiagnosing(true)
     try {
       const [report, runs] = await Promise.all([
@@ -792,19 +1078,42 @@ export function DashboardStudio({
     }
   }
 
+  const repairComponent = async (componentId: string): Promise<void> => {
+    if (!dashboard || repairingComponentId) return
+    const previous = cloneSpec(dashboard)
+    setRepairError('')
+    setRepairingComponentId(componentId)
+    try {
+      const result = await window.visslm.repairDashboardComponent(previous, componentId)
+      setHistory((items) => [...items.slice(-29), previous])
+      setDashboard(result.spec)
+      setSelectedId(componentId)
+      setQualityReport(result.report)
+      message.success(`组件已修复：完成 ${result.actions.length} 项调整`)
+    } catch (error) {
+      setRepairError(`组件修复失败，原大屏未变更：${formatComponentRepairError(error)}`)
+    } finally {
+      setRepairingComponentId(null)
+    }
+  }
+
   const restore = async (version: number): Promise<void> => {
-    if (!dashboard) return
+    if (!dashboard || restoringVersion !== null) return
+    setRestoringVersion(version)
     try {
       const restored = await window.visslm.restoreDashboard(dashboard.id, version)
       sampleDashboardRef.current = false
       setDashboard(restored.spec)
       setCurrentVersion(restored.version)
+      setAiArtifactVersion(restored.version)
       setHistory([])
       setVersions(await window.visslm.listDashboardVersions(dashboard.id))
       await refreshDashboards()
       message.success(`已从 V${version} 恢复，并保存为 V${restored.version}`)
     } catch (error) {
       message.error(error instanceof Error ? error.message : String(error))
+    } finally {
+      setRestoringVersion(null)
     }
   }
 
@@ -1224,61 +1533,319 @@ export function DashboardStudio({
     )
   }
 
-  const renderEncodingEditor = (component: DashboardComponentSpec): React.JSX.Element | null => {
+  const renderComponentDataEditor = (
+    component: DashboardComponentSpec
+  ): React.JSX.Element | null => {
+    const shape = dashboardComponentDataShape(component.type)
+    if (shape === 'text') return null
     const query = component.query
-    if (!query) return null
-    const dimensions = query.dimensions ?? []
-    const measureOptions = query.measures.map((measure) => ({
-      value: measure.id,
-      label: `${measure.id} · ${measure.aggregation}`
-    }))
-    const dimensionOptions = dimensions.map((dimension) => ({
-      value: dimension.field,
-      label: dimension.field
-    }))
-    const valueField = component.encoding?.value ?? query.measures[0]?.id
-    const secondaryOptions = measureOptions.filter((item) => item.value !== valueField)
+
+    if (query) {
+      const dimensions = query.dimensions ?? []
+      const measureOptions = query.measures.map((measure) => ({
+        value: measure.id,
+        label: `${measure.id} · ${measure.aggregation}`
+      }))
+      const dimensionOptions = dimensions.map((dimension) => ({
+        value: dimension.field,
+        label: profileByField.get(dimension.field)?.displayName ?? dimension.field
+      }))
+      const valueField = component.encoding?.value ?? query.measures[0]?.id
+      const secondaryOptions = measureOptions.filter((item) => item.value !== valueField)
+      const needsDimension = ['category-value', 'time-series', 'dual-measure'].includes(shape)
+      const supportsComparison = component.type === 'bar' || component.type === 'line' || shape === 'detail'
+      const dimensionIndex = dimensions.findIndex((item) => item.field === component.encoding?.label)
+      const activeDimension = dimensions[dimensionIndex >= 0 ? dimensionIndex : 0]
+
+      return (
+        <section className="dashboard-component-data-editor">
+          <div className="dashboard-query-section-header">
+            <strong>组件数据</strong>
+            <Tag>{queryLoading ? '刷新中' : '查询数据'}</Tag>
+          </div>
+          {needsDimension && (
+            <>
+              <label>{shape === 'time-series' ? '时间维度' : '分类维度'}</label>
+              <Select
+                placeholder="选择维度"
+                value={component.encoding?.label ?? dimensions[0]?.field}
+                options={dimensionOptions}
+                disabled={queryLoading || !dimensionOptions.length}
+                onChange={(label) => updateEncoding({ label })}
+              />
+            </>
+          )}
+          {shape === 'time-series' && activeDimension && (
+            <>
+              <label>时间粒度</label>
+              <Select
+                allowClear
+                placeholder="原始粒度"
+                value={activeDimension.timeGrain}
+                options={timeGrainOptions}
+                disabled={queryLoading || profileByField.get(activeDimension.field)?.inferredType !== 'date'}
+                onChange={(timeGrain) => updateDimensionTimeGrain(
+                  dimensionIndex >= 0 ? dimensionIndex : 0,
+                  timeGrain as QueryDimension['timeGrain'] | undefined
+                )}
+              />
+            </>
+          )}
+          <label>{shape === 'dual-measure' ? 'X 轴指标' : '主指标'}</label>
+          <Select
+            value={valueField}
+            options={measureOptions}
+            disabled={queryLoading || !measureOptions.length}
+            onChange={(value) => updateEncoding({ value })}
+          />
+          {(supportsComparison || shape === 'dual-measure') && (
+            <>
+              <label>{shape === 'dual-measure' ? 'Y 轴指标' : '对比指标'}</label>
+              <Select
+                allowClear={shape !== 'dual-measure'}
+                placeholder={shape === 'dual-measure' ? '选择第二指标' : '不显示对比指标'}
+                value={component.encoding?.secondaryValue}
+                options={secondaryOptions}
+                disabled={queryLoading || secondaryOptions.length === 0}
+                onChange={(secondaryValue) => updateEncoding({
+                  secondaryValue: secondaryValue || undefined
+                })}
+              />
+            </>
+          )}
+          {shape !== 'single-value' && (
+            <>
+              <label>{shape === 'detail' ? '显示行数' : '数据项数量'}</label>
+              <InputNumber
+                min={1}
+                max={shape === 'detail' ? 100 : 60}
+                precision={0}
+                value={query.limit ?? (shape === 'detail' ? 100 : 20)}
+                disabled={queryLoading}
+                onChange={(limit) => updateQuery((nextQuery) => ({
+                  ...nextQuery,
+                  limit: limit ?? undefined
+                }))}
+              />
+            </>
+          )}
+        </section>
+      )
+    }
+
+    const usesSecondary = shape === 'dual-measure' || shape === 'time-series' || shape === 'detail'
+    const visibleData = shape === 'single-value' ? component.data.slice(0, 1) : component.data
+    return (
+      <section className="dashboard-component-data-editor">
+        <div className="dashboard-query-section-header">
+          <strong>组件数据</strong>
+          <Tag>手动数据</Tag>
+        </div>
+        {component.type === 'radar' && component.data.length < 3 && (
+          <Alert
+            type="warning"
+            showIcon
+            message="雷达图建议至少配置 3 个指标项。"
+          />
+        )}
+        {visibleData.map((item, index) => (
+          <div
+            className={[
+              'dashboard-inline-data-row',
+              usesSecondary ? 'has-secondary' : '',
+              shape === 'single-value' ? 'is-single' : ''
+            ].filter(Boolean).join(' ')}
+            key={`${component.id}-data-${index}`}
+          >
+            <Input
+              aria-label={`数据项 ${index + 1} 名称`}
+              value={item.name}
+              placeholder="名称"
+              onChange={(event) => updateInlineDataPoint(index, { name: event.target.value })}
+            />
+            <InputNumber
+              aria-label={shape === 'dual-measure' ? `数据项 ${index + 1} X 值` : `数据项 ${index + 1} 数值`}
+              value={item.value}
+              placeholder={shape === 'dual-measure' ? 'X 值' : '数值'}
+              onChange={(value) => updateInlineDataPoint(index, { value: value ?? 0 })}
+            />
+            {usesSecondary && (
+              <InputNumber
+                aria-label={shape === 'dual-measure' ? `数据项 ${index + 1} Y 值` : `数据项 ${index + 1} 对比值`}
+                value={item.secondaryValue}
+                placeholder={shape === 'dual-measure' ? 'Y 值' : '对比值'}
+                onChange={(secondaryValue) => updateInlineDataPoint(index, {
+                  secondaryValue: secondaryValue ?? undefined
+                })}
+              />
+            )}
+            {shape !== 'single-value' && (
+              <Tooltip title="移除数据项">
+                <Button
+                  type="text"
+                  danger
+                  icon={<MinusCircleOutlined />}
+                  aria-label={`移除数据项 ${index + 1}`}
+                  disabled={component.data.length <= 1}
+                  onClick={() => removeInlineDataPoint(index)}
+                />
+              </Tooltip>
+            )}
+          </div>
+        ))}
+        {shape !== 'single-value' && (
+          <Button
+            type="dashed"
+            size="small"
+            icon={<PlusOutlined />}
+            disabled={component.data.length >= 20}
+            onClick={addInlineDataPoint}
+          >
+            添加数据项
+          </Button>
+        )}
+      </section>
+    )
+  }
+
+  const renderComponentStyleEditor = (component: DashboardComponentSpec): React.JSX.Element => {
+    const style = component.style ?? {}
+    const isValueComponent = ['kpi', 'progress', 'gauge'].includes(component.type)
+    const supportsLegend = ['bar', 'line', 'pie', 'funnel', 'radar'].includes(component.type)
+    const supportsGrid = ['bar', 'line', 'scatter'].includes(component.type)
+    const supportsLineWidth = ['line', 'radar'].includes(component.type)
+    const supportsOrientation = ['bar', 'funnel'].includes(component.type)
 
     return (
-      <section className="dashboard-encoding-editor">
+      <section className="dashboard-component-style-editor">
         <div className="dashboard-query-section-header">
-          <strong>图表编码与颜色</strong>
-          <Tag color={component.accent ? 'blue' : 'default'}>
-            {component.accent ?? '默认色板'}
-          </Tag>
+          <strong>组件样式</strong>
+          <Tag>{dashboardComponentRegistry.find((item) => item.type === component.type)?.name}</Tag>
         </div>
-        <label>标签维度</label>
-        <Select
-          allowClear
-          placeholder="无标签维度"
-          value={component.encoding?.label}
-          options={dimensionOptions}
-          disabled={queryLoading || !dimensionOptions.length}
-          onChange={(label) => updateEncoding({ label: label || undefined })}
-        />
-        <label>主指标</label>
-        <Select
-          value={valueField}
-          options={measureOptions}
-          disabled={queryLoading || !measureOptions.length}
-          onChange={(value) => updateEncoding({ value })}
-        />
-        <label>对比指标</label>
-        <Select
-          allowClear
-          placeholder="不显示对比指标"
-          value={component.encoding?.secondaryValue}
-          options={secondaryOptions}
-          disabled={queryLoading || secondaryOptions.length === 0}
-          onChange={(secondaryValue) => updateEncoding({ secondaryValue: secondaryValue || undefined })}
-        />
-        <label>强调色</label>
-        <ColorPicker
-          value={component.accent ?? '#64dbff'}
-          showText
-          disabled={queryLoading}
-          onChange={(color) => updateComponent({ accent: color.toHexString() })}
-        />
+        <div className="dashboard-style-grid">
+          <label className="dashboard-style-wide-control dashboard-style-color-control">
+            <span>强调色</span>
+            <ColorPicker
+              value={component.accent ?? '#64dbff'}
+              showText
+              onChange={(color) => updateComponent({ accent: color.toHexString() })}
+            />
+          </label>
+          <label>
+            <span>标题字号</span>
+            <InputNumber
+              min={9}
+              max={24}
+              value={style.titleFontSize ?? 11}
+              onChange={(value) => updateComponentStyle({ titleFontSize: value ?? 11 })}
+            />
+          </label>
+          <label>
+            <span>副标题字号</span>
+            <InputNumber
+              min={8}
+              max={18}
+              value={style.subtitleFontSize ?? 8}
+              onChange={(value) => updateComponentStyle({ subtitleFontSize: value ?? 8 })}
+            />
+          </label>
+          <label>
+            <span>内容字号</span>
+            <InputNumber
+              min={9}
+              max={20}
+              value={style.bodyFontSize ?? 10}
+              onChange={(value) => updateComponentStyle({ bodyFontSize: value ?? 10 })}
+            />
+          </label>
+          <label>
+            <span>内容边距</span>
+            <InputNumber
+              min={4}
+              max={20}
+              value={style.padding ?? 9}
+              onChange={(value) => updateComponentStyle({ padding: value ?? 9 })}
+            />
+          </label>
+          <label>
+            <span>圆角</span>
+            <InputNumber
+              min={0}
+              max={12}
+              value={style.borderRadius ?? 8}
+              onChange={(value) => updateComponentStyle({ borderRadius: value ?? 8 })}
+            />
+          </label>
+          {isValueComponent && (
+            <label>
+              <span>数值字号</span>
+              <InputNumber
+                min={14}
+                max={48}
+                value={style.valueFontSize ?? (component.type === 'kpi' ? 30 : 18)}
+                onChange={(value) => updateComponentStyle({ valueFontSize: value ?? 18 })}
+              />
+            </label>
+          )}
+          {supportsLineWidth && (
+            <label>
+              <span>线条宽度</span>
+              <InputNumber
+                min={1}
+                max={8}
+                value={style.lineWidth ?? 3}
+                onChange={(value) => updateComponentStyle({ lineWidth: value ?? 3 })}
+              />
+            </label>
+          )}
+          {supportsOrientation && (
+            <label className="dashboard-style-wide-control">
+              <span>排列方向</span>
+              <Segmented
+                value={style.orientation ?? (component.type === 'bar' ? 'horizontal' : 'vertical')}
+                options={[
+                  { label: '横向', value: 'horizontal' },
+                  { label: '纵向', value: 'vertical' }
+                ]}
+                onChange={(orientation) => updateComponentStyle({
+                  orientation: orientation as 'horizontal' | 'vertical'
+                })}
+              />
+            </label>
+          )}
+        </div>
+        <div className="dashboard-style-switches">
+          {supportsLegend && (
+            <label>
+              <span>显示图例</span>
+              <Switch
+                size="small"
+                checked={style.showLegend ?? true}
+                onChange={(showLegend) => updateComponentStyle({ showLegend })}
+              />
+            </label>
+          )}
+          {supportsGrid && (
+            <label>
+              <span>显示网格</span>
+              <Switch
+                size="small"
+                checked={style.showGrid ?? true}
+                onChange={(showGrid) => updateComponentStyle({ showGrid })}
+              />
+            </label>
+          )}
+          {component.type === 'pie' && (
+            <label>
+              <span>环形模式</span>
+              <Switch
+                size="small"
+                checked={style.donut ?? true}
+                onChange={(donut) => updateComponentStyle({ donut })}
+              />
+            </label>
+          )}
+        </div>
       </section>
     )
   }
@@ -1415,6 +1982,11 @@ export function DashboardStudio({
       className={`dashboard-preview ${preview ? 'is-full-preview' : ''}`}
       ref={preview ? undefined : canvasRef}
       title={!preview && interactionError ? interactionError : undefined}
+      onPointerDown={(event) => {
+        if (preview || !(event.target instanceof HTMLElement)) return
+        if (event.target.closest('.dashboard-widget, .dashboard-filter-bar')) return
+        setSelectedId(null)
+      }}
     >
       <header className="dashboard-preview-header">
         <div className="dashboard-title-mark" />
@@ -1490,6 +2062,13 @@ export function DashboardStudio({
           >
             质量
           </Button>
+          <Button
+            icon={<MessageOutlined />}
+            onClick={() => setAiOpen(true)}
+            disabled={!dashboard}
+          >
+            AI 修改
+          </Button>
           <Button icon={<HistoryOutlined />} disabled={!currentVersion} onClick={() => void openHistory()}>
             版本
           </Button>
@@ -1526,7 +2105,11 @@ export function DashboardStudio({
         </div>
       </div>
 
-      <div className="dashboard-studio-body">
+      <div
+        ref={studioBodyRef}
+        className="dashboard-studio-body"
+        style={{ '--dashboard-inspector-width': `${inspectorWidth}px` } as CSSProperties}
+      >
         <aside className="dashboard-library">
           <div className="dashboard-panel-title">
             <span>已保存大屏</span>
@@ -1570,40 +2153,56 @@ export function DashboardStudio({
         </main>
 
         <aside className="dashboard-inspector">
+          <div
+            className="dashboard-inspector-resizer"
+            role="separator"
+            tabIndex={0}
+            aria-label="调整属性面板宽度"
+            aria-orientation="vertical"
+            aria-valuemin={dashboardInspectorMinimumWidth}
+            aria-valuemax={dashboardInspectorMaximumWidth}
+            aria-valuenow={inspectorWidth}
+            title="拖拽调整属性面板宽度；使用左右方向键微调"
+            onPointerDown={beginInspectorResize}
+            onKeyDown={adjustInspectorWidthByKeyboard}
+          />
+          <div className="dashboard-inspector-scroll">
           <div className="dashboard-panel-title">
-            <span><EditOutlined /> 属性面板</span>
-            <small>{selectedComponent?.id ?? '未选择'}</small>
+            <span><EditOutlined /> {selectedComponent ? '组件属性' : '大屏属性'}</span>
+            <small>{selectedComponent?.id ?? '未选择组件'}</small>
           </div>
-          {dashboard && (
-            <section className="dashboard-dashboard-info-editor" aria-label="大屏信息编辑">
-              <div className="dashboard-query-section-header">
-                <strong>大屏信息</strong>
-                <Text type="secondary">可直接修改</Text>
-              </div>
-              <label htmlFor="dashboard-title-editor">主标题</label>
-              <Input
-                id="dashboard-title-editor"
-                aria-label="大屏主标题"
-                value={dashboard.title}
-                placeholder="输入大屏主标题"
-                onChange={(event) => mutateDashboard((draft) => {
-                  draft.title = event.target.value
-                })}
-              />
-              <label htmlFor="dashboard-subtitle-editor">副标题</label>
-              <Input
-                id="dashboard-subtitle-editor"
-                aria-label="大屏副标题"
-                value={dashboard.subtitle}
-                placeholder="输入大屏副标题"
-                onChange={(event) => mutateDashboard((draft) => {
-                  draft.subtitle = event.target.value
-                })}
-              />
-            </section>
+          {!selectedComponent && dashboard && (
+            <>
+              <section className="dashboard-dashboard-info-editor" aria-label="大屏信息编辑">
+                <div className="dashboard-query-section-header">
+                  <strong>大屏信息</strong>
+                  <Text type="secondary">点击组件可切换到组件属性</Text>
+                </div>
+                <label htmlFor="dashboard-title-editor">主标题</label>
+                <Input
+                  id="dashboard-title-editor"
+                  aria-label="大屏主标题"
+                  value={dashboard.title}
+                  placeholder="输入大屏主标题"
+                  onChange={(event) => mutateDashboard((draft) => {
+                    draft.title = event.target.value
+                  })}
+                />
+                <label htmlFor="dashboard-subtitle-editor">副标题</label>
+                <Input
+                  id="dashboard-subtitle-editor"
+                  aria-label="大屏副标题"
+                  value={dashboard.subtitle}
+                  placeholder="输入大屏副标题"
+                  onChange={(event) => mutateDashboard((draft) => {
+                    draft.subtitle = event.target.value
+                  })}
+                />
+              </section>
+              {renderGlobalFilterEditor()}
+            </>
           )}
-          {renderGlobalFilterEditor()}
-          {!selectedComponent ? <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="选择画布组件" /> : (
+          {selectedComponent && (
             <div className="dashboard-inspector-form">
               <label>组件标题</label>
               <Input
@@ -1622,22 +2221,42 @@ export function DashboardStudio({
                   value: item.type,
                   label: item.name
                 }))}
-                onChange={(type) => updateComponent({ type })}
+                disabled={queryLoading}
+                onChange={(type) => void changeComponentType(type)}
               />
-              <label>单位</label>
-              <Input
-                value={selectedComponent.unit}
-                placeholder="条、个、%"
-                onChange={(event) => updateComponent({ unit: event.target.value })}
-              />
-              {renderEncodingEditor(selectedComponent)}
+              {['kpi', 'progress', 'gauge'].includes(selectedComponent.type) && (
+                <>
+                  <label>单位</label>
+                  <Input
+                    value={selectedComponent.unit}
+                    placeholder="条、个、%"
+                    onChange={(event) => updateComponent({ unit: event.target.value })}
+                  />
+                </>
+              )}
+              {selectedComponent.type === 'insight' && (
+                <>
+                  <label>洞察内容</label>
+                  <Input.TextArea
+                    value={selectedComponent.insight}
+                    autoSize={{ minRows: 3, maxRows: 6 }}
+                    onChange={(event) => updateComponent({ insight: event.target.value })}
+                  />
+                </>
+              )}
+              {renderComponentDataEditor(selectedComponent)}
+              {renderComponentStyleEditor(selectedComponent)}
               <Divider>24 列网格</Divider>
               <div className="dashboard-layout-inputs">
                 {(['x', 'y', 'w', 'h'] as const).map((field) => (
                   <label key={field}>
                     <span>{field.toUpperCase()}</span>
                     <InputNumber
-                      min={field === 'w' || field === 'h' ? 2 : 0}
+                      min={field === 'w'
+                        ? dashboardLayoutProfiles[selectedComponent.type].minimumWidth
+                        : field === 'h'
+                          ? dashboardLayoutProfiles[selectedComponent.type].minimumHeight
+                          : 0}
                       max={field === 'x' || field === 'w' ? 24 : 20}
                       value={selectedComponent.layout[field]}
                       onChange={(value) => updateLayout(field, value)}
@@ -1651,8 +2270,19 @@ export function DashboardStudio({
               {selectedComponent.query && renderQueryEditor(selectedComponent.query)}
             </div>
           )}
+          </div>
         </aside>
       </div>
+
+      <DashboardAiDrawer
+        open={aiOpen}
+        onClose={() => setAiOpen(false)}
+        dashboard={dashboard}
+        selectedComponent={selectedComponent}
+        artifactVersion={aiArtifactVersion}
+        onDashboardChange={applyAgentDashboard}
+        onUndoDashboardChange={undoAgentDashboard}
+      />
 
       <Drawer title="版本历史" open={historyOpen} size={420} onClose={() => setHistoryOpen(false)}>
         <List
@@ -1672,14 +2302,23 @@ export function DashboardStudio({
                 >
                   对比
                 </Button>,
-                <Button
+                <Popconfirm
                   key="restore"
-                  size="small"
-                  disabled={item.version === currentVersion}
-                  onClick={() => void restore(item.version)}
+                  title="确认恢复此版本？"
+                  description="当前画布内容将被替换，并创建新的版本；未保存的修改会被覆盖。"
+                  okText="确认恢复"
+                  cancelText="取消"
+                  placement="left"
+                  onConfirm={() => void restore(item.version)}
                 >
-                  恢复
-                </Button>
+                  <Button
+                    size="small"
+                    loading={restoringVersion === item.version}
+                    disabled={item.version === currentVersion || restoringVersion !== null}
+                  >
+                    恢复
+                  </Button>
+                </Popconfirm>
               ]}
             >
               <List.Item.Meta
@@ -1707,6 +2346,7 @@ export function DashboardStudio({
               save: '保存版本',
               restore: '恢复版本',
               diagnose: '质量诊断',
+              'repair-component': '修复组件',
               'export-json': '导出 JSON',
               'export-pdf': '导出 PDF',
               'export-png': '导出 PNG',
@@ -1729,6 +2369,7 @@ export function DashboardStudio({
               metadata.componentCount === undefined ? '' : `${metadata.componentCount} 个组件`,
               metadata.queryCount === undefined ? '' : `${metadata.queryCount} 个查询`,
               metadata.recordCount === undefined ? '' : `${metadata.recordCount} 条数据`,
+              typeof metadata.specHash === 'string' ? `Spec ${metadata.specHash.slice(0, 12)}…` : '',
               item.errorMessage ?? ''
             ].filter(Boolean).join(' · ')
             return (
@@ -1791,6 +2432,7 @@ export function DashboardStudio({
         title="组件数据口径"
         open={Boolean(provenanceComponent)}
         size={500}
+        rootClassName="dashboard-provenance-drawer"
         onClose={() => setProvenanceComponent(null)}
       >
         {provenanceComponent && provenance ? (
@@ -1822,10 +2464,19 @@ export function DashboardStudio({
                 {dashboard ? new Date(dashboard.updatedAt).toLocaleString('zh-CN') : '—'}
               </Descriptions.Item>
             </Descriptions>
-            <Divider titlePlacement="start">QuerySpec</Divider>
-            <pre className="dashboard-query-spec">
-              {JSON.stringify(provenanceComponent.query, null, 2)}
-            </pre>
+            <Collapse
+              className="dashboard-provenance-query-collapse"
+              size="small"
+              items={[{
+                key: 'query-spec',
+                label: 'QuerySpec',
+                children: (
+                  <pre className="dashboard-query-spec">
+                    {JSON.stringify(provenanceComponent.query, null, 2)}
+                  </pre>
+                )
+              }]}
+            />
           </div>
         ) : <Empty description="当前组件没有受控查询" />}
       </Drawer>
@@ -1837,7 +2488,18 @@ export function DashboardStudio({
         onClose={() => setQualityOpen(false)}
       >
         {!qualityReport ? <Skeleton active paragraph={{ rows: 8 }} /> : (
-          <div className="dashboard-quality">
+          <div className="dashboard-quality" aria-busy={Boolean(repairingComponentId)}>
+            {repairError && (
+              <Alert
+                className="dashboard-quality-repair-alert"
+                type="error"
+                showIcon
+                closable
+                message="修复未完成"
+                description={repairError}
+                onClose={() => setRepairError('')}
+              />
+            )}
             <div className="dashboard-quality-score">
               <div>
                 <strong>{qualityReport.score}</strong>
@@ -1859,7 +2521,23 @@ export function DashboardStudio({
               locale={{ emptyText: '未发现结构、数据或性能问题' }}
               dataSource={qualityReport.issues}
               renderItem={(issue) => (
-                <List.Item>
+                <List.Item
+                  actions={issue.componentId && repairableQualityIssueCodes.has(issue.code)
+                    ? [
+                        <Button
+                          key="repair"
+                          size="small"
+                          icon={<ReloadOutlined />}
+                          loading={repairingComponentId === issue.componentId}
+                          disabled={Boolean(repairingComponentId && repairingComponentId !== issue.componentId)}
+                          aria-label={`修复组件 ${issue.componentId}`}
+                          onClick={() => void repairComponent(issue.componentId!)}
+                        >
+                          修复组件
+                        </Button>
+                      ]
+                    : undefined}
+                >
                   <List.Item.Meta
                     title={(
                       <Space>
@@ -1890,24 +2568,43 @@ export function DashboardStudio({
                 <div key={component.componentId}>
                   <div>
                     <Text strong ellipsis>{component.title}</Text>
-                    <Tag color={
-                      component.status === 'ok'
-                        ? 'success'
-                        : component.status === 'empty'
-                          ? 'warning'
-                          : 'error'
-                    }>
-                      {component.status === 'ok'
-                        ? `${component.elapsedMs} ms`
-                        : component.status === 'empty'
-                          ? '空结果'
-                          : '失败'}
-                    </Tag>
+                    <Space size={8}>
+                      <Tag color={
+                        component.status === 'ok'
+                          ? 'success'
+                          : component.status === 'empty'
+                            ? 'warning'
+                            : 'error'
+                      }>
+                        {component.status === 'ok'
+                          ? `${component.elapsedMs} ms`
+                          : component.status === 'empty'
+                            ? '空结果'
+                            : '失败'}
+                      </Tag>
+                      {component.status === 'error' && (
+                        <Button
+                          size="small"
+                          icon={<ReloadOutlined />}
+                          loading={repairingComponentId === component.componentId}
+                          disabled={Boolean(repairingComponentId && repairingComponentId !== component.componentId)}
+                          aria-label={`修复失败查询组件 ${component.componentId}`}
+                          onClick={() => void repairComponent(component.componentId)}
+                        >
+                          修复
+                        </Button>
+                      )}
+                    </Space>
                   </div>
                   <Text type="secondary">
                     扫描 {component.scannedRows} · 命中 {component.matchedRows} ·
                     返回 {component.resultRows}
                   </Text>
+                  {component.errorMessage && (
+                    <Text className="dashboard-quality-query-error" type="danger">
+                      {component.errorMessage}
+                    </Text>
+                  )}
                 </div>
               ))}
             </div>
@@ -1924,11 +2621,50 @@ export function DashboardStudio({
                         <Tag color={run.status === 'success' ? 'success' : 'error'}>
                           {run.status === 'success' ? '成功' : '失败'}
                         </Tag>
+                        <Tag>{run.mode === 'patch' ? '修改' : '生成'}</Tag>
                         <Text>{run.modelName}</Text>
                         <Text type="secondary">{run.durationMs} ms</Text>
                       </Space>
                     )}
-                    description={`${new Date(run.createdAt).toLocaleString('zh-CN')} · ${run.requestSummary}`}
+                    description={(
+                      <div className="dashboard-run-detail">
+                        <Text type="secondary">
+                          {new Date(run.createdAt).toLocaleString('zh-CN')} · {run.requestSummary}
+                        </Text>
+                        <Collapse
+                          ghost
+                          size="small"
+                          items={[{
+                            key: 'tools',
+                            label: `${run.toolCalls.length} 次受控工具调用`,
+                            children: run.toolCalls.length ? (
+                              <div className="dashboard-tool-audit" role="list">
+                                {run.toolCalls.map((call) => (
+                                  <div key={`${call.sequence}-${call.tool}-${call.componentId ?? ''}`} role="listitem">
+                                    <span>{call.sequence}</span>
+                                    <Text strong>{visualizationToolLabels[call.tool]}</Text>
+                                    {call.componentId
+                                      ? <Text code ellipsis>{call.componentId}</Text>
+                                      : <span className="dashboard-tool-audit-component" aria-hidden="true" />}
+                                    <Tag color={call.status === 'success' ? 'success' : 'error'}>
+                                      {call.status === 'success' ? '成功' : '失败'}
+                                    </Tag>
+                                    <Text type="secondary">{call.durationMs.toFixed(2)} ms</Text>
+                                    {call.metadata && (
+                                      <Text type="secondary" className="dashboard-tool-audit-metadata">
+                                        {Object.entries(call.metadata).map(([key, value]) =>
+                                          `${visualizationToolMetadataLabels[key] ?? key} ${typeof value === 'boolean' ? (value ? '是' : '否') : value}`
+                                        ).join(' · ')}
+                                      </Text>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
+                            ) : <Text type="secondary">该历史运行没有工具明细</Text>
+                          }]}
+                        />
+                      </div>
+                    )}
                   />
                 </List.Item>
               )}

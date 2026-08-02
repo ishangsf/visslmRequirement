@@ -77,6 +77,24 @@ const mimeFor = (extension: string): string => ({
 
 const fileHash = (bytes: Buffer): string => createHash('sha256').update(bytes).digest('hex')
 
+const validateDocumentSignature = (bytes: Buffer, extension: string): void => {
+  const startsWith = (...values: number[]): boolean => values.every((value, index) => bytes[index] === value)
+  if (extension === '.pdf' && bytes.subarray(0, 5).toString('ascii') !== '%PDF-') {
+    throw new Error('文件内容不是有效的 PDF')
+  }
+  if ((extension === '.docx' || extension === '.xlsx') && !startsWith(0x50, 0x4b)) {
+    throw new Error(`文件内容不是有效的 ${extension.slice(1).toUpperCase()} 压缩文档`)
+  }
+  if (extension === '.xls' && !startsWith(0xd0, 0xcf, 0x11, 0xe0)) {
+    throw new Error('文件内容不是有效的 XLS 文档')
+  }
+  if (extension === '.txt') {
+    const sample = bytes.subarray(0, Math.min(bytes.length, 4096))
+    const nullCount = [...sample].filter((value) => value === 0).length
+    if (sample.length && nullCount > sample.length / 10) throw new Error('文本文件包含过多二进制内容')
+  }
+}
+
 const cleanText = (value: string): string => value
   .replace(/\u0000/g, '')
   .replace(/[ \t]+\n/g, '\n')
@@ -501,11 +519,16 @@ export class KnowledgeService {
     }
   }
 
-  async processFiles(filePaths: string[]): Promise<KnowledgeUploadResult> {
+  async processFiles(
+    filePaths: string[],
+    onProgress?: (progress: KnowledgeIndexProgress) => void
+  ): Promise<KnowledgeUploadResult> {
     const taskId = randomUUID()
     const documents: KnowledgeDocument[] = []
     const skipped: Array<{ fileName: string; reason: string }> = []
     let failedCount = 0
+    let acceptedCount = 0
+    let reusedCount = 0
     for (const filePath of [...new Set(filePaths)]) {
       const fileName = filePath.split(/[\\/]/).pop() ?? filePath
       const extension = extensionFor(filePath)
@@ -528,20 +551,42 @@ export class KnowledgeService {
       const sha256 = fileHash(bytes)
       const existing = this.db.findKnowledgeDocumentByHash(sha256)
       if (existing) {
-        skipped.push({ fileName, reason: `重复文件，已存在于知识库（${existing.fileName}）` })
+        const managedPath = this.db.storeKnowledgeDocumentFile(bytes, sha256, extension)
+        this.db.updateKnowledgeDocumentFilePath(existing.id, managedPath)
+        const managedDocument = { ...existing, filePath: managedPath }
+        const reused = existing.status === 'ready'
+          ? managedDocument
+          : await this.processDocument(managedDocument, taskId, documents.length + 1, filePaths.length, onProgress)
+        documents.push(reused)
+        reusedCount += 1
+        if (reused.status === 'failed') failedCount += 1
+        if (existing.status === 'ready') {
+          this.emitAndNotify(onProgress, {
+            taskId,
+            phase: 'done',
+            documentId: reused.id,
+            fileName: reused.fileName,
+            message: `${reused.fileName} 已复用现有知识库索引`,
+            current: documents.length,
+            total: filePaths.length,
+            status: 'success'
+          })
+        }
+        skipped.push({ fileName, reason: `重复文件，已复用知识库索引（${existing.fileName}）` })
         continue
       }
+      const managedPath = this.db.storeKnowledgeDocumentFile(bytes, sha256, extension)
       const document = this.db.insertKnowledgeDocument({
         id: randomUUID(),
         fileName,
-        filePath,
+        filePath: managedPath,
         extension,
         mimeType: mimeFor(extension),
         byteSize,
         sha256,
         modelVersion: this.modelVersion
       })
-      this.emit({
+      this.emitAndNotify(onProgress, {
         taskId,
         phase: 'queued',
         documentId: document.id,
@@ -552,17 +597,41 @@ export class KnowledgeService {
         status: 'running'
       })
       documents.push(document)
-      const processed = await this.processDocument(document, taskId, documents.length, filePaths.length)
+      acceptedCount += 1
+      let processed: KnowledgeDocument
+      try {
+        if (!bytes.length) throw new Error('文件内容为空')
+        validateDocumentSignature(bytes, extension)
+        processed = await this.processDocument(document, taskId, documents.length, filePaths.length, onProgress)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        processed = this.db.updateKnowledgeDocument(document.id, {
+          status: 'failed',
+          errorMessage: message,
+          processedAt: ''
+        }) ?? { ...document, status: 'failed', errorMessage: message }
+        this.emitAndNotify(onProgress, {
+          taskId,
+          phase: 'error',
+          documentId: document.id,
+          fileName,
+          message: `${fileName}: ${message}`,
+          current: documents.length,
+          total: filePaths.length,
+          status: 'failed'
+        })
+      }
       if (processed.status === 'failed') failedCount += 1
     }
     return {
       ok: documents.length > failedCount || skipped.length === 0,
-      acceptedCount: documents.length,
+      acceptedCount,
+      reusedCount,
       skippedCount: skipped.length,
       failedCount,
       documents: documents.map((document) => this.db.getKnowledgeDocument(document.id) as KnowledgeDocument),
       skipped,
-      message: `知识库处理完成：${documents.length - failedCount} 个成功，${failedCount} 个失败，${skipped.length} 个跳过`
+      message: `知识库处理完成：${acceptedCount} 个新增，${reusedCount} 个复用，${failedCount} 个失败，${skipped.length - reusedCount} 个跳过`
     }
   }
 
@@ -729,7 +798,8 @@ export class KnowledgeService {
     document: KnowledgeDocument,
     taskId: string,
     current: number,
-    total: number
+    total: number,
+    onProgress?: (progress: KnowledgeIndexProgress) => void
   ): Promise<KnowledgeDocument> {
     this.db.updateKnowledgeDocument(document.id, {
       status: 'processing',
@@ -738,7 +808,7 @@ export class KnowledgeService {
     })
     this.db.clearKnowledgeDocumentChunks(document.id)
     try {
-      this.emit({
+      this.emitAndNotify(onProgress, {
         taskId,
         phase: 'parsing',
         documentId: document.id,
@@ -751,7 +821,7 @@ export class KnowledgeService {
       const parsed = await this.parser.parse(document.filePath)
       const chunks = chunkKnowledgePages(parsed.pages)
       if (!chunks.length) throw new Error('解析结果没有可索引的正文分块')
-      this.emit({
+      this.emitAndNotify(onProgress, {
         taskId,
         phase: 'embedding',
         documentId: document.id,
@@ -786,7 +856,7 @@ export class KnowledgeService {
           })
           vectors.push({ chunkId, vector: embeddings[batchIndex], modelVersion: this.modelVersion })
         }
-        this.emit({
+        this.emitAndNotify(onProgress, {
           taskId,
           phase: 'embedding',
           documentId: document.id,
@@ -807,7 +877,7 @@ export class KnowledgeService {
         processedAt: new Date().toISOString()
       })
       const result = updated ?? document
-      this.emit({
+      this.emitAndNotify(onProgress, {
         taskId,
         phase: 'done',
         documentId: document.id,
@@ -825,7 +895,7 @@ export class KnowledgeService {
         errorMessage: message,
         processedAt: ''
       })
-      this.emit({
+      this.emitAndNotify(onProgress, {
         taskId,
         phase: 'error',
         documentId: document.id,
@@ -926,5 +996,13 @@ export class KnowledgeService {
   private emit(progress: KnowledgeIndexProgress): void {
     this.db.saveKnowledgeIndexProgress(progress)
     this.progress?.(progress)
+  }
+
+  private emitAndNotify(
+    onProgress: ((progress: KnowledgeIndexProgress) => void) | undefined,
+    progress: KnowledgeIndexProgress
+  ): void {
+    this.emit(progress)
+    onProgress?.(progress)
   }
 }

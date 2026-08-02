@@ -4,6 +4,18 @@ export type ProjectMatchStatus = 'idle' | 'processing' | 'ready' | 'stale' | 'fa
 export type ProjectRequirementStatus = 'unmarked' | 'satisfied' | 'to_develop' | 'to_negotiate'
 export type ProjectRequirementStatusSource = 'ai' | 'manual'
 export type ProjectRequirementKeyInfoTermsSource = 'ai' | 'manual'
+export type ProjectRequirementCategory =
+  | 'functional'
+  | 'interface'
+  | 'data'
+  | 'performance'
+  | 'security'
+  | 'deployment'
+  | 'operations'
+  | 'acceptance'
+  | 'business'
+export type ProjectRequirementReviewStatus = 'pending' | 'approved' | 'rejected'
+export type ProjectRequirementSetStatus = 'reviewing' | 'published' | 'superseded'
 export type ProjectCostType = 'estimated' | 'actual'
 export type OrganizationPersonStatus = 'active' | 'inactive'
 export type ProjectPlanTaskType = 'milestone' | 'phase' | 'task'
@@ -39,6 +51,11 @@ export interface ManagedProject {
   assetCount: number
   participantCount: number
   taskCount: number
+  documentCount: number
+  reviewSetId?: string
+  reviewVersion: number
+  reviewRequirementCount: number
+  pendingReviewCount: number
   currentDocumentId?: string
   currentDocumentName?: string
   createdAt: string
@@ -254,7 +271,10 @@ export interface ProjectRequirement {
   id: string
   projectId: string
   documentId: string
+  setId: string
+  version: number
   requirementNo: number
+  category: ProjectRequirementCategory
   module: string
   title: string
   content: string
@@ -262,6 +282,10 @@ export interface ProjectRequirement {
   keyInfoTermsSource: ProjectRequirementKeyInfoTermsSource
   sourceLocation: string
   sourceChunkId: string
+  evidenceQuote: string
+  confidence: number
+  reviewStatus: ProjectRequirementReviewStatus
+  reviewNote: string
   status: ProjectRequirementStatus
   statusSource: ProjectRequirementStatusSource
   statusReason: string
@@ -280,6 +304,49 @@ export interface ProjectRequirementQuery {
   projectId: string
   page: number
   pageSize: number
+  scope?: 'active' | 'published'
+}
+
+export interface ProjectRequirementSetSummary {
+  id: string
+  projectId: string
+  documentId: string
+  version: number
+  status: ProjectRequirementSetStatus
+  totalChunks: number
+  analyzedChunks: number
+  warnings: string[]
+  requirementCount: number
+  pendingCount: number
+  approvedCount: number
+  rejectedCount: number
+  createdAt: string
+  publishedAt: string
+}
+
+export interface ProjectRequirementInput {
+  category: ProjectRequirementCategory
+  module?: string
+  title: string
+  content: string
+  keyInfoTerms?: string[]
+  sourceLocation?: string
+  sourceChunkId?: string
+  evidenceQuote?: string
+  confidence?: number
+  reviewNote?: string
+}
+
+export interface ProjectRequirementMergeInput extends ProjectRequirementInput {
+  requirementIds: string[]
+}
+
+export interface ProjectRequirementSplitInput {
+  parts: ProjectRequirementInput[]
+}
+
+export interface ProjectAgreementUploadOptions {
+  allowExternalProcessing?: boolean
 }
 
 export interface ProjectRequirementMatch {
@@ -323,9 +390,28 @@ export interface ProjectAnalysisProgress {
   projectId: string
   phase: ProjectAnalysisPhase
   message: string
+  detail?: string
+  documentId?: string
+  fileName?: string
   current: number
   total: number
   status: 'running' | 'success' | 'failed'
+}
+
+export interface ProjectAnalysisLogEntry {
+  id: string
+  taskId: string
+  projectId: string
+  taskType: 'agreement' | 'matching'
+  phase: ProjectAnalysisPhase
+  message: string
+  detail: string
+  documentId?: string
+  fileName?: string
+  current: number
+  total: number
+  status: 'running' | 'success' | 'failed'
+  createdAt: string
 }
 
 export interface ProjectAnalysisStartResult {

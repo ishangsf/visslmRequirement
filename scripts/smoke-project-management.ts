@@ -4,6 +4,8 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { randomUUID } from 'node:crypto'
 import { AppDatabase } from '../src/main/database'
+import { ProjectManagementService } from '../src/main/project-management'
+import type { KnowledgeService } from '../src/main/knowledge'
 import { normalizeProjectRequirementText } from '../src/shared/project-requirement-utils'
 
 const directory = mkdtempSync(join(tmpdir(), 'visslm-project-management-'))
@@ -21,6 +23,31 @@ try {
   assert.equal(project.contractAmount, 1000)
   assert.equal(project.estimatedCost, 240)
   assert.equal(project.remainingQuota, 760)
+
+  db.saveProjectAnalysisProgress({
+    taskId: 'smoke-analysis-task',
+    projectId: project.id,
+    phase: 'queued',
+    message: '已接收技术协议文件',
+    detail: '文件：technical-agreement.txt',
+    current: 0,
+    total: 1,
+    status: 'running'
+  })
+  db.saveProjectAnalysisProgress({
+    taskId: 'smoke-analysis-task',
+    projectId: project.id,
+    phase: 'error',
+    message: '需求抽取失败',
+    detail: '协议附件关联已保留，可重试',
+    current: 1,
+    total: 1,
+    status: 'failed'
+  })
+  const analysisLogs = db.listProjectAnalysisLogs(project.id)
+  assert.equal(analysisLogs.length, 2)
+  assert.equal(analysisLogs[0]?.message, '需求抽取失败')
+  assert.equal(analysisLogs[0]?.detail, '协议附件关联已保留，可重试')
 
   db.insertProjectCostEntry(project.id, {
     type: 'actual',
@@ -166,6 +193,59 @@ try {
     byteSize: 20,
     sha256: randomUUID()
   })
+  const readyDocument = db.updateKnowledgeDocument(document.id, {
+    status: 'ready',
+    chunkCount: 0,
+    modelVersion: 'smoke',
+    processedAt: new Date().toISOString()
+  })
+  assert(readyDocument)
+  db.linkProjectDocument(project.id, document.id)
+  const linkedProject = db.getManagedProject(project.id)
+  assert(linkedProject)
+  assert.equal(linkedProject.currentDocumentId, document.id)
+  assert.equal(linkedProject.currentDocumentName, document.fileName)
+  assert.equal(linkedProject.documentCount, 1)
+
+  const fakeKnowledge = {
+    processFiles: async () => ({
+      ok: true,
+      acceptedCount: 1,
+      reusedCount: 0,
+      skippedCount: 0,
+      failedCount: 0,
+      documents: [readyDocument],
+      skipped: [],
+      message: 'Smoke 协议已保存'
+    })
+  } as unknown as KnowledgeService
+  const service = new ProjectManagementService(
+    db,
+    fakeKnowledge,
+    () => ({
+      source: 'local',
+      provider: 'ollama',
+      baseUrl: 'http://127.0.0.1:1',
+      model: 'smoke',
+      thinking: false
+    })
+  )
+  const failedAnalysis = await service.startTechnicalAgreement(join(directory, 'uploaded-agreement.txt'))
+  assert.equal(failedAnalysis.ok, true)
+  assert(failedAnalysis.projectId)
+  let failedProject: ReturnType<AppDatabase['getManagedProject']> = null
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    failedProject = db.getManagedProject(failedAnalysis.projectId)
+    if (failedProject?.analysisStatus === 'failed') break
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  assert(failedProject)
+  assert.equal(failedProject.analysisStatus, 'failed')
+  assert.equal(failedProject.currentDocumentId, document.id)
+  assert.equal(failedProject.currentDocumentName, document.fileName)
+  assert.equal(failedProject.documentCount, 1)
+  assert(db.listProjectAnalysisLogs(failedAnalysis.projectId).some((log) => log.phase === 'error' && log.status === 'failed'))
+
   db.replaceProjectRequirements(project.id, document.id, [
     {
       id: 'smoke-requirement-1',
@@ -271,6 +351,65 @@ try {
   assert.equal(listedProject.participantCount, 1)
   assert.equal(listedProject.taskCount, 3)
   assert.equal(listedProject.laborEstimatedCost, 1200)
+
+  const reviewSet = db.createProjectRequirementSet({
+    projectId: project.id,
+    documentId: document.id,
+    totalChunks: 4,
+    analyzedChunks: 4,
+    warnings: [],
+    externalProcessing: false,
+    modelName: 'ollama:smoke'
+  })
+  const appendixDocument = db.insertKnowledgeDocument({
+    id: randomUUID(),
+    fileName: 'technical-appendix.txt',
+    filePath: join(directory, 'technical-appendix.txt'),
+    extension: '.txt',
+    mimeType: 'text/plain',
+    byteSize: 24,
+    sha256: randomUUID()
+  })
+  db.linkProjectDocument(project.id, appendixDocument.id)
+  db.replaceReviewProjectRequirements(reviewSet.id, project.id, document.id, [
+    {
+      id: 'review-requirement-1',
+      requirementNo: 1,
+      category: 'functional',
+      module: '订单管理',
+      title: '订单导出',
+      content: '支持导出订单明细',
+      keyInfoTerms: ['订单', '导出'],
+      sourceLocation: '第 3 页',
+      sourceChunkId: 'chunk-3',
+      evidenceQuote: '支持导出订单明细',
+      confidence: 0.92
+    },
+    {
+      id: 'review-requirement-2',
+      documentId: appendixDocument.id,
+      requirementNo: 2,
+      category: 'security',
+      module: '安全要求',
+      title: '访问审计',
+      content: '所有管理操作必须记录审计日志',
+      keyInfoTerms: ['管理操作', '审计日志'],
+      sourceLocation: '第 4 页',
+      sourceChunkId: 'chunk-4',
+      evidenceQuote: '所有管理操作必须记录审计日志',
+      confidence: 0.88
+    }
+  ])
+  const reviewRequirements = db.listProjectRequirements({ projectId: project.id, page: 1, pageSize: 20 })
+  assert.equal(reviewRequirements.total, 2)
+  assert.equal(reviewRequirements.rows.find((item) => item.id === 'review-requirement-2')?.documentId, appendixDocument.id)
+  assert.equal(db.listProjectRequirements({ projectId: project.id, page: 1, pageSize: 20, scope: 'published' }).total, 1)
+  db.reviewProjectRequirements(['review-requirement-1'], 'approved')
+  assert.throws(() => db.publishReviewProjectRequirementSet(project.id), /仍有 1 条需求未完成审核/)
+  db.reviewProjectRequirements(['review-requirement-2'], 'approved')
+  const publishedSet = db.publishReviewProjectRequirementSet(project.id)
+  assert.equal(publishedSet.status, 'published')
+  assert.equal(db.listAllProjectRequirements(project.id).length, 2)
 
   console.log(JSON.stringify({
     ok: true,

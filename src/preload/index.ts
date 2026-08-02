@@ -4,6 +4,7 @@ import type {
   ChatRequest,
   ChatSessionDeleteResult,
   ChatSessionSaveInput,
+  DataReviewApplyInput,
   KnowledgeDocumentDetail,
   KnowledgeDocumentPage,
   KnowledgeDocumentQuery,
@@ -34,13 +35,20 @@ import type {
   ManagedProjectListQuery,
   OrganizationPersonInput,
   OrganizationPersonListQuery,
+  ProjectAnalysisLogEntry,
   ProjectAnalysisProgress,
   ProjectCostEntryInput,
+  ProjectDocumentSnapshot,
   ProjectParticipantInput,
   ProjectPlanTaskInput,
   ProjectPlanTaskMoveInput,
+  ProjectRequirementInput,
+  ProjectRequirementMergeInput,
   ProjectRequirementMatchQuery,
   ProjectRequirementQuery,
+  ProjectRequirementReviewStatus,
+  ProjectRequirementSplitInput,
+  ProjectAgreementUploadOptions,
   ProjectRequirementStatus
 } from '../shared/project-types'
 
@@ -77,6 +85,8 @@ const api: AppApi = {
   saveSyncConfig: (config: SyncScopeConfig) => ipcRenderer.invoke('sync:save-config', config),
   previewSync: (config?: SyncScopeConfig) => ipcRenderer.invoke('sync:preview', config),
   startSync: (config?: SyncScopeConfig) => ipcRenderer.invoke('sync:start', config),
+  applyDataReview: (input: DataReviewApplyInput) =>
+    ipcRenderer.invoke('data:apply-review', input),
   listCollectionRequestLogs: (page?: number, pageSize?: number) =>
     ipcRenderer.invoke('sync:request-logs', page, pageSize),
   askAgent: (request: ChatRequest) => ipcRenderer.invoke('agent:ask', request),
@@ -112,6 +122,8 @@ const api: AppApi = {
     ipcRenderer.invoke('dashboards:restore', id, version),
   diagnoseDashboard: (spec: DashboardSpec) =>
     ipcRenderer.invoke('dashboards:diagnose', spec),
+  repairDashboardComponent: (spec: DashboardSpec, componentId: string) =>
+    ipcRenderer.invoke('dashboards:repair-component', spec, componentId),
   listVisualizationRuns: (limit?: number) =>
     ipcRenderer.invoke('dashboards:runs', limit),
   listDashboardAuditLogs: (dashboardId?: string, limit?: number): Promise<DashboardAuditLog[]> =>
@@ -161,19 +173,34 @@ const api: AppApi = {
   },
   listManagedProjects: (query: ManagedProjectListQuery) => ipcRenderer.invoke('projects:list', query),
   getManagedProject: (id: string) => ipcRenderer.invoke('projects:get', id),
+  listManagedProjectDocuments: (id: string): Promise<ProjectDocumentSnapshot[]> => ipcRenderer.invoke('projects:documents', id),
+  listProjectAnalysisLogs: (id: string, limit?: number): Promise<ProjectAnalysisLogEntry[]> => ipcRenderer.invoke('projects:analysis-logs', id, limit),
   createManagedProject: (input: ManagedProjectInput) => ipcRenderer.invoke('projects:create', input),
   updateManagedProject: (id: string, input: ManagedProjectInput) => ipcRenderer.invoke('projects:update', id, input),
   deleteManagedProject: (id: string) => ipcRenderer.invoke('projects:delete', id),
   exportManagedProjectData: (id: string) => ipcRenderer.invoke('projects:export-data', id),
+  exportManagedProjectExcel: (id: string) => ipcRenderer.invoke('projects:export-excel', id),
   importManagedProjectData: () => ipcRenderer.invoke('projects:import-data'),
   discardManagedProjectDraft: (id: string) => ipcRenderer.invoke('projects:discard-draft', id),
-  startProjectTechnicalAgreementUpload: (projectId?: string) =>
-    ipcRenderer.invoke('projects:upload-agreement', projectId),
+  startProjectTechnicalAgreementUpload: (projectId?: string, options?: ProjectAgreementUploadOptions) =>
+    ipcRenderer.invoke('projects:upload-agreement', projectId, options),
   confirmManagedProject: (id: string) => ipcRenderer.invoke('projects:confirm', id),
   retryProjectAnalysis: (id: string) => ipcRenderer.invoke('projects:retry-analysis', id),
   startProjectMatching: (id: string) => ipcRenderer.invoke('projects:start-matching', id),
   listProjectRequirements: (query: ProjectRequirementQuery) =>
     ipcRenderer.invoke('projects:requirements', query),
+  getProjectRequirementSet: (projectId: string) => ipcRenderer.invoke('projects:requirement-set', projectId),
+  createProjectRequirement: (projectId: string, input: ProjectRequirementInput) =>
+    ipcRenderer.invoke('projects:requirement-create', projectId, input),
+  updateProjectRequirement: (id: string, input: ProjectRequirementInput) =>
+    ipcRenderer.invoke('projects:requirement-update', id, input),
+  splitProjectRequirement: (id: string, input: ProjectRequirementSplitInput) =>
+    ipcRenderer.invoke('projects:requirement-split', id, input),
+  mergeProjectRequirements: (input: ProjectRequirementMergeInput) =>
+    ipcRenderer.invoke('projects:requirement-merge', input),
+  reviewProjectRequirements: (ids: string[], status: ProjectRequirementReviewStatus) =>
+    ipcRenderer.invoke('projects:requirement-review', ids, status),
+  publishProjectRequirements: (projectId: string) => ipcRenderer.invoke('projects:requirements-publish', projectId),
   deleteProjectRequirement: (id: string) => ipcRenderer.invoke('projects:requirement-delete', id),
   updateProjectRequirementStatus: (id: string, status: ProjectRequirementStatus) =>
     ipcRenderer.invoke('projects:requirement-status', id, status),

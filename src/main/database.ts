@@ -12,6 +12,10 @@ import type {
   CollectionRequestLogPage,
   CollectionRequestLogRow,
   CollectionRequestLogStatus,
+  DataReviewApplyResult,
+  DataReviewItem,
+  DataReviewSource,
+  DataReviewSummary,
   DataDeleteResult,
   DataImportResult,
   DashboardStats,
@@ -43,7 +47,9 @@ import type {
   OrganizationPersonInput,
   OrganizationPersonListQuery,
   OrganizationPersonPage,
+  ProjectAnalysisLogEntry,
   ProjectAsset,
+  ProjectAnalysisProgress,
   ProjectCostEntry,
   ProjectCostEntryInput,
   ProjectDataSnapshot,
@@ -54,11 +60,17 @@ import type {
   ProjectPlanTaskInput,
   ProjectPlanTaskMoveInput,
   ProjectRequirement,
+  ProjectRequirementCategory,
+  ProjectRequirementInput,
+  ProjectRequirementMergeInput,
   ProjectRequirementMatch,
   ProjectRequirementMatchPage,
   ProjectRequirementMatchQuery,
   ProjectRequirementPage,
   ProjectRequirementQuery,
+  ProjectRequirementReviewStatus,
+  ProjectRequirementSetSummary,
+  ProjectRequirementSplitInput,
   ProjectRequirementStatus,
   ProjectRequirementStatusSource
 } from '../shared/project-types'
@@ -81,7 +93,9 @@ import type {
   DashboardSummary,
   DashboardVersion,
   VisualizationRun,
-  VisualizationRunInput
+  VisualizationRunInput,
+  VisualizationToolCall,
+  VisualizationToolName
 } from '../shared/dashboard'
 
 export interface RecordInput {
@@ -104,9 +118,59 @@ export interface ImageInput {
   bytes: Buffer
 }
 
+export interface PendingDataReview extends DataReviewItem {
+  payload: unknown
+}
+
 type SqlRow = Record<string, unknown>
 
 const nowIso = (): string => new Date().toISOString()
+
+const parseJsonValue = (input: unknown, fallback: unknown): unknown => {
+  if (!input) return fallback
+  try {
+    return JSON.parse(String(input)) as unknown
+  } catch {
+    return fallback
+  }
+}
+
+const visualizationToolNames = new Set<VisualizationToolName>([
+  'profile-fields',
+  'model-compose',
+  'validate-dashboard',
+  'execute-query',
+  'apply-patch',
+  'repair-attempt'
+])
+
+const normalizeVisualizationToolCalls = (input: unknown): VisualizationToolCall[] => {
+  if (!Array.isArray(input)) return []
+  return input.slice(0, 100).flatMap((value, index): VisualizationToolCall[] => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return []
+    const call = value as Partial<VisualizationToolCall>
+    if (!visualizationToolNames.has(call.tool as VisualizationToolName)) return []
+    const rawMetadata = call.metadata && typeof call.metadata === 'object' && !Array.isArray(call.metadata)
+      ? call.metadata
+      : {}
+    const metadata = Object.fromEntries(
+      Object.entries(rawMetadata)
+        .filter(([, item]) => typeof item === 'boolean' || Number.isFinite(item))
+        .slice(0, 12)
+    ) as Record<string, number | boolean>
+    const durationMs = Number(call.durationMs)
+    const attempt = Number(call.attempt)
+    return [{
+      sequence: index + 1,
+      tool: call.tool as VisualizationToolName,
+      status: call.status === 'failed' ? 'failed' : 'success',
+      attempt: Number.isFinite(attempt) ? Math.max(0, Math.min(10, Math.floor(attempt))) : 0,
+      durationMs: Number.isFinite(durationMs) ? Math.max(0, Number(durationMs.toFixed(2))) : 0,
+      ...(call.componentId?.trim() ? { componentId: call.componentId.trim().slice(0, 120) } : {}),
+      ...(Object.keys(metadata).length ? { metadata } : {})
+    }]
+  })
+}
 
 export interface KnowledgeDocumentInput {
   id: string
@@ -505,6 +569,7 @@ export class AppDatabase {
       CREATE INDEX IF NOT EXISTS idx_records_type ON records(node_type);
       CREATE INDEX IF NOT EXISTS idx_records_parent ON records(parent_id);
       CREATE INDEX IF NOT EXISTS idx_records_modify ON records(last_modify_time);
+      CREATE INDEX IF NOT EXISTS idx_records_item_id ON records(item_id);
 
       CREATE TABLE IF NOT EXISTS images (
         id TEXT PRIMARY KEY,
@@ -575,6 +640,30 @@ export class AppDatabase {
       CREATE INDEX IF NOT EXISTS idx_collection_logs_status
         ON collection_request_logs(status);
 
+      CREATE TABLE IF NOT EXISTS data_review_items (
+        id TEXT PRIMARY KEY,
+        batch_id TEXT NOT NULL,
+        source TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        existing_uid TEXT NOT NULL,
+        existing_project_id TEXT NOT NULL DEFAULT '',
+        existing_node_type TEXT NOT NULL DEFAULT '',
+        existing_name TEXT NOT NULL DEFAULT '',
+        existing_last_modify_time TEXT NOT NULL DEFAULT '',
+        incoming_uid TEXT NOT NULL,
+        incoming_project_id TEXT NOT NULL DEFAULT '',
+        incoming_node_type TEXT NOT NULL DEFAULT '',
+        incoming_name TEXT NOT NULL DEFAULT '',
+        incoming_last_modify_time TEXT NOT NULL DEFAULT '',
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_data_review_batch
+        ON data_review_items(batch_id, source, created_at);
+      CREATE INDEX IF NOT EXISTS idx_data_review_item
+        ON data_review_items(item_id);
+
       CREATE TABLE IF NOT EXISTS dashboards (
         id TEXT PRIMARY KEY,
         title TEXT NOT NULL,
@@ -606,11 +695,13 @@ export class AppDatabase {
         request_summary TEXT NOT NULL DEFAULT '',
         model_name TEXT NOT NULL DEFAULT '',
         prompt_version TEXT NOT NULL DEFAULT '',
+        mode TEXT NOT NULL DEFAULT 'generate',
         status TEXT NOT NULL,
         attempt_count INTEGER NOT NULL DEFAULT 0,
         component_count INTEGER NOT NULL DEFAULT 0,
         query_count INTEGER NOT NULL DEFAULT 0,
         duration_ms REAL NOT NULL DEFAULT 0,
+        tool_calls_json TEXT NOT NULL DEFAULT '[]',
         error_message TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL
       );
@@ -814,6 +905,26 @@ export class AppDatabase {
       CREATE INDEX IF NOT EXISTS idx_pm_project_documents_current
         ON pm_project_documents(project_id, is_current, version DESC);
 
+      CREATE TABLE IF NOT EXISTS pm_requirement_sets (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        document_id TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'reviewing',
+        total_chunks INTEGER NOT NULL DEFAULT 0,
+        analyzed_chunks INTEGER NOT NULL DEFAULT 0,
+        warnings_json TEXT NOT NULL DEFAULT '[]',
+        external_processing INTEGER NOT NULL DEFAULT 0,
+        model_name TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        published_at TEXT NOT NULL DEFAULT '',
+        UNIQUE(project_id, version),
+        FOREIGN KEY(project_id) REFERENCES pm_projects(id) ON DELETE CASCADE,
+        FOREIGN KEY(document_id) REFERENCES knowledge_documents(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_pm_requirement_sets_project
+        ON pm_requirement_sets(project_id, status, version DESC);
+
       CREATE TABLE IF NOT EXISTS pm_project_assets (
         project_id TEXT NOT NULL,
         record_uid TEXT NOT NULL,
@@ -870,7 +981,10 @@ export class AppDatabase {
         id TEXT PRIMARY KEY,
         project_id TEXT NOT NULL,
         document_id TEXT NOT NULL,
+        set_id TEXT NOT NULL DEFAULT '',
+        version INTEGER NOT NULL DEFAULT 1,
         requirement_no INTEGER NOT NULL,
+        category TEXT NOT NULL DEFAULT 'functional',
         module TEXT NOT NULL DEFAULT '',
         title TEXT NOT NULL,
         content TEXT NOT NULL,
@@ -878,6 +992,10 @@ export class AppDatabase {
         key_info_terms_source TEXT NOT NULL DEFAULT 'ai',
         source_location TEXT NOT NULL DEFAULT '',
         source_chunk_id TEXT NOT NULL DEFAULT '',
+        evidence_quote TEXT NOT NULL DEFAULT '',
+        confidence REAL NOT NULL DEFAULT 1,
+        review_status TEXT NOT NULL DEFAULT 'approved',
+        review_note TEXT NOT NULL DEFAULT '',
         status TEXT NOT NULL DEFAULT 'unmarked',
         status_source TEXT NOT NULL DEFAULT 'ai',
         status_reason TEXT NOT NULL DEFAULT '',
@@ -926,6 +1044,27 @@ export class AppDatabase {
       );
       CREATE INDEX IF NOT EXISTS idx_pm_analysis_runs_project
         ON pm_analysis_runs(project_id, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS pm_analysis_logs (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        task_type TEXT NOT NULL,
+        phase TEXT NOT NULL,
+        status TEXT NOT NULL,
+        current_count INTEGER NOT NULL DEFAULT 0,
+        total_count INTEGER NOT NULL DEFAULT 0,
+        message TEXT NOT NULL DEFAULT '',
+        detail TEXT NOT NULL DEFAULT '',
+        document_id TEXT NOT NULL DEFAULT '',
+        file_name TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(project_id) REFERENCES pm_projects(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_pm_analysis_logs_project
+        ON pm_analysis_logs(project_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_pm_analysis_logs_task
+        ON pm_analysis_logs(task_id, created_at ASC);
     `)
 
     for (const statement of [
@@ -934,9 +1073,18 @@ export class AppDatabase {
       "ALTER TABLE records ADD COLUMN pushed_at TEXT NOT NULL DEFAULT ''",
       "ALTER TABLE records ADD COLUMN pushed_uid TEXT NOT NULL DEFAULT ''",
       "ALTER TABLE field_profiles ADD COLUMN sensitivity TEXT NOT NULL DEFAULT 'normal'",
+      "ALTER TABLE visualization_runs ADD COLUMN mode TEXT NOT NULL DEFAULT 'generate'",
+      "ALTER TABLE visualization_runs ADD COLUMN tool_calls_json TEXT NOT NULL DEFAULT '[]'",
       "ALTER TABLE pm_requirements ADD COLUMN key_info_terms_json TEXT NOT NULL DEFAULT '[]'",
       "ALTER TABLE pm_requirements ADD COLUMN key_info_terms_source TEXT NOT NULL DEFAULT 'ai'",
       "ALTER TABLE pm_requirements ADD COLUMN module TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE pm_requirements ADD COLUMN set_id TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE pm_requirements ADD COLUMN version INTEGER NOT NULL DEFAULT 1",
+      "ALTER TABLE pm_requirements ADD COLUMN category TEXT NOT NULL DEFAULT 'functional'",
+      "ALTER TABLE pm_requirements ADD COLUMN evidence_quote TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE pm_requirements ADD COLUMN confidence REAL NOT NULL DEFAULT 1",
+      "ALTER TABLE pm_requirements ADD COLUMN review_status TEXT NOT NULL DEFAULT 'approved'",
+      "ALTER TABLE pm_requirements ADD COLUMN review_note TEXT NOT NULL DEFAULT ''",
       "UPDATE pm_requirements SET status = 'unmarked', status_reason = '待人工标记' WHERE status_source = 'ai' AND status <> 'satisfied'",
       "ALTER TABLE pm_cost_entries ADD COLUMN responsible_participant_id TEXT",
       "ALTER TABLE pm_cost_entries ADD COLUMN responsible_person_name TEXT NOT NULL DEFAULT ''"
@@ -949,6 +1097,8 @@ export class AppDatabase {
     }
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_records_push_status ON records(push_status)')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_pm_cost_entries_responsible ON pm_cost_entries(responsible_participant_id)')
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_pm_requirements_set ON pm_requirements(set_id, requirement_no)')
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_pm_requirements_review ON pm_requirements(project_id, review_status)')
 
     try {
       this.db.exec(`
@@ -1150,6 +1300,20 @@ export class AppDatabase {
       .prepare('SELECT * FROM knowledge_documents WHERE sha256 = ?')
       .get(sha256) as SqlRow | undefined
     return row ? this.mapKnowledgeDocument(row) : null
+  }
+
+  storeKnowledgeDocumentFile(bytes: Buffer, sha256: string, extension: string): string {
+    const documentDir = join(this.assetDir, 'documents')
+    mkdirSync(documentDir, { recursive: true })
+    const safeExtension = /^\.[a-z0-9]{1,8}$/i.test(extension) ? extension.toLowerCase() : '.bin'
+    const target = join(documentDir, `${sha256}${safeExtension}`)
+    writeFileSync(target, bytes)
+    return target
+  }
+
+  updateKnowledgeDocumentFilePath(id: string, filePath: string): void {
+    this.db.prepare('UPDATE knowledge_documents SET file_path = ?, updated_at = ? WHERE id = ?')
+      .run(filePath, nowIso(), id)
   }
 
   insertKnowledgeDocument(input: KnowledgeDocumentInput): KnowledgeDocument {
@@ -1521,6 +1685,11 @@ export class AppDatabase {
       assetCount: Number(row.asset_count ?? 0),
       participantCount: Number(row.participant_count ?? 0),
       taskCount: Number(row.task_count ?? 0),
+      documentCount: Number(row.document_count ?? 0),
+      ...(row.review_set_id ? { reviewSetId: String(row.review_set_id) } : {}),
+      reviewVersion: Number(row.review_version ?? 0),
+      reviewRequirementCount: Number(row.review_requirement_count ?? 0),
+      pendingReviewCount: Number(row.pending_review_count ?? 0),
       ...(row.current_document_id ? { currentDocumentId: String(row.current_document_id) } : {}),
       ...(row.current_document_name ? { currentDocumentName: String(row.current_document_name) } : {}),
       createdAt: String(row.created_at ?? ''),
@@ -1531,15 +1700,25 @@ export class AppDatabase {
   private managedProjectSelect(): string {
     return `
       SELECT p.*,
-        (SELECT COUNT(*) FROM pm_requirements q WHERE q.project_id = p.id) AS requirement_count,
-        (SELECT COUNT(*) FROM pm_requirements q WHERE q.project_id = p.id AND q.status = 'satisfied') AS satisfied_count,
-        (SELECT COUNT(*) FROM pm_requirements q WHERE q.project_id = p.id AND q.status = 'to_develop') AS to_develop_count,
-        (SELECT COUNT(*) FROM pm_requirements q WHERE q.project_id = p.id AND q.status = 'to_negotiate') AS to_negotiate_count,
-        (SELECT COUNT(*) FROM pm_requirements q WHERE q.project_id = p.id AND q.status = 'unmarked') AS unmarked_count,
+        (SELECT COUNT(*) FROM pm_requirements q WHERE q.project_id = p.id AND q.review_status = 'approved'
+          AND (q.set_id = '' OR q.set_id IN (SELECT id FROM pm_requirement_sets WHERE project_id = p.id AND status = 'published'))) AS requirement_count,
+        (SELECT COUNT(*) FROM pm_requirements q WHERE q.project_id = p.id AND q.review_status = 'approved' AND q.status = 'satisfied'
+          AND (q.set_id = '' OR q.set_id IN (SELECT id FROM pm_requirement_sets WHERE project_id = p.id AND status = 'published'))) AS satisfied_count,
+        (SELECT COUNT(*) FROM pm_requirements q WHERE q.project_id = p.id AND q.review_status = 'approved' AND q.status = 'to_develop'
+          AND (q.set_id = '' OR q.set_id IN (SELECT id FROM pm_requirement_sets WHERE project_id = p.id AND status = 'published'))) AS to_develop_count,
+        (SELECT COUNT(*) FROM pm_requirements q WHERE q.project_id = p.id AND q.review_status = 'approved' AND q.status = 'to_negotiate'
+          AND (q.set_id = '' OR q.set_id IN (SELECT id FROM pm_requirement_sets WHERE project_id = p.id AND status = 'published'))) AS to_negotiate_count,
+        (SELECT COUNT(*) FROM pm_requirements q WHERE q.project_id = p.id AND q.review_status = 'approved' AND q.status = 'unmarked'
+          AND (q.set_id = '' OR q.set_id IN (SELECT id FROM pm_requirement_sets WHERE project_id = p.id AND status = 'published'))) AS unmarked_count,
+        (SELECT id FROM pm_requirement_sets WHERE project_id = p.id AND status = 'reviewing' ORDER BY version DESC LIMIT 1) AS review_set_id,
+        (SELECT version FROM pm_requirement_sets WHERE project_id = p.id AND status = 'reviewing' ORDER BY version DESC LIMIT 1) AS review_version,
+        (SELECT COUNT(*) FROM pm_requirements q WHERE q.set_id = (SELECT id FROM pm_requirement_sets WHERE project_id = p.id AND status = 'reviewing' ORDER BY version DESC LIMIT 1)) AS review_requirement_count,
+        (SELECT COUNT(*) FROM pm_requirements q WHERE q.review_status = 'pending' AND q.set_id = (SELECT id FROM pm_requirement_sets WHERE project_id = p.id AND status = 'reviewing' ORDER BY version DESC LIMIT 1)) AS pending_review_count,
         (SELECT COUNT(*) FROM pm_project_assets a WHERE a.project_id = p.id) AS asset_count,
         (SELECT COUNT(*) FROM pm_project_participants pp WHERE pp.project_id = p.id) AS participant_count,
         (SELECT COALESCE(SUM(pp.estimated_cost), 0) FROM pm_project_participants pp WHERE pp.project_id = p.id) AS labor_estimated_cost,
         (SELECT COUNT(*) FROM pm_project_tasks pt WHERE pt.project_id = p.id) AS task_count,
+        (SELECT COUNT(*) FROM pm_project_documents pd WHERE pd.project_id = p.id) AS document_count,
         (SELECT d.id FROM pm_project_documents pd JOIN knowledge_documents d ON d.id = pd.document_id
           WHERE pd.project_id = p.id AND pd.is_current = 1 ORDER BY pd.version DESC LIMIT 1) AS current_document_id,
         (SELECT d.file_name FROM pm_project_documents pd JOIN knowledge_documents d ON d.id = pd.document_id
@@ -1758,6 +1937,97 @@ export class AppDatabase {
     return this.getManagedProject(id)
   }
 
+  saveProjectAnalysisProgress(progress: ProjectAnalysisProgress): void {
+    const timestamp = nowIso()
+    const taskType = progress.phase === 'matching' ? 'matching' : 'agreement'
+    this.db.prepare(`
+      INSERT INTO pm_analysis_runs(
+        id, project_id, task_type, phase, status, current_count, total_count,
+        message, output_json, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
+      ON CONFLICT(id) DO UPDATE SET phase = excluded.phase, status = excluded.status,
+        current_count = excluded.current_count, total_count = excluded.total_count,
+        message = excluded.message, updated_at = excluded.updated_at
+    `).run(
+      progress.taskId, progress.projectId, taskType, progress.phase, progress.status,
+      progress.current, progress.total, progress.message, timestamp, timestamp
+    )
+    this.db.prepare(`
+      INSERT INTO pm_analysis_logs(
+        id, task_id, project_id, task_type, phase, status, current_count, total_count,
+        message, detail, document_id, file_name, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      randomUUID(),
+      progress.taskId,
+      progress.projectId,
+      taskType,
+      progress.phase,
+      progress.status,
+      Math.max(0, Math.trunc(progress.current)),
+      Math.max(0, Math.trunc(progress.total)),
+      progress.message,
+      progress.detail ?? '',
+      progress.documentId ?? '',
+      progress.fileName ?? '',
+      timestamp
+    )
+  }
+
+  listProjectAnalysisLogs(projectId: string, limit = 160): ProjectAnalysisLogEntry[] {
+    const safeLimit = Math.min(500, Math.max(1, Math.trunc(Number(limit) || 160)))
+    const rows = this.db.prepare(`
+      SELECT * FROM pm_analysis_logs
+      WHERE project_id = ?
+      ORDER BY created_at DESC, rowid DESC
+      LIMIT ?
+    `).all(projectId, safeLimit) as SqlRow[]
+    return rows.map((row): ProjectAnalysisLogEntry => ({
+      id: String(row.id),
+      taskId: String(row.task_id),
+      projectId: String(row.project_id),
+      taskType: String(row.task_type ?? 'agreement') === 'matching' ? 'matching' : 'agreement',
+      phase: String(row.phase ?? 'queued') as ProjectAnalysisLogEntry['phase'],
+      message: String(row.message ?? ''),
+      detail: String(row.detail ?? ''),
+      ...(String(row.document_id ?? '').trim() ? { documentId: String(row.document_id) } : {}),
+      ...(String(row.file_name ?? '').trim() ? { fileName: String(row.file_name) } : {}),
+      current: Number(row.current_count ?? 0),
+      total: Number(row.total_count ?? 0),
+      status: String(row.status ?? 'running') as ProjectAnalysisLogEntry['status'],
+      createdAt: String(row.created_at ?? '')
+    }))
+  }
+
+  reconcileInterruptedProjectAnalysis(): number {
+    const timestamp = nowIso()
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const result = this.db.prepare(`
+        UPDATE pm_projects SET
+          analysis_status = CASE WHEN analysis_status = 'processing' THEN 'failed' ELSE analysis_status END,
+          analysis_message = CASE WHEN analysis_status = 'processing' THEN '上次协议解析因应用退出而中断，请重新执行' ELSE analysis_message END,
+          match_status = CASE WHEN match_status = 'processing' THEN 'failed' ELSE match_status END,
+          match_message = CASE WHEN match_status = 'processing' THEN '上次需求匹配因应用退出而中断，请重新执行' ELSE match_message END,
+          updated_at = ?
+        WHERE analysis_status = 'processing' OR match_status = 'processing'
+      `).run(timestamp)
+      this.db.prepare(`
+        UPDATE pm_analysis_runs SET status = 'failed', message = message || '（应用退出中断）', updated_at = ?
+        WHERE status = 'running'
+      `).run(timestamp)
+      this.db.prepare(`
+        UPDATE pm_analysis_logs SET status = 'failed', message = message || '（应用退出中断）'
+        WHERE status = 'running'
+      `).run()
+      this.db.exec('COMMIT')
+      return Number(result.changes)
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
   deleteManagedProject(id: string): { ok: boolean; message: string } {
     const normalizedId = id.trim()
     if (!normalizedId) return { ok: false, message: '项目标识不能为空' }
@@ -1779,6 +2049,36 @@ export class AppDatabase {
       this.db.exec('ROLLBACK')
       throw error
     }
+  }
+
+  listManagedProjectDocuments(projectId: string): ProjectDocumentSnapshot[] {
+    return (this.db.prepare(`
+      SELECT d.*, pd.version, pd.is_current, pd.linked_at
+      FROM pm_project_documents pd
+      JOIN knowledge_documents d ON d.id = pd.document_id
+      WHERE pd.project_id = ?
+      ORDER BY pd.version DESC, d.created_at DESC
+    `).all(projectId) as SqlRow[]).map((row): ProjectDocumentSnapshot => ({
+      id: String(row.id),
+      fileName: String(row.file_name ?? ''),
+      filePath: String(row.file_path ?? ''),
+      extension: String(row.extension ?? ''),
+      mimeType: String(row.mime_type ?? 'application/octet-stream'),
+      byteSize: Number(row.byte_size ?? 0),
+      sha256: String(row.sha256 ?? ''),
+      tags: parseJsonArray(row.tags_json),
+      status: String(row.status ?? 'queued'),
+      errorMessage: String(row.error_message ?? ''),
+      chunkCount: Number(row.chunk_count ?? 0),
+      pageCount: Number(row.page_count ?? 0),
+      modelVersion: String(row.model_version ?? ''),
+      createdAt: String(row.created_at ?? ''),
+      updatedAt: String(row.updated_at ?? ''),
+      processedAt: String(row.processed_at ?? ''),
+      version: Number(row.version ?? 1),
+      isCurrent: Number(row.is_current ?? 0) === 1,
+      linkedAt: String(row.linked_at ?? '')
+    }))
   }
 
   exportManagedProjectSnapshot(projectId: string): ProjectDataSnapshot | null {
@@ -2051,16 +2351,20 @@ export class AppDatabase {
         }
         this.db.prepare(`
           INSERT INTO pm_requirements(
-            id, project_id, document_id, requirement_no, module, title, content,
+            id, project_id, document_id, set_id, version, requirement_no, category, module, title, content,
             key_info_terms_json, key_info_terms_source, source_location, source_chunk_id,
+            evidence_quote, confidence, review_status, review_note,
             status, status_source, status_reason, highest_match_score, match_count,
             created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           targetRequirementId,
           projectId,
           targetDocumentId,
+          '',
+          Math.max(1, Math.trunc(Number(requirement.version ?? 1))),
           Math.max(1, Math.trunc(Number(requirement.requirementNo ?? 0))),
+          validValue(requirement.category, ['functional', 'interface', 'data', 'performance', 'security', 'deployment', 'operations', 'acceptance', 'business'] as const, 'functional'),
           String(requirement.module ?? '').trim(),
           String(requirement.title ?? '').trim() || '未命名需求',
           String(requirement.content ?? '').trim(),
@@ -2068,6 +2372,10 @@ export class AppDatabase {
           validValue(requirement.keyInfoTermsSource, ['ai', 'manual'] as const, 'ai'),
           String(requirement.sourceLocation ?? ''),
           String(requirement.sourceChunkId ?? ''),
+          String(requirement.evidenceQuote ?? ''),
+          Math.max(0, Math.min(1, Number(requirement.confidence ?? 1))),
+          'approved',
+          String(requirement.reviewNote ?? ''),
           validValue(requirement.status, ['unmarked', 'satisfied', 'to_develop', 'to_negotiate'] as const, 'unmarked'),
           validValue(requirement.statusSource, ['ai', 'manual'] as const, 'ai'),
           String(requirement.statusReason ?? ''),
@@ -2278,6 +2586,177 @@ export class AppDatabase {
     `).run(projectId, documentId, Number(versionRow.version) + 1, nowIso())
   }
 
+  createProjectRequirementSet(input: {
+    projectId: string
+    documentId: string
+    totalChunks: number
+    analyzedChunks: number
+    warnings: string[]
+    externalProcessing: boolean
+    modelName: string
+  }): ProjectRequirementSetSummary {
+    const timestamp = nowIso()
+    const versionRow = this.db.prepare(
+      'SELECT COALESCE(MAX(version), 0) AS version FROM pm_requirement_sets WHERE project_id = ?'
+    ).get(input.projectId) as SqlRow
+    const id = randomUUID()
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      this.db.prepare(
+        "UPDATE pm_requirement_sets SET status = 'superseded' WHERE project_id = ? AND status = 'reviewing'"
+      ).run(input.projectId)
+      this.db.prepare(`
+        INSERT INTO pm_requirement_sets(
+          id, project_id, document_id, version, status, total_chunks, analyzed_chunks,
+          warnings_json, external_processing, model_name, created_at, published_at
+        ) VALUES (?, ?, ?, ?, 'reviewing', ?, ?, ?, ?, ?, ?, '')
+      `).run(
+        id,
+        input.projectId,
+        input.documentId,
+        Number(versionRow.version) + 1,
+        Math.max(0, Math.trunc(input.totalChunks)),
+        Math.max(0, Math.trunc(input.analyzedChunks)),
+        JSON.stringify(input.warnings),
+        input.externalProcessing ? 1 : 0,
+        input.modelName,
+        timestamp
+      )
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+    return this.getProjectRequirementSetById(id)!
+  }
+
+  getReviewProjectRequirementSet(projectId: string): ProjectRequirementSetSummary | null {
+    const row = this.db.prepare(`
+      SELECT s.*,
+        COUNT(q.id) AS requirement_count,
+        SUM(CASE WHEN q.review_status = 'pending' THEN 1 ELSE 0 END) AS pending_count,
+        SUM(CASE WHEN q.review_status = 'approved' THEN 1 ELSE 0 END) AS approved_count,
+        SUM(CASE WHEN q.review_status = 'rejected' THEN 1 ELSE 0 END) AS rejected_count
+      FROM pm_requirement_sets s
+      LEFT JOIN pm_requirements q ON q.set_id = s.id
+      WHERE s.project_id = ? AND s.status = 'reviewing'
+      GROUP BY s.id
+      ORDER BY s.version DESC LIMIT 1
+    `).get(projectId) as SqlRow | undefined
+    return row ? this.mapProjectRequirementSet(row) : null
+  }
+
+  private getProjectRequirementSetById(id: string): ProjectRequirementSetSummary | null {
+    const row = this.db.prepare(`
+      SELECT s.*,
+        COUNT(q.id) AS requirement_count,
+        SUM(CASE WHEN q.review_status = 'pending' THEN 1 ELSE 0 END) AS pending_count,
+        SUM(CASE WHEN q.review_status = 'approved' THEN 1 ELSE 0 END) AS approved_count,
+        SUM(CASE WHEN q.review_status = 'rejected' THEN 1 ELSE 0 END) AS rejected_count
+      FROM pm_requirement_sets s
+      LEFT JOIN pm_requirements q ON q.set_id = s.id
+      WHERE s.id = ? GROUP BY s.id
+    `).get(id) as SqlRow | undefined
+    return row ? this.mapProjectRequirementSet(row) : null
+  }
+
+  replaceReviewProjectRequirements(
+    setId: string,
+    projectId: string,
+    documentId: string,
+    requirements: Array<{
+      id: string
+      documentId?: string
+      requirementNo: number
+      category: ProjectRequirementCategory
+      module?: string
+      title: string
+      content: string
+      keyInfoTerms?: string[]
+      sourceLocation: string
+      sourceChunkId: string
+      evidenceQuote: string
+      confidence: number
+    }>
+  ): void {
+    const set = this.getProjectRequirementSetById(setId)
+    if (!set || set.projectId !== projectId || set.status !== 'reviewing') {
+      throw new Error('待审核需求版本不存在或已发布')
+    }
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      this.db.prepare('DELETE FROM pm_requirements WHERE set_id = ?').run(setId)
+      const insert = this.db.prepare(`
+        INSERT INTO pm_requirements(
+          id, project_id, document_id, set_id, version, requirement_no, category, module,
+          title, content, key_info_terms_json, key_info_terms_source, source_location,
+          source_chunk_id, evidence_quote, confidence, review_status, review_note,
+          status, status_source, status_reason, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ai', ?, ?, ?, ?, 'pending', '', 'unmarked', 'ai', '待人工审核', ?, ?)
+      `)
+      const timestamp = nowIso()
+      requirements.forEach((item, index) => insert.run(
+        item.id,
+        projectId,
+        item.documentId ?? documentId,
+        setId,
+        set.version,
+        index + 1,
+        item.category,
+        item.module ?? '',
+        item.title,
+        item.content,
+        JSON.stringify(item.keyInfoTerms ?? []),
+        item.sourceLocation,
+        item.sourceChunkId,
+        item.evidenceQuote,
+        Math.max(0, Math.min(1, item.confidence)),
+        timestamp,
+        timestamp
+      ))
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  publishReviewProjectRequirementSet(projectId: string): ProjectRequirementSetSummary {
+    const set = this.getReviewProjectRequirementSet(projectId)
+    if (!set) throw new Error('当前没有待发布的审核版本')
+    if (set.pendingCount > 0) throw new Error(`仍有 ${set.pendingCount} 条需求未完成审核`)
+    if (set.approvedCount < 1) throw new Error('至少需要审核通过一条需求后才能发布')
+    const timestamp = nowIso()
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      this.db.prepare(
+        "UPDATE pm_requirement_sets SET status = 'superseded' WHERE project_id = ? AND status = 'published'"
+      ).run(projectId)
+      this.db.prepare(`
+        UPDATE pm_requirements SET review_status = 'rejected', review_note = ?, updated_at = ?
+        WHERE project_id = ? AND set_id = ''
+      `).run(`已由需求版本 V${set.version} 替代`, timestamp, projectId)
+      this.db.prepare(
+        "UPDATE pm_requirement_sets SET status = 'published', published_at = ? WHERE id = ? AND status = 'reviewing'"
+      ).run(timestamp, set.id)
+      this.db.prepare(`
+        DELETE FROM pm_requirement_matches WHERE requirement_id IN (
+          SELECT id FROM pm_requirements WHERE project_id = ? AND set_id <> ?
+        )
+      `).run(projectId, set.id)
+      this.db.prepare(`
+        UPDATE pm_projects SET analysis_status = 'ready', analysis_message = ?,
+          match_status = 'idle', match_message = '审核已发布，等待开始匹配', updated_at = ?
+        WHERE id = ?
+      `).run(`已发布 V${set.version}，共 ${set.approvedCount} 条审核通过需求`, timestamp, projectId)
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+    return this.getProjectRequirementSetById(set.id)!
+  }
+
   replaceProjectRequirements(
     projectId: string,
     documentId: string,
@@ -2334,23 +2813,175 @@ export class AppDatabase {
   listProjectRequirements(query: ProjectRequirementQuery): ProjectRequirementPage {
     const page = Math.max(1, Math.floor(query.page || 1))
     const pageSize = Math.min(200, Math.max(1, Math.floor(query.pageSize || 20)))
+    const reviewSet = query.scope === 'published' ? null : this.getReviewProjectRequirementSet(query.projectId)
+    const where = reviewSet
+      ? 'project_id = ? AND set_id = ?'
+      : `project_id = ? AND review_status = 'approved' AND (
+          set_id = '' OR set_id IN (
+            SELECT id FROM pm_requirement_sets WHERE project_id = ? AND status = 'published'
+          )
+        )`
+    const params = reviewSet ? [query.projectId, reviewSet.id] : [query.projectId, query.projectId]
     const total = Number((this.db.prepare(
-      'SELECT COUNT(*) AS count FROM pm_requirements WHERE project_id = ?'
-    ).get(query.projectId) as SqlRow).count)
+      `SELECT COUNT(*) AS count FROM pm_requirements WHERE ${where}`
+    ).get(...params) as SqlRow).count)
     const rows = this.db.prepare(`
       SELECT * FROM pm_requirements
-      WHERE project_id = ?
+      WHERE ${where}
       ORDER BY requirement_no ASC, id ASC
       LIMIT ? OFFSET ?
-    `).all(query.projectId, pageSize, (page - 1) * pageSize) as SqlRow[]
+    `).all(...params, pageSize, (page - 1) * pageSize) as SqlRow[]
     return { rows: rows.map((row) => this.mapProjectRequirement(row)), total }
   }
 
   listAllProjectRequirements(projectId: string): ProjectRequirement[] {
-    const rows = this.db.prepare(
-      'SELECT * FROM pm_requirements WHERE project_id = ? ORDER BY requirement_no ASC, id ASC'
-    ).all(projectId) as SqlRow[]
+    const rows = this.db.prepare(`
+      SELECT * FROM pm_requirements
+      WHERE project_id = ? AND review_status = 'approved' AND (
+        set_id = '' OR set_id IN (
+          SELECT id FROM pm_requirement_sets WHERE project_id = ? AND status = 'published'
+        )
+      )
+      ORDER BY requirement_no ASC, id ASC
+    `).all(projectId, projectId) as SqlRow[]
     return rows.map((row) => this.mapProjectRequirement(row))
+  }
+
+  createReviewProjectRequirement(projectId: string, input: ProjectRequirementInput): ProjectRequirement {
+    const set = this.getReviewProjectRequirementSet(projectId)
+    if (!set) throw new Error('当前没有待审核需求版本')
+    const nextNo = Number((this.db.prepare(
+      'SELECT COALESCE(MAX(requirement_no), 0) + 1 AS next_no FROM pm_requirements WHERE set_id = ?'
+    ).get(set.id) as SqlRow).next_no)
+    const id = randomUUID()
+    const timestamp = nowIso()
+    this.db.prepare(`
+      INSERT INTO pm_requirements(
+        id, project_id, document_id, set_id, version, requirement_no, category, module,
+        title, content, key_info_terms_json, key_info_terms_source, source_location,
+        source_chunk_id, evidence_quote, confidence, review_status, review_note,
+        status, status_source, status_reason, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?, 'pending', ?, 'unmarked', 'manual', '人工补录，待审核', ?, ?)
+    `).run(
+      id, projectId, set.documentId, set.id, set.version, nextNo, input.category,
+      input.module ?? '', input.title, input.content, JSON.stringify(input.keyInfoTerms ?? []),
+      input.sourceLocation ?? '', input.sourceChunkId ?? '', input.evidenceQuote ?? '',
+      Math.max(0, Math.min(1, input.confidence ?? 1)), input.reviewNote ?? '', timestamp, timestamp
+    )
+    return this.getProjectRequirement(id)!
+  }
+
+  updateReviewProjectRequirement(id: string, input: ProjectRequirementInput): ProjectRequirement | null {
+    const timestamp = nowIso()
+    const result = this.db.prepare(`
+      UPDATE pm_requirements SET category = ?, module = ?, title = ?, content = ?,
+        key_info_terms_json = ?, key_info_terms_source = 'manual', source_location = ?,
+        source_chunk_id = ?, evidence_quote = ?, confidence = ?, review_status = 'pending',
+        review_note = ?, updated_at = ?
+      WHERE id = ? AND set_id IN (SELECT id FROM pm_requirement_sets WHERE status = 'reviewing')
+    `).run(
+      input.category, input.module ?? '', input.title, input.content,
+      JSON.stringify(input.keyInfoTerms ?? []), input.sourceLocation ?? '', input.sourceChunkId ?? '',
+      input.evidenceQuote ?? '', Math.max(0, Math.min(1, input.confidence ?? 1)),
+      input.reviewNote ?? '', timestamp, id
+    )
+    return Number(result.changes) ? this.getProjectRequirement(id) : null
+  }
+
+  reviewProjectRequirements(ids: string[], status: ProjectRequirementReviewStatus): number {
+    const normalized = [...new Set(ids.map((id) => id.trim()).filter(Boolean))]
+    if (!normalized.length) return 0
+    const placeholders = normalized.map(() => '?').join(', ')
+    const result = this.db.prepare(`
+      UPDATE pm_requirements SET review_status = ?, updated_at = ?
+      WHERE id IN (${placeholders})
+        AND set_id IN (SELECT id FROM pm_requirement_sets WHERE status = 'reviewing')
+    `).run(status, nowIso(), ...normalized)
+    return Number(result.changes)
+  }
+
+  splitReviewProjectRequirement(id: string, input: ProjectRequirementSplitInput): ProjectRequirement[] {
+    const current = this.getProjectRequirement(id)
+    if (!current || !current.setId || !input.parts.length) return []
+    const set = this.getProjectRequirementSetById(current.setId)
+    if (!set || set.status !== 'reviewing') return []
+    const timestamp = nowIso()
+    const createdIds: string[] = []
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      this.db.prepare('DELETE FROM pm_requirements WHERE id = ?').run(id)
+      const insert = this.db.prepare(`
+        INSERT INTO pm_requirements(
+          id, project_id, document_id, set_id, version, requirement_no, category, module,
+          title, content, key_info_terms_json, key_info_terms_source, source_location,
+          source_chunk_id, evidence_quote, confidence, review_status, review_note,
+          status, status_source, status_reason, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?, 'pending', ?, 'unmarked', 'manual', '人工拆分，待审核', ?, ?)
+      `)
+      input.parts.forEach((part, index) => {
+        const childId = randomUUID()
+        createdIds.push(childId)
+        insert.run(
+          childId, current.projectId, current.documentId, current.setId, current.version,
+          current.requirementNo + index, part.category, part.module ?? current.module,
+          part.title, part.content, JSON.stringify(part.keyInfoTerms ?? current.keyInfoTerms),
+          part.sourceLocation ?? current.sourceLocation, part.sourceChunkId ?? current.sourceChunkId,
+          part.evidenceQuote ?? current.evidenceQuote, Math.max(0, Math.min(1, part.confidence ?? current.confidence)),
+          part.reviewNote ?? '', timestamp, timestamp
+        )
+      })
+      this.renumberRequirementSet(current.setId)
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+    return createdIds.map((childId) => this.getProjectRequirement(childId)!).filter(Boolean)
+  }
+
+  mergeReviewProjectRequirements(input: ProjectRequirementMergeInput): ProjectRequirement | null {
+    const ids = [...new Set(input.requirementIds.map((id) => id.trim()).filter(Boolean))]
+    if (ids.length < 2) throw new Error('至少选择两条需求进行合并')
+    const rows = ids.map((id) => this.getProjectRequirement(id)).filter((item): item is ProjectRequirement => Boolean(item))
+    const first = rows[0]
+    if (!first || rows.some((item) => item.setId !== first.setId)) throw new Error('只能合并同一审核版本中的需求')
+    const set = this.getProjectRequirementSetById(first.setId)
+    if (!set || set.status !== 'reviewing') throw new Error('已发布需求不能合并')
+    const placeholders = ids.map(() => '?').join(', ')
+    const mergedId = randomUUID()
+    const timestamp = nowIso()
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      this.db.prepare(`DELETE FROM pm_requirements WHERE id IN (${placeholders})`).run(...ids)
+      this.db.prepare(`
+        INSERT INTO pm_requirements(
+          id, project_id, document_id, set_id, version, requirement_no, category, module,
+          title, content, key_info_terms_json, key_info_terms_source, source_location,
+          source_chunk_id, evidence_quote, confidence, review_status, review_note,
+          status, status_source, status_reason, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?, 'pending', ?, 'unmarked', 'manual', '人工合并，待审核', ?, ?)
+      `).run(
+        mergedId, first.projectId, first.documentId, first.setId, first.version,
+        Math.min(...rows.map((item) => item.requirementNo)), input.category, input.module ?? '',
+        input.title, input.content, JSON.stringify(input.keyInfoTerms ?? []), input.sourceLocation ?? '',
+        input.sourceChunkId ?? '', input.evidenceQuote ?? '', Math.max(0, Math.min(1, input.confidence ?? 1)),
+        input.reviewNote ?? '', timestamp, timestamp
+      )
+      this.renumberRequirementSet(first.setId)
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+    return this.getProjectRequirement(mergedId)
+  }
+
+  private renumberRequirementSet(setId: string): void {
+    const rows = this.db.prepare(
+      'SELECT id FROM pm_requirements WHERE set_id = ? ORDER BY requirement_no ASC, created_at ASC, id ASC'
+    ).all(setId) as SqlRow[]
+    const update = this.db.prepare('UPDATE pm_requirements SET requirement_no = ? WHERE id = ?')
+    rows.forEach((row, index) => update.run(index + 1, String(row.id)))
   }
 
   deleteProjectRequirement(id: string): { ok: boolean; message: string } {
@@ -2386,7 +3017,10 @@ export class AppDatabase {
       id: String(row.id),
       projectId: String(row.project_id),
       documentId: String(row.document_id),
+      setId: String(row.set_id ?? ''),
+      version: Number(row.version ?? 1),
       requirementNo: Number(row.requirement_no ?? 0),
+      category: String(row.category ?? 'functional') as ProjectRequirementCategory,
       module: normalizedText.module,
       title: normalizedText.title,
       content: normalizedText.content,
@@ -2394,6 +3028,10 @@ export class AppDatabase {
       keyInfoTermsSource: String(row.key_info_terms_source ?? 'ai') === 'manual' ? 'manual' : 'ai',
       sourceLocation: String(row.source_location ?? ''),
       sourceChunkId: String(row.source_chunk_id ?? ''),
+      evidenceQuote: String(row.evidence_quote ?? ''),
+      confidence: Math.max(0, Math.min(1, Number(row.confidence ?? 1))),
+      reviewStatus: String(row.review_status ?? 'approved') as ProjectRequirementReviewStatus,
+      reviewNote: String(row.review_note ?? ''),
       status,
       statusSource: String(row.status_source ?? 'ai') as ProjectRequirementStatusSource,
       statusReason: String(row.status_reason ?? ''),
@@ -2401,6 +3039,25 @@ export class AppDatabase {
       matchCount: Number(row.match_count ?? 0),
       createdAt: String(row.created_at ?? ''),
       updatedAt: String(row.updated_at ?? '')
+    }
+  }
+
+  private mapProjectRequirementSet(row: SqlRow): ProjectRequirementSetSummary {
+    return {
+      id: String(row.id),
+      projectId: String(row.project_id),
+      documentId: String(row.document_id),
+      version: Number(row.version ?? 1),
+      status: String(row.status ?? 'reviewing') as ProjectRequirementSetSummary['status'],
+      totalChunks: Number(row.total_chunks ?? 0),
+      analyzedChunks: Number(row.analyzed_chunks ?? 0),
+      warnings: parseJsonArray(row.warnings_json),
+      requirementCount: Number(row.requirement_count ?? 0),
+      pendingCount: Number(row.pending_count ?? 0),
+      approvedCount: Number(row.approved_count ?? 0),
+      rejectedCount: Number(row.rejected_count ?? 0),
+      createdAt: String(row.created_at ?? ''),
+      publishedAt: String(row.published_at ?? '')
     }
   }
 
@@ -3284,7 +3941,19 @@ export class AppDatabase {
     const existing = this.db.prepare(
       'SELECT current_version, created_at FROM dashboards WHERE id = ?'
     ).get(input.spec.id) as SqlRow | undefined
-    const version = existing ? Number(existing.current_version) + 1 : 1
+    const currentVersion = existing ? Number(existing.current_version) : 0
+    if (input.baseVersion !== undefined) {
+      if (!Number.isSafeInteger(input.baseVersion) || input.baseVersion < 0) {
+        throw new Error('大屏基础版本号无效，无法保存')
+      }
+      if (input.baseVersion !== currentVersion) {
+        throw new Error(
+          `大屏版本冲突：当前已是 V${currentVersion}，本次编辑基于 V${input.baseVersion}。` +
+          '请重新打开最新版本后再修改。'
+        )
+      }
+    }
+    const version = currentVersion + 1
     const spec: DashboardSpec = { ...input.spec, updatedAt: timestamp }
     this.db.exec('BEGIN IMMEDIATE')
     try {
@@ -3338,8 +4007,11 @@ export class AppDatabase {
   }
 
   recordVisualizationRun(input: VisualizationRunInput): VisualizationRun {
+    const toolCalls = normalizeVisualizationToolCalls(input.toolCalls)
     const run: VisualizationRun = {
       ...input,
+      mode: input.mode === 'patch' ? 'patch' : 'generate',
+      toolCalls,
       id: randomUUID(),
       requestSummary: input.requestSummary.slice(0, 500),
       errorMessage: input.errorMessage?.slice(0, 1000),
@@ -3347,20 +4019,23 @@ export class AppDatabase {
     }
     this.db.prepare(`
       INSERT INTO visualization_runs (
-        id, dashboard_id, request_summary, model_name, prompt_version, status,
-        attempt_count, component_count, query_count, duration_ms, error_message, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        id, dashboard_id, request_summary, model_name, prompt_version, mode, status,
+        attempt_count, component_count, query_count, duration_ms, tool_calls_json,
+        error_message, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       run.id,
       run.dashboardId ?? '',
       run.requestSummary,
       run.modelName,
       run.promptVersion,
+      run.mode,
       run.status,
       run.attemptCount,
       run.componentCount,
       run.queryCount,
       run.durationMs,
+      JSON.stringify(run.toolCalls),
       run.errorMessage ?? '',
       run.createdAt
     )
@@ -3375,17 +4050,22 @@ export class AppDatabase {
       LIMIT ?
     `).all(Math.min(100, Math.max(1, limit))).map((row) => {
       const value = row as SqlRow
+      const toolCalls = normalizeVisualizationToolCalls(
+        parseJsonValue(value.tool_calls_json, [])
+      )
       return {
         id: String(value.id),
         dashboardId: String(value.dashboard_id) || undefined,
         requestSummary: String(value.request_summary),
         modelName: String(value.model_name),
         promptVersion: String(value.prompt_version),
+        mode: String(value.mode) === 'patch' ? 'patch' : 'generate',
         status: String(value.status) as VisualizationRun['status'],
         attemptCount: Number(value.attempt_count),
         componentCount: Number(value.component_count),
         queryCount: Number(value.query_count),
         durationMs: Number(value.duration_ms),
+        toolCalls,
         errorMessage: String(value.error_message) || undefined,
         createdAt: String(value.created_at)
       }
@@ -3397,6 +4077,7 @@ export class AppDatabase {
       'save',
       'restore',
       'diagnose',
+      'repair-component',
       'export-json',
       'export-pdf',
       'export-png',
@@ -3408,6 +4089,8 @@ export class AppDatabase {
     const metadata = Object.fromEntries(
       Object.entries(input.metadata ?? {})
         .filter(([, value]) => value === null || ['string', 'number', 'boolean'].includes(typeof value))
+        .filter(([key, value]) => key !== 'specHash' && key !== 'sourceSpecHash'
+          || typeof value === 'string' && /^[a-f0-9]{64}$/i.test(value))
         .map(([key, value]) => [key.slice(0, 80), typeof value === 'string' ? value.slice(0, 500) : value])
     )
     const createdAt = nowIso()
@@ -3573,6 +4256,14 @@ export class AppDatabase {
   }
 
   upsertRecord(input: RecordInput): void {
+    const itemId = input.itemId.trim()
+    if (!itemId) throw new Error('记录缺少 _valm_ItemID，不能写入本地数据')
+    const conflict = this.db
+      .prepare('SELECT uid FROM records WHERE item_id = ? AND uid <> ? LIMIT 1')
+      .get(itemId, input.uid) as SqlRow | undefined
+    if (conflict) {
+      throw new Error(`_valm_ItemID ${itemId} 已存在，不能直接覆盖`)
+    }
     const rawJson = JSON.stringify(input.raw)
     const contentHash = createHash('sha256').update(rawJson).digest('hex')
     this.db
@@ -3613,7 +4304,7 @@ export class AppDatabase {
         input.uid,
         input.projectId,
         input.nodeType,
-        input.itemId,
+        itemId,
         input.parentId,
         input.name,
         input.lastModifyTime,
@@ -3622,6 +4313,118 @@ export class AppDatabase {
         contentHash,
         nowIso()
       )
+  }
+
+  findRecordByItemId(itemId: string): RecordRow | null {
+    const normalized = itemId.trim()
+    if (!normalized) return null
+    const row = this.db
+      .prepare(
+        `SELECT r.*, COUNT(i.id) AS image_count
+         FROM records r
+         LEFT JOIN images i ON i.record_uid = r.uid
+         WHERE r.item_id = ?
+         GROUP BY r.uid
+         ORDER BY r.synced_at DESC, r.uid DESC
+         LIMIT 1`
+      )
+      .get(normalized) as SqlRow | undefined
+    return row ? this.mapRecord(row) : null
+  }
+
+  stageDataReview(input: {
+    batchId: string
+    source: DataReviewSource
+    itemId: string
+    existing: DataReviewSummary
+    incoming: DataReviewSummary
+    payload: unknown
+  }): DataReviewItem {
+    const itemId = input.itemId.trim()
+    if (!itemId) throw new Error('待审查记录缺少 _valm_ItemID')
+    const review: DataReviewItem = {
+      id: randomUUID(),
+      source: input.source,
+      itemId,
+      existing: input.existing,
+      incoming: input.incoming
+    }
+    this.db
+      .prepare(
+        `INSERT INTO data_review_items(
+          id, batch_id, source, item_id,
+          existing_uid, existing_project_id, existing_node_type,
+          existing_name, existing_last_modify_time,
+          incoming_uid, incoming_project_id, incoming_node_type,
+          incoming_name, incoming_last_modify_time, payload_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        review.id,
+        input.batchId,
+        review.source,
+        review.itemId,
+        review.existing.uid,
+        review.existing.projectId,
+        review.existing.nodeType,
+        review.existing.name,
+        review.existing.lastModifyTime,
+        review.incoming.uid,
+        review.incoming.projectId,
+        review.incoming.nodeType,
+        review.incoming.name,
+        review.incoming.lastModifyTime,
+        JSON.stringify(input.payload),
+        nowIso()
+      )
+    return review
+  }
+
+  listDataReviews(batchId: string, source: DataReviewSource): DataReviewItem[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM data_review_items
+         WHERE batch_id = ? AND source = ?
+         ORDER BY created_at, id`
+      )
+      .all(batchId, source) as SqlRow[]
+    return rows.map((row) => this.mapDataReview(row))
+  }
+
+  getPendingDataReviews(
+    batchId: string,
+    source: DataReviewSource,
+    reviewIds?: string[]
+  ): PendingDataReview[] {
+    const selected = [...new Set((reviewIds ?? []).map((id) => id.trim()).filter(Boolean))]
+    const params: string[] = [batchId, source]
+    const conditions = ['batch_id = ?', 'source = ?']
+    if (selected.length) {
+      conditions.push(`id IN (${selected.map(() => '?').join(',')})`)
+      params.push(...selected)
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM data_review_items
+         WHERE ${conditions.join(' AND ')}
+         ORDER BY created_at, id`
+      )
+      .all(...params) as SqlRow[]
+    return rows.map((row) => ({
+      ...this.mapDataReview(row),
+      payload: parseJsonValue(row.payload_json, {})
+    }))
+  }
+
+  resolveDataReviews(batchId: string, source: DataReviewSource, reviewIds: string[]): void {
+    const selected = [...new Set(reviewIds.map((id) => id.trim()).filter(Boolean))]
+    if (!selected.length) return
+    this.db
+      .prepare(
+        `DELETE FROM data_review_items
+         WHERE batch_id = ? AND source = ? AND id IN (${selected.map(() => '?').join(',')})`
+      )
+      .run(batchId, source, ...selected)
   }
 
   retainRecords(uids: string[]): void {
@@ -4032,6 +4835,29 @@ export class AppDatabase {
     }
   }
 
+  private mapDataReview(row: SqlRow): DataReviewItem {
+    const source = String(row.source) === 'sync' ? 'sync' : 'import'
+    return {
+      id: String(row.id),
+      source,
+      itemId: String(row.item_id),
+      existing: {
+        uid: String(row.existing_uid),
+        projectId: String(row.existing_project_id ?? ''),
+        nodeType: String(row.existing_node_type ?? ''),
+        name: String(row.existing_name ?? ''),
+        lastModifyTime: String(row.existing_last_modify_time ?? '')
+      },
+      incoming: {
+        uid: String(row.incoming_uid),
+        projectId: String(row.incoming_project_id ?? ''),
+        nodeType: String(row.incoming_node_type ?? ''),
+        name: String(row.incoming_name ?? ''),
+        lastModifyTime: String(row.incoming_last_modify_time ?? '')
+      }
+    }
+  }
+
   private mapRecord(row: SqlRow): RecordRow {
     let raw: Record<string, unknown> = {}
     try {
@@ -4106,16 +4932,47 @@ export class AppDatabase {
          GROUP BY p.uid ORDER BY value DESC`
       )
       .all() as SqlRow[]
+    const projectManagement = {
+      projectCount: scalar('SELECT COUNT(*) FROM pm_projects'),
+      activeProjectCount: scalar("SELECT COUNT(*) FROM pm_projects WHERE lifecycle = 'active'"),
+      processingProjectCount: scalar(
+        "SELECT COUNT(*) FROM pm_projects WHERE analysis_status = 'processing' OR match_status = 'processing'"
+      ),
+      requirementCount: scalar(
+        `SELECT COUNT(*) FROM pm_requirements q
+         WHERE q.review_status = 'approved'
+           AND (q.set_id = '' OR q.set_id IN (
+             SELECT id FROM pm_requirement_sets WHERE project_id = q.project_id AND status = 'published'
+           ))`
+      ),
+      pendingReviewCount: scalar("SELECT COUNT(*) FROM pm_requirements WHERE review_status = 'pending'"),
+      linkedAssetCount: scalar('SELECT COUNT(*) FROM pm_project_assets')
+    }
+    const assetCenter = {
+      recordCount: scalar('SELECT COUNT(*) FROM records'),
+      projectCount: scalar(
+        "SELECT COUNT(DISTINCT project_id) FROM records WHERE project_id IS NOT NULL AND TRIM(project_id) <> ''"
+      ),
+      typeCount: byType.length,
+      imageCount: scalar('SELECT COUNT(*) FROM images')
+    }
     const releaseCounts = new Map<string, number>()
     const releaseRows = this.db.prepare('SELECT raw_json FROM records').all() as SqlRow[]
     for (const row of releaseRows) {
-      let releaseValue: unknown
+      let raw: Record<string, unknown>
       try {
-        const raw = JSON.parse(String(row.raw_json)) as Record<string, unknown>
-        releaseValue = raw._valm_Release
+        const parsed = JSON.parse(String(row.raw_json)) as unknown
+        raw = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+          ? parsed as Record<string, unknown>
+          : {}
       } catch {
-        releaseValue = undefined
+        raw = {}
       }
+      const displayValue = raw._valm_Release_text
+      const releaseValue =
+        displayValue !== undefined && displayValue !== null && String(displayValue).trim() !== ''
+          ? displayValue
+          : raw._valm_Release
       const name =
         releaseValue === undefined || releaseValue === null || String(releaseValue).trim() === ''
           ? '未设置'
@@ -4137,7 +4994,9 @@ export class AppDatabase {
       })),
       byRelease: [...releaseCounts.entries()]
         .map(([name, value]) => ({ name, value }))
-        .sort((left, right) => right.value - left.value)
+        .sort((left, right) => right.value - left.value),
+      projectManagement,
+      assetCenter
     }
   }
 
@@ -4517,17 +5376,47 @@ export class AppDatabase {
     })
   }
 
-  importRows(rows: unknown[]): DataImportResult {
+  importRows(
+    rows: unknown[],
+    options: {
+      overwriteExisting?: boolean
+      targetUidByItemId?: ReadonlyMap<string, string>
+    } = {}
+  ): DataImportResult {
     let recordCount = 0
     let imageCount = 0
     let skippedCount = 0
     const errors: string[] = []
+    const duplicates: DataReviewItem[] = []
+    let reviewBatchId: string | undefined
     const asObject = (input: unknown): Record<string, unknown> | null =>
       input && typeof input === 'object' && !Array.isArray(input)
         ? input as Record<string, unknown>
         : null
     const text = (input: unknown): string =>
       input === undefined || input === null ? '' : String(input)
+    const stageDuplicate = (
+      row: Record<string, unknown>,
+      itemId: string,
+      existing: RecordRow,
+      incoming: DataReviewSummary
+    ): void => {
+      reviewBatchId ??= randomUUID()
+      duplicates.push(this.stageDataReview({
+        batchId: reviewBatchId,
+        source: 'import',
+        itemId,
+        existing: {
+          uid: existing.uid,
+          projectId: existing.projectId,
+          nodeType: existing.nodeType,
+          name: existing.name,
+          lastModifyTime: existing.lastModifyTime
+        },
+        incoming,
+        payload: row
+      }))
+    }
 
     rows.forEach((input, index) => {
       try {
@@ -4554,22 +5443,47 @@ export class AppDatabase {
           text(raw._valm_ProjectId) ||
           text(raw._valm_ProjectUid) ||
           text(row.projectId)
-        const itemId = text(metadata.itemId) || text(raw._valm_ItemID) || text(row.itemId)
+        const itemIdCandidates = [
+          text(metadata.itemId),
+          text(raw._valm_ItemID),
+          text(row.itemId)
+        ].map((candidate) => candidate.trim()).filter(Boolean)
+        const itemId = itemIdCandidates[0] ?? ''
+        if (!itemId) throw new Error('缺少 _valm_ItemID，不能导入')
+        if (itemIdCandidates.some((candidate) => candidate !== itemId)) {
+          throw new Error('多个来源的 _valm_ItemID 不一致，不能导入')
+        }
         const lastModifyTime =
           text(metadata.updatedAt) ||
           text(raw._valm_LastModifyTime) ||
           text(row.lastModifyTime)
         const parentId = text(raw._valm_ParentId) || text(row.parentId)
+        const existing = options.overwriteExisting
+          ? null
+          : this.findRecordByItemId(itemId)
+        if (existing) {
+          skippedCount += 1
+          stageDuplicate(row, itemId, existing, {
+            uid,
+            projectId: nodeType === 'Project' ? uid : projectId,
+            nodeType,
+            name,
+            lastModifyTime
+          })
+          return
+        }
+        const targetUid = options.targetUidByItemId?.get(itemId) || uid
         const normalizedRaw = {
           ...raw,
-          _valm_Uid: text(raw._valm_Uid) || uid,
+          _valm_Uid: targetUid,
           _valm_NodeType: text(raw._valm_NodeType) || nodeType,
-          _valm_Name: text(raw._valm_Name) || name
+          _valm_Name: text(raw._valm_Name) || name,
+          _valm_ItemID: itemId
         }
 
         if (nodeType === 'Project') {
           this.upsertProject({
-            uid,
+            uid: targetUid,
             name,
             itemId,
             lastModifyTime,
@@ -4577,8 +5491,8 @@ export class AppDatabase {
           })
         }
         this.upsertRecord({
-          uid,
-          projectId: nodeType === 'Project' ? uid : projectId,
+          uid: targetUid,
+          projectId: nodeType === 'Project' ? targetUid : projectId,
           nodeType,
           itemId,
           parentId,
@@ -4590,7 +5504,7 @@ export class AppDatabase {
         const importedPushStatus = text(metadata.pushStatus)
         if (['pending', 'success', 'failed'].includes(importedPushStatus)) {
           this.markPushResult(
-            uid,
+            targetUid,
             importedPushStatus as 'pending' | 'success' | 'failed',
             text(metadata.pushMessage),
             text(metadata.pushedUid)
@@ -4609,7 +5523,7 @@ export class AppDatabase {
             continue
           }
           this.saveImage({
-            recordUid: uid,
+            recordUid: targetUid,
             name: text(image.name),
             mimeType: text(image.mimeType) || 'application/octet-stream',
             sourceUrl: text(image.sourceUrl) || 'imported:data',
@@ -4627,12 +5541,50 @@ export class AppDatabase {
 
     if (recordCount > 0) this.bumpAnalyticsRevision()
     return {
-      ok: recordCount > 0 || (rows.length === 0 && skippedCount === 0),
+      ok: recordCount > 0 || duplicates.length > 0 || (rows.length === 0 && skippedCount === 0),
       recordCount,
       imageCount,
       skippedCount,
       errors,
-      message: `导入完成：${recordCount} 条记录，${imageCount} 张图片，跳过 ${skippedCount} 条`
+      reviewBatchId,
+      duplicates,
+      message:
+        `导入完成：${recordCount} 条记录，${imageCount} 张图片，跳过 ${skippedCount} 条` +
+        (duplicates.length ? `，发现 ${duplicates.length} 条已有 _valm_ItemID，待审查覆盖` : '')
+    }
+  }
+
+  applyImportDataReviews(batchId: string, reviewIds?: string[]): DataReviewApplyResult {
+    const pending = this.getPendingDataReviews(batchId, 'import', reviewIds)
+    let updatedCount = 0
+    let imageCount = 0
+    const resolvedReviewIds: string[] = []
+    const errors: string[] = []
+    for (const review of pending) {
+      const targetUidByItemId = new Map([[review.itemId, review.existing.uid]])
+      const result = this.importRows([review.payload], {
+        overwriteExisting: true,
+        targetUidByItemId
+      })
+      if (result.recordCount === 1) {
+        updatedCount += 1
+        imageCount += result.imageCount
+        resolvedReviewIds.push(review.id)
+      } else {
+        errors.push(...result.errors.slice(0, 3))
+      }
+    }
+    this.resolveDataReviews(batchId, 'import', resolvedReviewIds)
+    return {
+      ok: updatedCount > 0 && errors.length === 0,
+      source: 'import',
+      updatedCount,
+      imageCount,
+      resolvedReviewIds,
+      errors: errors.slice(0, 50),
+      message:
+        `覆盖更新完成：${updatedCount} 条记录，${imageCount} 张图片` +
+        (errors.length ? `，${errors.length} 条失败` : '')
     }
   }
 
@@ -4659,6 +5611,7 @@ export class AppDatabase {
         )
         this.db.prepare('DELETE FROM records').run()
         this.db.prepare('DELETE FROM projects').run()
+        this.db.prepare('DELETE FROM data_review_items').run()
       } else {
         const recordWhere = `uid IN (${placeholders})`
         recordCount = Number(
@@ -4670,6 +5623,9 @@ export class AppDatabase {
         )
         this.db.prepare(`DELETE FROM records WHERE ${recordWhere}`).run(...selected)
         this.db.prepare(`DELETE FROM projects WHERE ${recordWhere}`).run(...selected)
+        this.db.prepare(
+          `DELETE FROM data_review_items WHERE existing_uid IN (${placeholders})`
+        ).run(...selected)
       }
       this.db.exec('COMMIT')
     } catch (error) {

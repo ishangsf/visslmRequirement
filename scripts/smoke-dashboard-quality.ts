@@ -79,13 +79,39 @@ try {
     requestSummary: '生成质量大屏',
     modelName: 'qwen3:8b',
     promptVersion: 'visualization-v1',
+    mode: 'generate',
     status: 'success',
     attemptCount: 1,
     componentCount: 2,
     queryCount: 2,
-    durationMs: 1200
+    durationMs: 1200,
+    toolCalls: [
+      {
+        sequence: 1,
+        tool: 'profile-fields',
+        status: 'success',
+        attempt: 0,
+        durationMs: 12.345,
+        metadata: { fieldCount: 8 }
+      },
+      {
+        sequence: 2,
+        tool: 'execute-query',
+        status: 'success',
+        attempt: 1,
+        durationMs: 20,
+        componentId: 'status-pie',
+        metadata: { resultRows: 5, truncated: true }
+      }
+    ]
   })
-  assert.equal(db.listVisualizationRuns()[0].dashboardId, dashboard.id)
+  const savedRun = db.listVisualizationRuns()[0]
+  assert.equal(savedRun.dashboardId, dashboard.id)
+  assert.equal(savedRun.mode, 'generate')
+  assert.equal(savedRun.toolCalls.length, 2)
+  assert.equal(savedRun.toolCalls[0].durationMs, 12.35)
+  assert.equal(savedRun.toolCalls[1].componentId, 'status-pie')
+  assert.deepEqual(savedRun.toolCalls[1].metadata, { resultRows: 5, truncated: true })
 } finally {
   db.close()
   rmSync(directory, { recursive: true, force: true })

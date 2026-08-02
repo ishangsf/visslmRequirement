@@ -18,7 +18,14 @@ export type AgentEvent =
   | { type: 'status'; stage: string; message: string }
   | { type: 'text'; content: string }
   | { type: 'artifact'; artifactId: string; version: number; dashboard: DashboardSpec }
-  | { type: 'error'; code: string; message: string; recoverable: boolean }
+  | {
+      type: 'error'
+      code: string
+      message: string
+      recoverable: boolean
+      stage?: string
+      attemptCount?: number
+    }
 
 export interface AgentProgressUpdate {
   conversationId?: string

@@ -81,6 +81,11 @@ const buildChartOption = (
     ? component.data.map((item) => item.secondaryValue ?? 0)
     : undefined
   const accent = component.accent ?? theme.palette[0]
+  const componentStyle = component.style ?? {}
+  const showLegend = componentStyle.showLegend ?? true
+  const showGrid = componentStyle.showGrid ?? true
+  const lineWidth = componentStyle.lineWidth ?? 3
+  const horizontalBar = component.type === 'bar' && componentStyle.orientation !== 'vertical'
   const common = {
     animationDuration: 500,
     color: component.accent
@@ -101,6 +106,7 @@ const buildChartOption = (
       ...common,
       tooltip: { ...common.tooltip, trigger: 'item', formatter: '{b}<br/>{c} 条 · {d}%' },
       legend: {
+        show: showLegend,
         orient: compact ? 'horizontal' : 'vertical',
         right: compact ? 'center' : 4,
         bottom: compact ? 0 : 'auto',
@@ -108,12 +114,12 @@ const buildChartOption = (
         icon: 'circle',
         itemWidth: 8,
         itemHeight: 8,
-        textStyle: { color: theme.textColor, fontSize: 10 }
+        textStyle: { color: theme.textColor, fontSize: componentStyle.bodyFontSize ?? 10 }
       },
       series: [
         {
           type: 'pie',
-          radius: ['48%', '72%'],
+          radius: componentStyle.donut === false ? ['0%', '72%'] : ['48%', '72%'],
           center: compact ? ['50%', '43%'] : ['36%', '53%'],
           data: component.data,
           label: { show: false },
@@ -127,47 +133,142 @@ const buildChartOption = (
     }
   }
 
+  if (component.type === 'gauge') {
+    return {
+      ...common,
+      series: [{
+        type: 'gauge',
+        min: 0,
+        max: 100,
+        progress: { show: true, width: 12, itemStyle: { color: accent } },
+        axisLine: { lineStyle: { width: 12, color: [[1, theme.gridColor]] } },
+        axisTick: { show: false },
+        splitLine: { show: false },
+        axisLabel: { show: false },
+        pointer: { itemStyle: { color: accent } },
+        detail: {
+          valueAnimation: true,
+          color: theme.tooltipTextColor,
+          fontSize: componentStyle.valueFontSize ?? 26,
+          offsetCenter: [0, '12%']
+        },
+        data: [{
+          value: Math.max(0, Math.min(100, component.data[0]?.value ?? 0)),
+          name: component.unit ?? '%'
+        }]
+      }]
+    }
+  }
+
+  if (component.type === 'funnel') {
+    return {
+      ...common,
+      tooltip: { ...common.tooltip, trigger: 'item' },
+      series: [{
+        type: 'funnel',
+        orient: componentStyle.orientation ?? 'vertical',
+        left: '8%',
+        right: '8%',
+        top: 8,
+        bottom: 8,
+        minSize: '12%',
+        maxSize: '92%',
+        sort: 'descending',
+        gap: 3,
+        label: { color: theme.tooltipTextColor, fontSize: componentStyle.bodyFontSize ?? 10 },
+        itemStyle: { borderColor: theme.tooltipBackground, borderWidth: 1 },
+        data: component.data.map((item) => ({ name: item.name, value: item.value }))
+      }]
+    }
+  }
+
+  if (component.type === 'radar') {
+    const maxValue = Math.max(...component.data.map((item) => item.value), 1)
+    return {
+      ...common,
+      radar: {
+        indicator: component.data.map((item) => ({ name: item.name, max: maxValue })),
+        axisName: { color: theme.textColor, fontSize: componentStyle.bodyFontSize ?? 10 },
+        splitArea: { areaStyle: { color: ['rgba(255,255,255,0.03)', 'rgba(255,255,255,0.01)'] } },
+        splitLine: { lineStyle: { color: theme.gridColor } },
+        axisLine: { lineStyle: { color: theme.gridColor } }
+      },
+      series: [{
+        type: 'radar',
+        data: [{ value: component.data.map((item) => item.value), name: component.encoding?.value ?? '指标' }],
+        lineStyle: { width: lineWidth, color: accent },
+        areaStyle: { color: hexToRgba(accent, 0.2) },
+        itemStyle: { color: accent }
+      }]
+    }
+  }
+
+  if (component.type === 'scatter') {
+    const axis = {
+      type: 'value',
+      axisLabel: { color: theme.textColor, fontSize: componentStyle.bodyFontSize ?? 10 },
+      splitLine: { show: showGrid, lineStyle: { color: theme.gridColor } }
+    }
+    return {
+      ...common,
+      tooltip: { ...common.tooltip, trigger: 'item' },
+      xAxis: axis,
+      yAxis: axis,
+      series: [{
+        type: 'scatter',
+        symbolSize: 9,
+        data: component.data.map((item) => [item.value, item.secondaryValue ?? item.value, item.name]),
+        itemStyle: { color: accent }
+      }]
+    }
+  }
+
   return {
     ...common,
-    ...(secondaryValues ? {
+    ...(secondaryValues && showLegend ? {
       legend: {
         top: 0,
         right: 4,
-        textStyle: { color: theme.textColor, fontSize: 10 },
+        textStyle: { color: theme.textColor, fontSize: componentStyle.bodyFontSize ?? 10 },
         data: [component.encoding?.value ?? '指标', component.encoding?.secondaryValue ?? '对比指标']
       }
     } : {}),
-    grid: { left: 8, right: 10, top: 18, bottom: 2, containLabel: true },
-    xAxis: component.type === 'bar'
+    grid: { left: 8, right: 10, top: showLegend && secondaryValues ? 18 : 4, bottom: 2, containLabel: true },
+    xAxis: horizontalBar
       ? {
           type: 'value',
           axisLine: { show: false },
           axisTick: { show: false },
-          splitLine: { lineStyle: { color: theme.gridColor } },
-          axisLabel: { color: theme.textColor, fontSize: 10 }
+          splitLine: { show: showGrid, lineStyle: { color: theme.gridColor } },
+          axisLabel: { color: theme.textColor, fontSize: componentStyle.bodyFontSize ?? 10 }
         }
       : {
           type: 'category',
           data: names,
-          boundaryGap: false,
+          boundaryGap: component.type === 'bar',
           axisLine: { lineStyle: { color: theme.gridColor } },
           axisTick: { show: false },
-          axisLabel: { color: theme.textColor, fontSize: 10 }
+          axisLabel: { color: theme.textColor, fontSize: componentStyle.bodyFontSize ?? 10 }
         },
-    yAxis: component.type === 'bar'
+    yAxis: horizontalBar
       ? {
           type: 'category',
           data: names,
           axisLine: { show: false },
           axisTick: { show: false },
-          axisLabel: { color: theme.textColor, fontSize: 10, width: 78, overflow: 'truncate' }
+          axisLabel: {
+            color: theme.textColor,
+            fontSize: componentStyle.bodyFontSize ?? 10,
+            width: 78,
+            overflow: 'truncate'
+          }
         }
       : {
           type: 'value',
           axisLine: { show: false },
           axisTick: { show: false },
-          splitLine: { lineStyle: { color: theme.gridColor } },
-          axisLabel: { color: theme.textColor, fontSize: 10 }
+          splitLine: { show: showGrid, lineStyle: { color: theme.gridColor } },
+          axisLabel: { color: theme.textColor, fontSize: componentStyle.bodyFontSize ?? 10 }
         },
     series: (component.type === 'bar'
       ? [
@@ -176,14 +277,20 @@ const buildChartOption = (
             type: 'bar',
             data: values,
             barMaxWidth: 16,
-            itemStyle: { color: accent, borderRadius: [0, 5, 5, 0] }
+            itemStyle: {
+              color: accent,
+              borderRadius: horizontalBar ? [0, 5, 5, 0] : [5, 5, 0, 0]
+            }
           },
           ...(secondaryValues ? [{
             name: component.encoding?.secondaryValue ?? '对比指标',
             type: 'bar',
             data: secondaryValues,
             barMaxWidth: 16,
-            itemStyle: { color: theme.palette[1], borderRadius: [0, 5, 5, 0] }
+            itemStyle: {
+              color: theme.palette[1],
+              borderRadius: horizontalBar ? [0, 5, 5, 0] : [5, 5, 0, 0]
+            }
           }] : [])
         ]
       : [
@@ -194,7 +301,7 @@ const buildChartOption = (
             smooth: true,
             symbol: 'circle',
             symbolSize: 6,
-            lineStyle: { width: 3, color: accent },
+            lineStyle: { width: lineWidth, color: accent },
             itemStyle: { color: accent },
             areaStyle: {
               color: {
@@ -222,6 +329,7 @@ const buildChartOption = (
           }] : [])
         ])
   }
+
 }
 
 function DashboardComponentRendererView({
@@ -244,7 +352,7 @@ function DashboardComponentRendererView({
   if (component.type === 'kpi') {
     return (
       <div className="viz-kpi">
-        <div className="viz-kpi-value" style={{ color: component.accent }}>
+        <div className="viz-kpi-value" style={{ color: component.accent, fontSize: component.style?.valueFontSize }}>
           {formatNumber(first.value)}
           <small>{component.unit}</small>
         </div>
@@ -263,7 +371,7 @@ function DashboardComponentRendererView({
           percent={Math.max(0, Math.min(100, first.value))}
           strokeColor={component.accent ?? '#54dfa6'}
           railColor="rgba(126, 151, 185, 0.15)"
-          format={(value) => <span>{value}%</span>}
+          format={(value) => <span style={{ fontSize: component.style?.valueFontSize }}>{value}%</span>}
         />
         <div className="viz-progress-labels">
           <span>当前覆盖</span>
@@ -276,7 +384,7 @@ function DashboardComponentRendererView({
   if (component.type === 'ranking') {
     const max = Math.max(...component.data.map((item) => item.value), 1)
     return (
-      <div className="viz-ranking">
+      <div className="viz-ranking" style={{ fontSize: component.style?.bodyFontSize }}>
         {component.data.map((item, index) => (
           <div className="viz-ranking-row" key={`${item.name}-${index}`}>
             <span className={`viz-ranking-index rank-${index + 1}`}>{index + 1}</span>
@@ -300,14 +408,14 @@ function DashboardComponentRendererView({
     return (
       <div className="viz-insight">
         <span className="viz-insight-icon"><BulbOutlined /></span>
-        <p>{component.insight}</p>
+        <p style={{ fontSize: component.style?.bodyFontSize }}>{component.insight}</p>
       </div>
     )
   }
 
   if (component.type === 'table') {
     return (
-      <div className="viz-table">
+      <div className="viz-table" style={{ fontSize: component.style?.bodyFontSize }}>
         {component.data.map((item) => (
           <div key={item.name}>
             <span>{item.name}</span>

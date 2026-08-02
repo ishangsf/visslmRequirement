@@ -22,7 +22,11 @@ export const dashboardLayoutProfiles: Record<DashboardComponentType, LayoutProfi
   ranking: { minimumWidth: 6, preferredWidth: 7, minimumHeight: 4, preferredHeight: 5 },
   progress: { minimumWidth: 5, preferredWidth: 6, minimumHeight: 2, preferredHeight: 3 },
   table: { minimumWidth: 10, preferredWidth: 12, minimumHeight: 5, preferredHeight: 5 },
-  insight: { minimumWidth: 6, preferredWidth: 8, minimumHeight: 3, preferredHeight: 3 }
+  insight: { minimumWidth: 6, preferredWidth: 8, minimumHeight: 3, preferredHeight: 3 },
+  gauge: { minimumWidth: 6, preferredWidth: 8, minimumHeight: 4, preferredHeight: 5 },
+  funnel: { minimumWidth: 7, preferredWidth: 9, minimumHeight: 4, preferredHeight: 5 },
+  radar: { minimumWidth: 7, preferredWidth: 9, minimumHeight: 4, preferredHeight: 5 },
+  scatter: { minimumWidth: 8, preferredWidth: 10, minimumHeight: 4, preferredHeight: 5 }
 }
 
 const rowCost = (components: DashboardComponentSpec[]): number => {
@@ -122,14 +126,12 @@ export interface DashboardLayoutSwapResult {
   errors: string[]
 }
 
-const containsPoint = (
-  layout: DashboardLayout,
-  point: { x: number; y: number }
-): boolean =>
-  point.x >= layout.x &&
-  point.x < layout.x + layout.w &&
-  point.y >= layout.y &&
-  point.y < layout.y + layout.h
+const overlapRatio = (left: DashboardLayout, right: DashboardLayout): number => {
+  const width = Math.max(0, Math.min(left.x + left.w, right.x + right.w) - Math.max(left.x, right.x))
+  const height = Math.max(0, Math.min(left.y + left.h, right.y + right.h) - Math.max(left.y, right.y))
+  const referenceArea = Math.min(left.w * left.h, right.w * right.h)
+  return referenceArea > 0 ? (width * height) / referenceArea : 0
+}
 
 export const validateDashboardLayout = (
   components: DashboardComponentSpec[],
@@ -160,8 +162,8 @@ export const validateDashboardLayout = (
 }
 
 /**
- * Builds a position-only swap when a dragged component's center enters another component.
- * Dimensions stay attached to their original components so a swap cannot silently resize them.
+ * Swaps complete grid slots when a dragged component substantially overlaps another component.
+ * Slot dimensions are exchanged only when both component minimum sizes remain valid.
  */
 export const swapDashboardComponentLayouts = (
   components: DashboardComponentSpec[],
@@ -170,25 +172,15 @@ export const swapDashboardComponentLayouts = (
 ): DashboardLayoutSwapResult | null => {
   const dragged = components.find((component) => component.id === componentId)
   if (!dragged) return null
-  const center = {
-    x: candidate.x + candidate.w / 2,
-    y: candidate.y + candidate.h / 2
-  }
-  const target = components.find((component) =>
-    component.id !== componentId && containsPoint(component.layout, center)
-  )
+  const target = components
+    .filter((component) => component.id !== componentId)
+    .map((component) => ({ component, ratio: overlapRatio(candidate, component.layout) }))
+    .filter((item) => item.ratio >= 0.25)
+    .sort((left, right) => right.ratio - left.ratio)[0]?.component
   if (!target) return null
 
-  const draggedLayout: DashboardLayout = {
-    ...candidate,
-    x: target.layout.x,
-    y: target.layout.y
-  }
-  const targetLayout: DashboardLayout = {
-    ...target.layout,
-    x: dragged.layout.x,
-    y: dragged.layout.y
-  }
+  const draggedLayout: DashboardLayout = { ...target.layout }
+  const targetLayout: DashboardLayout = { ...dragged.layout }
   const nextComponents = components.map((component) =>
     component.id === componentId
       ? { ...component, layout: draggedLayout }
