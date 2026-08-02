@@ -385,7 +385,21 @@ export type ProjectAnalysisPhase =
   | 'done'
   | 'error'
 
-export interface ProjectAnalysisProgress {
+export type ProjectAnalysisLogKind = 'stage' | 'model_request'
+
+export interface ProjectAnalysisLogMetrics {
+  logKind?: ProjectAnalysisLogKind
+  requestId?: string
+  batchNumber?: string
+  attempt?: number
+  elapsedMs?: number
+  inputChars?: number
+  outputChars?: number
+  doneReason?: string
+  modelName?: string
+}
+
+export interface ProjectAnalysisProgress extends ProjectAnalysisLogMetrics {
   taskId: string
   projectId: string
   phase: ProjectAnalysisPhase
@@ -398,7 +412,7 @@ export interface ProjectAnalysisProgress {
   status: 'running' | 'success' | 'failed'
 }
 
-export interface ProjectAnalysisLogEntry {
+export interface ProjectAnalysisLogEntry extends ProjectAnalysisLogMetrics {
   id: string
   taskId: string
   projectId: string

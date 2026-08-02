@@ -1,6 +1,13 @@
 import WebSocket from 'ws'
-import { writeFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+
+const projectPageSource = readFileSync(join(process.cwd(), 'src/renderer/src/project-management/ProjectManagementPage.tsx'), 'utf8')
+const projectStylesSource = readFileSync(join(process.cwd(), 'src/renderer/src/styles.css'), 'utf8')
+const analysisLogCollapseContract = projectPageSource.includes('aria-expanded={analysisLogsExpanded}')
+  && projectPageSource.includes('aria-controls={`project-analysis-log-list-${current.id}`}')
+  && projectPageSource.includes("setAnalysisLogsExpanded((expanded) => !expanded)")
+  && projectStylesSource.includes('.project-analysis-log-panel.is-collapsed')
 
 const cdpPort = process.env.VISSLM_CDP_PORT ?? '9223'
 const targets = await (await fetch(`http://127.0.0.1:${cdpPort}/json/list`)).json()
@@ -98,6 +105,7 @@ const checks = await evaluate(`(async () => {
     technicalIndicatorMatch: true,
     agreementStatus: true,
     matchStatus: true,
+    analysisLogCollapse: ${analysisLogCollapseContract},
     projectExport: true,
     projectDelete: true
   }
@@ -178,6 +186,7 @@ const checks = await evaluate(`(async () => {
       technicalIndicatorMatch: taskListFeatures.technicalIndicatorMatch,
       agreementStatus: taskListFeatures.agreementStatus,
       matchStatus: taskListFeatures.matchStatus,
+      analysisLogCollapse: taskListFeatures.analysisLogCollapse,
       projectExport: taskListFeatures.projectExport,
       projectDelete: taskListFeatures.projectDelete
     }
@@ -234,7 +243,7 @@ const checks = await evaluate(`(async () => {
   }
 })()`)
 
-  if (!checks.pageReady || !checks.listTable || !checks.organizationPeoplePage || !checks.createButton || !checks.importProjectButton || !checks.formReady || !checks.projectNameField || !checks.contractAmountField || !checks.projectOwnerSelects || !checks.taskPlanReady || !checks.taskGanttReady || !checks.resourceGanttReady || !checks.inlineEdit || !checks.subtaskEntry || !checks.inlineCreate || !checks.parentColumnRemoved || !checks.dragReady || !checks.costResponsibleField || !checks.requirementReviewPolicy || !checks.requirementModuleColumn || !checks.technicalIndicatorMatch || !checks.agreementStatus || !checks.matchStatus || !checks.projectExport || !checks.projectDelete) {
+  if (!checks.pageReady || !checks.listTable || !checks.organizationPeoplePage || !checks.createButton || !checks.importProjectButton || !checks.formReady || !checks.projectNameField || !checks.contractAmountField || !checks.projectOwnerSelects || !checks.taskPlanReady || !checks.taskGanttReady || !checks.resourceGanttReady || !checks.inlineEdit || !checks.subtaskEntry || !checks.inlineCreate || !checks.parentColumnRemoved || !checks.dragReady || !checks.costResponsibleField || !checks.requirementReviewPolicy || !checks.requirementModuleColumn || !checks.technicalIndicatorMatch || !checks.agreementStatus || !checks.matchStatus || !checks.analysisLogCollapse || !checks.projectExport || !checks.projectDelete) {
   throw new Error(`Project management UI smoke failed: ${JSON.stringify(checks)}`)
 }
 

@@ -776,7 +776,8 @@ export class KnowledgeService {
       const cosine = Math.max(0, this.cosine(queryVector, vector))
       const haystack = chunk.content.toLocaleLowerCase()
       const lexical = [...terms].filter((term) => haystack.includes(term)).length / Math.max(terms.size, 1)
-      const score = Math.max(0, Math.min(1, cosine * 0.75 + lexical * 0.25)) * 100
+      // Full-requirement semantics drive recall; literal overlap is only a small supporting signal.
+      const score = Math.max(0, Math.min(1, cosine * 0.85 + lexical * 0.15)) * 100
       const existing = bestByRecord.get(recordUid)
       if (existing && existing.score >= score) continue
       bestByRecord.set(recordUid, {

@@ -44,8 +44,14 @@ import { KnowledgeService, type KnowledgeRecordMatch } from './knowledge'
 import { ModelClient } from './model-client'
 
 const supportedAgreementExtensions = new Set(['.docx', '.pdf', '.xlsx', '.xls', '.txt'])
-const extractionBatchMaxChars = 9_000
-const extractionSplitChunkMaxChars = 4_500
+// Keep local-model requests small enough that a slow CPU model can finish
+// before the shared 180-second request timeout. Each completed batch is still
+// checkpointed, so smaller batches do not trade away recoverability.
+const extractionBatchMaxChars = 2_000
+const extractionSplitChunkMaxChars = 600
+const extractionOutputMaxTokens = 6_000
+const extractionStrictOutputMaxTokens = 8_000
+const extractionCompactOutputMaxTokens = 4_000
 const requirementCategories = new Set<ProjectRequirementCategory>([
   'functional', 'interface', 'data', 'performance', 'security',
   'deployment', 'operations', 'acceptance', 'business'
@@ -78,6 +84,228 @@ interface ExtractedRequirement {
   confidence?: number
 }
 
+export interface AgreementExtractionChunk {
+  id: string
+  documentId: string
+  location: string
+  content: string
+  normalizedContent?: string
+}
+
+export interface AgreementRequirementSourceInput {
+  title?: string
+  content?: string
+  sourceChunkId?: string
+  evidenceQuote?: string
+  confidence?: number
+}
+
+export type AgreementSourceValidationStatus = 'verified' | 'corrected' | 'inferred' | 'unverified'
+
+export interface AgreementRequirementSourceResult {
+  status: AgreementSourceValidationStatus
+  sourceChunkId: string
+  sourceDocumentId: string
+  sourceLocation: string
+  evidenceQuote: string
+  confidence: number
+}
+
+const estimateAgreementChunkChars = (chunk: AgreementExtractionChunk): number =>
+  chunk.id.length + chunk.location.length + chunk.content.length + 80
+
+export const buildAgreementExtractionBatches = (
+  chunks: AgreementExtractionChunk[],
+  maxChars = extractionBatchMaxChars
+): AgreementExtractionChunk[][] => {
+  const safeMaxChars = Math.max(800, Math.floor(maxChars))
+  const batches: AgreementExtractionChunk[][] = []
+  let currentBatch: AgreementExtractionChunk[] = []
+  let currentLength = 0
+  for (const chunk of chunks) {
+    const size = estimateAgreementChunkChars(chunk)
+    if (currentBatch.length && currentLength + size > safeMaxChars) {
+      batches.push(currentBatch)
+      currentBatch = []
+      currentLength = 0
+    }
+    currentBatch.push(chunk)
+    currentLength += size
+  }
+  if (currentBatch.length) batches.push(currentBatch)
+  return batches
+}
+
+const normalizeAgreementText = (value: string): string => value.replace(/[\s\u200B-\u200D\uFEFF]+/g, '')
+
+const normalizeAgreementMatchText = (value: string): string =>
+  normalizeAgreementText(value).replace(/[\p{P}\p{S}]+/gu, '')
+
+const agreementBigramRecall = (query: string, source: string): number => {
+  if (query.length < 2 || source.length < 2) return 0
+  const queryBigrams = new Set<string>()
+  for (let index = 0; index < query.length - 1; index += 1) {
+    queryBigrams.add(query.slice(index, index + 2))
+  }
+  if (!queryBigrams.size) return 0
+  let matched = 0
+  for (const bigram of queryBigrams) {
+    if (source.includes(bigram)) matched += 1
+  }
+  return matched / queryBigrams.size
+}
+
+const agreementLongestCommonSubstring = (left: string, right: string): number => {
+  if (!left || !right) return 0
+  let previous = new Array<number>(right.length + 1).fill(0)
+  let longest = 0
+  for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
+    const current = new Array<number>(right.length + 1).fill(0)
+    for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
+      if (left[leftIndex - 1] === right[rightIndex - 1]) {
+        current[rightIndex] = previous[rightIndex - 1] + 1
+        longest = Math.max(longest, current[rightIndex])
+      }
+    }
+    previous = current
+  }
+  return longest
+}
+
+type AgreementFuzzySourceMatch = {
+  chunk: AgreementExtractionChunk
+  evidenceQuote: string
+}
+
+const findAgreementFuzzySource = (
+  text: string,
+  candidates: AgreementExtractionChunk[]
+): AgreementFuzzySourceMatch | undefined => {
+  const query = normalizeAgreementMatchText(text)
+  if (query.length < 24) return undefined
+  const ranked = candidates.map((chunk) => {
+    const source = normalizeAgreementMatchText(chunk.content)
+    const recall = agreementBigramRecall(query, source)
+    const commonLength = agreementLongestCommonSubstring(query, source)
+    return {
+      chunk,
+      recall,
+      commonRatio: commonLength / query.length
+    }
+  }).sort((left, right) =>
+    right.recall - left.recall || right.commonRatio - left.commonRatio
+  )
+  const best = ranked[0]
+  if (!best || best.recall < 0.84 || best.commonRatio < 0.25) return undefined
+  const runnerUp = ranked[1]
+  if (runnerUp && best.recall < 0.92 && best.recall - runnerUp.recall < 0.04) return undefined
+  return {
+    chunk: best.chunk,
+    evidenceQuote: best.chunk.content.trim().slice(0, 1000)
+  }
+}
+
+const clampAgreementConfidence = (value: unknown, fallback = 0.7): number => {
+  const numeric = Number(value ?? fallback)
+  return Number.isFinite(numeric) ? Math.max(0, Math.min(1, numeric)) : fallback
+}
+
+export const resolveAgreementRequirementSource = (
+  requirement: AgreementRequirementSourceInput,
+  chunks: AgreementExtractionChunk[]
+): AgreementRequirementSourceResult => {
+  const requestedChunkId = String(requirement.sourceChunkId ?? '').trim()
+  const requestedChunkIndex = chunks.findIndex((chunk) => chunk.id === requestedChunkId)
+  const requestedChunk = requestedChunkIndex >= 0 ? chunks[requestedChunkIndex] : undefined
+  const requestedDocumentId = requestedChunk?.documentId ?? ''
+  const adjacentChunks = requestedChunk
+    ? [-1, 1]
+      .map((offset) => chunks[requestedChunkIndex + offset])
+      .filter((chunk): chunk is AgreementExtractionChunk => Boolean(chunk) && chunk.documentId === requestedDocumentId)
+    : []
+  const orderedChunks: AgreementExtractionChunk[] = requestedChunk
+    ? [
+        requestedChunk,
+        ...adjacentChunks,
+        ...chunks.filter((chunk) => chunk.documentId === requestedDocumentId && chunk.id !== requestedChunkId),
+        ...chunks.filter((_chunk, index) =>
+          _chunk.documentId !== requestedDocumentId &&
+          index !== requestedChunkIndex &&
+          index !== requestedChunkIndex - 1 &&
+          index !== requestedChunkIndex + 1
+        )
+      ]
+    : chunks
+  const requestedEvidence = String(requirement.evidenceQuote ?? '').trim().slice(0, 1000)
+  const normalizedEvidence = normalizeAgreementText(requestedEvidence)
+  const sourceCandidates = requestedDocumentId
+    ? orderedChunks.filter((chunk) => chunk.documentId === requestedDocumentId)
+    : orderedChunks
+  const sourceFor = (text: string): AgreementExtractionChunk | undefined => {
+    const normalizedText = normalizeAgreementText(text)
+    if (!normalizedText) return undefined
+    const matches = orderedChunks.filter((chunk) =>
+      (chunk.normalizedContent ?? normalizeAgreementText(chunk.content)).includes(normalizedText)
+    )
+    if (!matches.length) return undefined
+    if (requestedDocumentId) return matches.find((chunk) => chunk.documentId === requestedDocumentId)
+    const documentIds = new Set(matches.map((chunk) => chunk.documentId))
+    return documentIds.size === 1 ? matches[0] : undefined
+  }
+  const fuzzySourceFor = (text: string): AgreementFuzzySourceMatch | undefined => {
+    const exactChunk = sourceFor(text)
+    if (exactChunk) return { chunk: exactChunk, evidenceQuote: exactChunk.content.trim().slice(0, 1000) }
+    return findAgreementFuzzySource(text, sourceCandidates)
+  }
+  const evidenceChunk = normalizedEvidence
+    ? requestedChunk && (requestedChunk.normalizedContent ?? normalizeAgreementText(requestedChunk.content)).includes(normalizedEvidence)
+      ? requestedChunk
+      : sourceFor(requestedEvidence)
+    : undefined
+  const fuzzyEvidence = normalizedEvidence && !evidenceChunk
+    ? findAgreementFuzzySource(requestedEvidence, sourceCandidates)
+    : undefined
+  if (evidenceChunk || fuzzyEvidence) {
+    const resolvedChunk = evidenceChunk ?? fuzzyEvidence!.chunk
+    const corrected = resolvedChunk.id !== requestedChunkId
+    const confidence = corrected
+      ? Math.min(clampAgreementConfidence(requirement.confidence), 0.75)
+      : clampAgreementConfidence(requirement.confidence)
+    return {
+      status: corrected ? 'corrected' : 'verified',
+      sourceChunkId: resolvedChunk.id,
+      sourceDocumentId: resolvedChunk.documentId,
+      sourceLocation: resolvedChunk.location,
+      evidenceQuote: fuzzyEvidence?.evidenceQuote ?? requestedEvidence,
+      confidence
+    }
+  }
+
+  const content = String(requirement.content ?? '').trim()
+  const contentChunk = content ? sourceFor(content) : undefined
+  const fuzzyContent = content && !contentChunk ? fuzzySourceFor(content) : undefined
+  if (contentChunk || fuzzyContent) {
+    const resolvedChunk = contentChunk ?? fuzzyContent!.chunk
+    return {
+      status: 'inferred',
+      sourceChunkId: resolvedChunk.id,
+      sourceDocumentId: resolvedChunk.documentId,
+      sourceLocation: resolvedChunk.location,
+      evidenceQuote: fuzzyContent?.evidenceQuote ?? content.slice(0, 1000),
+      confidence: Math.min(clampAgreementConfidence(requirement.confidence), 0.7)
+    }
+  }
+
+  return {
+    status: 'unverified',
+    sourceChunkId: '',
+    sourceDocumentId: '',
+    sourceLocation: '',
+    evidenceQuote: '',
+    confidence: Math.min(clampAgreementConfidence(requirement.confidence), 0.35)
+  }
+}
+
 interface ExtractedAgreement {
   project?: ExtractedProject
   requirements?: ExtractedRequirement[]
@@ -88,6 +316,24 @@ interface AgreementExtractionResult {
   warnings: string[]
   analyzedChunks: number
 }
+
+type AgreementExtractionEventMetadata = Partial<Pick<
+  ProjectAnalysisProgress,
+  'logKind' | 'requestId' | 'batchNumber' | 'attempt' | 'elapsedMs' | 'inputChars' |
+  'outputChars' | 'doneReason' | 'modelName' | 'status'
+>>
+
+type AgreementExtractionEvent = (
+  message: string,
+  detail?: string,
+  metadata?: AgreementExtractionEventMetadata
+) => void
+
+type AgreementExtractionCheckpoint = (
+  agreement: ExtractedAgreement,
+  warnings: string[],
+  analyzedChunks: number
+) => void
 
 interface MatchReview {
   status?: ProjectRequirementStatus
@@ -123,7 +369,7 @@ export class ProjectManagementService {
     return this.db.listManagedProjectDocuments(id)
   }
 
-  listAnalysisLogs(id: string, limit = 160): ProjectAnalysisLogEntry[] {
+  listAnalysisLogs(id: string, limit = 2000): ProjectAnalysisLogEntry[] {
     return this.db.listProjectAnalysisLogs(id, limit)
   }
 
@@ -176,7 +422,7 @@ export class ProjectManagementService {
   confirmProject(id: string): ManagedProject | null {
     const project = this.db.confirmManagedProject(id)
     if (!project) return null
-    if (project.requirementCount > 0 && project.matchStatus !== 'processing') {
+    if (project.requirementCount > 0 && ['idle', 'stale', 'failed'].includes(project.matchStatus)) {
       this.startMatching(id)
     }
     return this.db.getManagedProject(id)
@@ -311,22 +557,37 @@ export class ProjectManagementService {
 
   reviewRequirements(ids: string[], status: ProjectRequirementReviewStatus): { ok: boolean; message: string } {
     if (!['pending', 'approved', 'rejected'].includes(status)) return { ok: false, message: '审核状态无效' }
+    const projectIds = [...new Set(ids
+      .map((id) => this.db.getProjectRequirement(id)?.projectId)
+      .filter((projectId): projectId is string => Boolean(projectId)))]
     const count = this.db.reviewProjectRequirements(ids, status)
-    return count
-      ? { ok: true, message: `已更新 ${count} 条需求的审核状态` }
-      : { ok: false, message: '没有可更新的待审核需求' }
+    if (!count) return { ok: false, message: '没有可更新的待审核需求' }
+
+    if (status === 'approved') {
+      for (const projectId of projectIds) {
+        const set = this.db.getReviewProjectRequirementSet(projectId)
+        if (!set) continue
+        const allApproved = set.requirementCount > 0 && set.pendingCount === 0 &&
+          set.rejectedCount === 0 && set.approvedCount === set.requirementCount
+        if (!allApproved) continue
+        const published = this.publishRequirements(projectId)
+        return {
+          ok: published.ok,
+          message: published.ok
+            ? `全部 ${set.approvedCount} 条需求已通过，${published.message}`
+            : published.message
+        }
+      }
+    }
+    return { ok: true, message: `已更新 ${count} 条需求的审核状态` }
   }
 
   publishRequirements(projectId: string): ProjectAnalysisStartResult {
     const set = this.db.publishReviewProjectRequirementSet(projectId)
-    const project = this.db.getManagedProject(projectId)
-    if (project?.lifecycle === 'active') {
-      const matching = this.startMatching(projectId)
-      return matching.ok
-        ? { ...matching, message: `需求 V${set.version} 已发布，匹配任务已启动` }
-        : matching
-    }
-    return { ok: true, projectId, message: `需求 V${set.version} 已发布，确认项目后将开始匹配` }
+    const matching = this.startMatching(projectId)
+    return matching.ok
+      ? { ...matching, message: `需求 V${set.version} 已自动发布，语义匹配任务已启动` }
+      : { ok: true, projectId, message: `需求 V${set.version} 已发布；${matching.message}` }
   }
 
   deleteRequirement(id: string): { ok: boolean; message: string } {
@@ -775,17 +1036,37 @@ export class ProjectManagementService {
         content: chunk.content
       })))
       analyzedTotal = chunks.length
+      if (!chunks.length) throw new Error('协议没有可分析的正文分块')
+      const primaryDocumentId = documentIds[documentIds.length - 1]
+      const settings = this.modelSettings()
+      const set = this.db.createProjectRequirementSet({
+        projectId,
+        documentId: primaryDocumentId,
+        totalChunks: chunks.length,
+        analyzedChunks: 0,
+        warnings: [],
+        externalProcessing,
+        modelName: `${settings.provider}:${settings.model}`
+      })
+      const saveExtractionCheckpoint: AgreementExtractionCheckpoint = (agreement, warnings, analyzedChunks) => {
+        const requirements = this.normalizeRequirements(projectId, primaryDocumentId, agreement.requirements ?? [])
+        this.db.replaceReviewProjectRequirements(set.id, projectId, primaryDocumentId, requirements)
+        this.db.updateProjectRequirementSetProgress(set.id, analyzedChunks, warnings)
+        this.db.updateManagedProjectState(projectId, {
+          analysisMessage: `已抽取 ${requirements.length} 条候选需求（${analyzedChunks}/${chunks.length} 个分块），正在继续分析`
+        })
+      }
       this.emit({
         taskId,
         projectId,
         phase: 'extracting',
         message: `开始抽取 ${chunks.length} 个正文分块中的可交付需求`,
-        detail: `协议：${details.map((detail) => detail!.fileName).join('、')}；模型会按小批次调用并自动拆分过长结果`,
+        detail: `协议：${details.map((detail) => detail!.fileName).join('、')}；按小批次调用模型，每批完成后保存候选需求并记录请求耗时`,
         current: 0,
         total: analyzedTotal,
         status: 'running'
       })
-      const extraction = await this.extractAgreement(chunks, (current, total, message, detail) => {
+      const extraction = await this.extractAgreement(chunks, (current, total, message, detail, metadata) => {
         analyzedCurrent = current
         analyzedTotal = total
         this.emit({
@@ -794,11 +1075,12 @@ export class ProjectManagementService {
           phase: 'extracting',
           message: message || `已分析 ${current}/${total} 个正文分块`,
           detail,
+          ...metadata,
           current,
           total,
-          status: 'running'
+          status: metadata?.status ?? 'running'
         })
-      })
+      }, saveExtractionCheckpoint)
       const extracted = extraction.agreement
       analyzedCurrent = analyzedTotal
       this.emit({
@@ -839,18 +1121,8 @@ export class ProjectManagementService {
           })
         }
       }
-      const primaryDocumentId = documentIds[documentIds.length - 1]
       const requirements = this.normalizeRequirements(projectId, primaryDocumentId, extracted.requirements ?? [])
-      const settings = this.modelSettings()
-      const set = this.db.createProjectRequirementSet({
-        projectId,
-        documentId: primaryDocumentId,
-        totalChunks: chunks.length,
-        analyzedChunks: extraction.analyzedChunks,
-        warnings: extraction.warnings,
-        externalProcessing,
-        modelName: `${settings.provider}:${settings.model}`
-      })
+      this.db.updateProjectRequirementSetProgress(set.id, extraction.analyzedChunks, extraction.warnings)
       this.db.replaceReviewProjectRequirements(set.id, projectId, primaryDocumentId, requirements)
       this.db.updateManagedProjectState(projectId, {
         analysisStatus: 'ready',
@@ -974,91 +1246,87 @@ export class ProjectManagementService {
   }
 
   private async extractAgreement(
-    chunks: Array<{ id: string; documentId: string; location: string; content: string }>,
-    onProgress?: (current: number, total: number, message?: string, detail?: string) => void
+    chunks: AgreementExtractionChunk[],
+    onProgress?: (current: number, total: number, message?: string, detail?: string, metadata?: AgreementExtractionEventMetadata) => void,
+    onCheckpoint?: AgreementExtractionCheckpoint
   ): Promise<AgreementExtractionResult> {
-    const batches: Array<Array<{ id: string; documentId: string; location: string; content: string }>> = []
-    let currentBatch: Array<{ id: string; documentId: string; location: string; content: string }> = []
-    let currentLength = 0
-    for (const chunk of chunks) {
-      const size = chunk.content.length + chunk.location.length + 80
-      if (currentBatch.length && currentLength + size > extractionBatchMaxChars) {
-        batches.push(currentBatch)
-        currentBatch = []
-        currentLength = 0
-      }
-      currentBatch.push(chunk)
-      currentLength += size
-    }
-    if (currentBatch.length) batches.push(currentBatch)
+    const batches = buildAgreementExtractionBatches(chunks)
     if (!batches.length) throw new Error('协议没有可分析的正文分块')
 
     const merged: ExtractedAgreement = { project: {}, requirements: [] }
+    const traceabilityChunks = chunks.map((chunk) => ({
+      ...chunk,
+      normalizedContent: normalizeAgreementText(chunk.content)
+    }))
     const warnings: string[] = []
     let analyzedChunks = 0
-    for (let index = 0; index < batches.length; index += 1) {
-      const batch = batches[index]
-      onProgress?.(
-        analyzedChunks,
-        chunks.length,
-        `正在调用模型分析第 ${index + 1}/${batches.length} 批正文`,
-        `本批包含 ${batch.length} 个正文分块，输入约 ${batch.reduce((sum, item) => sum + item.content.length, 0)} 字`
-      )
-      const extracted = await this.extractAgreementBatch(batch, String(index + 1), batches.length, (message, detail) => {
-        onProgress?.(analyzedChunks, chunks.length, message, detail)
+    const extractionConcurrency = this.modelSettings().source === 'local' ? 2 : 1
+    for (let windowStart = 0; windowStart < batches.length; windowStart += extractionConcurrency) {
+      const window = batches.slice(windowStart, windowStart + extractionConcurrency)
+      const windowAnalyzedChunks = analyzedChunks
+      window.forEach((batch, offset) => {
+        const index = windowStart + offset
+        onProgress?.(
+          windowAnalyzedChunks,
+          chunks.length,
+          `正在调用模型分析第 ${index + 1}/${batches.length} 批正文`,
+          `本批包含 ${batch.length} 个正文分块，输入约 ${batch.reduce((sum, item) => sum + item.content.length, 0)} 字${extractionConcurrency > 1 ? ` · 本地并发 ${extractionConcurrency}` : ''}`
+        )
       })
-      const fields = extracted.project ?? {}
-      const project = merged.project!
-      for (const key of Object.keys(fields) as Array<keyof ExtractedProject>) {
-        if (project[key] === undefined && fields[key] !== undefined) {
-          Object.assign(project, { [key]: fields[key] })
-        }
-      }
-      const byId = new Map(batch.map((chunk) => [chunk.id, chunk]))
-      for (const requirement of extracted.requirements ?? []) {
-        const sourceChunkId = String(requirement.sourceChunkId ?? '').trim()
-        const sourceChunk = byId.get(sourceChunkId)
-        let confidence = Math.max(0, Math.min(1, Number(requirement.confidence ?? 0.7)))
-        let evidenceQuote = String(requirement.evidenceQuote ?? '').trim().slice(0, 1000)
-        if (!sourceChunk) {
-          warnings.push(`第 ${index + 1} 批存在无法验证的需求来源：${requirement.title ?? '未命名需求'}`)
-          confidence = Math.min(confidence, 0.4)
-          evidenceQuote = ''
-        } else if (evidenceQuote) {
-          const normalizedSource = sourceChunk.content.replace(/\s+/g, '')
-          const normalizedEvidence = evidenceQuote.replace(/\s+/g, '')
-          if (!normalizedSource.includes(normalizedEvidence)) {
-            warnings.push(`证据原文未能精确回溯：${requirement.title ?? '未命名需求'}`)
-            confidence = Math.min(confidence, 0.5)
-            evidenceQuote = ''
-          }
-        } else {
-          warnings.push(`需求缺少证据摘录：${requirement.title ?? '未命名需求'}`)
-          confidence = Math.min(confidence, 0.55)
-        }
-        merged.requirements!.push({
-          ...requirement,
-          category: requirementCategories.has(requirement.category ?? 'functional')
-            ? requirement.category ?? 'functional'
-            : 'functional',
-          sourceChunkId: sourceChunk?.id ?? '',
-          sourceDocumentId: sourceChunk?.documentId ?? '',
-          sourceLocation: sourceChunk?.location ?? String(requirement.sourceLocation ?? '').trim(),
-          evidenceQuote,
-          confidence
+      const settled = await Promise.allSettled(window.map((batch, offset) => {
+        const index = windowStart + offset
+        return this.extractAgreementBatch(batch, String(index + 1), batches.length, (message, detail, metadata) => {
+          onProgress?.(windowAnalyzedChunks, chunks.length, message, detail, metadata)
         })
+      }))
+      for (let offset = 0; offset < settled.length; offset += 1) {
+        const result = settled[offset]
+        if (result.status === 'rejected') {
+          throw result.reason instanceof Error ? result.reason : new Error(String(result.reason))
+        }
+        const batch = window[offset]
+        const extracted = result.value
+        const fields = extracted.project ?? {}
+        const project = merged.project!
+        for (const key of Object.keys(fields) as Array<keyof ExtractedProject>) {
+          if (project[key] === undefined && fields[key] !== undefined) {
+            Object.assign(project, { [key]: fields[key] })
+          }
+        }
+        for (const requirement of extracted.requirements ?? []) {
+          const source = resolveAgreementRequirementSource(requirement, traceabilityChunks)
+          if (source.status === 'corrected') {
+            warnings.push(`需求来源已根据原文证据修正：${requirement.title ?? '未命名需求'}`)
+          } else if (source.status === 'inferred') {
+            warnings.push(`需求未提供证据摘录，已根据需求正文回溯：${requirement.title ?? '未命名需求'}`)
+          } else if (source.status === 'unverified') {
+            warnings.push(`需求无法回溯到协议原文，已降为低置信待复核：${requirement.title ?? '未命名需求'}`)
+          }
+          merged.requirements!.push({
+            ...requirement,
+            category: requirementCategories.has(requirement.category ?? 'functional')
+              ? requirement.category ?? 'functional'
+              : 'functional',
+            sourceChunkId: source.sourceChunkId,
+            sourceDocumentId: source.sourceDocumentId,
+            sourceLocation: source.sourceLocation,
+            evidenceQuote: source.evidenceQuote,
+            confidence: source.confidence
+          })
+        }
+        analyzedChunks += batch.length
+        onCheckpoint?.(merged, [...new Set(warnings)].slice(0, 100), analyzedChunks)
+        onProgress?.(analyzedChunks, chunks.length, `已完成第 ${windowStart + offset + 1}/${batches.length} 批需求抽取`, `当前累计识别 ${merged.requirements?.length ?? 0} 条候选需求`)
       }
-      analyzedChunks += batch.length
-      onProgress?.(analyzedChunks, chunks.length, `已完成第 ${index + 1}/${batches.length} 批需求抽取`, `当前累计识别 ${merged.requirements?.length ?? 0} 条候选需求`)
     }
     return { agreement: merged, warnings: [...new Set(warnings)].slice(0, 100), analyzedChunks }
   }
 
   private async extractAgreementBatch(
-    chunks: Array<{ id: string; documentId: string; location: string; content: string }>,
+    chunks: AgreementExtractionChunk[],
     batchNumber: string,
     batchCount: number,
-    onEvent?: (message: string, detail?: string) => void
+    onEvent?: AgreementExtractionEvent
   ): Promise<ExtractedAgreement> {
     const source = chunks
       .map((chunk) => `[分块ID:${chunk.id}][位置:${chunk.location}]\n${chunk.content}`)
@@ -1066,57 +1334,183 @@ export class ProjectManagementService {
     const systemPrompt = [
       '你是企业技术协议结构化分析器。只依据输入正文，不得补写正文没有出现的项目字段或需求。',
       `当前是第 ${batchNumber}/${batchCount} 批正文。提取项目基本信息以及所有可验证、可交付、可验收的技术或商务约束。`,
+      'project 只输出本批正文明确出现且能够直接确认的字段，可选字段为 projectName、customerName、contractAmount、riskFactor、deliveryReminderDays、plannedDeliveryDate、salesOwner、technicalOwner、developmentOwner、estimatedCost、estimatedDurationDays。未出现的字段不要输出，禁止使用 0、空字符串或 null 占位。',
       'category 必须从 functional、interface、data、performance、security、deployment、operations、acceptance、business 中选择，分别表示功能、接口、数据、性能、安全、部署、运维、验收和商务约束。不得因为内容属于非功能需求而丢弃。',
       '每条需求必须原子化：一条只描述一个动作、对象或约束。多个并列动作、指标或序号项必须拆成多条。',
+      '字段长度限制只用于压缩单条输出，不得因此省略或合并可靠需求；正文中的每个独立动作、指标、责任、交付物、付款条款和人员管理约束都必须分别保留。',
       '遇到任何同级序号标识都必须严格分条输出：包括 1.、1)、1）、1、（1）、(1)、①，以及 一、/（一）等。序号后的每一项对应 requirements 数组中的一个独立元素；即使它们共享同一个章节标题，也绝对不能合并到同一条 content 中。',
       '识别每条需求所在的最近章节或功能模块，并写入 module 字段，例如“2.1 整体要求”“2.2 项目策划”。同一章节下的多条需求必须复用相同 module；title 只写需求名称或功能动作，绝对不要把章节名称重复拼接到 title 前面。',
       '排除纯背景、宣传性描述和没有约束含义的泛泛目标，但保留明确的架构、技术选型、实施、培训、付款、性能、安全、验收和服务要求。',
-      '每条 content 使用简洁需求句，尽量不超过 200 字。sourceChunkId 必须从输入分块ID原样选择；evidenceQuote 必须逐字摘录该分块中的直接证据；confidence 返回 0 到 1。',
-      '为每条需求提取 keyInfoTerms：3-8 个用于数据中心匹配的关键功能信息词，只保留正文中出现的业务对象、动作、模块、接口/集成对象、指标或约束词；不要返回“系统、功能、支持、实现、能够、可以”等泛词，不要编造同义词。',
+      '每条 content 使用简洁需求句，最多 120 字。sourceChunkId 必须从输入分块ID原样选择；evidenceQuote 必须逐字摘录该分块中的直接证据，最多 80 字并优先保留核心约束；confidence 返回 0 到 1。sourceLocation 不要输出，程序会根据 sourceChunkId 回填。',
+      '为每条需求提取 keyInfoTerms：2-4 个用于数据中心匹配的关键功能信息词，只保留正文中出现的业务对象、动作、模块、接口/集成对象、指标或约束词；不要返回“系统、功能、支持、实现、能够、可以”等泛词，不要编造同义词。',
       '只输出一个完整且闭合的 JSON 对象，不要输出 Markdown、解释文字或思考过程。JSON 结构必须为：',
-      '{"project":{"projectName":"","customerName":"","contractAmount":0,"riskFactor":0,"deliveryReminderDays":0,"plannedDeliveryDate":"","salesOwner":"","technicalOwner":"","developmentOwner":"","estimatedCost":0,"estimatedDurationDays":0},"requirements":[{"category":"functional","module":"","title":"","content":"","keyInfoTerms":[""],"sourceLocation":"","sourceChunkId":"","evidenceQuote":"","confidence":0.8}]}',
-      '不确定的数字、日期和负责人字段使用空字符串或 null；requirements 没有可靠功能需求时返回空数组。'
+      '{"project":{},"requirements":[{"category":"functional","module":"","title":"","content":"","keyInfoTerms":[""],"sourceChunkId":"","evidenceQuote":"","confidence":0.8}]}',
+      'requirements 没有可靠需求时返回空数组。'
     ].join('\n')
-    const model = new ModelClient(this.modelSettings())
-    const request = (strict: boolean): Promise<Awaited<ReturnType<ModelClient['chat']>>> => model.chat({
+    const compactSystemPrompt = [
+      '这是格式重试（紧凑恢复）。你是企业技术协议需求抽取器，只依据输入正文，不得补写。',
+      '只输出一个完整且闭合的 JSON 对象：{"project":{},"requirements":[]}。',
+      '逐条提取正文中可验证、可交付、可验收的要求，不能合并同级序号项；每条只保留 category、module、title、content、keyInfoTerms、sourceChunkId、evidenceQuote、confidence。',
+      'content 最多 120 字，evidenceQuote 必须逐字摘录且最多 80 字，keyInfoTerms 最多 4 个；sourceChunkId 必须原样取自输入分块ID，sourceLocation 不要输出。',
+      '不要输出项目基本信息、解释文字、Markdown 或思考过程；requirements 没有可靠需求时返回空数组。'
+    ].join('\n')
+    const settings = this.modelSettings()
+    const model = new ModelClient(settings)
+    const modelName = `${settings.provider}:${settings.model}`
+    const strictPromptSuffix = '\n这是格式重试：上一次输出不完整或无法解析。请减少文字，确保最后一个字段和所有括号都闭合后再结束。'
+    type RequestMode = 'normal' | 'strict' | 'compact'
+    const request = (mode: RequestMode): Promise<Awaited<ReturnType<ModelClient['chat']>>> => {
+      const requestSystemPrompt = mode === 'compact'
+        ? compactSystemPrompt
+        : mode === 'strict'
+          ? `${systemPrompt}${strictPromptSuffix}`
+          : systemPrompt
+      return model.chat({
       messages: [
         {
           role: 'system',
-          content: strict
-            ? `${systemPrompt}\n这是格式重试：上一次输出不完整或无法解析。请减少文字，确保最后一个字段和所有括号都闭合后再结束。`
-            : systemPrompt
+          content: requestSystemPrompt
         },
         { role: 'user', content: source }
       ],
       format: 'json',
       think: false,
-      temperature: strict ? 0 : 0.1,
-      numPredict: strict ? 8_000 : 6_000
-    })
-    let response = await request(false)
+      temperature: 0,
+      numPredict: mode === 'compact'
+        ? extractionCompactOutputMaxTokens
+        : mode === 'strict'
+          ? extractionStrictOutputMaxTokens
+          : extractionOutputMaxTokens
+      })
+    }
+    let requestAttempt = 0
+    const executeRequest = async (mode: RequestMode): Promise<Awaited<ReturnType<ModelClient['chat']>>> => {
+      requestAttempt += 1
+      const requestId = randomUUID()
+      const startedAt = Date.now()
+      const requestSystemPrompt = mode === 'compact'
+        ? compactSystemPrompt
+        : mode === 'strict'
+          ? `${systemPrompt}${strictPromptSuffix}`
+          : systemPrompt
+      const inputChars = requestSystemPrompt.length + source.length
+      const requestLabel = mode === 'strict' ? '（格式重试）' : mode === 'compact' ? '（紧凑恢复）' : ''
+      try {
+        const response = await request(mode)
+        const elapsedMs = Math.max(0, Date.now() - startedAt)
+        const outputChars = response.message?.content?.length ?? 0
+        const doneReason = String(response.done_reason ?? '')
+        onEvent?.(
+          `模型请求完成：第 ${batchNumber}/${batchCount} 批${requestLabel}`,
+          `模型 ${modelName} · 输入 ${inputChars} 字 · 输出 ${outputChars} 字 · 耗时 ${elapsedMs} ms · 结束 ${doneReason || '未知'}`,
+          {
+            logKind: 'model_request',
+            requestId,
+            batchNumber,
+            attempt: requestAttempt,
+            elapsedMs,
+            inputChars,
+            outputChars,
+            doneReason,
+            modelName,
+            status: 'success'
+          }
+        )
+        return response
+      } catch (error) {
+        const elapsedMs = Math.max(0, Date.now() - startedAt)
+        const message = error instanceof Error ? error.message : String(error)
+        onEvent?.(
+          `模型请求失败：第 ${batchNumber}/${batchCount} 批${requestLabel}`,
+          `模型 ${modelName} · 输入 ${inputChars} 字 · 耗时 ${elapsedMs} ms · ${message}`,
+          {
+            logKind: 'model_request',
+            requestId,
+            batchNumber,
+            attempt: requestAttempt,
+            elapsedMs,
+            inputChars,
+            outputChars: 0,
+            doneReason: 'error',
+            modelName,
+            status: 'failed'
+          }
+        )
+        throw error
+      }
+    }
+    let response: Awaited<ReturnType<ModelClient['chat']>>
+    let compactAttempted = false
+    try {
+      response = await executeRequest('normal')
+    } catch (error) {
+      const split = this.splitExtractionBatch(chunks)
+      if (split) {
+        onEvent?.(
+          `第 ${batchNumber}/${batchCount} 批请求失败，正在拆分重试`,
+          `原批次 ${chunks.length} 个正文分块；失败原因：${error instanceof Error ? error.message : String(error)}`
+        )
+        return this.extractSplitAgreementBatch(split, batchNumber, batchCount, onEvent)
+      }
+      onEvent?.(
+        `第 ${batchNumber}/${batchCount} 批请求失败，正在尝试紧凑恢复`,
+        `无法继续拆分单个正文分块；失败原因：${error instanceof Error ? error.message : String(error)}`
+      )
+      compactAttempted = true
+      response = await executeRequest('compact')
+    }
     let parsed = this.parseAgreementJson(response.message?.content ?? '')
-    if (!parsed) {
-      response = await request(true)
+    if (!parsed && response.done_reason !== 'length') {
+      try {
+        response = await executeRequest('strict')
+      } catch (error) {
+        const split = this.splitExtractionBatch(chunks)
+        if (split) {
+          onEvent?.(
+            `第 ${batchNumber}/${batchCount} 批格式重试失败，正在拆分重试`,
+            `原批次 ${chunks.length} 个正文分块；失败原因：${error instanceof Error ? error.message : String(error)}`
+          )
+          return this.extractSplitAgreementBatch(split, batchNumber, batchCount, onEvent)
+        }
+        onEvent?.(
+          `第 ${batchNumber}/${batchCount} 批格式重试失败，正在尝试紧凑恢复`,
+          `无法继续拆分单个正文分块；失败原因：${error instanceof Error ? error.message : String(error)}`
+        )
+        compactAttempted = true
+        response = await executeRequest('compact')
+      }
       parsed = this.parseAgreementJson(response.message?.content ?? '')
     }
     if (!parsed) {
       const split = this.splitExtractionBatch(chunks)
       if (split) {
         onEvent?.(
-          `第 ${batchNumber}/${batchCount} 批模型结果过长，正在自动拆分重试`,
-          `原批次 ${chunks.length} 个正文分块；拆分后分别分析，避免一次输出被截断`
+          `第 ${batchNumber}/${batchCount} 批模型结果无法完整解析，正在拆分重试`,
+          `原批次 ${chunks.length} 个正文分块；已避免重复请求同一批次`
         )
-        const [left, right] = split
-        const leftResult = await this.extractAgreementBatch(left, `${batchNumber}.1`, batchCount, onEvent)
-        const rightResult = await this.extractAgreementBatch(right, `${batchNumber}.2`, batchCount, onEvent)
-        return this.mergeExtractedAgreements(leftResult, rightResult)
+        return this.extractSplitAgreementBatch(split, batchNumber, batchCount, onEvent)
+      }
+      if (!compactAttempted && (response.done_reason === 'length' || response.message?.content)) {
+        onEvent?.(
+          `第 ${batchNumber}/${batchCount} 批模型结果仍不完整，正在尝试紧凑恢复`,
+          `当前批次已无法继续拆分；将只要求模型输出短字段和短证据`
+        )
+        compactAttempted = true
+        response = await executeRequest('compact')
+        parsed = this.parseAgreementJson(response.message?.content ?? '')
+        if (parsed) {
+          return this.normalizeExtractedAgreement(parsed)
+        }
       }
       if (response.done_reason === 'length') {
-        throw new Error(`第 ${batchNumber}/${batchCount} 批模型输出被截断，已自动重试仍未完成`)
+        throw new Error(`第 ${batchNumber}/${batchCount} 批模型输出被截断，拆分后仍未完成`)
       }
       throw new Error('大模型返回的技术协议分析结果不是有效 JSON，已自动重试')
     }
-    const value = parsed
+    return this.normalizeExtractedAgreement(parsed)
+  }
+
+  private normalizeExtractedAgreement(value: Record<string, unknown>): ExtractedAgreement {
     const project = value.project && typeof value.project === 'object'
       ? value.project as Record<string, unknown>
       : {}
@@ -1155,11 +1549,25 @@ export class ProjectManagementService {
     }
   }
 
+  private async extractSplitAgreementBatch(
+    split: [AgreementExtractionChunk[], AgreementExtractionChunk[]],
+    batchNumber: string,
+    batchCount: number,
+    onEvent?: AgreementExtractionEvent
+  ): Promise<ExtractedAgreement> {
+    const [left, right] = split
+    const [leftResult, rightResult] = await Promise.all([
+      this.extractAgreementBatch(left, `${batchNumber}.1`, batchCount, onEvent),
+      this.extractAgreementBatch(right, `${batchNumber}.2`, batchCount, onEvent)
+    ])
+    return this.mergeExtractedAgreements(leftResult, rightResult)
+  }
+
   private splitExtractionBatch(
-    chunks: Array<{ id: string; documentId: string; location: string; content: string }>
+    chunks: AgreementExtractionChunk[]
   ): [
-    Array<{ id: string; documentId: string; location: string; content: string }>,
-    Array<{ id: string; documentId: string; location: string; content: string }>
+    AgreementExtractionChunk[],
+    AgreementExtractionChunk[]
   ] | null {
     if (chunks.length > 1) {
       const midpoint = Math.ceil(chunks.length / 2)
@@ -1235,7 +1643,8 @@ export class ProjectManagementService {
           detail: [
             requirement.module,
             requirement.title,
-            requirement.keyInfoTerms.length ? `关键功能词：${requirement.keyInfoTerms.join('、')}` : requirement.content.slice(0, 180)
+            requirement.content.slice(0, 180),
+            requirement.keyInfoTerms.length ? `补充信息词：${requirement.keyInfoTerms.join('、')}` : ''
           ].filter(Boolean).join(' · '),
           current: index,
           total: requirements.length,
@@ -1270,7 +1679,8 @@ export class ProjectManagementService {
         message: `正在重新匹配：${requirement.title}`,
         detail: [
           requirement.module,
-          requirement.keyInfoTerms.length ? `关键功能词：${requirement.keyInfoTerms.join('、')}` : requirement.content.slice(0, 180)
+          requirement.content.slice(0, 180),
+          requirement.keyInfoTerms.length ? `补充信息词：${requirement.keyInfoTerms.join('、')}` : ''
         ].filter(Boolean).join(' · '),
         current: 0,
         total: 1,
@@ -1306,7 +1716,7 @@ export class ProjectManagementService {
   private async matchSingleRequirement(requirement: ProjectRequirement): Promise<void> {
     const matchingQuery = this.buildRequirementMatchQuery(requirement)
     const vectorMatches = await this.knowledge.rankRecordMatches(matchingQuery)
-    const reviewed = await this.reviewMatches(matchingQuery, vectorMatches.slice(0, 20))
+    const reviewed = await this.reviewMatches(requirement, vectorMatches.slice(0, 20))
     const reviewByRecord = new Map(
       (reviewed.matches ?? [])
         .filter((item) => item.recordUid)
@@ -1341,11 +1751,16 @@ export class ProjectManagementService {
 
   private buildRequirementMatchQuery(requirement: ProjectRequirement): string {
     const terms = this.normalizeKeyInfoTerms(requirement.keyInfoTerms)
-    if (terms.length) return terms.join(' ')
-    return requirement.title.trim() || requirement.content.trim().slice(0, 120)
+    return [
+      `需求分类：${requirement.category}`,
+      requirement.module.trim() ? `业务模块：${requirement.module.trim()}` : '',
+      `需求标题：${requirement.title.trim()}`,
+      `需求描述：${requirement.content.trim()}`,
+      terms.length ? `补充信息词：${terms.join('、')}` : ''
+    ].filter(Boolean).join('\n')
   }
 
-  private async reviewMatches(requirement: string, candidates: KnowledgeRecordMatch[]): Promise<MatchReview> {
+  private async reviewMatches(requirement: ProjectRequirement, candidates: KnowledgeRecordMatch[]): Promise<MatchReview> {
     if (!candidates.length) return { status: 'unmarked', reason: '数据中心没有可用的向量匹配记录', matches: [] }
     try {
       const response = await new ModelClient(this.modelSettings()).chat({
@@ -1353,7 +1768,8 @@ export class ProjectManagementService {
           {
             role: 'system',
             content: [
-              '你是技术需求与数据资产匹配评审器。输入中的 requirement 是经过人工或 AI 提取的关键功能信息词，不是完整协议正文；只依据这些词和候选记录进行判断。',
+              '你是技术需求与数据资产语义匹配评审器。请综合需求分类、业务模块、标题和完整需求描述理解真实意图，再评审候选记录。',
+              'keyInfoTerms 只是帮助理解行业术语、缩写和重点概念的补充信息，不是硬约束。候选记录即使没有逐字命中这些词，只要整体语义和能力一致，也不能因此降为不匹配。',
               '为每个候选记录给出 0 到 100 的匹配分数和简短理由，不能虚构候选记录字段。',
               '同时给出需求整体状态：satisfied 仅表示已有数据明确支持；unmarked 表示匹配度不足、无法确认满足或需要人工标记。AI 不要输出 to_develop 或 to_negotiate，这两个状态只由用户手动标记。',
               '只输出 JSON：{"status":"satisfied|unmarked","reason":"","matches":[{"recordUid":"","score":0,"reason":""}]}'
@@ -1361,7 +1777,16 @@ export class ProjectManagementService {
           },
           {
             role: 'user',
-            content: JSON.stringify({ keyInfoTerms: requirement.split(/\s+/).filter(Boolean), candidates })
+            content: JSON.stringify({
+              requirement: {
+                category: requirement.category,
+                module: requirement.module,
+                title: requirement.title,
+                content: requirement.content,
+                keyInfoTerms: this.normalizeKeyInfoTerms(requirement.keyInfoTerms)
+              },
+              candidates
+            })
           }
         ],
         format: 'json',

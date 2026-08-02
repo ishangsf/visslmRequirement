@@ -28,6 +28,7 @@ import {
   SyncOutlined,
   TeamOutlined,
   DisconnectOutlined,
+  DownOutlined,
   UploadOutlined,
   WarningOutlined
 } from '@ant-design/icons'
@@ -194,6 +195,13 @@ const formatAnalysisLogTime = (value: string): string => {
     hour12: false
   }).format(timestamp)
 }
+
+const formatAnalysisDuration = (value?: number): string => {
+  const milliseconds = Math.max(0, Math.trunc(Number(value ?? 0)))
+  return milliseconds >= 1000 ? `${(milliseconds / 1000).toFixed(1)} 秒` : `${milliseconds} 毫秒`
+}
+
+const formatAnalysisChars = (value?: number): string => `${Math.max(0, Math.trunc(Number(value ?? 0))).toLocaleString('zh-CN')} 字`
 
 const projectRiskMeta = (project: ManagedProject): { label: string; color: string } => {
   const delivery = deliveryHint(project)
@@ -941,8 +949,8 @@ function MatchDrawer({
               </div>
             ) : (
               <div className="project-key-info-terms-display">
-                {requirement.keyInfoTerms.length ? <Space wrap size={[6, 6]}>{requirement.keyInfoTerms.map((term) => <Tag color="purple" key={term}>{term}</Tag>)}</Space> : <Text type="secondary">暂未提取信息词，可手动添加后重新匹配</Text>}
-                <Text type="secondary" className="project-key-info-terms-source">{requirement.keyInfoTermsSource === 'manual' ? '人工修改' : 'AI 提取'} · 匹配仅使用这些词</Text>
+                {requirement.keyInfoTerms.length ? <Space wrap size={[6, 6]}>{requirement.keyInfoTerms.map((term) => <Tag color="purple" key={term}>{term}</Tag>)}</Space> : <Text type="secondary">暂无补充信息词，系统仍会使用完整需求进行语义匹配</Text>}
+                <Text type="secondary" className="project-key-info-terms-source">{requirement.keyInfoTermsSource === 'manual' ? '人工修改' : 'AI 提取'} · 作为语义匹配的补充信息，不作为硬约束</Text>
               </div>
             )}
           </Card>
@@ -1773,6 +1781,7 @@ function ProjectDetail({
   const [assets, setAssets] = useState<ProjectAsset[]>([])
   const [projectDocuments, setProjectDocuments] = useState<ProjectDocumentSnapshot[]>([])
   const [analysisLogs, setAnalysisLogs] = useState<ProjectAnalysisLogEntry[]>([])
+  const [analysisLogsExpanded, setAnalysisLogsExpanded] = useState(true)
   const [participants, setParticipants] = useState<ProjectParticipant[]>([])
   const [tasks, setTasks] = useState<ProjectPlanTask[]>([])
   const [organizationPeople, setOrganizationPeople] = useState<OrganizationPerson[]>([])
@@ -1803,7 +1812,7 @@ function ProjectDetail({
   const reloadAnalysisLogs = useCallback(async (): Promise<void> => {
     const requestId = analysisLogRequestRef.current + 1
     analysisLogRequestRef.current = requestId
-    const nextLogs = await window.visslm.listProjectAnalysisLogs(project.id, 160)
+    const nextLogs = await window.visslm.listProjectAnalysisLogs(project.id, 2000)
     if (requestId === analysisLogRequestRef.current) setAnalysisLogs(nextLogs)
   }, [project.id])
 
@@ -1817,7 +1826,7 @@ function ProjectDetail({
         window.visslm.listProjectCostEntries(project.id),
         window.visslm.listProjectAssets(project.id),
         window.visslm.listManagedProjectDocuments(project.id),
-        window.visslm.listProjectAnalysisLogs(project.id, 160),
+        window.visslm.listProjectAnalysisLogs(project.id, 2000),
         window.visslm.listProjectParticipants(project.id),
         window.visslm.listProjectTasks(project.id)
       ])
@@ -2011,7 +2020,7 @@ function ProjectDetail({
       await reload()
       return
     }
-    message.success('关键功能信息词已保存，正在重新识别匹配度')
+    message.success('补充信息词已保存，正在重新执行语义匹配')
     await reload()
     onChanged()
   }
@@ -2106,6 +2115,7 @@ function ProjectDetail({
     }
     setSelectedRequirementIds([])
     await reload()
+    onChanged()
     message.success(result.message)
   }
 
@@ -2465,6 +2475,7 @@ function ProjectDetail({
               />
               <div className="project-analysis-progress-copy">
                 <Text type="secondary">{projectProgress ? projectProgress.message : '正在执行协议分析'}</Text>
+                {projectProgress?.detail && <Text type="secondary" className="project-analysis-progress-detail">{projectProgress.detail}</Text>}
                 <div className="project-analysis-current-step"><Text type="secondary">当前执行</Text><Text strong>{analysisStageMeta[activeStageIndex]?.label || '处理中'}</Text></div>
               </div>
             </div>
@@ -2485,7 +2496,7 @@ function ProjectDetail({
       )}
 
       {analysisLogs.length > 0 && (
-        <section className="project-analysis-log-panel" aria-label="技术协议执行日志">
+        <section className={`project-analysis-log-panel${analysisLogsExpanded ? '' : ' is-collapsed'}`} aria-label="技术协议执行日志">
           <div className="project-analysis-log-heading">
             <div>
               <Text strong>技术协议执行日志</Text>
@@ -2494,30 +2505,48 @@ function ProjectDetail({
             <Space size={8}>
               {latestAnalysisLog && <Tag color={latestAnalysisLog.status === 'failed' ? 'error' : latestAnalysisLog.status === 'success' ? 'success' : 'processing'}>{analysisLogPhaseMeta[latestAnalysisLog.phase]}</Tag>}
               <Text type="secondary">{analysisLogs.length} 条记录</Text>
+              <Tooltip title={analysisLogsExpanded ? '收起执行日志' : '展开执行日志'}>
+                <Button
+                  type="text"
+                  className="project-analysis-log-toggle"
+                  icon={<DownOutlined />}
+                  aria-label={analysisLogsExpanded ? '收起技术协议执行日志' : '展开技术协议执行日志'}
+                  aria-expanded={analysisLogsExpanded}
+                  aria-controls={`project-analysis-log-list-${current.id}`}
+                  onClick={() => setAnalysisLogsExpanded((expanded) => !expanded)}
+                />
+              </Tooltip>
             </Space>
           </div>
-          <div className="project-analysis-log-list" role="log" aria-live={isProcessing ? 'polite' : 'off'}>
+          {analysisLogsExpanded && <div id={`project-analysis-log-list-${current.id}`} className="project-analysis-log-list" role="log" aria-live={isProcessing ? 'polite' : 'off'}>
             {analysisLogs.map((log) => (
-              <div key={log.id} className={`project-analysis-log-entry is-${log.status}`}>
+              <div key={log.id} className={`project-analysis-log-entry is-${log.status}${log.logKind === 'model_request' ? ' is-model-request' : ''}`}>
                 <span className="project-analysis-log-dot" aria-hidden="true" />
                 <div className="project-analysis-log-copy">
                   <div className="project-analysis-log-title">
-                    <Text strong>{analysisLogPhaseMeta[log.phase]}</Text>
+                    <Text strong>{log.logKind === 'model_request' ? '模型调用' : analysisLogPhaseMeta[log.phase]}</Text>
                     <Text>{log.message}</Text>
                     <Text type="secondary">{formatAnalysisLogTime(log.createdAt)}</Text>
                   </div>
                   {log.detail && <Text type="secondary" className="project-analysis-log-detail">{log.detail}</Text>}
-                  {(log.fileName || log.total > 0) && (
+                  {(log.fileName || log.total > 0 || log.logKind === 'model_request') && (
                     <div className="project-analysis-log-meta">
                       {log.fileName && <span>{log.fileName}</span>}
                       {log.total > 0 && <span>{Math.min(log.current, log.total)} / {log.total}</span>}
+                      {log.batchNumber && <span>批次 {log.batchNumber}</span>}
+                      {log.attempt !== undefined && <span>第 {log.attempt} 次</span>}
+                      {log.elapsedMs !== undefined && <span>耗时 {formatAnalysisDuration(log.elapsedMs)}</span>}
+                      {log.inputChars !== undefined && <span>输入 {formatAnalysisChars(log.inputChars)}</span>}
+                      {log.outputChars !== undefined && <span>输出 {formatAnalysisChars(log.outputChars)}</span>}
+                      {log.doneReason && <span>结束 {log.doneReason}</span>}
+                      {log.modelName && <span>{log.modelName}</span>}
                       <span>{log.taskType === 'matching' ? '需求匹配任务' : '协议分析任务'}</span>
                     </div>
                   )}
                 </div>
               </div>
             ))}
-          </div>
+          </div>}
         </section>
       )}
 

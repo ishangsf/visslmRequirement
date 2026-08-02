@@ -7084,6 +7084,15 @@ body,
   white-space: nowrap;
 }
 
+.project-analysis-progress-copy > .project-analysis-progress-detail {
+  display: -webkit-box;
+  max-width: 260px;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  white-space: normal;
+}
+
 .project-analysis-progress-row {
   display: flex;
   align-items: baseline;
@@ -7239,6 +7248,36 @@ body,
   border-bottom: 1px solid var(--stroke);
 }
 
+.project-analysis-log-panel.is-collapsed .project-analysis-log-heading {
+  border-bottom-color: transparent;
+}
+
+.project-analysis-log-toggle.ant-btn {
+  width: 32px;
+  min-width: 32px;
+  height: 32px;
+  padding: 0;
+  color: var(--text-muted);
+}
+
+.project-analysis-log-toggle.ant-btn:hover {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.project-analysis-log-toggle.ant-btn:focus-visible {
+  outline: 2px solid var(--focus-ring, var(--accent));
+  outline-offset: 2px;
+}
+
+.project-analysis-log-toggle .anticon {
+  transition: transform 160ms ease;
+}
+
+.project-analysis-log-panel.is-collapsed .project-analysis-log-toggle .anticon {
+  transform: rotate(-90deg);
+}
+
 .project-analysis-log-heading > div:first-child {
   display: flex;
   min-width: 0;
@@ -7286,6 +7325,14 @@ body,
 .project-analysis-log-entry.is-failed .project-analysis-log-dot {
   border-color: var(--state-error);
   background: var(--state-error);
+}
+
+.project-analysis-log-entry.is-model-request .project-analysis-log-dot {
+  border-color: var(--state-info);
+}
+
+.project-analysis-log-entry.is-model-request:not(.is-failed) .project-analysis-log-title > .ant-typography:first-child {
+  color: var(--state-info) !important;
 }
 
 .project-analysis-log-copy {

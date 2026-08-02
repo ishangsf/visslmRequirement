@@ -4,14 +4,77 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { randomUUID } from 'node:crypto'
 import { AppDatabase } from '../src/main/database'
-import { ProjectManagementService } from '../src/main/project-management'
-import type { KnowledgeService } from '../src/main/knowledge'
+import {
+  buildAgreementExtractionBatches,
+  ProjectManagementService,
+  resolveAgreementRequirementSource
+} from '../src/main/project-management'
+import type { KnowledgeRecordMatch, KnowledgeService } from '../src/main/knowledge'
+import type { ProjectAnalysisProgress, ProjectRequirement } from '../src/shared/project-types'
 import { normalizeProjectRequirementText } from '../src/shared/project-requirement-utils'
 
 const directory = mkdtempSync(join(tmpdir(), 'visslm-project-management-'))
 const db = new AppDatabase(join(directory, 'projects.db'), join(directory, 'assets'))
 
 try {
+  const sourceChunks = [
+    { id: 'source-a', documentId: 'agreement-a', location: '协议 · 第 1 页', content: '项目应支持用户登录和权限配置。' },
+    { id: 'source-b', documentId: 'agreement-a', location: '协议 · 第 2 页', content: '项目应支持跨系统接口同步和订单明细导出。' },
+    { id: 'source-c', documentId: 'agreement-a', location: '协议 · 第 3 页', content: '项目应在验收前提供部署文档。' }
+  ]
+  const batchChunks = sourceChunks.map((chunk) => ({ ...chunk, content: `${chunk.content}${'x'.repeat(500)}` }))
+  const batches = buildAgreementExtractionBatches(batchChunks, 1_300)
+  assert.equal(batches.length, 2)
+  assert.deepEqual(batches.flat().map((chunk) => chunk.id), sourceChunks.map((chunk) => chunk.id))
+  const correctedSource = resolveAgreementRequirementSource({
+    title: '接口同步',
+    sourceChunkId: 'source-a',
+    evidenceQuote: '支持跨系统接口同步',
+    confidence: 0.9
+  }, sourceChunks)
+  assert.equal(correctedSource.status, 'corrected')
+  assert.equal(correctedSource.sourceChunkId, 'source-b')
+  assert.equal(correctedSource.sourceLocation, '协议 · 第 2 页')
+  const inferredSource = resolveAgreementRequirementSource({
+    title: '部署文档',
+    content: '项目应在验收前提供部署文档。',
+    sourceChunkId: 'source-c',
+    confidence: 0.9
+  }, sourceChunks)
+  assert.equal(inferredSource.status, 'inferred')
+  assert.equal(inferredSource.evidenceQuote, '项目应在验收前提供部署文档。')
+  const fuzzySourceChunks = [{
+    id: 'fuzzy-source',
+    documentId: 'agreement-a',
+    location: 'page-4',
+    content: '系统必须在验收前提供完整的部署文档、安装手册和配置清单，并完成环境部署说明。'
+  }]
+  const recoveredFuzzySource = resolveAgreementRequirementSource({
+    title: '部署文档',
+    content: '系统须在验收前提供完整部署文档、安装手册和配置清单，并完成环境部署说明。',
+    confidence: 0.9
+  }, fuzzySourceChunks)
+  assert.equal(recoveredFuzzySource.status, 'inferred')
+  assert.equal(recoveredFuzzySource.sourceChunkId, 'fuzzy-source')
+  assert.equal(recoveredFuzzySource.evidenceQuote, fuzzySourceChunks[0].content)
+  const unverifiedSource = resolveAgreementRequirementSource({
+    title: '无法回溯',
+    content: '协议没有出现的需求',
+    sourceChunkId: 'source-a',
+    confidence: 0.9
+  }, sourceChunks)
+  assert.equal(unverifiedSource.status, 'unverified')
+  assert.equal(unverifiedSource.sourceChunkId, '')
+  assert.equal(unverifiedSource.confidence, 0.35)
+  const ambiguousCrossDocumentSource = resolveAgreementRequirementSource({
+    title: '跨文档同名原文',
+    evidenceQuote: '项目应支持跨系统接口同步和订单明细导出。'
+  }, [
+    ...sourceChunks,
+    { id: 'other-document', documentId: 'agreement-b', location: '另一协议 · 第 1 页', content: '项目应支持跨系统接口同步和订单明细导出。' }
+  ])
+  assert.equal(ambiguousCrossDocumentSource.status, 'unverified')
+
   const project = db.createManagedProject(randomUUID(), {
     projectName: '项目管理 Smoke',
     customerName: '示例客户',
@@ -44,10 +107,34 @@ try {
     total: 1,
     status: 'failed'
   })
+  db.saveProjectAnalysisProgress({
+    taskId: 'smoke-analysis-task',
+    projectId: project.id,
+    phase: 'extracting',
+    message: '模型请求完成：第 1/1 批',
+    detail: '模型 ollama:smoke · 结束 stop',
+    current: 0,
+    total: 1,
+    status: 'running',
+    logKind: 'model_request',
+    requestId: 'smoke-request-1',
+    batchNumber: '1',
+    attempt: 1,
+    elapsedMs: 1234,
+    inputChars: 4567,
+    outputChars: 0,
+    doneReason: 'stop',
+    modelName: 'ollama:smoke'
+  })
   const analysisLogs = db.listProjectAnalysisLogs(project.id)
-  assert.equal(analysisLogs.length, 2)
-  assert.equal(analysisLogs[0]?.message, '需求抽取失败')
-  assert.equal(analysisLogs[0]?.detail, '协议附件关联已保留，可重试')
+  assert.equal(analysisLogs.length, 3)
+  assert.equal(analysisLogs[0]?.logKind, 'model_request')
+  assert.equal(analysisLogs[0]?.requestId, 'smoke-request-1')
+  assert.equal(analysisLogs[0]?.elapsedMs, 1234)
+  assert.equal(analysisLogs[0]?.inputChars, 4567)
+  assert.equal(analysisLogs[0]?.outputChars, 0)
+  assert.equal(analysisLogs[1]?.message, '需求抽取失败')
+  assert.equal(analysisLogs[1]?.detail, '协议附件关联已保留，可重试')
 
   db.insertProjectCostEntry(project.id, {
     type: 'actual',
@@ -207,6 +294,7 @@ try {
   assert.equal(linkedProject.currentDocumentName, document.fileName)
   assert.equal(linkedProject.documentCount, 1)
 
+  const semanticMatchQueries: string[] = []
   const fakeKnowledge = {
     processFiles: async () => ({
       ok: true,
@@ -217,7 +305,11 @@ try {
       documents: [readyDocument],
       skipped: [],
       message: 'Smoke 协议已保存'
-    })
+    }),
+    rankRecordMatches: async (query: string) => {
+      semanticMatchQueries.push(query)
+      return []
+    }
   } as unknown as KnowledgeService
   const service = new ProjectManagementService(
     db,
@@ -230,6 +322,117 @@ try {
       thinking: false
     })
   )
+  const originalFetch = globalThis.fetch
+  const extractBatch = (service as unknown as {
+    extractAgreementBatch: (
+      chunks: typeof sourceChunks,
+      batchNumber: string,
+      batchCount: number,
+      onEvent?: (message: string, detail?: string, metadata?: Partial<ProjectAnalysisProgress>) => void
+    ) => Promise<unknown>
+  }).extractAgreementBatch
+  let extractionModelCalls = 0
+  let extractionSystemPrompt = ''
+  let extractionTemperature: unknown
+  const extractionEvents: Array<{ message: string; detail?: string; metadata?: Partial<ProjectAnalysisProgress> }> = []
+  globalThis.fetch = async (_input, init) => {
+    extractionModelCalls += 1
+    const body = JSON.parse(String(init?.body ?? '{}')) as {
+      messages?: Array<{ role?: string; content?: string }>
+      options?: { temperature?: unknown }
+    }
+    extractionSystemPrompt ||= body.messages?.find((message) => message.role === 'system')?.content ?? ''
+    extractionTemperature ??= body.options?.temperature
+    const content = extractionModelCalls === 1
+      ? '{"project":'
+      : '{"project":{},"requirements":[]}'
+    return new Response(JSON.stringify({
+      done_reason: extractionModelCalls === 1 ? 'length' : 'stop',
+      message: { role: 'assistant', content }
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  }
+  try {
+    await extractBatch.call(service, sourceChunks.slice(0, 2), '1', 1, (message, detail, metadata) => {
+      extractionEvents.push({ message, detail, metadata })
+    })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+  assert.equal(extractionModelCalls, 3)
+  const modelRequestEvents = extractionEvents.filter((event) => event.metadata?.logKind === 'model_request')
+  assert.equal(modelRequestEvents.length, 3)
+  assert.equal(modelRequestEvents[0]?.metadata?.doneReason, 'length')
+  assert.equal(modelRequestEvents[0]?.metadata?.status, 'success')
+  assert.equal(modelRequestEvents[0]?.metadata?.batchNumber, '1')
+  assert.equal(modelRequestEvents[0]?.metadata?.elapsedMs !== undefined, true)
+  assert.match(extractionSystemPrompt, /未出现的字段不要输出/)
+  assert.match(extractionSystemPrompt, /content 使用简洁需求句，最多 120 字/)
+  assert.match(extractionSystemPrompt, /不得因此省略或合并可靠需求/)
+  assert.doesNotMatch(extractionSystemPrompt, /"contractAmount":0/)
+  assert.doesNotMatch(extractionSystemPrompt, /"sourceLocation"/)
+  assert.equal(extractionTemperature, 0)
+  let compactRecoveryCalls = 0
+  globalThis.fetch = async (_input, init) => {
+    compactRecoveryCalls += 1
+    const body = JSON.parse(String(init?.body ?? '{}')) as { messages?: Array<{ role?: string; content?: string }> }
+    const system = body.messages?.find((message) => message.role === 'system')?.content ?? ''
+    const compact = system.includes('紧凑恢复')
+    return new Response(JSON.stringify({
+      done_reason: compact ? 'stop' : 'length',
+      message: {
+        role: 'assistant',
+        content: compact
+          ? '{"project":{},"requirements":[{"category":"functional","module":"登录","title":"用户登录","content":"项目应支持用户登录。","keyInfoTerms":["用户登录"],"sourceChunkId":"source-a","evidenceQuote":"项目应支持用户登录","confidence":0.9}]}'
+          : '{"project":'
+      }
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  }
+  try {
+    const recovered = await extractBatch.call(service, [sourceChunks[0]], 'compact-recovery', 1)
+    assert.equal(compactRecoveryCalls, 2)
+    assert.equal((recovered as { requirements?: Array<{ sourceChunkId?: string }> }).requirements?.[0]?.sourceChunkId, 'source-a')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+  const concurrentChunks = Array.from({ length: 3 }, (_, index) => ({
+    id: `concurrent-${index + 1}`,
+    documentId: 'agreement-concurrent',
+    location: `协议 · 并发测试 ${index + 1}`,
+    content: `第${index + 1}批${'需求内容'.repeat(400)}`
+  }))
+  let activeModelCalls = 0
+  let maxActiveModelCalls = 0
+  let concurrentModelCalls = 0
+  const concurrentCheckpoints: number[] = []
+  globalThis.fetch = async (_input, _init) => {
+    concurrentModelCalls += 1
+    activeModelCalls += 1
+    maxActiveModelCalls = Math.max(maxActiveModelCalls, activeModelCalls)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    activeModelCalls -= 1
+    return new Response(JSON.stringify({
+      done_reason: 'stop',
+      message: { role: 'assistant', content: '{"project":{},"requirements":[]}' }
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  }
+  try {
+    const extractAgreement = (service as unknown as {
+      extractAgreement: (
+        chunks: typeof concurrentChunks,
+        onProgress?: (current: number, total: number, message?: string, detail?: string, metadata?: Partial<ProjectAnalysisProgress>) => void,
+        onCheckpoint?: (agreement: unknown, warnings: string[], analyzedChunks: number) => void
+      ) => Promise<{ analyzedChunks: number }>
+    }).extractAgreement
+    const extraction = await extractAgreement.call(service, concurrentChunks, undefined, (_agreement, _warnings, analyzedChunks) => {
+      concurrentCheckpoints.push(analyzedChunks)
+    })
+    assert.equal(concurrentModelCalls, 3)
+    assert.equal(maxActiveModelCalls, 2)
+    assert.deepEqual(concurrentCheckpoints, [1, 2, 3])
+    assert.equal(extraction.analyzedChunks, 3)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
   const failedAnalysis = await service.startTechnicalAgreement(join(directory, 'uploaded-agreement.txt'))
   assert.equal(failedAnalysis.ok, true)
   assert(failedAnalysis.projectId)
@@ -361,6 +564,10 @@ try {
     externalProcessing: false,
     modelName: 'ollama:smoke'
   })
+  const checkpointSet = db.updateProjectRequirementSetProgress(reviewSet.id, 2, ['来源待复核'])
+  assert(checkpointSet)
+  assert.equal(checkpointSet.analyzedChunks, 2)
+  assert.deepEqual(checkpointSet.warnings, ['来源待复核'])
   const appendixDocument = db.insertKnowledgeDocument({
     id: randomUUID(),
     fileName: 'technical-appendix.txt',
@@ -410,6 +617,98 @@ try {
   const publishedSet = db.publishReviewProjectRequirementSet(project.id)
   assert.equal(publishedSet.status, 'published')
   assert.equal(db.listAllProjectRequirements(project.id).length, 2)
+
+  const draftProject = db.createManagedProject(randomUUID(), {
+    projectName: '技术协议草稿自动匹配'
+  }, 'technical_agreement', 'draft')
+  db.linkProjectDocument(draftProject.id, document.id)
+  const draftReviewSet = db.createProjectRequirementSet({
+    projectId: draftProject.id,
+    documentId: document.id,
+    totalChunks: 1,
+    analyzedChunks: 1,
+    warnings: [],
+    externalProcessing: false,
+    modelName: 'ollama:smoke'
+  })
+  db.replaceReviewProjectRequirements(draftReviewSet.id, draftProject.id, document.id, [{
+    id: 'draft-semantic-requirement',
+    requirementNo: 1,
+    category: 'functional',
+    module: '订单管理',
+    title: '订单明细导出',
+    content: '系统应允许业务人员按时间范围筛选订单，并导出包含商品与金额的明细文件。',
+    keyInfoTerms: ['订单导出', '时间范围'],
+    sourceLocation: '第 5 页',
+    sourceChunkId: 'chunk-5',
+    evidenceQuote: '按时间范围筛选订单并导出明细',
+    confidence: 0.94
+  }])
+  const automaticPublish = service.reviewRequirements(['draft-semantic-requirement'], 'approved')
+  assert.equal(automaticPublish.ok, true)
+  assert.match(automaticPublish.message, /全部 1 条需求已通过/)
+  assert.match(automaticPublish.message, /语义匹配任务已启动/)
+  assert.equal(db.getReviewProjectRequirementSet(draftProject.id), null)
+  for (let attempt = 0; attempt < 50 && db.getManagedProject(draftProject.id)?.matchStatus === 'processing'; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  const matchedDraftProject = db.getManagedProject(draftProject.id)
+  assert(matchedDraftProject)
+  assert.equal(matchedDraftProject.lifecycle, 'draft')
+  assert.equal(matchedDraftProject.matchStatus, 'ready')
+  const semanticQuery = semanticMatchQueries.at(-1) ?? ''
+  assert.match(semanticQuery, /业务模块：订单管理/)
+  assert.match(semanticQuery, /需求标题：订单明细导出/)
+  assert.match(semanticQuery, /需求描述：系统应允许业务人员按时间范围筛选订单，并导出包含商品与金额的明细文件。/)
+  assert.match(semanticQuery, /补充信息词：订单导出、时间范围/)
+
+  const matchCallCountBeforeConfirm = semanticMatchQueries.length
+  const confirmedDraftProject = service.confirmProject(draftProject.id)
+  assert(confirmedDraftProject)
+  assert.equal(confirmedDraftProject.lifecycle, 'active')
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  assert.equal(semanticMatchQueries.length, matchCallCountBeforeConfirm)
+
+  const publishedRequirement = db.getProjectRequirement('draft-semantic-requirement')
+  assert(publishedRequirement)
+  let semanticReviewRequest: Record<string, unknown> = {}
+  globalThis.fetch = async (_input, init) => {
+    semanticReviewRequest = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>
+    return new Response(JSON.stringify({
+      done_reason: 'stop',
+      message: {
+        role: 'assistant',
+        content: '{"status":"unmarked","reason":"需要人工确认","matches":[]}'
+      }
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  }
+  try {
+    const reviewMatches = (service as unknown as {
+      reviewMatches: (requirement: ProjectRequirement, candidates: KnowledgeRecordMatch[]) => Promise<unknown>
+    }).reviewMatches
+    await reviewMatches.call(service, publishedRequirement, [{
+      recordUid: 'semantic-candidate',
+      recordName: '订单数据服务',
+      nodeType: 'record',
+      itemId: 'semantic-candidate',
+      score: 88,
+      chunkId: 'semantic-chunk',
+      snippet: '提供订单明细查询与文件导出能力'
+    }])
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+  const semanticMessages = semanticReviewRequest.messages as Array<{ role?: string; content?: string }>
+  const semanticSystemPrompt = semanticMessages.find((item) => item.role === 'system')?.content ?? ''
+  const semanticUserPayload = JSON.parse(semanticMessages.find((item) => item.role === 'user')?.content ?? '{}') as {
+    requirement?: Partial<ProjectRequirement>
+  }
+  assert.match(semanticSystemPrompt, /补充信息，不是硬约束/)
+  assert.match(semanticSystemPrompt, /没有逐字命中这些词/)
+  assert.equal(semanticUserPayload.requirement?.module, '订单管理')
+  assert.equal(semanticUserPayload.requirement?.title, '订单明细导出')
+  assert.equal(semanticUserPayload.requirement?.content, '系统应允许业务人员按时间范围筛选订单，并导出包含商品与金额的明细文件。')
+  assert.deepEqual(semanticUserPayload.requirement?.keyInfoTerms, ['订单导出', '时间范围'])
 
   console.log(JSON.stringify({
     ok: true,

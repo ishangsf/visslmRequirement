@@ -1058,6 +1058,15 @@ export class AppDatabase {
         detail TEXT NOT NULL DEFAULT '',
         document_id TEXT NOT NULL DEFAULT '',
         file_name TEXT NOT NULL DEFAULT '',
+        log_kind TEXT NOT NULL DEFAULT 'stage',
+        request_id TEXT NOT NULL DEFAULT '',
+        batch_number TEXT NOT NULL DEFAULT '',
+        attempt INTEGER NOT NULL DEFAULT 0,
+        elapsed_ms INTEGER NOT NULL DEFAULT 0,
+        input_chars INTEGER NOT NULL DEFAULT 0,
+        output_chars INTEGER NOT NULL DEFAULT 0,
+        done_reason TEXT NOT NULL DEFAULT '',
+        model_name TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL,
         FOREIGN KEY(project_id) REFERENCES pm_projects(id) ON DELETE CASCADE
       );
@@ -1087,7 +1096,16 @@ export class AppDatabase {
       "ALTER TABLE pm_requirements ADD COLUMN review_note TEXT NOT NULL DEFAULT ''",
       "UPDATE pm_requirements SET status = 'unmarked', status_reason = '待人工标记' WHERE status_source = 'ai' AND status <> 'satisfied'",
       "ALTER TABLE pm_cost_entries ADD COLUMN responsible_participant_id TEXT",
-      "ALTER TABLE pm_cost_entries ADD COLUMN responsible_person_name TEXT NOT NULL DEFAULT ''"
+      "ALTER TABLE pm_cost_entries ADD COLUMN responsible_person_name TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE pm_analysis_logs ADD COLUMN log_kind TEXT NOT NULL DEFAULT 'stage'",
+      "ALTER TABLE pm_analysis_logs ADD COLUMN request_id TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE pm_analysis_logs ADD COLUMN batch_number TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE pm_analysis_logs ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE pm_analysis_logs ADD COLUMN elapsed_ms INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE pm_analysis_logs ADD COLUMN input_chars INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE pm_analysis_logs ADD COLUMN output_chars INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE pm_analysis_logs ADD COLUMN done_reason TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE pm_analysis_logs ADD COLUMN model_name TEXT NOT NULL DEFAULT ''"
     ]) {
       try {
         this.db.exec(statement)
@@ -1099,6 +1117,7 @@ export class AppDatabase {
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_pm_cost_entries_responsible ON pm_cost_entries(responsible_participant_id)')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_pm_requirements_set ON pm_requirements(set_id, requirement_no)')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_pm_requirements_review ON pm_requirements(project_id, review_status)')
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_pm_analysis_logs_kind ON pm_analysis_logs(project_id, log_kind, created_at DESC)')
 
     try {
       this.db.exec(`
@@ -1955,8 +1974,9 @@ export class AppDatabase {
     this.db.prepare(`
       INSERT INTO pm_analysis_logs(
         id, task_id, project_id, task_type, phase, status, current_count, total_count,
-        message, detail, document_id, file_name, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        message, detail, document_id, file_name, log_kind, request_id, batch_number,
+        attempt, elapsed_ms, input_chars, output_chars, done_reason, model_name, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       randomUUID(),
       progress.taskId,
@@ -1970,33 +1990,54 @@ export class AppDatabase {
       progress.detail ?? '',
       progress.documentId ?? '',
       progress.fileName ?? '',
+      progress.logKind ?? 'stage',
+      progress.requestId ?? '',
+      progress.batchNumber ?? '',
+      Math.max(0, Math.trunc(Number(progress.attempt ?? 0))),
+      Math.max(0, Math.trunc(Number(progress.elapsedMs ?? 0))),
+      Math.max(0, Math.trunc(Number(progress.inputChars ?? 0))),
+      Math.max(0, Math.trunc(Number(progress.outputChars ?? 0))),
+      progress.doneReason ?? '',
+      progress.modelName ?? '',
       timestamp
     )
   }
 
-  listProjectAnalysisLogs(projectId: string, limit = 160): ProjectAnalysisLogEntry[] {
-    const safeLimit = Math.min(500, Math.max(1, Math.trunc(Number(limit) || 160)))
+  listProjectAnalysisLogs(projectId: string, limit = 2000): ProjectAnalysisLogEntry[] {
+    const safeLimit = Math.min(5000, Math.max(1, Math.trunc(Number(limit) || 2000)))
     const rows = this.db.prepare(`
       SELECT * FROM pm_analysis_logs
       WHERE project_id = ?
       ORDER BY created_at DESC, rowid DESC
       LIMIT ?
     `).all(projectId, safeLimit) as SqlRow[]
-    return rows.map((row): ProjectAnalysisLogEntry => ({
-      id: String(row.id),
-      taskId: String(row.task_id),
-      projectId: String(row.project_id),
-      taskType: String(row.task_type ?? 'agreement') === 'matching' ? 'matching' : 'agreement',
-      phase: String(row.phase ?? 'queued') as ProjectAnalysisLogEntry['phase'],
-      message: String(row.message ?? ''),
-      detail: String(row.detail ?? ''),
-      ...(String(row.document_id ?? '').trim() ? { documentId: String(row.document_id) } : {}),
-      ...(String(row.file_name ?? '').trim() ? { fileName: String(row.file_name) } : {}),
-      current: Number(row.current_count ?? 0),
-      total: Number(row.total_count ?? 0),
-      status: String(row.status ?? 'running') as ProjectAnalysisLogEntry['status'],
-      createdAt: String(row.created_at ?? '')
-    }))
+    return rows.map((row): ProjectAnalysisLogEntry => {
+      const logKind = String(row.log_kind ?? 'stage') === 'model_request' ? 'model_request' : 'stage'
+      return {
+        id: String(row.id),
+        taskId: String(row.task_id),
+        projectId: String(row.project_id),
+        taskType: String(row.task_type ?? 'agreement') === 'matching' ? 'matching' : 'agreement',
+        phase: String(row.phase ?? 'queued') as ProjectAnalysisLogEntry['phase'],
+        message: String(row.message ?? ''),
+        detail: String(row.detail ?? ''),
+        ...(String(row.document_id ?? '').trim() ? { documentId: String(row.document_id) } : {}),
+        ...(String(row.file_name ?? '').trim() ? { fileName: String(row.file_name) } : {}),
+        logKind,
+        ...(String(row.request_id ?? '').trim() ? { requestId: String(row.request_id) } : {}),
+        ...(String(row.batch_number ?? '').trim() ? { batchNumber: String(row.batch_number) } : {}),
+        ...(Number(row.attempt ?? 0) > 0 ? { attempt: Number(row.attempt) } : {}),
+        ...(logKind === 'model_request' || Number(row.elapsed_ms ?? 0) > 0 ? { elapsedMs: Number(row.elapsed_ms ?? 0) } : {}),
+        ...(logKind === 'model_request' || Number(row.input_chars ?? 0) > 0 ? { inputChars: Number(row.input_chars ?? 0) } : {}),
+        ...(logKind === 'model_request' || Number(row.output_chars ?? 0) > 0 ? { outputChars: Number(row.output_chars ?? 0) } : {}),
+        ...(String(row.done_reason ?? '').trim() ? { doneReason: String(row.done_reason) } : {}),
+        ...(String(row.model_name ?? '').trim() ? { modelName: String(row.model_name) } : {}),
+        current: Number(row.current_count ?? 0),
+        total: Number(row.total_count ?? 0),
+        status: String(row.status ?? 'running') as ProjectAnalysisLogEntry['status'],
+        createdAt: String(row.created_at ?? '')
+      }
+    })
   }
 
   reconcileInterruptedProjectAnalysis(): number {
@@ -2628,6 +2669,25 @@ export class AppDatabase {
       throw error
     }
     return this.getProjectRequirementSetById(id)!
+  }
+
+  updateProjectRequirementSetProgress(
+    setId: string,
+    analyzedChunks: number,
+    warnings: string[]
+  ): ProjectRequirementSetSummary | null {
+    const set = this.getProjectRequirementSetById(setId)
+    if (!set || set.status !== 'reviewing') return null
+    this.db.prepare(`
+      UPDATE pm_requirement_sets
+      SET analyzed_chunks = ?, warnings_json = ?
+      WHERE id = ? AND status = 'reviewing'
+    `).run(
+      Math.max(0, Math.trunc(Number(analyzedChunks))),
+      JSON.stringify([...new Set(warnings)].slice(0, 100)),
+      setId
+    )
+    return this.getProjectRequirementSetById(setId)
   }
 
   getReviewProjectRequirementSet(projectId: string): ProjectRequirementSetSummary | null {
