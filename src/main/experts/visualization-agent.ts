@@ -40,8 +40,8 @@ const dashboardJsonSchema = {
   ],
   properties: {
     schemaVersion: { type: 'string', enum: ['1.0'] },
-    id: { type: 'string' },
-    title: { type: 'string' },
+    id: { type: 'string', minLength: 1 },
+    title: { type: 'string', minLength: 1 },
     subtitle: { type: 'string' },
     businessContext: {
       type: 'object',
@@ -76,9 +76,9 @@ const dashboardJsonSchema = {
         additionalProperties: false,
         required: ['id', 'field', 'label', 'operator', 'options'],
         properties: {
-          id: { type: 'string' },
-          field: { type: 'string' },
-          label: { type: 'string' },
+          id: { type: 'string', minLength: 1 },
+          field: { type: 'string', minLength: 1 },
+          label: { type: 'string', minLength: 1 },
           operator: { type: 'string', enum: ['equals', 'in'] },
           options: { type: 'array', maxItems: 50 },
           value: { type: ['string', 'number', 'boolean', 'array', 'null'] }
@@ -100,7 +100,7 @@ const dashboardJsonSchema = {
             type: 'string',
             enum: ['kpi', 'bar', 'line', 'pie', 'ranking', 'table', 'progress', 'insight', 'gauge', 'funnel', 'radar', 'scatter']
           },
-          title: { type: 'string' },
+          title: { type: 'string', minLength: 1 },
           subtitle: { type: 'string' },
           layout: {
             type: 'object',
@@ -722,15 +722,77 @@ const catalogForPrompt = (profiles: FieldProfile[]): object[] =>
     samples: profile.samples.slice(0, 3)
   }))
 
-const normalizeGeneratedSpec = (input: unknown, scope: DataScope): unknown => {
+const componentTypeNames: Record<DashboardComponentType, string> = {
+  kpi: '核心指标',
+  bar: '分类对比',
+  line: '趋势分析',
+  pie: '结构占比',
+  ranking: '业务排行',
+  table: '数据明细',
+  progress: '目标进度',
+  insight: '数据洞察',
+  gauge: '指标仪表',
+  funnel: '业务漏斗',
+  radar: '多维分析',
+  scatter: '相关性分析'
+}
+
+const normalizedText = (...values: unknown[]): string | undefined => {
+  const value = values.find((candidate) => typeof candidate === 'string' && candidate.trim())
+  return typeof value === 'string' ? value.trim() : undefined
+}
+
+const normalizeGeneratedSpec = (
+  input: unknown,
+  scope: DataScope,
+  profiles: FieldProfile[]
+): unknown => {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return input
   const spec = input as Record<string, unknown>
   if (!Array.isArray(spec.components)) return input
+  const profileByField = new Map(
+    profiles.map((profile) => [profile.field.toLocaleLowerCase(), profile])
+  )
+  const globalFilters = Array.isArray(spec.globalFilters)
+    ? spec.globalFilters.map((value, index) => {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return value
+        const filter = value as Record<string, unknown>
+        const field = normalizedText(filter.field) ?? ''
+        const profile = profileByField.get(field.toLocaleLowerCase())
+        const operator = filter.operator === 'in' || filter.operator === 'equals'
+          ? filter.operator
+          : Array.isArray(filter.value) ? 'in' : 'equals'
+        return {
+          ...filter,
+          id: normalizedText(filter.id) ?? `global-filter-${index + 1}`,
+          field,
+          label: normalizedText(
+            filter.label,
+            filter.displayName,
+            filter.name,
+            profile?.displayName,
+            field
+          ) ?? `筛选条件 ${index + 1}`,
+          operator,
+          options: Array.isArray(filter.options) ? filter.options.slice(0, 50) : []
+        }
+      })
+    : spec.globalFilters
   return {
     ...spec,
-    components: spec.components.map((value) => {
+    id: normalizedText(spec.id) ?? randomUUID(),
+    title: normalizedText(spec.title) ?? 'AI 数据看板',
+    ...(globalFilters === undefined ? {} : { globalFilters }),
+    components: spec.components.map((value, index) => {
       if (!value || typeof value !== 'object' || Array.isArray(value)) return value
       const component = value as Record<string, unknown>
+      const type = String(component.type) as DashboardComponentType
+      const id = normalizedText(component.id) ?? `component-${index + 1}`
+      const title = normalizedText(
+        component.title,
+        component.name,
+        component.label
+      ) ?? `${componentTypeNames[type] ?? '数据组件'} ${index + 1}`
       const rawQuery = (
         component.query && typeof component.query === 'object'
           ? component.query
@@ -830,6 +892,8 @@ const normalizeGeneratedSpec = (input: unknown, scope: DataScope): unknown => {
       if (singleValue) delete normalizedEncoding.label
       return {
         ...component,
+        id,
+        title,
         data: [],
         query: {
           ...rawQuery,
@@ -983,7 +1047,7 @@ export class VisualizationAgent {
           () => this.generateSpec(question, scope, profiles, validationFeedback)
         )
         progress('query', '正在校验受控查询和字段引用')
-        const normalized = normalizeGeneratedSpec(raw, scope) as DashboardSpec
+        const normalized = normalizeGeneratedSpec(raw, scope, profiles) as DashboardSpec
         const spec: DashboardSpec = {
           ...normalized,
           viewport: { width: 1920, height: 1080, columns: 24, rowHeight: 56 },

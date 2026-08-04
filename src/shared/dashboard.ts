@@ -149,6 +149,26 @@ export interface DashboardExportResult {
   message: string
 }
 
+export interface DashboardOfflineExportPayload {
+  spec: DashboardSpec
+  version: number | null
+  exportedAt: string
+}
+
+export interface DashboardOfflineManifest {
+  format: 'visslm-dashboard-offline'
+  schemaVersion: '1.0'
+  generatedAt: string
+  dashboardId: string
+  dashboardTitle: string
+  dashboardVersion: number | null
+  theme: DashboardThemeId
+  componentCount: number
+  dataMode: 'snapshot'
+  networkAccess: 'none'
+  specHash: string
+}
+
 export type DashboardAuditAction =
   | 'save'
   | 'restore'
@@ -157,6 +177,7 @@ export type DashboardAuditAction =
   | 'export-json'
   | 'export-pdf'
   | 'export-png'
+  | 'export-offline'
   | 'export-data'
 
 export type DashboardAuditStatus = 'success' | 'canceled' | 'failed'
@@ -166,7 +187,7 @@ export interface DashboardAuditLogInput {
   action: DashboardAuditAction
   status: DashboardAuditStatus
   version?: number
-  format?: 'json' | 'pdf' | 'png' | 'jsonl'
+  format?: 'json' | 'pdf' | 'png' | 'offline' | 'jsonl'
   metadata?: Record<string, string | number | boolean | null>
   errorMessage?: string
 }

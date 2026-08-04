@@ -45,6 +45,8 @@ type GridInteraction = {
   rejected: boolean
 }
 
+type DropState = 'valid' | 'invalid' | null
+
 const swapCompactor = getCompactor(null, true, false)
 
 const toDashboardLayout = (item: LayoutItem): DashboardLayout => ({
@@ -126,6 +128,7 @@ export function DashboardGrid({
   const [containerHeight, setContainerHeight] = useState(0)
   const [activeDragId, setActiveDragId] = useState<string | null>(null)
   const [swapTargetId, setSwapTargetId] = useState<string | null>(null)
+  const [dropState, setDropState] = useState<DropState>(null)
   const [layoutResetKey, setLayoutResetKey] = useState(0)
   const interactionRef = useRef<GridInteraction | null>(null)
   const pendingLayoutRef = useRef<GridLayout | null>(null)
@@ -177,6 +180,7 @@ export function DashboardGrid({
     }
     setActiveDragId(id)
     setSwapTargetId(null)
+    setDropState('valid')
     setError('')
     onSelect(id)
   }
@@ -194,6 +198,7 @@ export function DashboardGrid({
       if (swap) {
         if (swap.errors.length) {
           interaction.rejected = true
+          setDropState('invalid')
           setSwapTargetId(null)
           setError(swap.errors[0])
           return
@@ -204,6 +209,7 @@ export function DashboardGrid({
           [swap.targetId]: swap.targetLayout
         }
         interaction.rejected = false
+        setDropState('valid')
         setSwapTargetId(swap.targetId)
         setError('')
         return
@@ -213,6 +219,7 @@ export function DashboardGrid({
     const errors = validateDashboardLayout(originComponents, interaction.id, candidate)
     if (errors.length) {
       interaction.rejected = true
+      setDropState('invalid')
       setSwapTargetId(null)
       setError(errors[0])
       return
@@ -222,6 +229,7 @@ export function DashboardGrid({
       [interaction.id]: candidate
     }
     interaction.rejected = false
+    setDropState('valid')
     setSwapTargetId(null)
     setError('')
   }
@@ -242,6 +250,7 @@ export function DashboardGrid({
     interactionRef.current = null
     setActiveDragId(null)
     setSwapTargetId(null)
+    setDropState(null)
     setError('')
     if (rejected) setLayoutResetKey((current) => current + 1)
     if (layoutsChanged(components, accepted)) onLayoutCommit(accepted)
@@ -301,7 +310,11 @@ export function DashboardGrid({
 
   return (
     <div
-      className="dashboard-grid-shell"
+      className={[
+        'dashboard-grid-shell',
+        dropState === 'valid' ? 'is-drop-valid' : '',
+        dropState === 'invalid' ? 'is-drop-invalid' : ''
+      ].filter(Boolean).join(' ')}
       ref={containerRef}
       onPointerDown={(event) => {
         if (preview || !(event.target instanceof HTMLElement)) return

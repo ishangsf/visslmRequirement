@@ -3,6 +3,7 @@ import type {
   DataReviewApplyResult,
   DataReviewItem,
   DataReviewSummary,
+  FieldDefinition,
   PushConfig,
   PushRequestTrace,
   PushResult,
@@ -64,14 +65,31 @@ const stripHtml = (text: string): string =>
     .replace(/\s+/g, ' ')
     .trim()
 
-const normalizeText = (raw: JsonObject): string => {
+const fieldPathLabel = (path: string, fieldLabels: Record<string, string>): string => {
+  const direct = fieldLabels[path]?.trim()
+  if (direct) return direct
+  const withoutIndexes = path.replace(/\[\d+\]/g, '')
+  const indexed = fieldLabels[withoutIndexes]?.trim()
+  if (indexed) return indexed
+  return path.split('.').map((segment) => {
+    const match = /^(.*?)(\[\d+\])+$/.exec(segment)
+    const field = match?.[1] ?? segment
+    const suffix = match ? segment.slice(field.length) : ''
+    return `${fieldLabels[field]?.trim() || field}${suffix}`
+  }).join('.')
+}
+
+export const normalizeText = (
+  raw: JsonObject,
+  fieldLabels: Record<string, string> = {}
+): string => {
   const parts: string[] = []
   const visit = (input: unknown, path = ''): void => {
     if (input === null || input === undefined) return
     if (typeof input === 'string' || typeof input === 'number' || typeof input === 'boolean') {
       const text = stripHtml(String(input))
       if (text && !text.startsWith('data:image/') && text.length < 100_000) {
-        parts.push(path ? `${path}: ${text}` : text)
+        parts.push(path ? `${fieldPathLabel(path, fieldLabels)}: ${text}` : text)
       }
       return
     }
@@ -103,6 +121,148 @@ const ITEM_BASE_PROPERTIES = [
 
 const identifierPattern = /^[A-Za-z_][A-Za-z0-9_.]*$/
 const pureNumericPattern = /^\d+$/
+
+const FIELD_KEY_KEYS = [
+  '_valm_MemberName',
+  '_valm_FieldName',
+  '_valm_PropertyName',
+  '_valm_AttributeName',
+  '_valm_Key',
+  'memberName',
+  'fieldName',
+  'propertyName',
+  'attributeName',
+  'key',
+  'field',
+  'property',
+  'attribute',
+  'name',
+  '_valm_Name'
+]
+
+const FIELD_DISPLAY_KEYS = [
+  '_valm_DisplayName',
+  '_valm_MemberDisplayName',
+  '_valm_DisplayText',
+  '_valm_MemberCaption',
+  '_valm_Caption',
+  '_valm_Label',
+  '_valm_Title',
+  '_valm_Description',
+  'displayName',
+  'display_name',
+  'displayText',
+  'label',
+  'caption',
+  'title',
+  'description',
+  'text'
+]
+
+const FIELD_NODE_TYPE_KEYS = ['_valm_NodeType', 'nodeType', 'node_type', 'NodeType']
+
+const FIELD_COLLECTION_KEYS = new Set([
+  'data',
+  'props',
+  'prop',
+  'proplist',
+  'fields',
+  'members',
+  'properties',
+  'attributes',
+  'items',
+  'rows'
+])
+
+const readTextCandidate = (object: JsonObject, keys: string[]): string => {
+  for (const key of keys) {
+    const current = object[key]
+    if (typeof current !== 'string' && typeof current !== 'number') continue
+    const text = String(current).trim()
+    if (text) return text
+  }
+  return ''
+}
+
+const parseJsonPayload = (input: unknown): unknown => {
+  let current = input
+  for (let attempt = 0; attempt < 2 && typeof current === 'string'; attempt += 1) {
+    const text = current.trim()
+    if (!text || !['{', '['].includes(text[0])) break
+    try {
+      current = JSON.parse(text) as unknown
+    } catch {
+      break
+    }
+  }
+  return current
+}
+
+const validFieldKey = (field: string): boolean =>
+  field.length > 0 && field.length <= 240 && field !== '_valm_NodeType' &&
+  !FIELD_COLLECTION_KEYS.has(field.toLocaleLowerCase())
+
+export const parseFieldDefinitions = (
+  input: unknown,
+  fallbackNodeType = ''
+): FieldDefinition[] => {
+  const definitions = new Map<string, FieldDefinition>()
+  const add = (nodeTypeInput: string, fieldInput: string, displayInput: string): void => {
+    const nodeType = nodeTypeInput.trim() || fallbackNodeType.trim()
+    const field = fieldInput.trim()
+    const displayName = stripHtml(displayInput).trim()
+    if (!nodeType || !validFieldKey(field) || !displayName || displayName.length > 200) return
+    definitions.set(`${nodeType}\u0000${field}`, { nodeType, field, displayName })
+  }
+
+  const visit = (
+    inputValue: unknown,
+    inheritedNodeType: string,
+    collectionContext: boolean,
+    depth: number
+  ): void => {
+    const valueToVisit = parseJsonPayload(inputValue)
+    if (Array.isArray(valueToVisit)) {
+      valueToVisit.forEach((item) => visit(item, inheritedNodeType, collectionContext, depth + 1))
+      return
+    }
+    if (!valueToVisit || typeof valueToVisit !== 'object') return
+    const object = valueToVisit as JsonObject
+    const nodeType = readTextCandidate(object, FIELD_NODE_TYPE_KEYS) || inheritedNodeType
+    const field = readTextCandidate(object, FIELD_KEY_KEYS)
+    const displayName = readTextCandidate(object, FIELD_DISPLAY_KEYS)
+    if (field && displayName) add(nodeType, field, displayName)
+
+    const dynamicCollection = collectionContext || (depth === 0 && Boolean(nodeType) && !field)
+    for (const [key, child] of Object.entries(object)) {
+      const normalizedKey = key.toLocaleLowerCase()
+      const childIsCollection = FIELD_COLLECTION_KEYS.has(normalizedKey)
+      const parsedChild = childIsCollection || key === 'Data' ? parseJsonPayload(child) : child
+      visit(parsedChild, nodeType, dynamicCollection || childIsCollection, depth + 1)
+    }
+
+    if (!dynamicCollection || field) return
+    for (const [key, child] of Object.entries(object)) {
+      const normalizedKey = key.toLocaleLowerCase()
+      if (
+        FIELD_COLLECTION_KEYS.has(normalizedKey) ||
+        FIELD_NODE_TYPE_KEYS.some((candidate) => candidate.toLocaleLowerCase() === normalizedKey) ||
+        normalizedKey.startsWith('error')
+      ) continue
+      if (typeof child === 'string' || typeof child === 'number') {
+        add(nodeType, key, String(child))
+        continue
+      }
+      if (!child || typeof child !== 'object' || Array.isArray(child)) continue
+      const childObject = child as JsonObject
+      const childDisplayName = readTextCandidate(childObject, FIELD_DISPLAY_KEYS)
+      if (childDisplayName) add(nodeType, key, childDisplayName)
+    }
+  }
+
+  visit(input, fallbackNodeType, false, 0)
+  return [...definitions.values()]
+}
 
 const pureNumericValue = (input: unknown): string | null => {
   if (typeof input === 'number') {
@@ -378,6 +538,16 @@ export class VisslmClient {
         message: error instanceof Error ? error.message : String(error)
       }
     }
+  }
+
+  async getFieldDefinitions(nodeType: string): Promise<FieldDefinition[]> {
+    const normalizedNodeType = nodeType.trim()
+    if (!normalizedNodeType) return []
+    const response = await this.getJson('/Admin/Virtualization_ReadMember', {
+      nodeType: normalizedNodeType,
+      name: `${this.credentials.username},user`
+    })
+    return parseFieldDefinitions(response, normalizedNodeType)
   }
 
   async getAttachments(id: string): Promise<JsonObject[]> {
@@ -998,6 +1168,19 @@ export class SyncService {
           current: typeIndex,
           total: config.selectedTypes.length
         })
+        if (typeof client.getFieldDefinitions === 'function') {
+          try {
+            const definitions = await client.getFieldDefinitions(configuredType)
+            this.db.replaceFieldDefinitions(definitions)
+          } catch (error) {
+            this.progress({
+              phase: 'projects',
+              message: `field definitions unavailable for ${configuredType}; continue collection (${error instanceof Error ? error.message : String(error)})`,
+              current: typeIndex,
+              total: config.selectedTypes.length
+            })
+          }
+        }
         const requestTrace = client.queryItemsTrace(
           configuredType,
           filters,
@@ -1058,6 +1241,7 @@ export class SyncService {
             _valm_Uid: uid,
             _valm_ItemID: itemId
           }
+          const fieldLabels = this.db.getFieldDisplayNames(nodeType, Object.keys(normalizedRaw))
           const record: RecordInput = {
             uid,
             projectId,
@@ -1067,7 +1251,7 @@ export class SyncService {
             name,
             lastModifyTime,
             raw: normalizedRaw,
-            normalizedText: normalizeText(normalizedRaw)
+            normalizedText: normalizeText(normalizedRaw, fieldLabels)
           }
           this.progress({
             phase: 'records',
@@ -1080,6 +1264,17 @@ export class SyncService {
           if (existing) {
             retainedUids.push(existing.uid)
             skippedCount += 1
+            const existingDetail = this.db.getRecord(existing.uid, false)
+            if (existingDetail) {
+              const existingLabels = this.db.getFieldDisplayNames(
+                existingDetail.nodeType,
+                Object.keys(existingDetail.raw)
+              )
+              const refreshedText = normalizeText(existingDetail.raw, existingLabels)
+              if (refreshedText !== existingDetail.normalizedText) {
+                this.db.updateRecordNormalizedText(existing.uid, refreshedText)
+              }
+            }
             if (!stagedItemIds.has(itemId)) {
               duplicates.push(this.db.stageDataReview({
                 batchId: reviewBatchId,
@@ -1208,16 +1403,18 @@ export class SyncService {
           _valm_Uid: targetUid,
           _valm_ItemID: review.itemId
         }
+        const nodeType = String(candidate.nodeType)
+        const fieldLabels = this.db.getFieldDisplayNames(nodeType, Object.keys(raw))
         const record: RecordInput = {
           uid: targetUid,
-          projectId: candidate.nodeType === 'Project' ? targetUid : String(candidate.projectId ?? ''),
-          nodeType: String(candidate.nodeType),
+          projectId: nodeType === 'Project' ? targetUid : String(candidate.projectId ?? ''),
+          nodeType,
           itemId: review.itemId,
           parentId: String(candidate.parentId ?? ''),
           name: String(candidate.name ?? targetUid),
           lastModifyTime: String(candidate.lastModifyTime ?? ''),
           raw,
-          normalizedText: String(candidate.normalizedText ?? '')
+          normalizedText: normalizeText(raw, fieldLabels)
         }
         this.db.upsertRecord(record)
         if (record.nodeType === 'Project') {

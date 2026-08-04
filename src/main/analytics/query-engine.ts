@@ -29,6 +29,7 @@ const metadataFields: Record<string, keyof Omit<AnalyticsRecord, 'raw'>> = {
 type AnalyticsDatabase = Pick<AppDatabase, 'scanAnalyticsRecords'> & Partial<{
   getAnalyticsRevision(): number
   getFieldProfiles(scopeKey: string, dataRevision: number): FieldProfile[] | null
+  getFieldDisplayNames?(nodeType: string | string[], fields?: string[]): Record<string, string>
   saveFieldProfiles(scopeKey: string, dataRevision: number, profiles: FieldProfile[]): void
   updateFieldProfileSemantics(
     scopeKey: string,
@@ -559,8 +560,14 @@ export class QueryEngine {
   profile(scope: DataScope): FieldProfile[] {
     const dataRevision = safeRevision(this.db)
     const cacheKey = scopeCacheKey(scope)
+    const fieldLabels = this.db.getFieldDisplayNames?.(scope.nodeTypes ?? [], []) ?? {}
+    const applyFieldLabels = (profiles: FieldProfile[]): FieldProfile[] => profiles.map((profile) => (
+      profile.displayName?.trim() || !fieldLabels[profile.field]
+        ? profile
+        : { ...profile, displayName: fieldLabels[profile.field] }
+    ))
     const cached = this.db.getFieldProfiles?.(cacheKey, dataRevision)
-    if (cached) return cached
+    if (cached) return applyFieldLabels(cached)
 
     const records = this.db.scanAnalyticsRecords(scope)
     const fields = new Map<string, {
@@ -605,12 +612,13 @@ export class QueryEngine {
             : 0,
           distinctCount,
           samples: [...new Set(profile.values.map(String))].slice(0, 5),
+          ...(fieldLabels[field] ? { displayName: fieldLabels[field] } : {}),
           profiledAt: new Date().toISOString()
         }
       })
       .sort((left, right) => right.nonNullRate - left.nonNullRate || left.field.localeCompare(right.field))
     this.db.saveFieldProfiles?.(cacheKey, dataRevision, profiles)
-    return profiles
+    return applyFieldLabels(profiles)
   }
 
   updateFieldProfileSemantics(

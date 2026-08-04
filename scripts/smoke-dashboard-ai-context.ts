@@ -2,6 +2,8 @@ import { strict as assert } from 'node:assert'
 import { QueryEngine } from '../src/main/analytics/query-engine'
 import type { AnalyticsRecord, AppDatabase } from '../src/main/database'
 import { VisualizationAgent } from '../src/main/experts/visualization-agent'
+import { resolveVisualizationRequestMode } from '../src/main/experts/visualization-intent'
+import { ExpertRouter } from '../src/main/experts/router'
 import { validateDashboardSpec } from '../src/main/dashboards/validator'
 import type {
   DashboardComponentSpec,
@@ -80,6 +82,33 @@ const settings = {
   model: 'test-model',
   thinking: false
 }
+
+assert.equal(resolveVisualizationRequestMode('生成项目管理大屏看板', true), 'generate')
+assert.equal(
+  resolveVisualizationRequestMode(
+    '生成项目管理看板，最低不少于8个组件，需要统计开发负责人排行、测试负责人排行、发布数排行。',
+    true
+  ),
+  'generate'
+)
+assert.equal(resolveVisualizationRequestMode('把当前大屏改成明亮商务主题', true), 'patch')
+assert.equal(resolveVisualizationRequestMode('修改选中组件标题', true, 'kpi-total'), 'patch')
+assert.equal(resolveVisualizationRequestMode('生成新的项目看板', true, 'kpi-total'), 'patch')
+assert.equal(resolveVisualizationRequestMode('生成项目管理大屏看板', false), 'generate')
+
+const expertRouter = new ExpertRouter()
+assert.equal(expertRouter.route({
+  question: '@数据可视化专家 生成项目管理大屏',
+  conversationId: 'chat-routing-smoke',
+  entrypoint: 'chat',
+  expertId: 'general'
+}).expert.id, 'visualization')
+assert.equal(expertRouter.route({
+  question: '按开发负责人、测试负责人、发布统计当前数据',
+  conversationId: 'chat-routing-smoke',
+  entrypoint: 'chat',
+  expertId: 'general'
+}).expert.id, 'general')
 
 const modelResponses = [
   [{ op: 'set-dashboard-title', value: 'Operations overview' }],
@@ -322,6 +351,54 @@ try {
   assert.equal(fullRefreshQueryBaseline, 35)
   assert.equal(incrementalQueryExecutions, 5)
   assert.deepEqual(validateDashboardSpec(current, new QueryEngine(fakeDb)), [])
+
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    message: {
+      content: JSON.stringify({
+        schemaVersion: '1.0',
+        id: 'generated-with-missing-title',
+        title: 'Generated dashboard',
+        subtitle: 'Normalization smoke test',
+        businessContext: {
+          audience: 'QA',
+          objective: 'Normalize generated metadata',
+          scopeDescription: 'p1'
+        },
+        viewport: { width: 1920, height: 1080, columns: 24, rowHeight: 56 },
+        theme: 'technology-dark',
+        globalFilters: [{
+          id: 'status-filter',
+          field: 'status',
+          label: '',
+          operator: 'in',
+          options: ['open', 'closed']
+        }],
+        updatedAt: new Date().toISOString(),
+        components: [1, 2, 3, 4].map((index) => ({
+          id: `generated-${index}`,
+          type: 'kpi',
+          title: index === 2 ? '' : `Metric ${index}`,
+          layout: { x: (index - 1) * 6, y: 0, w: 6, h: 3 },
+          data: [],
+          query: {
+            source: 'records',
+            scope: { projectIds: ['p1'] },
+            dimensions: [],
+            measures: [{ id: 'records', aggregation: 'count' }],
+            limit: 1
+          },
+          encoding: { value: 'records' }
+        }))
+      })
+    }
+  }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  const generatedWithFallback = await new VisualizationAgent(
+    new QueryEngine(fakeDb),
+    settings
+  ).generate('Generate a dashboard', { projectIds: ['p1'] })
+  assert.equal(generatedWithFallback.components[1].title, '核心指标 2')
+  assert.equal(generatedWithFallback.globalFilters?.[0].label, 'status')
+  assert.deepEqual(validateDashboardSpec(generatedWithFallback, new QueryEngine(fakeDb)), [])
 
   console.log(JSON.stringify({
     ok: true,

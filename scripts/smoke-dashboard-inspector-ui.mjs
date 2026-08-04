@@ -144,6 +144,35 @@ const checks = await evaluate(`(async () => {
   const initiallySelected = inspectorTitle().includes('组件属性')
   const dashboardInfoHiddenWhenSelected = !document.querySelector('.dashboard-dashboard-info-editor')
   const componentDataVisible = Boolean(document.querySelector('.dashboard-component-data-editor'))
+  const queryRows = [...document.querySelectorAll('.dashboard-query-editor .dashboard-query-row')]
+  const queryRowsFitInspector = queryRows.length === 0 || queryRows.every((row) =>
+    row.scrollWidth <= row.clientWidth + 1
+  )
+  const measureRow = document.querySelector('.dashboard-query-measure-row')
+  const queryLayoutProbe = document.createElement('div')
+  queryLayoutProbe.className = 'dashboard-query-row dashboard-query-measure-row'
+  document.querySelector('.dashboard-inspector-scroll')?.append(queryLayoutProbe)
+  const queryLayoutProbeGrid = getComputedStyle(queryLayoutProbe).gridTemplateColumns
+  queryLayoutProbe.remove()
+  const measureRowStacksInNarrowInspector = (measureRow ?? queryLayoutProbe) === queryLayoutProbe
+    ? queryLayoutProbeGrid.split(' ').length <= 2
+    : getComputedStyle(measureRow).gridTemplateColumns.split(' ').length <= 2
+  const gridShell = document.querySelector('.dashboard-grid-shell')
+  const placeholderProbe = document.createElement('div')
+  placeholderProbe.className = 'react-grid-item react-grid-placeholder'
+  gridShell?.append(placeholderProbe)
+  gridShell?.classList.add('is-drop-valid')
+  const validPlaceholderStyle = getComputedStyle(placeholderProbe)
+  gridShell?.classList.remove('is-drop-valid')
+  gridShell?.classList.add('is-drop-invalid')
+  const invalidPlaceholderStyle = getComputedStyle(placeholderProbe)
+  gridShell?.classList.remove('is-drop-invalid')
+  placeholderProbe.remove()
+  const validDropPlaceholderUsesStateColor = validPlaceholderStyle.opacity === '1' &&
+    validPlaceholderStyle.backgroundColor !== 'rgb(255, 0, 0)' &&
+    validPlaceholderStyle.backgroundColor !== 'rgba(255, 0, 0, 0.2)'
+  const invalidDropPlaceholderHasDistinctState = invalidPlaceholderStyle.backgroundColor !==
+    validPlaceholderStyle.backgroundColor
   const dataEditor = document.querySelector('.dashboard-component-data-editor')
   const dataEditorBackground = dataEditor
     ? getComputedStyle(dataEditor).backgroundColor
@@ -326,6 +355,10 @@ const checks = await evaluate(`(async () => {
     initiallySelected,
     dashboardInfoHiddenWhenSelected,
     componentDataVisible,
+    queryRowsFitInspector,
+    measureRowStacksInNarrowInspector,
+    validDropPlaceholderUsesStateColor,
+    invalidDropPlaceholderHasDistinctState,
     dataEditorUsesThemeSurface: dataEditorBackground === expectedPanelBackground,
     dashboardInspectorVisible,
     dashboardInfoVisible,

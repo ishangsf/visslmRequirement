@@ -1128,7 +1128,10 @@ export class OllamaAgent {
           itemId: detail.itemId
         },
         text: detail.normalizedText,
-        raw: detail.raw
+        raw: detail.raw,
+        ...(detail.fieldLabels && Object.keys(detail.fieldLabels).length
+          ? { fieldLabels: detail.fieldLabels }
+          : {})
       }
     }
     if (name === 'aggregate_records') {
@@ -1177,6 +1180,10 @@ export class OllamaAgent {
       }
       const field = String(aggregate.field ?? args.field ?? '').trim()
       if (!field || !aggregate.items?.length) return null
+      const fieldLabels = this.db.getFieldDisplayNames(
+        String(args.node_type ?? '').trim(),
+        [field]
+      )
       const groups = aggregate.items.slice(0, 5).map((item) => {
         const groupName = String(item.name ?? '')
         const query = this.db.queryRecordsByFields({
@@ -1194,7 +1201,7 @@ export class OllamaAgent {
       })
       return {
         id: `aggregate-by-field:${field}`,
-        title: `${field} 查询数据`,
+        title: `${fieldLabels[field] ?? field} 查询数据`,
         description: [
           `统计范围 ${Number(aggregate.totalRecords ?? 0)} 条`,
           `字段非空 ${Number(aggregate.matchedRecords ?? 0)} 条`,
@@ -1204,6 +1211,7 @@ export class OllamaAgent {
         ].filter(Boolean).join(' · '),
         total: Number(aggregate.matchedRecords ?? 0),
         fields: [field],
+        ...(Object.keys(fieldLabels).length ? { fieldLabels } : {}),
         groups
       }
     }
@@ -1212,6 +1220,7 @@ export class OllamaAgent {
       const query = result as {
         matchedCount?: number
         fields?: string[]
+        fieldLabels?: Record<string, string>
         records?: Array<{
           source: ChatSource
           values: Record<string, string | string[]>
@@ -1219,12 +1228,17 @@ export class OllamaAgent {
       }
       if (!query.records?.length) return null
       const fields = query.fields ?? []
+      const fieldLabels = query.fieldLabels ?? this.db.getFieldDisplayNames(
+        String(args.node_type ?? '').trim(),
+        fields
+      )
       return {
         id: `field-query:${fields.join(',') || 'records'}`,
         title: '属性查询数据',
         description: `共命中 ${Number(query.matchedCount ?? query.records.length)} 条，当前展示 ${query.records.length} 条`,
         total: Number(query.matchedCount ?? query.records.length),
         fields,
+        ...(Object.keys(fieldLabels).length ? { fieldLabels } : {}),
         groups: [{
           name: '查询结果',
           count: Number(query.matchedCount ?? query.records.length),
@@ -1256,6 +1270,7 @@ export class OllamaAgent {
       const detail = result as {
         source?: ChatSource
         raw?: Record<string, unknown>
+        fieldLabels?: Record<string, string>
       }
       if (!detail.source) return null
       const values: Record<string, string | string[]> = {}
@@ -1271,6 +1286,9 @@ export class OllamaAgent {
         description: '当前回答读取的具体记录',
         total: 1,
         fields: Object.keys(values),
+        ...(detail.fieldLabels && Object.keys(detail.fieldLabels).length
+          ? { fieldLabels: detail.fieldLabels }
+          : {}),
         groups: [{
           name: '记录',
           count: 1,

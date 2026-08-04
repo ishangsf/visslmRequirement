@@ -24,11 +24,17 @@ const styleRanges = {
   lineWidth: [1, 8]
 } as const
 
+export interface DashboardValidationOptions {
+  allowInlineData?: boolean
+}
+
 export const validateDashboardSpec = (
   input: unknown,
-  queryEngine?: QueryEngine
+  queryEngine?: QueryEngine,
+  options: DashboardValidationOptions = {}
 ): string[] => {
   const errors: string[] = []
+  const allowInlineData = options.allowInlineData === true
   if (!input || typeof input !== 'object' || Array.isArray(input)) {
     return ['DashboardSpec 必须是对象']
   }
@@ -113,13 +119,17 @@ export const validateDashboardSpec = (
         occupied.add(cell)
       }
     }
-    if (!component.query) errors.push(`组件 ${component.id} 缺少 query`)
+    if (!component.query && !allowInlineData) errors.push(`组件 ${component.id} 缺少 query`)
     else if (queryEngine) {
-      errors.push(...queryEngine.validate(component.query).map(
-        (error) => `组件 ${component.id}: ${error}`
-      ))
+      if (component.query) {
+        errors.push(...queryEngine.validate(component.query).map(
+          (error) => `组件 ${component.id}: ${error}`
+        ))
+      }
     }
-    if (!component.encoding?.value) errors.push(`组件 ${component.id} 缺少 encoding.value`)
+    if (!component.encoding?.value && (Boolean(component.query) || !allowInlineData)) {
+      errors.push(`组件 ${component.id} 缺少 encoding.value`)
+    }
     if (component.query && component.encoding?.value) {
       const measureIds = new Set(component.query.measures.map((measure) => measure.id))
       const dimensionFields = new Set(

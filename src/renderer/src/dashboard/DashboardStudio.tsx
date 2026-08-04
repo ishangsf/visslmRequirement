@@ -6,6 +6,7 @@ import {
   DownloadOutlined,
   EditOutlined,
   FileImageOutlined,
+  FileZipOutlined,
   FullscreenOutlined,
   HistoryOutlined,
   InfoCircleOutlined,
@@ -256,6 +257,9 @@ const cloneSpec = (spec: DashboardSpec): DashboardSpec =>
 const cloneQuery = (query: QuerySpec): QuerySpec =>
   JSON.parse(JSON.stringify(query)) as QuerySpec
 
+const escapeRegExp = (value: string): string =>
+  value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
 const queryDataPoints = (
   component: DashboardComponentSpec,
   dataset: QueryDataset
@@ -331,7 +335,7 @@ export function DashboardStudio({
   const [auditLogs, setAuditLogs] = useState<DashboardAuditLog[]>([])
   const [qualityOpen, setQualityOpen] = useState(false)
   const [provenanceComponent, setProvenanceComponent] = useState<DashboardComponentSpec | null>(null)
-  const [pendingExport, setPendingExport] = useState<'png' | 'pdf' | 'json' | null>(null)
+  const [pendingExport, setPendingExport] = useState<'png' | 'pdf' | 'json' | 'offline' | null>(null)
   const [exportMenuOpen, setExportMenuOpen] = useState(false)
   const [draftSavedAt, setDraftSavedAt] = useState<string | null>(null)
   const [qualityReport, setQualityReport] = useState<DashboardQualityReport | null>(null)
@@ -786,6 +790,12 @@ export function DashboardStudio({
   const profileByField = new Map(fieldProfiles.map((profile) => [profile.field, profile]))
 
   const updateDimension = (index: number, field?: string): void => {
+    if (field && selectedComponent?.query?.dimensions?.some((dimension, dimensionIndex) =>
+      dimensionIndex !== index && dimension.field === field
+    )) {
+      message.warning('同一查询不能重复使用相同维度')
+      return
+    }
     updateQuery((query) => {
       const dimensions = [...(query.dimensions ?? [])]
       if (!field) {
@@ -839,6 +849,13 @@ export function DashboardStudio({
 
   const updateMeasure = (index: number, patch: Partial<QueryMeasure>): void => {
     const previous = selectedComponent?.query?.measures[index]
+    if (!previous) return
+    if (patch.id && patch.id !== previous.id && selectedComponent?.query?.measures.some(
+      (measure, measureIndex) => measureIndex !== index && measure.id === patch.id
+    )) {
+      message.warning('指标名称必须唯一')
+      return
+    }
     const encodingPatch = previous && patch.id && previous.id !== patch.id
       ? {
           ...(selectedComponent?.encoding?.value === previous.id ? { value: patch.id } : {}),
@@ -849,7 +866,17 @@ export function DashboardStudio({
       : undefined
     updateQuery((query) => {
       const measures = query.measures.map((measure, measureIndex) =>
-        measureIndex === index ? { ...measure, ...patch } : measure
+        measureIndex === index
+          ? { ...measure, ...patch }
+          : patch.id && previous.id !== patch.id && measure.formula
+            ? {
+                ...measure,
+                formula: measure.formula.replace(
+                  new RegExp(`\\b${escapeRegExp(previous.id)}\\b`, 'g'),
+                  patch.id
+                )
+              }
+            : measure
       )
       const sort = patch.id && previous && patch.id !== previous.id
         ? query.sort?.map((item) => item.field === previous.id
@@ -921,7 +948,7 @@ export function DashboardStudio({
       ...query,
       filters: [
         ...(query.filters ?? []),
-        { field, operator: 'equals', value: '' }
+        { field, operator: 'equals' }
       ]
     }))
   }
@@ -1117,7 +1144,7 @@ export function DashboardStudio({
     }
   }
 
-  const exportDashboard = async (format: 'json' | 'pdf' | 'png'): Promise<void> => {
+  const exportDashboard = async (format: 'json' | 'pdf' | 'png' | 'offline'): Promise<void> => {
     if (!dashboard) return
     setExporting(true)
     try {
@@ -1138,6 +1165,8 @@ export function DashboardStudio({
           backgroundColor: dashboardThemeBackgrounds[dashboard.theme]
         })
         result = await window.visslm.exportDashboardPng(dashboard, dataUrl, currentVersion || undefined)
+      } else if (format === 'offline') {
+        result = await window.visslm.exportDashboardOffline(dashboard, currentVersion || undefined)
       } else {
         result = format === 'json'
           ? await window.visslm.exportDashboardJson(dashboard, currentVersion || undefined)
@@ -1302,7 +1331,12 @@ export function DashboardStudio({
                           if (!id) {
                             event.currentTarget.value = measure.id
                           } else if (id !== measure.id) {
-                            updateMeasure(index, { id })
+                            if (query.measures.some((item, itemIndex) => itemIndex !== index && item.id === id)) {
+                              event.currentTarget.value = measure.id
+                              message.warning('指标名称必须唯一')
+                            } else {
+                              updateMeasure(index, { id })
+                            }
                           }
                         }}
                       />
@@ -1360,7 +1394,10 @@ export function DashboardStudio({
                             message.warning('同比、环比和累计需要先设置时间粒度')
                             return
                           }
-                          updateMeasure(index, { calculation: next || undefined })
+                          updateMeasure(index, {
+                            calculation: next || undefined,
+                            ...(next ? { formula: undefined, comparison: undefined } : {})
+                          })
                         }}
                       />
                       <Input
@@ -1369,9 +1406,13 @@ export function DashboardStudio({
                         placeholder="自定义公式"
                         disabled={queryLoading}
                         onPressEnter={(event) => event.currentTarget.blur()}
-                        onBlur={(event) => updateMeasure(index, {
-                          formula: event.target.value.trim() || undefined
-                        })}
+                        onBlur={(event) => {
+                          const formula = event.target.value.trim()
+                          updateMeasure(index, {
+                            formula: formula || undefined,
+                            ...(formula ? { calculation: undefined, comparison: undefined } : {})
+                          })
+                        }}
                       />
                       <Tooltip title="向前 N 个当前时间粒度周期对比">
                         <InputNumber
@@ -1380,14 +1421,18 @@ export function DashboardStudio({
                           precision={0}
                           placeholder="周期"
                           value={measure.comparison?.offset}
-                          disabled={queryLoading || !dimensions.some((dimension) => Boolean(dimension.timeGrain))}
+                          disabled={queryLoading || Boolean(measure.calculation || measure.formula?.trim()) ||
+                            !dimensions.some((dimension) => Boolean(dimension.timeGrain))}
                           onChange={(offset) => updateMeasure(index, {
                             comparison: offset === null
                               ? undefined
                               : {
                                   offset,
                                   mode: measure.comparison?.mode ?? 'percent'
-                                }
+                                },
+                            ...(offset === null
+                              ? {}
+                              : { calculation: undefined, formula: undefined })
                           })}
                         />
                       </Tooltip>
@@ -1443,7 +1488,7 @@ export function DashboardStudio({
                       showSearch
                       optionFilterProp="label"
                       disabled={queryLoading || !fieldProfiles.length || filter.source === 'dashboard'}
-                      onChange={(field) => updateFilter(index, { field })}
+                      onChange={(field) => updateFilter(index, { field, value: undefined })}
                     />
                     <Select
                       value={filter.operator}
@@ -2086,13 +2131,14 @@ export function DashboardStudio({
               items: [
                 { key: 'png', label: 'PNG 图片', icon: <FileImageOutlined /> },
                 { key: 'json', label: 'DashboardSpec JSON' },
-                { key: 'pdf', label: 'PDF 文档' }
+                { key: 'pdf', label: 'PDF 文档' },
+                { key: 'offline', label: '离线预览包（ZIP）', icon: <FileZipOutlined /> }
               ],
               onClick: ({ key, domEvent }) => {
                 domEvent.stopPropagation()
                 window.setTimeout(() => {
                   setExportMenuOpen(false)
-                  setPendingExport(key as 'png' | 'json' | 'pdf')
+                  setPendingExport(key as 'png' | 'json' | 'pdf' | 'offline')
                 }, 0)
               }
             }}
@@ -2350,6 +2396,7 @@ export function DashboardStudio({
               'export-json': '导出 JSON',
               'export-pdf': '导出 PDF',
               'export-png': '导出 PNG',
+              'export-offline': '导出离线预览包',
               'export-data': '导出数据'
             }
             const statusLabels: Record<DashboardAuditLog['status'], string> = {
@@ -2689,7 +2736,7 @@ export function DashboardStudio({
       <Modal
         title="确认导出大屏"
         open={Boolean(pendingExport)}
-        okText={`确认导出 ${pendingExport?.toUpperCase() ?? ''}`}
+        okText={`确认导出 ${pendingExport === 'offline' ? '离线预览包' : pendingExport?.toUpperCase() ?? ''}`}
         cancelText="取消"
         confirmLoading={exporting}
         onCancel={() => !exporting && setPendingExport(null)}
@@ -2739,8 +2786,13 @@ export function DashboardStudio({
                 </Space>
               </Descriptions.Item>
               <Descriptions.Item label="导出格式">
-                {pendingExport?.toUpperCase()}
+                {pendingExport === 'offline' ? '离线预览包（ZIP）' : pendingExport?.toUpperCase()}
               </Descriptions.Item>
+              {pendingExport === 'offline' && (
+                <Descriptions.Item label="离线行为">
+                  解压后直接打开 index.html；查看器只展示导出时的快照数据，不会重新查询或访问网络。
+                </Descriptions.Item>
+              )}
             </Descriptions>
           </div>
         )}
