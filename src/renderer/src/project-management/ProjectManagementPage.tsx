@@ -1,10 +1,12 @@
 import {
+  ApartmentOutlined,
   ArrowRightOutlined,
   ArrowLeftOutlined,
   CalendarOutlined,
   CheckCircleOutlined,
   CheckCircleFilled,
   ClockCircleOutlined,
+  CloseOutlined,
   DatabaseOutlined,
   DeleteOutlined,
   DollarOutlined,
@@ -61,6 +63,9 @@ import {
 import type { TableColumnsType, TablePaginationConfig } from 'antd'
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import pdfWorkerUrl from 'pdfjs-dist/legacy/build/pdf.worker.mjs?url'
+import { Gantt, Tooltip as GanttTooltip } from '@svar-ui/react-gantt'
+import type { IApi, ILink, IResource, IScaleConfig, ITask } from '@svar-ui/react-gantt'
+import '@svar-ui/react-gantt/style.css'
 import type {
   ManagedProject,
   ManagedProjectInput,
@@ -68,6 +73,7 @@ import type {
   OrganizationPersonInput,
   ProjectAnalysisLogEntry,
   ProjectAnalysisProgress,
+  ProjectAnalysisStartResult,
   ProjectAsset,
   ProjectCostEntry,
   ProjectCostEntryInput,
@@ -90,6 +96,7 @@ import type {
 import type { KnowledgeDocumentDetail, KnowledgeDocumentPreview, ModelSettings, RecordDetail, RecordRow } from '../../../shared/types'
 import { RichDescription } from '../RichDescription'
 import { ResizableTable } from '../ResizableTable'
+import { ProjectRelationshipGraph } from './ProjectRelationshipGraph'
 
 const { Text, Title, Paragraph } = Typography
 
@@ -338,12 +345,28 @@ const parseProjectDate = (value: string): Date | null => {
   return Number.isNaN(date.getTime()) ? null : date
 }
 
-const calendarDaysBetween = (startDate: string, endDate: string): number => {
-  const start = parseProjectDate(startDate)
-  const end = parseProjectDate(endDate)
-  if (!start || !end) return 0
-  return Math.max(0, Math.floor((end.getTime() - start.getTime()) / 86_400_000) + 1)
-}
+const padProjectGanttNumber = (value: number): string => String(value).padStart(2, '0')
+
+const formatProjectGanttDate = (date: Date): string =>
+  `${String(date.getFullYear()).padStart(4, '0')}-${padProjectGanttNumber(date.getMonth() + 1)}-${padProjectGanttNumber(date.getDate())}`
+
+const formatProjectGanttMonth = (date: Date): string =>
+  `${String(date.getFullYear()).padStart(4, '0')}\u5e74${padProjectGanttNumber(date.getMonth() + 1)}\u6708`
+
+const isProjectGanttWeekend = (date: Date): boolean => date.getDay() === 0 || date.getDay() === 6
+
+const projectGanttHighlightTime = (date: Date, unit: 'day' | 'hour'): string =>
+  unit === 'day' && isProjectGanttWeekend(date) ? 'wx-weekend project-gantt-weekend' : ''
+
+const projectGanttScales: IScaleConfig[] = [
+  { unit: 'month', step: 1, format: formatProjectGanttMonth },
+  {
+    unit: 'day',
+    step: 1,
+    format: (date: Date) => padProjectGanttNumber(date.getDate()),
+    css: (date: Date) => isProjectGanttWeekend(date) ? 'project-gantt-weekend' : ''
+  }
+]
 
 const getProjectTaskDescendantIds = (tasks: ProjectPlanTask[], taskId?: string): Set<string> => {
   const descendants = new Set<string>()
@@ -508,7 +531,7 @@ function ProjectStatus({ project }: { project: ManagedProject }): React.JSX.Elem
 type MatchTableColumnKey = 'record' | 'score' | 'reason' | 'asset'
 type MatchTableColumnWidths = Record<MatchTableColumnKey, number>
 
-const matchTableColumnStorageKey = 'visslm:project-match-table-column-widths:v1'
+const matchTableColumnStorageKey = 'visslm:project-match-table-column-widths:v2'
 const projectAppTableScrollY = 'min(560px, max(260px, calc(100vh - 300px)))'
 const projectCompactTableScrollY = 'min(360px, max(180px, calc(100vh - 420px)))'
 const projectDetailTableScrollY = 'min(440px, max(220px, calc(100vh - 500px)))'
@@ -517,19 +540,19 @@ const matchTableColumnDefaults: MatchTableColumnWidths = {
   record: 224,
   score: 112,
   reason: 280,
-  asset: 120
+  asset: 180
 }
 const matchTableColumnMinWidths: MatchTableColumnWidths = {
   record: 180,
   score: 96,
   reason: 220,
-  asset: 104
+  asset: 144
 }
 const matchTableColumnMaxWidths: MatchTableColumnWidths = {
   record: 420,
   score: 180,
   reason: 480,
-  asset: 200
+  asset: 300
 }
 const matchTableColumnLabels: Record<MatchTableColumnKey, string> = {
   record: '数据中心数据',
@@ -747,14 +770,22 @@ function MatchDrawer({
   onClose,
   onOpenRecord,
   onLinkAsset,
-  onSaveKeyInfoTerms
+  assets,
+  onUnlinkAssetRequirement,
+  onSaveKeyInfoTerms,
+  matchScoreThreshold,
+  progress
 }: {
   requirement: ProjectRequirement | null
   open: boolean
   onClose: () => void
   onOpenRecord: (uid: string) => void
-  onLinkAsset: (recordUid: string) => void
-  onSaveKeyInfoTerms: (requirementId: string, terms: string[]) => Promise<void>
+  onLinkAsset: (recordUid: string, requirementId: string) => Promise<boolean>
+  assets: ProjectAsset[]
+  onUnlinkAssetRequirement: (recordUid: string, requirementId: string) => Promise<boolean>
+  onSaveKeyInfoTerms: (requirementId: string, terms: string[]) => Promise<ProjectAnalysisStartResult>
+  matchScoreThreshold: number
+  progress: ProjectAnalysisProgress | null
 }): React.JSX.Element {
   const [matches, setMatches] = useState<ProjectRequirementMatch[]>([])
   const [total, setTotal] = useState(0)
@@ -764,6 +795,11 @@ function MatchDrawer({
   const [editingKeyInfoTerms, setEditingKeyInfoTerms] = useState(false)
   const [keyInfoTermsDraft, setKeyInfoTermsDraft] = useState<string[]>([])
   const [savingKeyInfoTerms, setSavingKeyInfoTerms] = useState(false)
+  const [matchingTaskId, setMatchingTaskId] = useState<string | null>(null)
+  const [matchingProgress, setMatchingProgress] = useState<ProjectAnalysisProgress | null>(null)
+  const [linkingRecordUid, setLinkingRecordUid] = useState<string | null>(null)
+  const [unlinkingRecordUid, setUnlinkingRecordUid] = useState<string | null>(null)
+  const [hiddenLinkedAssetUids, setHiddenLinkedAssetUids] = useState<Set<string>>(new Set())
   const [columnWidths, setColumnWidths] = useState<MatchTableColumnWidths>(readMatchTableColumnWidths)
   const columnWidthsRef = useRef(columnWidths)
 
@@ -781,29 +817,64 @@ function MatchDrawer({
     } finally {
       setLoading(false)
     }
-  }, [page, pageSize, requirement])
+  }, [matchScoreThreshold, page, pageSize, requirement])
 
   useEffect(() => {
     if (!open) return
     setPage(1)
     setEditingKeyInfoTerms(false)
     setKeyInfoTermsDraft(requirement?.keyInfoTerms ?? [])
-  }, [open, requirement?.id])
+  }, [matchScoreThreshold, open, requirement?.id])
+
+  useEffect(() => {
+    setMatchingTaskId(null)
+    setMatchingProgress(null)
+    setHiddenLinkedAssetUids(new Set())
+  }, [requirement?.id])
+
+  useEffect(() => {
+    if (!matchingTaskId || !progress || progress.taskId !== matchingTaskId || progress.projectId !== requirement?.projectId) return
+    setMatchingProgress(progress)
+  }, [matchingTaskId, progress, requirement?.projectId])
 
   useEffect(() => {
     void load()
   }, [load])
 
+  useEffect(() => {
+    if (!matchingProgress || matchingProgress.status === 'running') return
+    void load()
+  }, [load, matchingProgress?.status, matchingProgress?.taskId])
+
   const saveKeyInfoTerms = async (): Promise<void> => {
     if (!requirement) return
+    setMatchingTaskId(null)
+    setMatchingProgress(null)
     setSavingKeyInfoTerms(true)
     try {
-      await onSaveKeyInfoTerms(requirement.id, keyInfoTermsDraft)
+      const result = await onSaveKeyInfoTerms(requirement.id, keyInfoTermsDraft)
+      if (result.ok && result.taskId) setMatchingTaskId(result.taskId)
       setEditingKeyInfoTerms(false)
     } finally {
       setSavingKeyInfoTerms(false)
     }
   }
+
+  const matchingProgressStatus = matchingProgress?.status ?? 'running'
+  const matchingProgressPercent = matchingProgress
+    ? matchingProgress.status === 'success'
+      ? 100
+      : matchingProgress.total > 0
+        ? Math.round(Math.max(0, Math.min(100, (matchingProgress.current / matchingProgress.total) * 100)))
+        : 0
+    : 0
+  const matchingProgressLabel = matchingProgressStatus === 'success'
+    ? '匹配完成'
+    : matchingProgressStatus === 'failed'
+      ? '匹配失败'
+      : '匹配中'
+  const matchingProgressMessage = matchingProgress?.message ?? '正在保存信息词并启动匹配'
+  const showMatchingProgress = savingKeyInfoTerms || Boolean(matchingTaskId) || Boolean(matchingProgress)
 
   const resizeColumn = useCallback((key: MatchTableColumnKey, value: number): void => {
     const nextWidths = {
@@ -828,6 +899,58 @@ function MatchDrawer({
     () => Object.values(columnWidths).reduce((total, width) => total + width, 0),
     [columnWidths]
   )
+
+  const linkMatchAsset = useCallback(async (row: ProjectRequirementMatch): Promise<void> => {
+    if (!requirement) return
+    setLinkingRecordUid(row.recordUid)
+    try {
+      const linked = await onLinkAsset(row.recordUid, requirement.id)
+      if (linked) {
+        setMatches((current) => current.map((item) => item.recordUid === row.recordUid
+          ? { ...item, assetLinked: true, requirementLinked: true }
+          : item
+        ))
+        setHiddenLinkedAssetUids((current) => {
+          if (!current.has(row.recordUid)) return current
+          const next = new Set(current)
+          next.delete(row.recordUid)
+          return next
+        })
+      }
+    } finally {
+      setLinkingRecordUid(null)
+    }
+  }, [onLinkAsset, requirement])
+
+  const linkedAssets = useMemo(() => {
+    if (!requirement) return []
+    return assets.filter((asset) => !hiddenLinkedAssetUids.has(asset.recordUid) && asset.requirements.some((item) => item.requirementId === requirement.id))
+  }, [assets, hiddenLinkedAssetUids, requirement])
+
+  useEffect(() => {
+    if (!requirement) return
+    setHiddenLinkedAssetUids((current) => {
+      const next = new Set([...current].filter((recordUid) => assets.some((asset) => asset.recordUid === recordUid && asset.requirements.some((item) => item.requirementId === requirement.id))))
+      return next.size === current.size ? current : next
+    })
+  }, [assets, requirement])
+
+  const unlinkMatchAsset = useCallback(async (asset: ProjectAsset): Promise<void> => {
+    if (!requirement) return
+    setUnlinkingRecordUid(asset.recordUid)
+    try {
+      const unlinked = await onUnlinkAssetRequirement(asset.recordUid, requirement.id)
+      if (unlinked) {
+        setHiddenLinkedAssetUids((current) => {
+          const next = new Set(current)
+          next.add(asset.recordUid)
+          return next
+        })
+      }
+    } finally {
+      setUnlinkingRecordUid(null)
+    }
+  }, [onUnlinkAssetRequirement, requirement])
 
   const matchColumns = useMemo<TableColumnsType<ProjectRequirementMatch>>(() => [
     {
@@ -899,11 +1022,24 @@ function MatchDrawer({
         onResize: (width: number) => resizeColumn('asset', width),
         onResizeEnd: (width: number) => commitColumnResize('asset', width)
       } as ResizableHeaderCellProps),
-      render: (_value, row) => row.assetLinked
-        ? <Tag color="success" icon={<CheckCircleOutlined />}>已关联</Tag>
-        : <Button type="link" size="small" icon={<LinkOutlined />} onClick={() => onLinkAsset(row.recordUid)}>关联资产</Button>
+      render: (_value, row) => row.requirementLinked
+        ? <Tag color="success" icon={<CheckCircleOutlined />}>需求已关联</Tag>
+        : (
+          <Space size={4} wrap>
+            {row.assetLinked && <Tag color="success">资产已关联</Tag>}
+            <Button
+              type="link"
+              size="small"
+              icon={<LinkOutlined />}
+              loading={linkingRecordUid === row.recordUid}
+              onClick={() => void linkMatchAsset(row)}
+            >
+              {row.assetLinked ? '关联当前需求' : '关联资产'}
+            </Button>
+          </Space>
+        )
     }
-  ], [columnWidths, commitColumnResize, onLinkAsset, onOpenRecord, resizeColumn])
+  ], [columnWidths, commitColumnResize, linkMatchAsset, linkingRecordUid, onOpenRecord, resizeColumn])
 
   return (
     <Drawer
@@ -920,7 +1056,8 @@ function MatchDrawer({
             <Paragraph ellipsis={{ rows: 3, expandable: true }}>{requirement.content}</Paragraph>
             <Space wrap>
               <Tag>最高匹配度 {requirement.highestMatchScore.toFixed(1)}%</Tag>
-              <Tag>{requirement.matchCount} 条数据</Tag>
+              <Tag>匹配度 &gt; {matchScoreThreshold}%</Tag>
+              <Tag>{total} 条数据</Tag>
               {requirement.module && <Tag>{requirement.module}</Tag>}
               {requirement.sourceLocation && <Tag>{requirement.sourceLocation}</Tag>}
             </Space>
@@ -954,6 +1091,105 @@ function MatchDrawer({
               </div>
             )}
           </Card>
+          <Card
+            size="small"
+            className="project-linked-assets-card"
+            title={(
+              <div className="project-linked-assets-heading">
+                <span>已关联数据中心数据</span>
+                <span className="project-linked-assets-count">{linkedAssets.length} 条</span>
+              </div>
+            )}
+          >
+            {linkedAssets.length ? (
+              <div className="project-linked-assets-list" role="list" aria-label="当前需求已关联数据中心数据">
+                {linkedAssets.map((asset) => {
+                  const linkedRequirement = asset.requirements.find((item) => item.requirementId === requirement.id)
+                  const matchScore = linkedRequirement?.matchScore
+                  return (
+                    <div key={asset.recordUid} className="project-linked-asset-item" role="listitem">
+                    <div className="project-linked-asset-copy">
+                      <Button
+                        type="link"
+                        className="project-linked-asset-name"
+                        icon={<DatabaseOutlined />}
+                        title={`打开数据中心记录：${asset.name || asset.recordUid}`}
+                        aria-label={`打开数据中心记录：${asset.name || asset.recordUid}`}
+                        onClick={() => onOpenRecord(asset.recordUid)}
+                      >
+                        <span>{asset.name || asset.recordUid}</span>
+                      </Button>
+                      <div className="project-linked-asset-meta">
+                        <Text type="secondary">
+                          {asset.nodeType || '数据中心记录'}{asset.itemId ? ` / ${asset.itemId}` : ''}
+                        </Text>
+                        {matchScore !== undefined ? (
+                          <strong
+                            className="project-linked-asset-score"
+                            aria-label={`数据匹配度 ${matchScore.toFixed(1)}%`}
+                          >
+                            匹配度 {matchScore.toFixed(1)}%
+                          </strong>
+                        ) : (
+                          <Text type="secondary">暂无匹配度</Text>
+                        )}
+                      </div>
+                    </div>
+                    <Popconfirm
+                      title="取消当前需求与该数据的关联？"
+                      description="项目资产和其他需求关联不会受到影响。"
+                      onConfirm={() => void unlinkMatchAsset(asset)}
+                    >
+                      <Button
+                        type="link"
+                        danger
+                        size="small"
+                        icon={<DisconnectOutlined />}
+                        loading={unlinkingRecordUid === asset.recordUid}
+                        disabled={Boolean(unlinkingRecordUid && unlinkingRecordUid !== asset.recordUid)}
+                        aria-label={`取消当前需求与数据 ${asset.name || asset.recordUid} 的关联`}
+                      >
+                        取消关联
+                      </Button>
+                    </Popconfirm>
+                    </div>
+                  )
+                })}
+              </div>
+            ) : (
+              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="当前需求暂无已关联数据" />
+            )}
+          </Card>
+          {showMatchingProgress && (
+            <section className={`project-match-progress is-${matchingProgressStatus}`} aria-label="匹配执行进度" aria-live="polite">
+              <div className="project-match-progress-heading">
+                <div>
+                  <Text strong>匹配执行进度</Text>
+                  <Text type="secondary">当前需求的重新匹配任务在此处实时更新</Text>
+                </div>
+                <Tag color={matchingProgressStatus === 'success' ? 'success' : matchingProgressStatus === 'failed' ? 'error' : 'processing'}>{matchingProgressLabel}</Tag>
+              </div>
+              <div className="project-match-progress-main">
+                <Progress
+                  className="project-match-progress-ring"
+                  type="circle"
+                  percent={matchingProgressPercent}
+                  size={56}
+                  strokeWidth={9}
+                  status={matchingProgressStatus === 'failed' ? 'exception' : matchingProgressStatus === 'success' ? 'success' : 'active'}
+                  strokeColor={matchingProgressStatus === 'failed' ? 'var(--state-error)' : matchingProgressStatus === 'success' ? 'var(--state-success)' : 'var(--accent)'}
+                  trailColor="var(--stroke-strong)"
+                  format={(percent) => `${percent ?? 0}%`}
+                  aria-label={`匹配执行进度 ${matchingProgressPercent}%`}
+                />
+                <div className="project-match-progress-copy">
+                  <Text strong>{matchingProgressMessage}</Text>
+                  {matchingProgress?.detail && <Text type="secondary">{matchingProgress.detail}</Text>}
+                  {matchingProgress && matchingProgress.total > 0 && <Text type="secondary" className="project-match-progress-count">已处理 {Math.min(matchingProgress.current, matchingProgress.total)} / {matchingProgress.total}</Text>}
+                </div>
+              </div>
+            </section>
+          )}
           <Table<ProjectRequirementMatch>
             className="project-match-table"
             rowKey="recordUid"
@@ -1225,24 +1461,30 @@ const projectTaskColumnMinWidths: Record<ProjectTaskColumnKey, number> = { type:
 const projectTaskColumnMaxWidths: Record<ProjectTaskColumnKey, number> = { type: 180, title: 620, period: 360, owner: 260, status: 180, progress: 160, action: 340 }
 const projectTaskColumnLabels: Record<ProjectTaskColumnKey, string> = { type: '类型', title: '计划项', period: '计划周期', owner: '负责人', status: '完成状态', progress: '完成度', action: '操作' }
 
-type ProjectGanttRow = {
-  id: string
-  label: string
-  meta?: string
-  startDate: string
-  endDate: string
-  barLabel: string
-  barTitle: string
-  barClassName?: string
-  indent?: number
-  prefix?: React.ReactNode
+type ProjectGanttTask = ITask & {
+  statusKey: string
+  statusLabel: string
+  displayEnd?: Date
+  hourlyRate?: number
+  estimatedCost?: number
+}
+
+type ProjectGanttTooltipData =
+  | { task: ITask; segmentIndex: number | null }
+  | { link: ILink }
+  | { rollup: ITask }
+  | { resource: IResource }
+
+type ProjectGanttTooltipProps = {
+  api: IApi
+  data: ProjectGanttTooltipData
 }
 
 type ProjectGanttTimelineProps = {
   title: string
   description: string
   labelHeader: string
-  rows: ProjectGanttRow[]
+  rows: ProjectGanttTask[]
   emptyDescription: string
   sectionClassName: string
 }
@@ -1255,15 +1497,19 @@ function ProjectGanttTimeline({
   emptyDescription,
   sectionClassName
 }: ProjectGanttTimelineProps): React.JSX.Element {
-  const startDate = rows.reduce((earliest, row) => row.startDate < earliest ? row.startDate : earliest, rows[0]?.startDate ?? '')
-  const endDate = rows.reduce((latest, row) => row.endDate > latest ? row.endDate : latest, rows[0]?.endDate ?? startDate)
-  const dayCount = rows.length ? Math.max(1, calendarDaysBetween(startDate, endDate)) : 1
-  const days = Array.from({ length: dayCount }, (_, index) => {
-    const date = parseProjectDate(startDate) ?? new Date()
-    date.setDate(date.getDate() + index)
-    return date
-  })
-  const timelineWidth = dayCount * 34
+  const [ganttApi, setGanttApi] = useState<IApi | null>(null)
+  const validRows = rows.filter((row): row is ProjectGanttTask => Boolean(row.start && row.end))
+  const range = validRows.reduce<{ start: Date; end: Date } | null>((current, row) => {
+    if (!row.start || !row.end) return current
+    if (!current) return { start: row.start, end: row.end }
+    return {
+      start: row.start < current.start ? row.start : current.start,
+      end: row.end > current.end ? row.end : current.end
+    }
+  }, null)
+  const dayCount = range ? Math.max(1, Math.round((range.end.getTime() - range.start.getTime()) / 86_400_000)) : 0
+  const displayRangeEnd = range ? new Date(range.end) : null
+  if (displayRangeEnd) displayRangeEnd.setDate(displayRangeEnd.getDate() - 1)
 
   return (
     <section className={`project-gantt-section ${sectionClassName}`}>
@@ -1272,61 +1518,116 @@ function ProjectGanttTimeline({
           <Title level={4}>{title}</Title>
           <Text type="secondary">{description}</Text>
         </div>
-        <Text type="secondary">{rows.length ? `${formatDate(startDate)} 至 ${formatDate(endDate)} · ${dayCount} 天` : '暂无时间范围'}</Text>
+        <Text type="secondary">{range && displayRangeEnd ? `${formatProjectGanttDate(range.start)} 至 ${formatProjectGanttDate(displayRangeEnd)} · ${dayCount} 天` : '暂无时间范围'}</Text>
       </div>
-      {rows.length ? (
-        <div className="project-gantt-scroll">
-          <div className="project-gantt-grid" style={{ width: 220 + timelineWidth, gridTemplateColumns: `220px ${timelineWidth}px` }}>
-            <div className="project-gantt-label-head">{labelHeader}</div>
-            <div className="project-gantt-axis" style={{ gridTemplateColumns: `repeat(${dayCount}, 34px)` }}>
-              {days.map((date, index) => <div key={date.toISOString()} className={index % 7 === 0 ? 'is-week-start' : ''}>{index % 7 === 0 ? `${date.getMonth() + 1}/${date.getDate()}` : ''}</div>)}
-            </div>
-            {rows.map((row) => {
-              const offset = Math.max(0, calendarDaysBetween(startDate, row.startDate) - 1)
-              const duration = Math.max(1, calendarDaysBetween(row.startDate, row.endDate))
-              return <React.Fragment key={row.id}>
-                <div className="project-gantt-label" style={{ paddingLeft: 12 + (row.indent ?? 0) * 18 }}>
-                  {row.prefix}
-                  <div className="project-gantt-label-copy">
-                    <span title={row.label}>{row.label}</span>
-                    {row.meta && <span className="project-gantt-label-meta" title={row.meta}>{row.meta}</span>}
-                  </div>
-                </div>
-                <div className="project-gantt-track">
-                  <div
-                    className={`project-gantt-bar ${row.barClassName ?? ''}`}
-                    style={{ left: offset * 34 + 2, width: Math.max(28, duration * 34 - 4) }}
-                    title={row.barTitle}
-                    aria-label={row.barTitle}
-                    role="img"
-                  >
-                    <span>{row.barLabel}</span>
-                  </div>
-                </div>
-              </React.Fragment>
-            })}
-          </div>
+      {validRows.length && range ? (
+        <div className="project-gantt-plugin wx-willow-dark-theme" aria-label={title}>
+          <GanttTooltip api={ganttApi ?? undefined} content={ProjectGanttTooltip}>
+            <Gantt
+              tasks={validRows}
+              init={(api) => setGanttApi(api)}
+              taskTypes={[
+                { id: 'task', label: projectTaskTypeMeta.task.label },
+                { id: 'phase', label: projectTaskTypeMeta.phase.label },
+                { id: 'milestone', label: projectTaskTypeMeta.milestone.label },
+                { id: 'resource', label: '项目人员' }
+              ]}
+              columns={[
+                { id: 'text', header: labelHeader, width: 240, flexgrow: 1, resize: true },
+                { id: 'start', header: '开始', width: 112, align: 'center', resize: true, template: (value) => value instanceof Date ? formatProjectGanttDate(value) : String(value ?? '') },
+                { id: 'end', header: '结束', width: 112, align: 'center', resize: true, getter: (task) => task.displayEnd ?? task.end, template: (value) => value instanceof Date ? formatProjectGanttDate(value) : String(value ?? '') },
+                { id: 'duration', header: '工期', width: 76, align: 'center', resize: true }
+              ]}
+              readonly
+              lengthUnit="day"
+              durationUnit="day"
+              cellWidth={42}
+              cellHeight={42}
+              scaleHeight={44}
+              gridWidth={480}
+              autoScale={false}
+              zoom={false}
+              cellBorders="full"
+              displayMode="all"
+              start={range.start}
+              end={range.end}
+              scales={projectGanttScales}
+              highlightTime={projectGanttHighlightTime}
+              taskTemplate={ProjectGanttTaskTemplate}
+            />
+          </GanttTooltip>
         </div>
       ) : <Empty className="project-gantt-empty" description={emptyDescription} />}
     </section>
   )
 }
 
+function ProjectGanttTooltip({ data }: ProjectGanttTooltipProps): React.JSX.Element {
+  if (!('task' in data)) return <div className="project-gantt-tooltip">暂无甘特图信息</div>
+
+  const task = data.task as ProjectGanttTask
+  const endDate = task.displayEnd ?? task.end
+  const isResource = task.statusKey === 'resource'
+  const dateText = (value: unknown): string => value instanceof Date ? formatProjectGanttDate(value) : '—'
+
+  return (
+    <div className="project-gantt-tooltip">
+      <div className="project-gantt-tooltip-title">{String(task.text ?? '未命名计划项')}</div>
+      {task.statusLabel ? <div className="project-gantt-tooltip-status">{task.statusLabel}</div> : null}
+      <dl className="project-gantt-tooltip-details">
+        <div><dt>开始日期</dt><dd>{dateText(task.start)}</dd></div>
+        <div><dt>结束日期</dt><dd>{dateText(endDate)}</dd></div>
+        {typeof task.progress === 'number' ? <div><dt>完成进度</dt><dd>{task.progress}%</dd></div> : null}
+        {isResource ? <>
+          <div><dt>工时报价</dt><dd className="is-accent">{formatRate(Number(task.hourlyRate ?? 0))}</dd></div>
+          <div><dt>人力预估成本</dt><dd className="is-warning">{formatAmount(Number(task.estimatedCost ?? 0))}</dd></div>
+        </> : null}
+      </dl>
+      {task.details ? <div className="project-gantt-tooltip-details-text">{String(task.details)}</div> : null}
+    </div>
+  )
+}
+
+function ProjectGanttTaskTemplate({ data }: { data: ITask }): React.JSX.Element {
+  const statusLabel = String(data.statusLabel ?? '')
+  const taskLabel = String(data.text ?? '')
+  const titleParts = [taskLabel, statusLabel, typeof data.progress === 'number' ? `${data.progress}%` : ''].filter(Boolean)
+  if (data.statusKey === 'resource') {
+    titleParts.push(`工时报价：${formatRate(Number(data.hourlyRate ?? 0))}`, `人力预估成本：${formatAmount(Number(data.estimatedCost ?? 0))}`)
+  }
+  const title = titleParts.join(' · ')
+  return <div className="project-gantt-task-content" data-status={String(data.statusKey ?? 'not_started')} title={title} aria-label={title}>{taskLabel}</div>
+}
+
+const addProjectGanttDay = (value: string): Date | null => {
+  const date = parseProjectDate(value)
+  if (!date) return null
+  date.setDate(date.getDate() + 1)
+  return date
+}
+
 function ProjectTaskGantt({ tasks }: { tasks: ProjectPlanTask[] }): React.JSX.Element {
-  const rows = tasks.map<ProjectGanttRow>((task) => {
+  const parentTaskIds = new Set(tasks.flatMap((task) => task.parentTaskId ? [task.parentTaskId] : []))
+  const rows = tasks.flatMap<ProjectGanttTask>((task) => {
     const type = projectTaskTypeMeta[task.taskType]
     const status = projectTaskStatusMeta[task.status]
-    return {
+    const start = parseProjectDate(task.startDate)
+    const end = addProjectGanttDay(task.endDate)
+    if (!start || !end) return []
+    return [{
       id: task.id,
-      label: task.title,
-      startDate: task.startDate,
-      endDate: task.endDate,
-      barLabel: task.title,
-      barTitle: `${task.title} · ${status.label} · ${task.progressPercent}%`,
-      barClassName: `is-${task.taskType} is-${task.status}`,
-      indent: task.depth,
-      prefix: <Tag color={type.color}>{type.label}</Tag>
-    }
+      text: task.title,
+      start,
+      end,
+      displayEnd: parseProjectDate(task.endDate) ?? undefined,
+      progress: Math.min(100, Math.max(0, task.progressPercent)),
+      type: task.taskType,
+      parent: task.parentTaskId ?? 0,
+      open: parentTaskIds.has(task.id),
+      details: task.description,
+      statusKey: task.status,
+      statusLabel: `${type.label} · ${status.label}`
+    }]
   })
 
   return <ProjectGanttTimeline title="任务甘特图" description="按任务起止时间展示项目执行节奏" labelHeader="任务" rows={rows} emptyDescription="新增里程碑或任务后生成任务甘特图" sectionClassName="project-task-gantt" />
@@ -1336,17 +1637,27 @@ function ProjectResourceGantt({ participants }: { participants: ProjectParticipa
   const rows = participants
     .slice()
     .sort((left, right) => left.startDate.localeCompare(right.startDate) || left.personName.localeCompare(right.personName, 'zh-CN'))
-    .map<ProjectGanttRow>((participant) => ({
-      id: participant.id,
-      label: participant.personName,
-      meta: [participant.employeeNo, participant.department, participant.role].filter(Boolean).join(' · ') || '未补充岗位信息',
-      startDate: participant.startDate,
-      endDate: participant.endDate,
-      barLabel: participant.personName,
-      barTitle: `${participant.personName} · 参与开始：${formatDate(participant.startDate)} · 参与结束：${formatDate(participant.endDate)}`,
-      barClassName: 'is-resource',
-      prefix: <span className="project-gantt-label-icon" aria-hidden="true"><TeamOutlined /></span>
-    }))
+    .flatMap<ProjectGanttTask>((participant) => {
+      const start = parseProjectDate(participant.startDate)
+      const end = addProjectGanttDay(participant.endDate)
+      if (!start || !end) return []
+      return [{
+        id: participant.id,
+        text: participant.personName,
+        start,
+        end,
+        displayEnd: parseProjectDate(participant.endDate) ?? undefined,
+        progress: 100,
+        type: 'resource',
+        parent: 0,
+        open: false,
+        details: [participant.employeeNo, participant.department, participant.role].filter(Boolean).join(' · '),
+        statusKey: 'resource',
+        statusLabel: '项目人员',
+        hourlyRate: participant.hourlyRate,
+        estimatedCost: participant.estimatedCost
+      }]
+    })
 
   return <ProjectGanttTimeline title="人力资源甘特图" description="按参与开始时间展示项目内所有人员的参与周期" labelHeader="项目人员" rows={rows} emptyDescription="绑定项目参与人员后生成资源甘特图" sectionClassName="project-resource-gantt" />
 }
@@ -1757,7 +2068,8 @@ function ProjectDetail({
   onBack,
   onChanged,
   onDeleted,
-  modelSettings
+  modelSettings,
+  matchScoreThreshold
 }: {
   project: ManagedProject
   progress: ProjectAnalysisProgress | null
@@ -1765,10 +2077,12 @@ function ProjectDetail({
   onChanged: () => void
   onDeleted: () => void
   modelSettings: ModelSettings | null
+  matchScoreThreshold: number
 }): React.JSX.Element {
   const { message, modal } = AntApp.useApp()
   const [current, setCurrent] = useState(project)
   const [requirements, setRequirements] = useState<ProjectRequirement[]>([])
+  const [allRequirements, setAllRequirements] = useState<ProjectRequirement[]>([])
   const [requirementsTotal, setRequirementsTotal] = useState(0)
   const [requirementSet, setRequirementSet] = useState<ProjectRequirementSetSummary | null>(null)
   const [selectedRequirementIds, setSelectedRequirementIds] = useState<React.Key[]>([])
@@ -1777,11 +2091,12 @@ function ProjectDetail({
   const [splitRequirementTarget, setSplitRequirementTarget] = useState<ProjectRequirement | null>(null)
   const [requirementPage, setRequirementPage] = useState(1)
   const [requirementPageSize, setRequirementPageSize] = useState(20)
+  const [requirementStatusFilter, setRequirementStatusFilter] = useState<ProjectRequirementStatus | undefined>()
   const [costs, setCosts] = useState<ProjectCostEntry[]>([])
   const [assets, setAssets] = useState<ProjectAsset[]>([])
   const [projectDocuments, setProjectDocuments] = useState<ProjectDocumentSnapshot[]>([])
   const [analysisLogs, setAnalysisLogs] = useState<ProjectAnalysisLogEntry[]>([])
-  const [analysisLogsExpanded, setAnalysisLogsExpanded] = useState(true)
+  const [analysisLogsExpanded, setAnalysisLogsExpanded] = useState(false)
   const [participants, setParticipants] = useState<ProjectParticipant[]>([])
   const [tasks, setTasks] = useState<ProjectPlanTask[]>([])
   const [organizationPeople, setOrganizationPeople] = useState<OrganizationPerson[]>([])
@@ -1808,20 +2123,41 @@ function ProjectDetail({
   const [requirementForm] = Form.useForm<ProjectRequirementInput>()
   const [splitForm] = Form.useForm<{ parts: string }>()
   const analysisLogRequestRef = useRef(0)
+  const analysisLogInitializedRef = useRef(false)
+  const analysisLogLatestIdRef = useRef('')
+
+  const applyAnalysisLogs = useCallback((nextLogs: ProjectAnalysisLogEntry[]): void => {
+    const latestId = nextLogs[0]?.id ?? ''
+    const matchingTaskIds = new Set(nextLogs
+      .filter((log) => log.taskType === 'matching' || log.phase === 'matching')
+      .map((log) => log.taskId))
+    const latestIsAgreementLog = nextLogs[0]?.taskType === 'agreement' && !matchingTaskIds.has(nextLogs[0]?.taskId ?? '')
+    const hasNewAgreementLog = analysisLogInitializedRef.current && latestId !== analysisLogLatestIdRef.current && latestIsAgreementLog
+    analysisLogInitializedRef.current = true
+    analysisLogLatestIdRef.current = latestId
+    if (hasNewAgreementLog) setAnalysisLogsExpanded(true)
+    setAnalysisLogs(nextLogs)
+  }, [])
 
   const reloadAnalysisLogs = useCallback(async (): Promise<void> => {
     const requestId = analysisLogRequestRef.current + 1
     analysisLogRequestRef.current = requestId
     const nextLogs = await window.visslm.listProjectAnalysisLogs(project.id, 2000)
-    if (requestId === analysisLogRequestRef.current) setAnalysisLogs(nextLogs)
-  }, [project.id])
+    if (requestId === analysisLogRequestRef.current) applyAnalysisLogs(nextLogs)
+  }, [applyAnalysisLogs, project.id])
 
   const reload = useCallback(async (): Promise<void> => {
     setLoading(true)
     try {
-      const [nextProject, requirementPageResult, nextRequirementSet, nextCosts, nextAssets, nextDocuments, nextLogs, nextParticipants, nextTasks] = await Promise.all([
+      const [nextProject, requirementPageResult, nextAllRequirements, nextRequirementSet, nextCosts, nextAssets, nextDocuments, nextLogs, nextParticipants, nextTasks] = await Promise.all([
         window.visslm.getManagedProject(project.id),
-        window.visslm.listProjectRequirements({ projectId: project.id, page: requirementPage, pageSize: requirementPageSize }),
+        window.visslm.listProjectRequirements({
+          projectId: project.id,
+          page: requirementPage,
+          pageSize: requirementPageSize,
+          ...(requirementStatusFilter ? { status: requirementStatusFilter } : {})
+        }),
+        window.visslm.listAllProjectRequirements(project.id),
         window.visslm.getProjectRequirementSet(project.id),
         window.visslm.listProjectCostEntries(project.id),
         window.visslm.listProjectAssets(project.id),
@@ -1832,6 +2168,7 @@ function ProjectDetail({
       ])
       if (nextProject) setCurrent(nextProject)
       setRequirements(requirementPageResult.rows)
+      setAllRequirements(nextAllRequirements)
       setRequirementsTotal(requirementPageResult.total)
       setRequirementSet(nextRequirementSet)
       setSelectedRequirementIds((ids) => ids.filter((id) => requirementPageResult.rows.some((item) => item.id === id)))
@@ -1842,13 +2179,19 @@ function ProjectDetail({
       setCosts(nextCosts)
       setAssets(nextAssets)
       setProjectDocuments(nextDocuments)
-      setAnalysisLogs(nextLogs)
+      applyAnalysisLogs(nextLogs)
       setParticipants(nextParticipants)
       setTasks(nextTasks)
     } finally {
       setLoading(false)
     }
-  }, [project.id, requirementPage, requirementPageSize])
+  }, [applyAnalysisLogs, project.id, requirementPage, requirementPageSize, requirementStatusFilter])
+
+  useEffect(() => {
+    analysisLogInitializedRef.current = false
+    analysisLogLatestIdRef.current = ''
+    setAnalysisLogsExpanded(false)
+  }, [project.id])
 
   useEffect(() => {
     void reload()
@@ -2007,28 +2350,50 @@ function ProjectDetail({
     else message.success(result.message)
   }
 
-  const saveRequirementKeyInfoTerms = async (id: string, terms: string[]): Promise<void> => {
+  const saveRequirementKeyInfoTerms = async (id: string, terms: string[]): Promise<ProjectAnalysisStartResult> => {
     const updated = await window.visslm.updateProjectRequirementKeyInfoTerms(id, terms)
     if (!updated) {
       message.error('关键功能信息词保存失败')
-      return
+      return { ok: false, message: '关键功能信息词保存失败' }
     }
     setMatchRequirement((selected) => selected?.id === id ? updated : selected)
     const result = await window.visslm.startProjectRequirementMatching(id)
     if (!result.ok) {
       message.error(result.message)
       await reload()
-      return
+      return result
     }
     message.success('补充信息词已保存，正在重新执行语义匹配')
     await reload()
     onChanged()
+    return result
   }
 
   const updateRequirementStatus = async (id: string, status: ProjectRequirementStatus): Promise<void> => {
     await window.visslm.updateProjectRequirementStatus(id, status)
     await reload()
     onChanged()
+  }
+
+  const selectRequirementStatus = (status: ProjectRequirementStatus): void => {
+    setRequirementStatusFilter(status)
+    setRequirementPage(1)
+    setSelectedRequirementIds([])
+  }
+
+  const clearRequirementStatusFilter = (): void => {
+    setRequirementStatusFilter(undefined)
+    setRequirementPage(1)
+    setSelectedRequirementIds([])
+  }
+
+  const handleRequirementStatusCardKeyDown = (
+    event: React.KeyboardEvent<HTMLDivElement>,
+    status: ProjectRequirementStatus
+  ): void => {
+    if (event.key !== 'Enter' && event.key !== ' ') return
+    event.preventDefault()
+    selectRequirementStatus(status)
   }
 
   const deleteRequirement = async (id: string): Promise<void> => {
@@ -2184,17 +2549,31 @@ function ProjectDetail({
   }
 
   const loadRecords = async (): Promise<void> => {
-    const result = await window.visslm.listRecords({ page: 1, pageSize: 50, search: recordSearch })
+    const result = await window.visslm.listRecords({
+      page: 1,
+      pageSize: 50,
+      search: recordSearch,
+      excludeProjectAssetProjectId: current.id
+    })
     setRecords(result.rows)
     setRecordTotal(result.total)
   }
 
-  const linkAsset = async (recordUid: string): Promise<void> => {
-    const linked = await window.visslm.linkProjectAsset(current.id, recordUid)
-    if (linked) {
+  const linkAsset = async (recordUid: string, requirementId?: string): Promise<boolean> => {
+    try {
+      const linked = await window.visslm.linkProjectAsset(current.id, recordUid, requirementId)
+      if (!linked) {
+        message.warning('项目资产关联失败，数据中心记录或需求条目不存在')
+        return false
+      }
       await reload()
-      message.success('已关联项目资产')
+      message.success(requirementId ? '已关联项目资产和当前需求' : '已关联项目资产')
       onChanged()
+      if (!requirementId) await loadRecords()
+      return true
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '项目资产关联失败')
+      return false
     }
   }
 
@@ -2204,6 +2583,60 @@ function ProjectDetail({
       await reload()
       message.success(result.message)
       onChanged()
+    }
+  }
+
+  const unlinkAssetRequirement = async (recordUid: string, requirementId: string): Promise<boolean> => {
+    try {
+      let result: { ok: boolean; message: string }
+      if (typeof window.visslm.unlinkProjectAssetRequirement === 'function') {
+        result = await window.visslm.unlinkProjectAsset(current.id, recordUid)
+      } else {
+        // Keep already-open windows usable while their preload still comes from the previous build.
+        const asset = assets.find((item) => item.recordUid === recordUid)
+        const otherRequirementIds = asset?.requirements
+          .filter((item) => item.requirementId !== requirementId)
+          .map((item) => item.requirementId) ?? []
+        const removed = await window.visslm.unlinkProjectAsset(current.id, recordUid)
+        if (!removed.ok) {
+          result = removed
+        } else {
+          for (const otherRequirementId of [] as string[]) {
+            const restored = await window.visslm.linkProjectAsset(current.id, recordUid, otherRequirementId)
+            if (!restored) throw new Error('恢复其他需求关联失败')
+          }
+          result = { ok: true, message: '当前需求已取消数据关联' }
+        }
+      }
+      if (!result.ok) {
+        message.warning(result.message)
+        return false
+      }
+      await reload()
+      message.success(result.message)
+      onChanged()
+      return true
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '取消需求与数据的关联失败')
+      return false
+    }
+  }
+
+  const openRequirementMatch = async (requirementId: string): Promise<void> => {
+    const localRequirement = requirements.find((item) => item.id === requirementId)
+    if (localRequirement) {
+      setMatchRequirement(localRequirement)
+      return
+    }
+    try {
+      const requirement = await window.visslm.getProjectRequirement(requirementId)
+      if (!requirement || requirement.projectId !== current.id) {
+        message.warning('关联的需求条目不存在或已不属于当前项目')
+        return
+      }
+      setMatchRequirement(requirement)
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '打开需求匹配明细失败')
     }
   }
 
@@ -2324,6 +2757,7 @@ function ProjectDetail({
   }
 
   const projectProgress = progress?.projectId === current.id ? progress : null
+  const availableAssetRecords = records.filter((row) => !assets.some((asset) => asset.recordUid === row.uid))
   const isProcessing = current.analysisStatus === 'processing' || current.matchStatus === 'processing'
   const isFailed = current.analysisStatus === 'failed' || current.matchStatus === 'failed'
   const analysisPhase = projectProgress?.phase
@@ -2362,7 +2796,13 @@ function ProjectDetail({
   const actualCostPercent = current.contractAmount > 0 ? (current.actualCost / current.contractAmount) * 100 : 0
   const remainingQuotaPercent = current.contractAmount > 0 ? (current.remainingQuota / current.contractAmount) * 100 : 0
   const documentStatus = projectProgress?.message || current.analysisMessage || current.matchMessage || (current.currentDocumentName ? '技术协议已建立索引' : '尚未上传技术协议')
-  const latestAnalysisLog = analysisLogs[0]
+  const matchingTaskIds = new Set(analysisLogs
+    .filter((log) => log.taskType === 'matching' || log.phase === 'matching')
+    .map((log) => log.taskId))
+  const agreementAnalysisLogs = analysisLogs.filter((log) => !matchingTaskIds.has(log.taskId))
+  const latestAnalysisLog = agreementAnalysisLogs[0]
+  const activeRequirementStatusMeta = requirementStatusFilter ? requirementStatusMeta[requirementStatusFilter] : null
+  const relationshipNodeCount = allRequirements.length + assets.length + projectDocuments.length + participants.length + tasks.length + costs.length
 
   return (
     <div className="project-detail-page page-stack">
@@ -2387,6 +2827,7 @@ function ProjectDetail({
                 { key: 'knowledge', label: '查看技术协议', icon: <FileTextOutlined />, onClick: () => setActiveTab('knowledge') },
                 { key: 'requirements', label: '查看功能需求', icon: <FileSearchOutlined />, onClick: () => setActiveTab('requirements') },
                 { key: 'assets', label: '查看项目资产', icon: <DatabaseOutlined />, onClick: () => setActiveTab('assets') },
+                { key: 'relationships', label: '查看关系图谱', icon: <ApartmentOutlined />, onClick: () => setActiveTab('relationships') },
                 { type: 'divider' },
                 { key: 'delete', label: '删除项目', icon: <DeleteOutlined />, danger: true, disabled: isProcessing, onClick: deleteCurrentProject }
               ]
@@ -2495,7 +2936,7 @@ function ProjectDetail({
         </section>
       )}
 
-      {analysisLogs.length > 0 && (
+      {agreementAnalysisLogs.length > 0 && (
         <section className={`project-analysis-log-panel${analysisLogsExpanded ? '' : ' is-collapsed'}`} aria-label="技术协议执行日志">
           <div className="project-analysis-log-heading">
             <div>
@@ -2504,7 +2945,7 @@ function ProjectDetail({
             </div>
             <Space size={8}>
               {latestAnalysisLog && <Tag color={latestAnalysisLog.status === 'failed' ? 'error' : latestAnalysisLog.status === 'success' ? 'success' : 'processing'}>{analysisLogPhaseMeta[latestAnalysisLog.phase]}</Tag>}
-              <Text type="secondary">{analysisLogs.length} 条记录</Text>
+              <Text type="secondary">{agreementAnalysisLogs.length} 条记录</Text>
               <Tooltip title={analysisLogsExpanded ? '收起执行日志' : '展开执行日志'}>
                 <Button
                   type="text"
@@ -2519,7 +2960,7 @@ function ProjectDetail({
             </Space>
           </div>
           {analysisLogsExpanded && <div id={`project-analysis-log-list-${current.id}`} className="project-analysis-log-list" role="log" aria-live={isProcessing ? 'polite' : 'off'}>
-            {analysisLogs.map((log) => (
+            {agreementAnalysisLogs.map((log) => (
               <div key={log.id} className={`project-analysis-log-entry is-${log.status}${log.logKind === 'model_request' ? ' is-model-request' : ''}`}>
                 <span className="project-analysis-log-dot" aria-hidden="true" />
                 <div className="project-analysis-log-copy">
@@ -2661,6 +3102,7 @@ function ProjectDetail({
                       <button type="button" className="project-resource-link" onClick={() => setActiveTab('assets')}><DatabaseOutlined /><span>项目资产</span><strong>{current.assetCount}</strong><ArrowRightOutlined /></button>
                       <button type="button" className="project-resource-link" onClick={() => setActiveTab('participants')}><TeamOutlined /><span>项目参与人</span><strong>{current.participantCount}</strong><ArrowRightOutlined /></button>
                       <button type="button" className="project-resource-link" onClick={() => setActiveTab('plan')}><CalendarOutlined /><span>项目计划</span><strong>{current.taskCount}</strong><ArrowRightOutlined /></button>
+                      <button type="button" className="project-resource-link project-resource-link-graph" onClick={() => setActiveTab('relationships')}><ApartmentOutlined /><span>关系图谱</span><strong>{relationshipNodeCount}</strong><ArrowRightOutlined /></button>
                     </div>
                   </section>
                 </aside>
@@ -2697,10 +3139,68 @@ function ProjectDetail({
                   </section>
                 ) : (
                   <div className="project-requirement-stats">
-                    <Card className="project-requirement-stat project-requirement-stat-neutral"><Statistic title="未标记" value={current.unmarkedCount} /></Card>
-                    <Card className="project-requirement-stat project-requirement-stat-success"><Statistic title="已满足" value={current.satisfiedCount} /></Card>
-                    <Card className="project-requirement-stat project-requirement-stat-info"><Statistic title="待开发" value={current.toDevelopCount} /></Card>
-                    <Card className="project-requirement-stat project-requirement-stat-warning"><Statistic title="待协商" value={current.toNegotiateCount} /></Card>
+                    <Card
+                      className={`project-requirement-stat project-requirement-stat-neutral${requirementStatusFilter === 'unmarked' ? ' is-active' : ''}`}
+                      hoverable
+                      role="button"
+                      tabIndex={0}
+                      aria-pressed={requirementStatusFilter === 'unmarked'}
+                      aria-label={`按状态过滤：未标记，共 ${current.unmarkedCount} 条`}
+                      data-status="unmarked"
+                      onClick={() => selectRequirementStatus('unmarked')}
+                      onKeyDown={(event) => handleRequirementStatusCardKeyDown(event, 'unmarked')}
+                    >
+                      <Statistic title="未标记" value={current.unmarkedCount} />
+                    </Card>
+                    <Card
+                      className={`project-requirement-stat project-requirement-stat-success${requirementStatusFilter === 'satisfied' ? ' is-active' : ''}`}
+                      hoverable
+                      role="button"
+                      tabIndex={0}
+                      aria-pressed={requirementStatusFilter === 'satisfied'}
+                      aria-label={`按状态过滤：已满足，共 ${current.satisfiedCount} 条`}
+                      data-status="satisfied"
+                      onClick={() => selectRequirementStatus('satisfied')}
+                      onKeyDown={(event) => handleRequirementStatusCardKeyDown(event, 'satisfied')}
+                    >
+                      <Statistic title="已满足" value={current.satisfiedCount} />
+                    </Card>
+                    <Card
+                      className={`project-requirement-stat project-requirement-stat-info${requirementStatusFilter === 'to_develop' ? ' is-active' : ''}`}
+                      hoverable
+                      role="button"
+                      tabIndex={0}
+                      aria-pressed={requirementStatusFilter === 'to_develop'}
+                      aria-label={`按状态过滤：待开发，共 ${current.toDevelopCount} 条`}
+                      data-status="to_develop"
+                      onClick={() => selectRequirementStatus('to_develop')}
+                      onKeyDown={(event) => handleRequirementStatusCardKeyDown(event, 'to_develop')}
+                    >
+                      <Statistic title="待开发" value={current.toDevelopCount} />
+                    </Card>
+                    <Card
+                      className={`project-requirement-stat project-requirement-stat-warning${requirementStatusFilter === 'to_negotiate' ? ' is-active' : ''}`}
+                      hoverable
+                      role="button"
+                      tabIndex={0}
+                      aria-pressed={requirementStatusFilter === 'to_negotiate'}
+                      aria-label={`按状态过滤：待协商，共 ${current.toNegotiateCount} 条`}
+                      data-status="to_negotiate"
+                      onClick={() => selectRequirementStatus('to_negotiate')}
+                      onKeyDown={(event) => handleRequirementStatusCardKeyDown(event, 'to_negotiate')}
+                    >
+                      <Statistic title="待协商" value={current.toNegotiateCount} />
+                    </Card>
+                  </div>
+                )}
+                {!requirementSet && requirementStatusFilter && activeRequirementStatusMeta && (
+                  <div className="project-requirement-filter-bar" role="status" aria-live="polite">
+                    <Space size={8} wrap>
+                      <Text type="secondary">当前过滤</Text>
+                      <Tag color={activeRequirementStatusMeta.color}>{activeRequirementStatusMeta.label}</Tag>
+                      <Text className="project-requirement-filter-count" type="secondary">共 {requirementsTotal} 条需求</Text>
+                    </Space>
+                    <Button type="link" size="small" icon={<CloseOutlined />} onClick={clearRequirementStatusFilter}>清除过滤</Button>
                   </div>
                 )}
                 {!requirementsTotal ? (
@@ -2849,7 +3349,43 @@ function ProjectDetail({
             label: `项目资产 (${assets.length})`,
             children: (
               <Card className="project-table-card" extra={<Button type="primary" icon={<LinkOutlined />} onClick={() => { setAssetModalOpen(true); void loadRecords() }}>关联数据中心记录</Button>}>
-                {assets.length ? <ResizableTable<ProjectAsset> tableKey="project-assets" rowKey="recordUid" dataSource={assets} pagination={{ pageSize: 10 }} scroll={{ x: 800, y: projectDetailTableScrollY }} columns={[{ title: '数据名称', dataIndex: 'name', render: (value: string, row) => <Button type="link" className="project-table-link" onClick={() => void openRecord(row.recordUid)}>{value || row.recordUid}</Button> }, { title: '类型', dataIndex: 'nodeType', width: 160 }, { title: '业务编号', dataIndex: 'itemId', width: 180 }, { title: '关联时间', dataIndex: 'linkedAt', width: 180, render: formatDate }, { title: '操作', key: 'action', width: 110, render: (_value, row) => <Popconfirm title="取消项目资产关联？" onConfirm={() => void unlinkAsset(row.recordUid)}><Button type="link" danger size="small" icon={<DisconnectOutlined />}>取消关联</Button></Popconfirm> }]} /> : <Empty description="尚未关联数据中心记录" />}
+                {assets.length ? <ResizableTable<ProjectAsset>
+                  tableKey="project-assets-v2"
+                  rowKey="recordUid"
+                  dataSource={assets}
+                  pagination={{ pageSize: 10 }}
+                  scroll={{ x: 1160, y: projectDetailTableScrollY }}
+                  columns={[
+                    { title: '数据名称', dataIndex: 'name', width: 240, ellipsis: true, render: (value: string, row) => <Button type="link" className="project-table-link" onClick={() => void openRecord(row.recordUid)}>{value || row.recordUid}</Button> },
+                    { title: '类型', dataIndex: 'nodeType', width: 140 },
+                    { title: '业务编号', dataIndex: 'itemId', width: 180 },
+                    {
+                      title: '关联需求',
+                      key: 'requirements',
+                      width: 300,
+                      render: (_value, row) => row.requirements.length ? (
+                        <div className="project-asset-requirements">
+                          {row.requirements.map((requirement) => (
+                            <Button
+                              key={requirement.requirementId}
+                              type="link"
+                              size="small"
+                              className="project-asset-requirement-link"
+                              icon={<FileSearchOutlined />}
+                              title={`打开需求匹配明细：${requirement.title}`}
+                              aria-label={`打开需求匹配明细：${requirement.title}`}
+                              onClick={() => void openRequirementMatch(requirement.requirementId)}
+                            >
+                              <span>{requirement.requirementNo > 0 ? `REQ-${String(requirement.requirementNo).padStart(3, '0')} · ` : ''}{requirement.title}</span>
+                            </Button>
+                          ))}
+                        </div>
+                      ) : <Text type="secondary">未指定需求</Text>
+                    },
+                    { title: '关联时间', dataIndex: 'linkedAt', width: 170, render: formatDate },
+                    { title: '操作', key: 'action', width: 110, render: (_value, row) => <Popconfirm title="取消项目资产关联？" onConfirm={() => void unlinkAsset(row.recordUid)}><Button type="link" danger size="small" icon={<DisconnectOutlined />}>取消关联</Button></Popconfirm> }
+                  ]}
+                /> : <Empty description="尚未关联数据中心记录" />}
               </Card>
             )
           },
@@ -2881,11 +3417,28 @@ function ProjectDetail({
                 </Space>
               </Card>
             )
+          },
+          {
+            key: 'relationships',
+            label: `关系图谱 (${relationshipNodeCount})`,
+            children: activeTab === 'relationships' ? (
+              <ProjectRelationshipGraph
+                project={current}
+                requirements={allRequirements}
+                assets={assets}
+                participants={participants}
+                tasks={tasks}
+                costs={costs}
+                documents={projectDocuments}
+                onOpenRecord={(uid) => void openRecord(uid)}
+                onOpenRequirement={(requirementId) => void openRequirementMatch(requirementId)}
+              />
+            ) : null
           }
         ]}
       />
 
-      <MatchDrawer requirement={matchRequirement} open={Boolean(matchRequirement)} onClose={() => setMatchRequirement(null)} onOpenRecord={(uid) => void openRecord(uid)} onLinkAsset={(uid) => void linkAsset(uid)} onSaveKeyInfoTerms={saveRequirementKeyInfoTerms} />
+      <MatchDrawer requirement={matchRequirement} open={Boolean(matchRequirement)} assets={assets} progress={projectProgress} onClose={() => setMatchRequirement(null)} onOpenRecord={(uid) => void openRecord(uid)} onLinkAsset={(uid, requirementId) => linkAsset(uid, requirementId)} onUnlinkAssetRequirement={(uid, requirementId) => unlinkAssetRequirement(uid, requirementId)} onSaveKeyInfoTerms={saveRequirementKeyInfoTerms} matchScoreThreshold={matchScoreThreshold} />
 
       <Modal title="编辑项目基本信息" open={editModalOpen} onCancel={() => setEditModalOpen(false)} footer={null} destroyOnHidden afterOpenChange={(open) => { if (open) editForm.setFieldsValue(current) }}>
         <ProjectForm form={editForm} onFinish={(values) => void saveProject(values)} organizationPeople={organizationPeople} currentProject={current} />
@@ -3093,7 +3646,7 @@ function ProjectDetail({
 
       <Modal title="关联数据中心记录" open={assetModalOpen} onCancel={() => setAssetModalOpen(false)} footer={null} width={900}>
         <div className="project-asset-search"><Input.Search allowClear prefix={<SearchOutlined />} placeholder="搜索数据名称、编号或内容" value={recordSearch} onChange={(event) => setRecordSearch(event.target.value)} onSearch={() => void loadRecords()} enterButton="搜索" /></div>
-        <ResizableTable<RecordRow> tableKey="project-asset-picker" rowKey="uid" dataSource={records.filter((row) => !assets.some((asset) => asset.recordUid === row.uid))} pagination={{ total: recordTotal, pageSize: 50, showTotal: (count) => `共 ${count} 条数据` }} scroll={{ x: 760, y: projectCompactTableScrollY }} columns={[{ title: '数据名称', dataIndex: 'name', render: (value: string) => value }, { title: '类型', dataIndex: 'nodeType', width: 160 }, { title: '业务编号', dataIndex: 'itemId', width: 180 }, { title: '操作', key: 'action', width: 110, render: (_value, row) => <Button type="link" icon={<LinkOutlined />} onClick={() => void linkAsset(row.uid)}>关联</Button> }]} />
+        <ResizableTable<RecordRow> tableKey="project-asset-picker" rowKey="uid" dataSource={availableAssetRecords} pagination={{ total: recordTotal, pageSize: 50, showTotal: (count) => `共 ${count} 条数据` }} scroll={{ x: 760, y: projectCompactTableScrollY }} columns={[{ title: '数据名称', dataIndex: 'name', render: (value: string) => value }, { title: '类型', dataIndex: 'nodeType', width: 160 }, { title: '业务编号', dataIndex: 'itemId', width: 180 }, { title: '操作', key: 'action', width: 110, render: (_value, row) => <Button type="link" icon={<LinkOutlined />} onClick={() => void linkAsset(row.uid)}>关联</Button> }]} />
       </Modal>
     </div>
   )
@@ -3102,11 +3655,13 @@ function ProjectDetail({
 export function ProjectManagementPage({
   refreshKey,
   onChanged,
-  modelSettings
+  modelSettings,
+  matchScoreThreshold
 }: {
   refreshKey: number
   onChanged: () => void
   modelSettings: ModelSettings | null
+  matchScoreThreshold: number
 }): React.JSX.Element {
   const { message, modal } = AntApp.useApp()
   const [projects, setProjects] = useState<ManagedProject[]>([])
@@ -3226,7 +3781,7 @@ export function ProjectManagementPage({
   if (selectedProjectId) {
     const selected = projects.find((project) => project.id === selectedProjectId)
     if (selected) {
-      return <ProjectDetail project={selected} progress={progress} modelSettings={modelSettings} onBack={() => { setSelectedProjectId(null); void loadProjects() }} onChanged={() => { void loadProjects(); onChanged() }} onDeleted={() => { setSelectedProjectId(null); void loadProjects(); onChanged() }} />
+      return <ProjectDetail project={selected} progress={progress} modelSettings={modelSettings} matchScoreThreshold={matchScoreThreshold} onBack={() => { setSelectedProjectId(null); void loadProjects() }} onChanged={() => { void loadProjects(); onChanged() }} onDeleted={() => { setSelectedProjectId(null); void loadProjects(); onChanged() }} />
     }
   }
 

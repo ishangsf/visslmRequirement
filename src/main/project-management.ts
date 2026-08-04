@@ -37,7 +37,11 @@ import type {
   ProjectDataTransferResult,
   ProjectDocumentSnapshot
 } from '../shared/project-types'
-import type { KnowledgeIndexProgress, ModelSettings } from '../shared/types'
+import {
+  DEFAULT_PROJECT_MATCHING_SETTINGS,
+  normalizeProjectMatchScore
+} from '../shared/types'
+import type { KnowledgeIndexProgress, ModelSettings, ProjectMatchingSettings } from '../shared/types'
 import { normalizeProjectRequirementText } from '../shared/project-requirement-utils'
 import { AppDatabase } from './database'
 import { KnowledgeService, type KnowledgeRecordMatch } from './knowledge'
@@ -352,7 +356,8 @@ export class ProjectManagementService {
     private readonly db: AppDatabase,
     private readonly knowledge: KnowledgeService,
     private readonly modelSettings: () => ModelSettings,
-    private readonly progress?: (progress: ProjectAnalysisProgress) => void
+    private readonly progress?: (progress: ProjectAnalysisProgress) => void,
+    private readonly projectMatchingSettings: () => ProjectMatchingSettings = () => DEFAULT_PROJECT_MATCHING_SETTINGS
   ) {
     this.db.reconcileInterruptedProjectAnalysis()
   }
@@ -528,6 +533,15 @@ export class ProjectManagementService {
     return this.db.listProjectRequirements(query)
   }
 
+  listAllRequirements(projectId: string): ProjectRequirement[] {
+    this.assertProject(projectId)
+    return this.db.listAllProjectRequirements(projectId, 'active')
+  }
+
+  getRequirement(id: string): ProjectRequirement | null {
+    return this.db.getProjectRequirement(id)
+  }
+
   getRequirementSet(projectId: string): ProjectRequirementSetSummary | null {
     return this.db.getReviewProjectRequirementSet(projectId)
   }
@@ -624,7 +638,10 @@ export class ProjectManagementService {
   }
 
   listMatches(query: ProjectRequirementMatchQuery): ProjectRequirementMatchPage {
-    return this.db.listProjectRequirementMatches(query)
+    return this.db.listProjectRequirementMatches({
+      ...query,
+      minScore: normalizeProjectMatchScore(this.projectMatchingSettings().minScore)
+    })
   }
 
   listCostEntries(projectId: string): ProjectCostEntry[] {
@@ -731,13 +748,25 @@ export class ProjectManagementService {
     return this.db.listProjectAssets(projectId)
   }
 
-  linkAsset(projectId: string, recordUid: string): ProjectAsset | null {
+  linkAsset(projectId: string, recordUid: string, requirementId?: string): ProjectAsset | null {
     this.assertProject(projectId)
-    return this.db.linkProjectAsset(projectId, recordUid)
+    const normalizedRequirementId = requirementId?.trim()
+    if (normalizedRequirementId) {
+      const requirement = this.db.getProjectRequirement(normalizedRequirementId)
+      if (!requirement || requirement.projectId !== projectId) {
+        throw new Error('需求条目不存在或不属于当前项目')
+      }
+    }
+    return this.db.linkProjectAsset(projectId, recordUid, normalizedRequirementId)
   }
 
   unlinkAsset(projectId: string, recordUid: string): { ok: boolean; message: string } {
     return this.db.unlinkProjectAsset(projectId, recordUid)
+  }
+
+  unlinkAssetRequirement(projectId: string, recordUid: string, requirementId: string): { ok: boolean; message: string } {
+    this.assertProject(projectId)
+    return this.db.unlinkProjectAssetRequirement(projectId, recordUid, requirementId)
   }
 
   private normalizeProjectInput(input: ManagedProjectInput): ManagedProjectInput {

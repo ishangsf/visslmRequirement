@@ -136,6 +136,30 @@ try {
   assert.equal(analysisLogs[1]?.message, '需求抽取失败')
   assert.equal(analysisLogs[1]?.detail, '协议附件关联已保留，可重试')
 
+  db.saveProjectAnalysisProgress({
+    taskId: 'smoke-matching-task',
+    projectId: project.id,
+    phase: 'matching',
+    message: '正在重新匹配：接口同步',
+    detail: '补充信息词：接口同步',
+    current: 0,
+    total: 1,
+    status: 'running'
+  })
+  db.saveProjectAnalysisProgress({
+    taskId: 'smoke-matching-task',
+    projectId: project.id,
+    phase: 'done',
+    message: '功能需求匹配完成',
+    detail: '需求「接口同步」的匹配结果已保存',
+    current: 1,
+    total: 1,
+    status: 'success'
+  })
+  const matchingLogs = db.listProjectAnalysisLogs(project.id).filter((log) => log.taskId === 'smoke-matching-task')
+  assert.equal(matchingLogs.length, 2)
+  assert(matchingLogs.every((log) => log.taskType === 'matching'))
+
   db.insertProjectCostEntry(project.id, {
     type: 'actual',
     category: '人力',
@@ -270,6 +294,8 @@ try {
   const asset = db.linkProjectAsset(project.id, 'smoke-record-1')
   assert(asset)
   assert.equal(db.listProjectAssets(project.id).length, 1)
+  const availableAssetRecords = db.listRecords({ page: 1, pageSize: 20, excludeProjectAssetProjectId: project.id })
+  assert.equal(availableAssetRecords.rows.some((row) => row.uid === 'smoke-record-1'), false)
 
   const document = db.insertKnowledgeDocument({
     id: randomUUID(),
@@ -498,11 +524,55 @@ try {
   ])
   db.updateProjectRequirementAiStatus('smoke-requirement-1', 'satisfied', '已有数据中心能力')
   db.updateProjectRequirementStatus('smoke-requirement-2', 'to_develop')
+  const satisfiedRequirements = db.listProjectRequirements({ projectId: project.id, page: 1, pageSize: 20, status: 'satisfied' })
+  assert.equal(satisfiedRequirements.total, 1)
+  assert.equal(satisfiedRequirements.rows[0]?.id, 'smoke-requirement-1')
+  const toDevelopRequirements = db.listProjectRequirements({ projectId: project.id, page: 1, pageSize: 20, status: 'to_develop' })
+  assert.equal(toDevelopRequirements.total, 1)
+  assert.equal(toDevelopRequirements.rows[0]?.id, 'smoke-requirement-2')
+  const unmarkedRequirements = db.listProjectRequirements({ projectId: project.id, page: 1, pageSize: 20, status: 'unmarked' })
+  assert.equal(unmarkedRequirements.total, 0)
+  db.updateProjectRequirementStatus('smoke-requirement-2', 'to_negotiate')
+  const toNegotiateRequirements = db.listProjectRequirements({ projectId: project.id, page: 1, pageSize: 20, status: 'to_negotiate' })
+  assert.equal(toNegotiateRequirements.total, 1)
+  assert.equal(toNegotiateRequirements.rows[0]?.id, 'smoke-requirement-2')
+  db.updateProjectRequirementStatus('smoke-requirement-2', 'to_develop')
 
   const matchPage = db.listProjectRequirementMatches({ requirementId: 'smoke-requirement-1', page: 1, pageSize: 1 })
   assert.equal(matchPage.total, 2)
   assert.equal(matchPage.rows[0]?.recordUid, 'smoke-record-1')
   assert.equal(matchPage.rows[0]?.finalScore, 95)
+  const thresholdMatchPage = db.listProjectRequirementMatches({ requirementId: 'smoke-requirement-1', page: 1, pageSize: 20, minScore: 40 })
+  assert.equal(thresholdMatchPage.total, 1)
+  assert.equal(thresholdMatchPage.rows[0]?.recordUid, 'smoke-record-1')
+  const serviceMatchPage = service.listMatches({ requirementId: 'smoke-requirement-1', page: 1, pageSize: 20 })
+  assert.equal(serviceMatchPage.total, 1)
+  assert.equal(serviceMatchPage.rows[0]?.finalScore, 95)
+  const linkedAssetWithRequirement = db.linkProjectAsset(project.id, 'smoke-record-1', 'smoke-requirement-1')
+  assert(linkedAssetWithRequirement)
+  assert.equal(linkedAssetWithRequirement.requirements[0]?.requirementId, 'smoke-requirement-1')
+  assert.equal(linkedAssetWithRequirement.requirements[0]?.title, '订单查询')
+  assert.equal(linkedAssetWithRequirement.requirements[0]?.matchScore, 95)
+  const linkedAssetWithSecondRequirement = db.linkProjectAsset(project.id, 'smoke-record-1', 'smoke-requirement-2')
+  assert(linkedAssetWithSecondRequirement)
+  assert.equal(linkedAssetWithSecondRequirement.requirements.length, 2)
+  const linkedMatchPage = db.listProjectRequirementMatches({ requirementId: 'smoke-requirement-1', page: 1, pageSize: 20 })
+  assert.equal(linkedMatchPage.rows[0]?.assetLinked, true)
+  assert.equal(linkedMatchPage.rows[0]?.requirementLinked, true)
+  const unlinkedRequirementAsset = db.unlinkProjectAssetRequirement(project.id, 'smoke-record-1', 'smoke-requirement-1')
+  assert.equal(unlinkedRequirementAsset.ok, true)
+  assert.equal(db.listProjectAssets(project.id).some((item) => item.recordUid === 'smoke-record-1'), false)
+  const availableAssetRecordsAfterUnlink = db.listRecords({ page: 1, pageSize: 20, excludeProjectAssetProjectId: project.id })
+  assert.equal(availableAssetRecordsAfterUnlink.rows.some((row) => row.uid === 'smoke-record-1'), true)
+  const unlinkedMatchPage = db.listProjectRequirementMatches({ requirementId: 'smoke-requirement-1', page: 1, pageSize: 20 })
+  assert.equal(unlinkedMatchPage.rows[0]?.assetLinked, false)
+  assert.equal(unlinkedMatchPage.rows[0]?.requirementLinked, false)
+  const relinkedRequirementAsset = db.linkProjectAsset(project.id, 'smoke-record-1', 'smoke-requirement-1')
+  assert(relinkedRequirementAsset)
+  assert.equal(relinkedRequirementAsset.requirements.length, 1)
+  const relinkedAssetWithSecondRequirement = db.linkProjectAsset(project.id, 'smoke-record-1', 'smoke-requirement-2')
+  assert(relinkedAssetWithSecondRequirement)
+  assert.equal(relinkedAssetWithSecondRequirement.requirements.length, 2)
   const requirementPage = db.listProjectRequirements({ projectId: project.id, page: 1, pageSize: 20 })
   assert.equal(requirementPage.total, 2)
   assert.equal(requirementPage.rows[0]?.module, '订单管理')
@@ -512,6 +582,8 @@ try {
   const deleteRequirementResult = db.deleteProjectRequirement('smoke-requirement-1')
   assert.equal(deleteRequirementResult.ok, true)
   assert.equal(db.listProjectRequirementMatches({ requirementId: 'smoke-requirement-1', page: 1, pageSize: 20 }).total, 0)
+  assert.equal(db.listProjectAssets(project.id).find((asset) => asset.recordUid === 'smoke-record-1')?.requirements.length, 1)
+  assert.equal(db.listProjectAssets(project.id).find((asset) => asset.recordUid === 'smoke-record-1')?.requirements[0]?.requirementId, 'smoke-requirement-2')
   const remainingRequirementPage = db.listProjectRequirements({ projectId: project.id, page: 1, pageSize: 20 })
   assert.equal(remainingRequirementPage.total, 1)
   assert.equal(remainingRequirementPage.rows[0]?.id, 'smoke-requirement-2')
@@ -536,6 +608,7 @@ try {
   assert.equal(db.listProjectTasks(imported.projectId).length, 3)
   assert.equal(db.listProjectRequirements({ projectId: imported.projectId, page: 1, pageSize: 20 }).total, 1)
   assert.equal(db.listProjectAssets(imported.projectId).length, 1)
+  assert.equal(db.listProjectAssets(imported.projectId)[0]?.requirements[0]?.title, '库存同步')
   assert.equal(db.getKnowledgeDocument(document.id)?.id, document.id)
   assert.equal(db.getRecord('smoke-record-1')?.uid, 'smoke-record-1')
   const deleteImportedResult = db.deleteManagedProject(imported.projectId)

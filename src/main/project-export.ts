@@ -16,6 +16,13 @@ const cell = (value: unknown): ExcelCell | '' => {
 
 const listCell = (values: string[] | undefined): string => (values ?? []).join('、')
 
+const assetRequirementCell = (asset: ProjectDataSnapshot['assets'][number]): string => (
+  (asset.requirements ?? []).map((requirement) => {
+    const number = requirement.requirementNo > 0 ? `REQ-${String(requirement.requirementNo).padStart(3, '0')}` : ''
+    return [number, requirement.title].filter(Boolean).join(' ')
+  }).join('；')
+)
+
 const columnName = (index: number): string => {
   let current = index + 1
   let name = ''
@@ -152,7 +159,8 @@ const matchRows = (matches: ProjectRequirementMatch[]): ExcelCell[][] => matches
   match.scoreSource,
   match.reason,
   match.bestChunkId,
-  match.assetLinked ? '是' : '否'
+  match.assetLinked ? '是' : '否',
+  match.requirementLinked ? '是' : '否'
 ].map(cell))
 
 export const createProjectWorkbook = (snapshot: ProjectDataSnapshot): XLSX.WorkBook => {
@@ -184,10 +192,11 @@ export const createProjectWorkbook = (snapshot: ProjectDataSnapshot): XLSX.WorkB
     cost.assetRecordUid ?? '', cost.responsibleParticipantId ?? '', cost.responsiblePersonName ?? '', cost.createdAt, cost.updatedAt
   ].map(cell)), [38, 38, 14, 18, 36, 14, 18, 38, 38, 18, 24, 24])
   appendSheet(workbook, '项目资产', [
-    '项目 ID', '记录 UID', '名称', '节点类型', '项目编号', '描述', '关联时间'
+    '项目 ID', '记录 UID', '名称', '节点类型', '项目编号', '描述', '关联需求', '关联时间'
   ], snapshot.assets.map((asset) => [
-    asset.projectId, asset.recordUid, asset.name, asset.nodeType, asset.itemId, asset.description, asset.linkedAt
-  ].map(cell)), [38, 38, 28, 20, 20, 60, 24])
+    asset.projectId, asset.recordUid, asset.name, asset.nodeType, asset.itemId, asset.description,
+    assetRequirementCell(asset), asset.linkedAt
+  ].map(cell)), [38, 38, 28, 20, 20, 60, 48, 24])
   appendSheet(workbook, '项目计划', [
     '任务 ID', '任务类型', '任务名称', '任务说明', '父任务 ID', '开始日期', '结束日期', '负责人 ID', '负责人',
     '状态', '进度（%）', '排序', '层级', '包含子任务', '创建时间', '更新时间'
@@ -203,8 +212,8 @@ export const createProjectWorkbook = (snapshot: ProjectDataSnapshot): XLSX.WorkB
   ], requirementRows(snapshot.requirements), [38, 12, 14, 20, 32, 70, 30, 14, 22, 38, 60, 12, 14, 36, 14, 14, 36, 14, 10, 38, 38, 10, 38, 24, 24])
   appendSheet(workbook, '需求匹配', [
     '需求 ID', '记录 UID', '记录名称', '节点类型', '项目编号', '记录描述', '向量分数', 'AI 分数', '最终分数',
-    '分数来源', '匹配原因', '最佳分块 ID', '已关联项目资产'
-  ], matchRows(snapshot.matches), [38, 38, 30, 20, 20, 70, 14, 14, 14, 14, 60, 38, 18])
+    '分数来源', '匹配原因', '最佳分块 ID', '已关联项目资产', '已关联当前需求'
+  ], matchRows(snapshot.matches), [38, 38, 30, 20, 20, 70, 14, 14, 14, 14, 60, 38, 18, 18])
 
   return workbook
 }

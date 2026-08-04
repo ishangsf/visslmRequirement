@@ -210,6 +210,14 @@ export interface ProjectPlanTaskMoveInput {
   sortOrder?: number
 }
 
+export interface ProjectAssetRequirement {
+  requirementId: string
+  requirementNo: number
+  title: string
+  linkedAt: string
+  matchScore?: number
+}
+
 export interface ProjectAsset {
   projectId: string
   recordUid: string
@@ -218,6 +226,7 @@ export interface ProjectAsset {
   itemId: string
   description: string
   linkedAt: string
+  requirements: ProjectAssetRequirement[]
 }
 
 export interface ProjectDocumentSnapshot {
@@ -304,6 +313,7 @@ export interface ProjectRequirementQuery {
   projectId: string
   page: number
   pageSize: number
+  status?: ProjectRequirementStatus
   scope?: 'active' | 'published'
 }
 
@@ -363,6 +373,7 @@ export interface ProjectRequirementMatch {
   reason: string
   bestChunkId: string
   assetLinked: boolean
+  requirementLinked: boolean
 }
 
 export interface ProjectRequirementMatchPage {
@@ -374,6 +385,7 @@ export interface ProjectRequirementMatchQuery {
   requirementId: string
   page: number
   pageSize: number
+  minScore?: number
 }
 
 export type ProjectAnalysisPhase =
