@@ -19,6 +19,7 @@ import type {
   DataDeleteResult,
   DataImportResult,
   DashboardStats,
+  FieldDefinition,
   ImageAsset,
   KnowledgeChunk,
   KnowledgeDocument,
@@ -297,6 +298,7 @@ export interface FieldInspectionResult {
   totalRecords: number
   fields: Array<{
     field: string
+    displayName?: string
     nonEmptyRecords: number
     coverageRate: number
     types: string[]
@@ -339,6 +341,7 @@ export interface FieldQueryResult {
   matchedCount: number
   returnedCount: number
   fields: string[]
+  fieldLabels?: Record<string, string>
   records: Array<{
     source: ChatSource
     values: Record<string, string | string[]>
@@ -745,6 +748,17 @@ export class AppDatabase {
       CREATE INDEX IF NOT EXISTS idx_field_profiles_revision
         ON field_profiles(data_revision);
 
+      CREATE TABLE IF NOT EXISTS field_definitions (
+        node_type TEXT NOT NULL,
+        field TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(node_type, field)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_field_definitions_field
+        ON field_definitions(field);
+
       CREATE TABLE IF NOT EXISTS query_cache (
         cache_key TEXT PRIMARY KEY,
         data_revision INTEGER NOT NULL,
@@ -1027,6 +1041,20 @@ export class AppDatabase {
       );
       CREATE INDEX IF NOT EXISTS idx_pm_requirement_matches_rank
         ON pm_requirement_matches(requirement_id, final_score DESC, record_uid);
+
+      CREATE TABLE IF NOT EXISTS pm_project_asset_requirements (
+        project_id TEXT NOT NULL,
+        record_uid TEXT NOT NULL,
+        requirement_id TEXT NOT NULL,
+        linked_at TEXT NOT NULL,
+        PRIMARY KEY(project_id, record_uid, requirement_id),
+        FOREIGN KEY(project_id) REFERENCES pm_projects(id) ON DELETE CASCADE,
+        FOREIGN KEY(record_uid) REFERENCES records(uid) ON DELETE CASCADE,
+        FOREIGN KEY(requirement_id) REFERENCES pm_requirements(id) ON DELETE CASCADE,
+        FOREIGN KEY(project_id, record_uid) REFERENCES pm_project_assets(project_id, record_uid) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_pm_project_asset_requirements_requirement
+        ON pm_project_asset_requirements(requirement_id);
 
       CREATE TABLE IF NOT EXISTS pm_analysis_runs (
         id TEXT PRIMARY KEY,
@@ -1550,7 +1578,9 @@ export class AppDatabase {
       nodeType: String(row.node_type),
       itemId: String(row.item_id),
       content: String(row.normalized_text ?? ''),
-      contentHash: String(row.content_hash ?? '')
+      contentHash: createHash('sha256')
+        .update(`${String(row.content_hash ?? '')}\n${String(row.normalized_text ?? '')}`)
+        .digest('hex')
     }))
   }
 
@@ -1958,7 +1988,10 @@ export class AppDatabase {
 
   saveProjectAnalysisProgress(progress: ProjectAnalysisProgress): void {
     const timestamp = nowIso()
-    const taskType = progress.phase === 'matching' ? 'matching' : 'agreement'
+    const existingRun = this.db.prepare(
+      'SELECT task_type FROM pm_analysis_runs WHERE id = ?'
+    ).get(progress.taskId) as SqlRow | undefined
+    const taskType = existingRun?.task_type === 'matching' || progress.phase === 'matching' ? 'matching' : 'agreement'
     this.db.prepare(`
       INSERT INTO pm_analysis_runs(
         id, project_id, task_type, phase, status, current_count, total_count,
@@ -2163,14 +2196,17 @@ export class AppDatabase {
     `).all(projectId) as SqlRow[]).map((row) => this.mapOrganizationPerson(row))
     const matches = (this.db.prepare(`
       SELECT m.*, r.name AS record_name, r.node_type, r.item_id, r.normalized_text,
-             CASE WHEN a.record_uid IS NULL THEN 0 ELSE 1 END AS asset_linked
+             CASE WHEN a.record_uid IS NULL THEN 0 ELSE 1 END AS asset_linked,
+             CASE WHEN ar.requirement_id IS NULL THEN 0 ELSE 1 END AS requirement_linked
       FROM pm_requirement_matches m
       JOIN pm_requirements q ON q.id = m.requirement_id
       LEFT JOIN records r ON r.uid = m.record_uid
       LEFT JOIN pm_project_assets a ON a.project_id = ? AND a.record_uid = m.record_uid
+      LEFT JOIN pm_project_asset_requirements ar
+        ON ar.project_id = ? AND ar.record_uid = m.record_uid AND ar.requirement_id = m.requirement_id
       WHERE q.project_id = ?
       ORDER BY q.requirement_no ASC, m.final_score DESC, m.record_uid ASC
-    `).all(projectId, projectId) as SqlRow[]).map((row): ProjectRequirementMatch => ({
+    `).all(projectId, projectId, projectId) as SqlRow[]).map((row): ProjectRequirementMatch => ({
       requirementId: String(row.requirement_id),
       recordUid: String(row.record_uid),
       recordName: String(row.record_name ?? ''),
@@ -2183,7 +2219,8 @@ export class AppDatabase {
       scoreSource: String(row.score_source ?? 'vector') === 'ai' ? 'ai' : 'vector',
       reason: String(row.reason ?? ''),
       bestChunkId: String(row.best_chunk_id ?? ''),
-      assetLinked: Number(row.asset_linked ?? 0) === 1
+      assetLinked: Number(row.asset_linked ?? 0) === 1,
+      requirementLinked: Number(row.requirement_linked ?? 0) === 1
     }))
     return {
       format: 'visslm-project',
@@ -2510,6 +2547,24 @@ export class AppDatabase {
           VALUES (?, ?, ?)
         `).run(projectId, recordUid, sourceTimestamp(asset.linkedAt))
         linkedRecordIds.add(recordUid)
+      }
+
+      for (const asset of snapshot.assets ?? []) {
+        const recordUid = String(asset.recordUid ?? '').trim()
+        if (!recordUid || !linkedRecordIds.has(recordUid)) continue
+        for (const linkedRequirement of asset.requirements ?? []) {
+          const sourceRequirementId = String(linkedRequirement.requirementId ?? '').trim()
+          const targetRequirementId = requirementMap.get(sourceRequirementId)
+          if (!targetRequirementId) {
+            warnings.push(`项目资产“${String(asset.name ?? recordUid)}”的需求关联未找到对应需求，已跳过`)
+            continue
+          }
+          this.db.prepare(`
+            INSERT INTO pm_project_asset_requirements(project_id, record_uid, requirement_id, linked_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(project_id, record_uid, requirement_id) DO NOTHING
+          `).run(projectId, recordUid, targetRequirementId, sourceTimestamp(linkedRequirement.linkedAt || asset.linkedAt))
+        }
       }
 
       for (const cost of snapshot.costs ?? []) {
@@ -2874,14 +2929,16 @@ export class AppDatabase {
     const page = Math.max(1, Math.floor(query.page || 1))
     const pageSize = Math.min(200, Math.max(1, Math.floor(query.pageSize || 20)))
     const reviewSet = query.scope === 'published' ? null : this.getReviewProjectRequirementSet(query.projectId)
+    const statusClause = query.status ? ' AND status = ?' : ''
     const where = reviewSet
-      ? 'project_id = ? AND set_id = ?'
+      ? `project_id = ? AND set_id = ?${statusClause}`
       : `project_id = ? AND review_status = 'approved' AND (
           set_id = '' OR set_id IN (
             SELECT id FROM pm_requirement_sets WHERE project_id = ? AND status = 'published'
           )
-        )`
+        )${statusClause}`
     const params = reviewSet ? [query.projectId, reviewSet.id] : [query.projectId, query.projectId]
+    if (query.status) params.push(query.status)
     const total = Number((this.db.prepare(
       `SELECT COUNT(*) AS count FROM pm_requirements WHERE ${where}`
     ).get(...params) as SqlRow).count)
@@ -2894,16 +2951,21 @@ export class AppDatabase {
     return { rows: rows.map((row) => this.mapProjectRequirement(row)), total }
   }
 
-  listAllProjectRequirements(projectId: string): ProjectRequirement[] {
+  listAllProjectRequirements(projectId: string, scope: ProjectRequirementQuery['scope'] = 'published'): ProjectRequirement[] {
+    const reviewSet = scope === 'published' ? null : this.getReviewProjectRequirementSet(projectId)
+    const where = reviewSet
+      ? 'project_id = ? AND set_id = ?'
+      : `project_id = ? AND review_status = 'approved' AND (
+          set_id = '' OR set_id IN (
+            SELECT id FROM pm_requirement_sets WHERE project_id = ? AND status = 'published'
+          )
+        )`
+    const params = reviewSet ? [projectId, reviewSet.id] : [projectId, projectId]
     const rows = this.db.prepare(`
       SELECT * FROM pm_requirements
-      WHERE project_id = ? AND review_status = 'approved' AND (
-        set_id = '' OR set_id IN (
-          SELECT id FROM pm_requirement_sets WHERE project_id = ? AND status = 'published'
-        )
-      )
+      WHERE ${where}
       ORDER BY requirement_no ASC, id ASC
-    `).all(projectId, projectId) as SqlRow[]
+    `).all(...params) as SqlRow[]
     return rows.map((row) => this.mapProjectRequirement(row))
   }
 
@@ -3233,24 +3295,31 @@ export class AppDatabase {
   listProjectRequirementMatches(query: ProjectRequirementMatchQuery): ProjectRequirementMatchPage {
     const page = Math.max(1, Math.floor(query.page || 1))
     const pageSize = Math.min(200, Math.max(1, Math.floor(query.pageSize || 20)))
+    const minScore = query.minScore === undefined
+      ? -1
+      : Math.max(0, Math.min(100, Number.isFinite(Number(query.minScore)) ? Number(query.minScore) : 0))
     const total = Number((this.db.prepare(
-      'SELECT COUNT(*) AS count FROM pm_requirement_matches WHERE requirement_id = ?'
-    ).get(query.requirementId) as SqlRow).count)
+      'SELECT COUNT(*) AS count FROM pm_requirement_matches WHERE requirement_id = ? AND final_score > ?'
+    ).get(query.requirementId, minScore) as SqlRow).count)
     const rows = this.db.prepare(`
       SELECT m.*, r.uid AS uid, r.name, r.node_type, r.item_id, r.raw_json, r.normalized_text,
              r.last_modify_time, r.project_id, r.parent_id, r.synced_at,
              r.content_hash, r.push_status, r.push_message, r.pushed_at, r.pushed_uid,
              COUNT(i.id) AS image_count,
-             CASE WHEN a.record_uid IS NULL THEN 0 ELSE 1 END AS asset_linked
+             CASE WHEN a.record_uid IS NULL THEN 0 ELSE 1 END AS asset_linked,
+             CASE WHEN ar.requirement_id IS NULL THEN 0 ELSE 1 END AS requirement_linked
       FROM pm_requirement_matches m
       JOIN records r ON r.uid = m.record_uid
       LEFT JOIN images i ON i.record_uid = r.uid
-      LEFT JOIN pm_project_assets a ON a.record_uid = r.uid
-      WHERE m.requirement_id = ?
+      JOIN pm_requirements q ON q.id = m.requirement_id
+      LEFT JOIN pm_project_assets a ON a.project_id = q.project_id AND a.record_uid = r.uid
+      LEFT JOIN pm_project_asset_requirements ar
+        ON ar.project_id = q.project_id AND ar.record_uid = r.uid AND ar.requirement_id = m.requirement_id
+      WHERE m.requirement_id = ? AND m.final_score > ?
       GROUP BY r.uid, m.requirement_id
       ORDER BY m.final_score DESC, m.record_uid ASC
       LIMIT ? OFFSET ?
-    `).all(query.requirementId, pageSize, (page - 1) * pageSize) as SqlRow[]
+    `).all(query.requirementId, minScore, pageSize, (page - 1) * pageSize) as SqlRow[]
     return {
       total,
       rows: rows.map((row) => {
@@ -3268,7 +3337,8 @@ export class AppDatabase {
           scoreSource: String(row.score_source ?? 'vector') as ProjectRequirementMatch['scoreSource'],
           reason: String(row.reason ?? ''),
           bestChunkId: String(row.best_chunk_id ?? ''),
-          assetLinked: Number(row.asset_linked ?? 0) === 1
+          assetLinked: Number(row.asset_linked ?? 0) === 1,
+          requirementLinked: Number(row.requirement_linked ?? 0) === 1
         }
       })
     }
@@ -3709,6 +3779,29 @@ export class AppDatabase {
       GROUP BY r.uid
       ORDER BY a.linked_at DESC, r.name ASC
     `).all(projectId) as SqlRow[]
+    const requirementRows = this.db.prepare(`
+      SELECT ar.record_uid, ar.linked_at, q.id AS requirement_id,
+             q.requirement_no, q.title, m.final_score AS match_score
+      FROM pm_project_asset_requirements ar
+      JOIN pm_requirements q ON q.id = ar.requirement_id
+      LEFT JOIN pm_requirement_matches m
+        ON m.requirement_id = ar.requirement_id AND m.record_uid = ar.record_uid
+      WHERE ar.project_id = ?
+      ORDER BY q.requirement_no ASC, q.title COLLATE NOCASE ASC
+    `).all(projectId) as SqlRow[]
+    const requirementsByRecord = new Map<string, ProjectAsset['requirements']>()
+    for (const row of requirementRows) {
+      const recordUid = String(row.record_uid ?? '')
+      const requirements = requirementsByRecord.get(recordUid) ?? []
+      requirements.push({
+        requirementId: String(row.requirement_id ?? ''),
+        requirementNo: Number(row.requirement_no ?? 0),
+        title: String(row.title ?? ''),
+        linkedAt: String(row.linked_at ?? ''),
+        ...(row.match_score === null || row.match_score === undefined ? {} : { matchScore: Number(row.match_score) })
+      })
+      requirementsByRecord.set(recordUid, requirements)
+    }
     return rows.map((row) => {
       const record = this.mapRecord(row)
       return {
@@ -3718,23 +3811,50 @@ export class AppDatabase {
         nodeType: record.nodeType,
         itemId: record.itemId,
         description: record.description,
-        linkedAt: String(row.linked_at ?? '')
+        linkedAt: String(row.linked_at ?? ''),
+        requirements: requirementsByRecord.get(record.uid) ?? []
       }
     })
   }
 
-  linkProjectAsset(projectId: string, recordUid: string): ProjectAsset | null {
+  linkProjectAsset(projectId: string, recordUid: string, requirementId?: string): ProjectAsset | null {
     const exists = this.db.prepare('SELECT uid FROM records WHERE uid = ?').get(recordUid)
     if (!exists) return null
+    if (requirementId) {
+      const requirement = this.db.prepare(
+        'SELECT id FROM pm_requirements WHERE id = ? AND project_id = ?'
+      ).get(requirementId, projectId)
+      if (!requirement) return null
+    }
     this.db.prepare(`
       INSERT INTO pm_project_assets(project_id, record_uid, linked_at)
       VALUES (?, ?, ?)
       ON CONFLICT(project_id, record_uid) DO NOTHING
     `).run(projectId, recordUid, nowIso())
+    if (requirementId) {
+      this.db.prepare(`
+        INSERT INTO pm_project_asset_requirements(project_id, record_uid, requirement_id, linked_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(project_id, record_uid, requirement_id) DO NOTHING
+      `).run(projectId, recordUid, requirementId, nowIso())
+    }
     return this.listProjectAssets(projectId).find((asset) => asset.recordUid === recordUid) ?? null
   }
 
+  unlinkProjectAssetRequirement(projectId: string, recordUid: string, _requirementId: string): { ok: boolean; message: string } {
+    const result = this.db.prepare(`
+      DELETE FROM pm_project_assets
+      WHERE project_id = ? AND record_uid = ?
+    `).run(projectId, recordUid)
+    return Number(result.changes)
+      ? { ok: true, message: '当前需求已取消数据关联' }
+      : { ok: false, message: '当前需求与数据的关联不存在' }
+  }
+
   unlinkProjectAsset(projectId: string, recordUid: string): { ok: boolean; message: string } {
+    this.db.prepare(
+      'DELETE FROM pm_project_asset_requirements WHERE project_id = ? AND record_uid = ?'
+    ).run(projectId, recordUid)
     const result = this.db.prepare(
       'DELETE FROM pm_project_assets WHERE project_id = ? AND record_uid = ?'
     ).run(projectId, recordUid)
@@ -3763,6 +3883,85 @@ export class AppDatabase {
     this.setSetting('analytics:data-revision', String(next))
     this.db.prepare('DELETE FROM query_cache WHERE data_revision < ?').run(next)
     return next
+  }
+
+  replaceFieldDefinitions(definitions: FieldDefinition[]): void {
+    const grouped = new Map<string, Map<string, string>>()
+    for (const definition of definitions) {
+      const nodeType = String(definition.nodeType ?? '').trim()
+      const field = String(definition.field ?? '').trim()
+      const displayName = String(definition.displayName ?? '').trim()
+      if (!nodeType || !field || !displayName) continue
+      const fields = grouped.get(nodeType) ?? new Map<string, string>()
+      fields.set(field, displayName.slice(0, 200))
+      grouped.set(nodeType, fields)
+    }
+    if (!grouped.size) return
+
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const deleteDefinitions = this.db.prepare(
+        'DELETE FROM field_definitions WHERE node_type = ?'
+      )
+      const insertDefinition = this.db.prepare(`
+        INSERT INTO field_definitions(node_type, field, display_name, updated_at)
+        VALUES (?, ?, ?, ?)
+      `)
+      const updatedAt = nowIso()
+      for (const [nodeType, fields] of grouped) {
+        deleteDefinitions.run(nodeType)
+        for (const [field, displayName] of fields) {
+          insertDefinition.run(nodeType, field, displayName, updatedAt)
+        }
+      }
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  getFieldDisplayNames(
+    nodeType: string | string[],
+    fields?: string[]
+  ): Record<string, string> {
+    const nodeTypes = [...new Set(
+      (Array.isArray(nodeType) ? nodeType : [nodeType])
+        .map((value) => String(value ?? '').trim())
+        .filter(Boolean)
+    )]
+    const requestedFields = [...new Set(
+      (fields ?? [])
+        .map((value) => String(value ?? '').trim())
+        .filter(Boolean)
+    )]
+    const labels: Record<string, string> = {}
+    for (const currentNodeType of nodeTypes.length ? nodeTypes : [null]) {
+      const conditions: string[] = []
+      const params: string[] = []
+      if (currentNodeType !== null) {
+        conditions.push('node_type = ?')
+        params.push(currentNodeType)
+      }
+      if (requestedFields.length) {
+        conditions.push(`field IN (${requestedFields.map(() => '?').join(', ')})`)
+      }
+      if (requestedFields.length) params.push(...requestedFields)
+      const rows = this.db.prepare(`
+        SELECT field, display_name
+        FROM field_definitions
+        WHERE ${conditions.length ? conditions.join(' AND ') : '1 = 1'}
+        ORDER BY node_type ASC, field ASC
+      `).all(...params) as SqlRow[]
+      for (const row of rows) {
+        const field = String(row.field ?? '').trim()
+        const displayName = String(row.display_name ?? '').trim()
+        if (field && displayName && !Object.prototype.hasOwnProperty.call(labels, field)) {
+          labels[field] = displayName
+        }
+      }
+    }
+    return labels
   }
 
   getFieldProfiles(scopeKey: string, dataRevision: number): FieldProfile[] | null {
@@ -4141,6 +4340,7 @@ export class AppDatabase {
       'export-json',
       'export-pdf',
       'export-png',
+      'export-offline',
       'export-data'
     ])
     const statuses = new Set<DashboardAuditStatus>(['success', 'canceled', 'failed'])
@@ -4373,6 +4573,14 @@ export class AppDatabase {
         contentHash,
         nowIso()
       )
+  }
+
+  updateRecordNormalizedText(uid: string, normalizedText: string): void {
+    this.db.prepare(`
+      UPDATE records
+      SET normalized_text = ?
+      WHERE uid = ?
+    `).run(normalizedText, uid)
   }
 
   findRecordByItemId(itemId: string): RecordRow | null {
@@ -4628,6 +4836,13 @@ export class AppDatabase {
       clauses.push('r.node_type = ?')
       params.push(query.nodeType)
     }
+    if (query.excludeProjectAssetProjectId) {
+      clauses.push(`NOT EXISTS (
+        SELECT 1 FROM pm_project_assets pa
+        WHERE pa.project_id = ? AND pa.record_uid = r.uid
+      )`)
+      params.push(query.excludeProjectAssetProjectId)
+    }
     return {
       join,
       where: clauses.length ? `WHERE ${clauses.join(' AND ')}` : '',
@@ -4669,6 +4884,11 @@ export class AppDatabase {
       )
       .get(uid) as SqlRow | undefined
     if (!row) return null
+    const raw = JSON.parse(String(row.raw_json)) as Record<string, unknown>
+    const fieldLabels = this.getFieldDisplayNames(
+      String(row.node_type ?? ''),
+      Object.keys(raw)
+    )
     const images = includeImages
       ? (
           this.db
@@ -4679,8 +4899,9 @@ export class AppDatabase {
     return {
       ...this.mapRecord(row),
       normalizedText: String(row.normalized_text),
-      raw: JSON.parse(String(row.raw_json)) as Record<string, unknown>,
-      images
+      raw,
+      images,
+      ...(Object.keys(fieldLabels).length ? { fieldLabels } : {})
     }
   }
 
@@ -5181,7 +5402,7 @@ export class AppDatabase {
       params.push(options.nodeType.trim())
     }
     const where = clauses.length ? ` WHERE ${clauses.join(' AND ')}` : ''
-    const rows = this.db.prepare(`SELECT raw_json FROM records${where}`).all(...params) as SqlRow[]
+    const rows = this.db.prepare(`SELECT node_type, raw_json FROM records${where}`).all(...params) as SqlRow[]
     const profiles = new Map<string, {
       nonEmptyRecords: number
       types: Set<string>
@@ -5223,10 +5444,17 @@ export class AppDatabase {
 
     const searchTerms = fieldSearchTerms(options.search)
     const limit = Math.min(100, Math.max(1, Math.trunc(options.limit ?? 40)))
+    const displayNames = this.getFieldDisplayNames(
+      options.nodeType?.trim() || [...new Set(rows.map((row) => String(row.node_type ?? '').trim()))],
+      [...profiles.keys()]
+    )
     const fields = [...profiles.entries()]
       .filter(([field]) =>
         !searchTerms.length ||
-        searchTerms.some((term) => field.toLocaleLowerCase().includes(term))
+        searchTerms.some((term) =>
+          field.toLocaleLowerCase().includes(term) ||
+          (displayNames[field] ?? '').toLocaleLowerCase().includes(term)
+        )
       )
       .sort((left, right) =>
         right[1].nonEmptyRecords - left[1].nonEmptyRecords ||
@@ -5235,6 +5463,7 @@ export class AppDatabase {
       .slice(0, limit)
       .map(([field, profile]) => ({
         field,
+        ...(displayNames[field] ? { displayName: displayNames[field] } : {}),
         nonEmptyRecords: profile.nonEmptyRecords,
         coverageRate: rows.length
           ? Number(((profile.nonEmptyRecords / rows.length) * 100).toFixed(2))
@@ -5342,11 +5571,16 @@ export class AppDatabase {
 
     const limit = Math.min(50, Math.max(1, Math.trunc(options.limit ?? 10)))
     const records = matched.slice(0, limit).map(({ source, values }) => ({ source, values }))
+    const fieldLabels = this.getFieldDisplayNames(
+      options.nodeType?.trim() || [...new Set(matched.map((item) => item.source.nodeType))],
+      fields
+    )
     return {
       totalScanned: rows.length,
       matchedCount: matched.length,
       returnedCount: records.length,
       fields,
+      ...(Object.keys(fieldLabels).length ? { fieldLabels } : {}),
       records
     }
   }

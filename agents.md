@@ -52,6 +52,12 @@
 
 后续所有功能开发、新功能页面开发和 UI 调整，必须先读取本文件，并沿用以下设计约束。设计目标是让 VISSLM Agent 保持统一的深色数据工作台体验：内容优先、紫色作为唯一主操作色、信息密度可控、页面在全屏和窄窗口下都保持稳定。
 
+### 0. 主题模式
+
+- 当前应用已支持暗色主题与亮色主题切换。新增或调整的页面、组件和交互状态必须同时兼容两种主题，不得只针对单一主题编写样式。
+- 主题相关颜色优先使用现有 CSS 变量和主题作用域覆盖；暗色主题下不得出现白色或浅色局部背景，亮色主题下也必须保持正文、边框、控件和状态色的可读对比度。
+- 提交前必须分别在暗色和亮色主题下检查背景层级、边框、正文/次要文字、输入控件、主要/危险按钮及 hover、focus-visible、disabled、loading 状态。
+
 ### 1. 设计令牌与颜色
 
 - 页面和组件必须优先使用现有主题变量：`--surface-base`、`--surface-raised`、`--surface-soft`、`--surface-elevated`、`--surface-overlay`、`--stroke`、`--stroke-strong`、`--text-main`、`--text-muted`、`--accent`、`--accent-soft`、`--state-success`、`--state-info`、`--state-warning`、`--state-error`。

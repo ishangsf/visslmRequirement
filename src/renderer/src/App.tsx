@@ -22,6 +22,7 @@ import {
   ImportOutlined,
   LeftOutlined,
   MessageOutlined,
+  MoonOutlined,
   MinusOutlined,
   PictureOutlined,
   PlusOutlined,
@@ -31,6 +32,7 @@ import {
   SendOutlined,
   SettingOutlined,
   SyncOutlined,
+  SunOutlined,
   UserOutlined
 } from '@ant-design/icons'
 import {
@@ -47,6 +49,7 @@ import {
   Form,
   Image,
   Input,
+  InputNumber,
   Layout,
   Menu,
   Modal,
@@ -60,6 +63,7 @@ import {
   Switch,
   Tabs,
   Tag,
+  Tooltip,
   Typography
 } from 'antd'
 import type { TablePaginationConfig } from 'antd'
@@ -72,10 +76,12 @@ import { DashboardStudio } from './dashboard/DashboardStudio'
 import { RichDescription } from './RichDescription'
 import { ResizableTable } from './ResizableTable'
 import { ProjectManagementPage } from './project-management/ProjectManagementPage'
+import type { AppThemeMode } from './theme'
 import type { DashboardSpec } from '../../shared/dashboard'
 import type { DataScope } from '../../shared/query-spec'
 import type { AgentEvent, ExpertId } from '../../shared/expert-types'
 import {
+  DEFAULT_PROJECT_MATCHING_SETTINGS,
   DEFAULT_FEATURE_MODULE_SETTINGS,
   DEFAULT_FEATURE_NAVIGATION_ORDER
 } from '../../shared/types'
@@ -101,6 +107,7 @@ import type {
   ModelProvider,
   ModelSource,
   PlatformSettingsInput,
+  ProjectMatchingSettings,
   ProjectRow,
   PushConfig,
   PushFieldMapping,
@@ -108,6 +115,7 @@ import type {
   PushResult,
   RecordDetail,
   RecordRow,
+  SystemSettingsInput,
   SyncFieldFilter,
   SyncPreviewResult,
   SyncProgress,
@@ -119,11 +127,26 @@ const { Content, Sider } = Layout
 const { Title, Text, Paragraph } = Typography
 
 type PageKey = 'dashboard' | 'visualization' | 'projects' | 'data' | 'chat' | 'sync' | 'push' | 'settings'
+type AppProps = {
+  themeMode: AppThemeMode
+  onThemeModeChange: (next: AppThemeMode) => void
+}
+type SystemSettingsTabKey = 'platform' | 'model' | 'general' | 'features'
 type FeatureDropPosition = 'before' | 'after'
 type FeatureDropTarget = {
   key: FeatureModuleKey
   position: FeatureDropPosition
 }
+
+const systemSettingsTabKeys: readonly SystemSettingsTabKey[] = [
+  'platform',
+  'model',
+  'general',
+  'features'
+]
+
+const isSystemSettingsTabKey = (key: string): key is SystemSettingsTabKey =>
+  systemSettingsTabKeys.includes(key as SystemSettingsTabKey)
 
 const artifactVersionOf = (events: AgentEvent[] | undefined): number | undefined =>
   events?.find((event): event is Extract<AgentEvent, { type: 'artifact' }> => event.type === 'artifact')?.version
@@ -1590,6 +1613,7 @@ function ChatPage({
   const [mentionQuery, setMentionQuery] = useState('')
   const [mentionIndex, setMentionIndex] = useState(0)
   const [agentProgress, setAgentProgress] = useState<Array<Extract<AgentEvent, { type: 'status' }>>>([])
+  const [artifactAttached, setArtifactAttached] = useState(Boolean(activeArtifact))
   const conversationId = useRef<string>(crypto.randomUUID())
   const [activeConversationId, setActiveConversationId] = useState(conversationId.current)
   const [historySessions, setHistorySessions] = useState<ChatSessionSummary[]>([])
@@ -1613,6 +1637,10 @@ function ChatPage({
   useEffect(() => {
     void refreshHistory()
   }, [refreshHistory])
+
+  useEffect(() => {
+    setArtifactAttached(Boolean(activeArtifact))
+  }, [activeArtifact])
 
   const openDataView = (view: ChatDataView): void => {
     setActiveDataView(view)
@@ -1651,6 +1679,7 @@ function ChatPage({
     setQuestion('')
     setMentionOpen(false)
     setAgentProgress([])
+    setArtifactAttached(false)
     onClearDataScope()
     closeDataView()
     message.success(successMessage)
@@ -1718,6 +1747,9 @@ function ChatPage({
         .find((item) => item.dashboard)
       if (latestDashboardMessage?.dashboard) {
         onDashboardUpdate(latestDashboardMessage.dashboard, latestDashboardMessage.dashboardVersion)
+        setArtifactAttached(true)
+      } else {
+        setArtifactAttached(false)
       }
       message.success(`已加载历史会话：${session.title}`)
     } catch (error) {
@@ -1821,6 +1853,8 @@ function ChatPage({
     setAgentProgress([])
     setLoading(true)
     try {
+      const requestsVisualization = /@数据可视化专家(?:\s|$)/.test(text)
+      const requestArtifact = requestsVisualization && artifactAttached ? activeArtifact : null
       const contextMessages = messages
         .filter((message) => message.contextOutcome !== 'failed' && message.contextOutcome !== 'undone')
         .map(({ role, content, contextOutcome }) => ({
@@ -1831,28 +1865,32 @@ function ChatPage({
       const response = await window.visslm.askAgent({
         question: text,
         conversationId: conversationId.current,
-        entrypoint: dataScope || activeArtifact ? 'dashboard' : 'chat',
+        entrypoint: 'chat',
+        expertId: 'general',
         ...(dataScope ? { dataScope } : {}),
-        ...(activeArtifact
+        ...(requestArtifact
           ? {
               activeArtifact: {
-                artifactId: activeArtifact.id,
+                artifactId: requestArtifact.id,
                 ...(activeArtifactVersion === undefined ? {} : { version: activeArtifactVersion }),
-                dashboard: activeArtifact
+                dashboard: requestArtifact
               }
             }
           : {}),
-        history: activeArtifact ? contextMessages : contextMessages.slice(-8)
+        history: requestArtifact ? contextMessages : contextMessages.slice(-8)
       })
       const responseError = response.events?.find((event) => event.type === 'error')
       if (responseError?.recoverable) {
         setQuestion(text)
       }
-      if (activeArtifact && (responseError || !response.dashboard)) {
+      if (requestArtifact && (responseError || !response.dashboard)) {
         throw new Error(responseError?.message ?? response.answer)
       }
       const dashboardVersion = artifactVersionOf(response.events)
-      if (response.dashboard) onDashboardUpdate(response.dashboard, dashboardVersion)
+      if (response.dashboard) {
+        onDashboardUpdate(response.dashboard, dashboardVersion)
+        setArtifactAttached(true)
+      }
       const completedMessages: ChatMessage[] = [
         ...messages,
         { ...userMessage, contextOutcome: responseError ? 'failed' : 'success' },
@@ -2468,7 +2506,7 @@ function ChatPage({
                           width: 100
                         },
                         ...activeDataView.fields.map((field) => ({
-                          title: field,
+                          title: activeDataView.fieldLabels?.[field] ?? field,
                           key: field,
                           width: 180,
                           ellipsis: true,
@@ -3837,6 +3875,30 @@ function PushPage({
   )
 }
 
+function SettingsPanelHeading({
+  title,
+  description,
+  titleId,
+  extra,
+  className
+}: {
+  title: string
+  description: string
+  titleId?: string
+  extra?: React.ReactNode
+  className?: string
+}): React.JSX.Element {
+  return (
+    <div className={['settings-panel-heading', className].filter(Boolean).join(' ')}>
+      <div className="settings-panel-heading-copy">
+        <Title id={titleId} level={4}>{title}</Title>
+        <Text type="secondary">{description}</Text>
+      </div>
+      {extra}
+    </div>
+  )
+}
+
 function SettingsPage({
   settings,
   onChanged
@@ -3846,10 +3908,12 @@ function SettingsPage({
 }): React.JSX.Element {
   const { message } = AntApp.useApp()
   const [platformForm] = Form.useForm<PlatformSettingsInput>()
+  const [systemForm] = Form.useForm<SystemSettingsInput>()
   const [modelForm] = Form.useForm<ModelSettings>()
-  const [settingsTab, setSettingsTab] = useState<'platform' | 'model' | 'features'>('platform')
+  const [settingsTab, setSettingsTab] = useState<SystemSettingsTabKey>('platform')
   const [platformTesting, setPlatformTesting] = useState(false)
   const [modelTesting, setModelTesting] = useState(false)
+  const [matchingForm] = Form.useForm<ProjectMatchingSettings>()
   const [modelSource, setModelSource] = useState<ModelSource>('local')
   const [modelProvider, setModelProvider] = useState<ModelProvider>('ollama')
   const [featureSettings, setFeatureSettings] = useState<FeatureModuleSettings>(
@@ -3886,18 +3950,21 @@ function SettingsPage({
       platformForm.setFieldsValue({
         baseUrl: settings.platform.baseUrl,
         username: settings.platform.username,
-        userPropertyKeys: settings.platform.userPropertyKeys,
         token: ''
       })
     }
     if (settingsTab === 'model') {
       modelForm.setFieldsValue({ ...settings.model, apiKey: '' })
     }
+    if (settingsTab === 'general') {
+      systemForm.setFieldsValue(settings.system)
+      matchingForm.setFieldsValue(settings.projectMatching)
+    }
     setModelSource(settings.model.source)
     setModelProvider(settings.model.provider)
     setFeatureSettings({ ...DEFAULT_FEATURE_MODULE_SETTINGS, ...settings.features })
     setNavigationOrder(normalizeFeatureNavigationOrder(settings.navigationOrder))
-  }, [settings, settingsTab, platformForm, modelForm])
+  }, [settings, settingsTab, platformForm, systemForm, modelForm, matchingForm])
 
   const orderedFeatureDefinitions = useMemo(() => {
     const order = normalizeFeatureNavigationOrder(navigationOrder)
@@ -3924,6 +3991,13 @@ function SettingsPage({
     message.success('平台配置已安全保存')
   }
 
+  const saveSystem = async (values: SystemSettingsInput): Promise<void> => {
+    const next = await window.visslm.saveSystemSettings(values)
+    onChanged(next)
+    systemForm.setFieldsValue(next.system)
+    message.success('系统配置已保存')
+  }
+
   const testModel = async (): Promise<void> => {
     const values = await modelForm.validateFields()
     setModelTesting(true)
@@ -3940,6 +4014,13 @@ function SettingsPage({
     onChanged(next)
     modelForm.setFieldValue('apiKey', '')
     message.success('模型配置已保存')
+  }
+
+  const saveProjectMatching = async (values: ProjectMatchingSettings): Promise<void> => {
+    const next = await window.visslm.saveProjectMatchingSettings(values)
+    onChanged(next)
+    matchingForm.setFieldsValue(next.projectMatching)
+    message.success('项目匹配配置已保存')
   }
 
   const saveFeature = async (key: FeatureModuleKey, enabled: boolean): Promise<void> => {
@@ -4093,36 +4174,25 @@ function SettingsPage({
         <Tabs
           className="settings-tabs"
           activeKey={settingsTab}
-          onChange={(key) => setSettingsTab(key as typeof settingsTab)}
+          onChange={(key) => {
+            if (isSystemSettingsTabKey(key)) setSettingsTab(key)
+          }}
           items={[
             {
               key: 'platform',
               label: '平台配置',
               children: (
                 <div className="settings-panel">
-                  <div className="settings-panel-heading">
-                    <Title level={4}>VISSLM 平台</Title>
-                    <Text type="secondary">配置业务平台的数据采集与推送连接</Text>
-                  </div>
+                  <SettingsPanelHeading
+                    title="VISSLM 平台"
+                    description="配置业务平台的数据采集与推送连接"
+                  />
                   <Form form={platformForm} layout="vertical" onFinish={(values) => void savePlatform(values)}>
                     <Form.Item label="平台地址" name="baseUrl" rules={[{ required: true, message: '请输入平台地址' }]}>
                       <Input placeholder="http://server/alm" />
                     </Form.Item>
                     <Form.Item label="用户名" name="username" rules={[{ required: true, message: '请输入用户名' }]}>
                       <Input autoComplete="off" />
-                    </Form.Item>
-                    <Form.Item
-                      label="用户属性 Key"
-                      name="userPropertyKeys"
-                      extra="仅对这些字段的非空值查询用户显示名；相同登录名只查询一次。"
-                    >
-                      <Select
-                        mode="tags"
-                        allowClear
-                        tokenSeparators={[',', '，', ';', '；', '\n']}
-                        maxTagCount="responsive"
-                        placeholder="例如：_valm_AssignedTo"
-                      />
                     </Form.Item>
                     <Form.Item
                       label="API Token"
@@ -4149,20 +4219,21 @@ function SettingsPage({
               label: '大模型配置',
               children: (
                 <div className="settings-panel">
-                  <div className="settings-panel-heading model-settings-heading">
-                    <div>
-                      <Title level={4}>大模型连接</Title>
-                      <Text type="secondary">选择 Agent 使用的本地或在线模型服务</Text>
-                    </div>
-                    <Segmented
-                      value={modelSource}
-                      options={[
-                        { label: '本地大模型', value: 'local' },
-                        { label: '在线大模型', value: 'online' }
-                      ]}
-                      onChange={changeModelSource}
-                    />
-                  </div>
+                  <SettingsPanelHeading
+                    title="大模型连接"
+                    description="选择 Agent 使用的本地或在线模型服务"
+                    className="model-settings-heading"
+                    extra={(
+                      <Segmented
+                        value={modelSource}
+                        options={[
+                          { label: '本地大模型', value: 'local' },
+                          { label: '在线大模型', value: 'online' }
+                        ]}
+                        onChange={changeModelSource}
+                      />
+                    )}
+                  />
                   <Form form={modelForm} layout="vertical" onFinish={(values) => void saveModel(values)}>
                     <Form.Item name="source" hidden><Input /></Form.Item>
                     <Form.Item name="provider" hidden={modelSource === 'local'} label="模型服务商">
@@ -4220,14 +4291,78 @@ function SettingsPage({
               )
             },
             {
+              key: 'general',
+              label: '通用配置',
+              children: (
+                <div className="settings-panel settings-general-panel">
+                  <SettingsPanelHeading
+                    title="系统参数"
+                    description="配置跨平台复用的用户属性字段和项目需求匹配参数，供数据查询与项目匹配使用。"
+                  />
+                  <Form
+                    className="settings-form settings-general-form"
+                    form={systemForm}
+                    layout="vertical"
+                    onFinish={(values) => void saveSystem(values)}
+                  >
+                    <Form.Item
+                      label="用户属性 Key"
+                      name="userPropertyKeys"
+                      extra="仅对这些字段的非空值查询用户显示名；相同登录名只查询一次。"
+                    >
+                      <Select
+                        mode="tags"
+                        allowClear
+                        tokenSeparators={[',', '，', ';', '；', '\n']}
+                        maxTagCount="responsive"
+                        placeholder="例如：_valm_AssignedTo"
+                      />
+                    </Form.Item>
+                    <div className="settings-form-actions">
+                      <Button type="primary" htmlType="submit">保存系统配置</Button>
+                    </div>
+                  </Form>
+                  <section
+                    className="settings-general-section settings-matching-section"
+                    aria-labelledby="project-matching-settings-title"
+                  >
+                    <SettingsPanelHeading
+                      title="项目需求匹配"
+                      titleId="project-matching-settings-title"
+                      description="控制“查看匹配”列表展示的数据最低匹配度，低于或等于阈值的数据不会显示。"
+                    />
+                    <Form
+                      className="settings-form settings-matching-form"
+                      form={matchingForm}
+                      layout="vertical"
+                      onFinish={(values) => void saveProjectMatching(values)}
+                    >
+                      <Form.Item
+                        className="settings-matching-score-field"
+                        name="minScore"
+                        label="最低匹配度"
+                        extra="默认 40%；系统只展示匹配度严格高于该值的数据。"
+                        rules={[{ required: true, message: '请输入最低匹配度' }]}
+                      >
+                        <InputNumber min={0} max={100} precision={0} step={1} suffix="%" />
+                      </Form.Item>
+                      <div className="settings-form-actions">
+                        <Button type="primary" htmlType="submit">保存项目匹配配置</Button>
+                      </div>
+                    </Form>
+                  </section>
+                </div>
+              )
+            },
+            {
               key: 'features',
               label: '功能模块',
               children: (
                 <div className="settings-panel feature-settings-panel">
-                  <div className="settings-panel-heading">
-                    <Title level={4}>导航功能</Title>
-                    <Text type="secondary">按需开放工作台功能，关闭后对应入口不会出现在左侧导航栏。</Text>
-                  </div>
+                  <SettingsPanelHeading
+                    title="导航功能"
+                    description="按需开放工作台功能，关闭后对应入口不会出现在左侧导航栏。"
+                  />
                   <Alert
                     className="feature-settings-notice"
                     type="warning"
@@ -4289,7 +4424,13 @@ function SettingsPage({
   )
 }
 
-function WindowTitleBar(): React.JSX.Element {
+function WindowTitleBar({
+  themeMode,
+  onThemeModeChange
+}: {
+  themeMode: AppThemeMode
+  onThemeModeChange: (next: AppThemeMode) => void
+}): React.JSX.Element {
   const [maximized, setMaximized] = useState(false)
 
   useEffect(() => {
@@ -4307,6 +4448,17 @@ function WindowTitleBar(): React.JSX.Element {
         <Text strong>VISSLM Agent</Text>
       </div>
       <div className="window-controls">
+        <Tooltip title={themeMode === 'dark' ? '切换到亮色主题' : '切换到暗色主题'} placement="bottom">
+          <button
+            type="button"
+            className="window-control-button window-theme-toggle"
+            aria-label={themeMode === 'dark' ? '切换到亮色主题' : '切换到暗色主题'}
+            aria-pressed={themeMode === 'dark'}
+            onClick={() => onThemeModeChange(themeMode === 'dark' ? 'light' : 'dark')}
+          >
+            {themeMode === 'dark' ? <SunOutlined /> : <MoonOutlined />}
+          </button>
+        </Tooltip>
         <button
           type="button"
           className="window-control-button"
@@ -4375,7 +4527,7 @@ function AssetCenterPage({
   )
 }
 
-function AppShell(): React.JSX.Element {
+function AppShell({ themeMode, onThemeModeChange }: AppProps): React.JSX.Element {
   const { message } = AntApp.useApp()
   const [page, setPage] = useState<PageKey>('dashboard')
   const [settings, setSettings] = useState<AppSettings | null>(null)
@@ -4455,7 +4607,7 @@ function AppShell(): React.JSX.Element {
     chat: { title: 'AI 助手', description: '用自然语言检索、统计和解释本地数据' },
     sync: { title: '数据采集', description: '定义采集范围、预览请求并执行同步' },
     push: { title: '数据推送', description: '配置字段映射并将数据安全推送回平台' },
-    settings: { title: '系统配置', description: '配置平台连接、模型服务与功能模块' }
+    settings: { title: '系统配置', description: '配置平台连接、模型服务、通用参数与功能模块' }
   }
 
   const currentPage = useMemo(() => {
@@ -4470,7 +4622,7 @@ function AppShell(): React.JSX.Element {
       )
     }
     if (page === 'projects') {
-      return <ProjectManagementPage refreshKey={refreshKey} modelSettings={settings?.model ?? null} onChanged={() => setRefreshKey((key) => key + 1)} />
+      return <ProjectManagementPage refreshKey={refreshKey} modelSettings={settings?.model ?? null} matchScoreThreshold={settings?.projectMatching.minScore ?? DEFAULT_PROJECT_MATCHING_SETTINGS.minScore} onChanged={() => setRefreshKey((key) => key + 1)} />
     }
     if (page === 'data') {
       return (
@@ -4555,7 +4707,7 @@ function AppShell(): React.JSX.Element {
 
   return (
     <div className="app-frame">
-      <WindowTitleBar />
+      <WindowTitleBar themeMode={themeMode} onThemeModeChange={onThemeModeChange} />
       <Layout className="app-layout">
         <Sider width={224} className="app-sider" theme="light">
           <div className="brand">
@@ -4605,10 +4757,10 @@ function AppShell(): React.JSX.Element {
   )
 }
 
-export default function App(): React.JSX.Element {
+export default function App({ themeMode, onThemeModeChange }: AppProps): React.JSX.Element {
   return (
     <AntApp>
-      <AppShell />
+      <AppShell themeMode={themeMode} onThemeModeChange={onThemeModeChange} />
     </AntApp>
   )
 }

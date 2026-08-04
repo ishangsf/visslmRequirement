@@ -16,6 +16,8 @@ import type {
   FeatureModuleSettings,
   ModelSettings,
   PlatformSettingsInput,
+  ProjectMatchingSettings,
+  SystemSettingsInput,
   PushConfig,
   RecordQuery,
   SyncProgress,
@@ -66,8 +68,12 @@ const api: AppApi = {
   getSettings: () => ipcRenderer.invoke('settings:get'),
   savePlatformSettings: (input: PlatformSettingsInput) =>
     ipcRenderer.invoke('settings:save-platform', input),
+  saveSystemSettings: (input: SystemSettingsInput) =>
+    ipcRenderer.invoke('settings:save-system', input),
   saveModelSettings: (input: ModelSettings) =>
     ipcRenderer.invoke('settings:save-model', input),
+  saveProjectMatchingSettings: (input: ProjectMatchingSettings) =>
+    ipcRenderer.invoke('settings:save-project-matching', input),
   saveFeatureSettings: (input: FeatureModuleSettings) =>
     ipcRenderer.invoke('settings:save-features', input),
   saveNavigationOrder: (input: FeatureNavigationOrder) =>
@@ -134,6 +140,8 @@ const api: AppApi = {
     ipcRenderer.invoke('dashboards:export-pdf', spec, version),
   exportDashboardPng: (spec: DashboardSpec, dataUrl: string, version?: number) =>
     ipcRenderer.invoke('dashboards:export-png', spec, dataUrl, version),
+  exportDashboardOffline: (spec: DashboardSpec, version?: number) =>
+    ipcRenderer.invoke('dashboards:export-offline', spec, version),
   importData: () => ipcRenderer.invoke('data:import'),
   exportData: () => ipcRenderer.invoke('data:export'),
   deleteData: (uids?: string[]) => ipcRenderer.invoke('data:delete', uids),
@@ -189,6 +197,9 @@ const api: AppApi = {
   startProjectMatching: (id: string) => ipcRenderer.invoke('projects:start-matching', id),
   listProjectRequirements: (query: ProjectRequirementQuery) =>
     ipcRenderer.invoke('projects:requirements', query),
+  listAllProjectRequirements: (projectId: string) =>
+    ipcRenderer.invoke('projects:requirements-all', projectId),
+  getProjectRequirement: (id: string) => ipcRenderer.invoke('projects:requirement', id),
   getProjectRequirementSet: (projectId: string) => ipcRenderer.invoke('projects:requirement-set', projectId),
   createProjectRequirement: (projectId: string, input: ProjectRequirementInput) =>
     ipcRenderer.invoke('projects:requirement-create', projectId, input),
@@ -217,10 +228,12 @@ const api: AppApi = {
     ipcRenderer.invoke('projects:cost-update', id, input),
   deleteProjectCostEntry: (id: string) => ipcRenderer.invoke('projects:cost-delete', id),
   listProjectAssets: (projectId: string) => ipcRenderer.invoke('projects:assets', projectId),
-  linkProjectAsset: (projectId: string, recordUid: string) =>
-    ipcRenderer.invoke('projects:asset-link', projectId, recordUid),
+  linkProjectAsset: (projectId: string, recordUid: string, requirementId?: string) =>
+    ipcRenderer.invoke('projects:asset-link', projectId, recordUid, requirementId),
   unlinkProjectAsset: (projectId: string, recordUid: string) =>
     ipcRenderer.invoke('projects:asset-unlink', projectId, recordUid),
+  unlinkProjectAssetRequirement: (projectId: string, recordUid: string, requirementId: string) =>
+    ipcRenderer.invoke('projects:asset-requirement-unlink', projectId, recordUid, requirementId),
   onProjectProgress: (callback: (progress: ProjectAnalysisProgress) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, progress: ProjectAnalysisProgress): void =>
       callback(progress)

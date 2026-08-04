@@ -58,13 +58,19 @@ export interface PlatformSettings {
   baseUrl: string
   username: string
   hasToken: boolean
-  userPropertyKeys: string[]
 }
 
 export interface PlatformSettingsInput {
   baseUrl: string
   username: string
   token?: string
+}
+
+export interface SystemSettings {
+  userPropertyKeys: string[]
+}
+
+export interface SystemSettingsInput {
   userPropertyKeys?: string[]
 }
 
@@ -104,6 +110,23 @@ export type FeatureModuleSettings = Record<FeatureModuleKey, boolean>
 
 export type FeatureNavigationOrder = FeatureModuleKey[]
 
+export interface ProjectMatchingSettings {
+  minScore: number
+}
+
+export const DEFAULT_PROJECT_MATCHING_SETTINGS: ProjectMatchingSettings = {
+  minScore: 40
+}
+
+export const normalizeProjectMatchScore = (value: unknown): number => {
+  if (value === null || value === undefined || value === '') {
+    return DEFAULT_PROJECT_MATCHING_SETTINGS.minScore
+  }
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return DEFAULT_PROJECT_MATCHING_SETTINGS.minScore
+  return Math.max(0, Math.min(100, Math.round(numeric)))
+}
+
 export const DEFAULT_FEATURE_MODULE_SETTINGS: FeatureModuleSettings = {
   dashboard: true,
   visualization: true,
@@ -126,7 +149,9 @@ export const DEFAULT_FEATURE_NAVIGATION_ORDER: FeatureNavigationOrder = [
 
 export interface AppSettings {
   platform: PlatformSettings
+  system: SystemSettings
   model: ModelSettings
+  projectMatching: ProjectMatchingSettings
   features: FeatureModuleSettings
   navigationOrder: FeatureNavigationOrder
 }
@@ -163,9 +188,17 @@ export interface RecordRow {
   pushedUid: string
 }
 
+export interface FieldDefinition {
+  nodeType: string
+  field: string
+  displayName: string
+  updatedAt?: string
+}
+
 export interface RecordDetail extends RecordRow {
   raw: Record<string, unknown>
   images: ImageAsset[]
+  fieldLabels?: Record<string, string>
 }
 
 export interface ImageAsset {
@@ -185,6 +218,7 @@ export interface RecordQuery {
   search?: string
   projectId?: string
   nodeType?: string
+  excludeProjectAssetProjectId?: string
 }
 
 export interface RecordPage {
@@ -635,6 +669,7 @@ export interface ChatDataView {
   description: string
   total: number
   fields: string[]
+  fieldLabels?: Record<string, string>
   groups: ChatDataGroup[]
 }
 
@@ -672,7 +707,9 @@ export interface AppApi {
   onWindowMaximized(callback: (maximized: boolean) => void): () => void
   getSettings(): Promise<AppSettings>
   savePlatformSettings(input: PlatformSettingsInput): Promise<AppSettings>
+  saveSystemSettings(input: SystemSettingsInput): Promise<AppSettings>
   saveModelSettings(input: ModelSettings): Promise<AppSettings>
+  saveProjectMatchingSettings(input: ProjectMatchingSettings): Promise<AppSettings>
   saveFeatureSettings(input: FeatureModuleSettings): Promise<AppSettings>
   saveNavigationOrder(input: FeatureNavigationOrder): Promise<AppSettings>
   testPlatform(input?: PlatformSettingsInput): Promise<ConnectionResult>
@@ -709,6 +746,7 @@ export interface AppApi {
   exportDashboardJson(spec: DashboardSpec, version?: number): Promise<DashboardExportResult>
   exportDashboardPdf(spec: DashboardSpec, version?: number): Promise<DashboardExportResult>
   exportDashboardPng(spec: DashboardSpec, dataUrl: string, version?: number): Promise<DashboardExportResult>
+  exportDashboardOffline(spec: DashboardSpec, version?: number): Promise<DashboardExportResult>
   diagnoseDashboard(spec: DashboardSpec): Promise<DashboardQualityReport>
   repairDashboardComponent(
     spec: DashboardSpec,
@@ -749,6 +787,8 @@ export interface AppApi {
   retryProjectAnalysis(id: string): Promise<ProjectAnalysisStartResult>
   startProjectMatching(id: string): Promise<ProjectAnalysisStartResult>
   listProjectRequirements(query: ProjectRequirementQuery): Promise<ProjectRequirementPage>
+  listAllProjectRequirements(projectId: string): Promise<ProjectRequirement[]>
+  getProjectRequirement(id: string): Promise<ProjectRequirement | null>
   getProjectRequirementSet(projectId: string): Promise<ProjectRequirementSetSummary | null>
   createProjectRequirement(projectId: string, input: ProjectRequirementInput): Promise<ProjectRequirement>
   updateProjectRequirement(id: string, input: ProjectRequirementInput): Promise<ProjectRequirement | null>
@@ -766,8 +806,9 @@ export interface AppApi {
   updateProjectCostEntry(id: string, input: ProjectCostEntryInput): Promise<ProjectCostEntry | null>
   deleteProjectCostEntry(id: string): Promise<{ ok: boolean; message: string }>
   listProjectAssets(projectId: string): Promise<ProjectAsset[]>
-  linkProjectAsset(projectId: string, recordUid: string): Promise<ProjectAsset | null>
+  linkProjectAsset(projectId: string, recordUid: string, requirementId?: string): Promise<ProjectAsset | null>
   unlinkProjectAsset(projectId: string, recordUid: string): Promise<{ ok: boolean; message: string }>
+  unlinkProjectAssetRequirement(projectId: string, recordUid: string, requirementId: string): Promise<{ ok: boolean; message: string }>
   onProjectProgress(callback: (progress: ProjectAnalysisProgress) => void): () => void
   listOrganizationPeople(query: OrganizationPersonListQuery): Promise<OrganizationPersonPage>
   createOrganizationPerson(input: OrganizationPersonInput): Promise<OrganizationPerson>

@@ -6,11 +6,15 @@ import type {
   FeatureModuleSettings,
   ModelSettings,
   PlatformSettingsInput,
+  ProjectMatchingSettings,
+  SystemSettingsInput,
   SyncScopeConfig
 } from '../shared/types'
 import {
+  DEFAULT_PROJECT_MATCHING_SETTINGS,
   DEFAULT_FEATURE_MODULE_SETTINGS,
-  DEFAULT_FEATURE_NAVIGATION_ORDER
+  DEFAULT_FEATURE_NAVIGATION_ORDER,
+  normalizeProjectMatchScore
 } from '../shared/types'
 import { AppDatabase } from './database'
 
@@ -19,7 +23,9 @@ const DEFAULT_MODEL_URL = 'http://127.0.0.1:11434'
 const FEATURE_MODULE_KEYS = Object.keys(DEFAULT_FEATURE_MODULE_SETTINGS) as FeatureModuleKey[]
 const NAVIGATION_ORDER_VERSION = 1
 const USER_PROPERTY_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_.]*$/
-const USER_PROPERTY_KEYS_SETTING = 'platform.userPropertyKeys'
+const USER_PROPERTY_KEYS_SETTING = 'system.userPropertyKeys'
+const LEGACY_USER_PROPERTY_KEYS_SETTING = 'platform.userPropertyKeys'
+const PROJECT_MATCH_SCORE_SETTING = 'projectMatching.minScore'
 
 const normalizeUserPropertyKeys = (input: unknown): string[] => {
   if (!Array.isArray(input)) return []
@@ -61,7 +67,9 @@ export class SettingsService {
       platform: {
         baseUrl: this.db.getSetting('platform.baseUrl') ?? DEFAULT_PLATFORM_URL,
         username: this.db.getSetting('platform.username') ?? '',
-        hasToken: Boolean(this.db.getSetting('platform.token')),
+        hasToken: Boolean(this.db.getSetting('platform.token'))
+      },
+      system: {
         userPropertyKeys: this.getUserPropertyKeys()
       },
       model: {
@@ -71,6 +79,9 @@ export class SettingsService {
         model: this.db.getSetting('model.model') ?? 'qwen3:8b',
         thinking: (this.db.getSetting('model.thinking') ?? 'false') === 'true',
         hasApiKey: Boolean(this.db.getSetting(`model.apiKey.${this.db.getSetting('model.provider') ?? 'ollama'}`))
+      },
+      projectMatching: {
+        minScore: normalizeProjectMatchScore(this.db.getSetting(PROJECT_MATCH_SCORE_SETTING))
       },
       features: this.getFeatureSettings(),
       navigationOrder: this.getNavigationOrder()
@@ -93,18 +104,23 @@ export class SettingsService {
     token: string
     userPropertyKeys: string[]
   } {
-    const settings = this.getAll().platform
+    const settings = this.getAll()
     return {
-      baseUrl: override?.baseUrl?.trim() || settings.baseUrl,
-      username: override?.username?.trim() || settings.username,
+      baseUrl: override?.baseUrl?.trim() || settings.platform.baseUrl,
+      username: override?.username?.trim() || settings.platform.username,
       token: override?.token?.trim() || this.readSecret('platform.token'),
-      userPropertyKeys: settings.userPropertyKeys
+      userPropertyKeys: settings.system.userPropertyKeys
     }
   }
 
   savePlatform(input: PlatformSettingsInput): AppSettings {
     this.db.setSetting('platform.baseUrl', input.baseUrl.trim().replace(/\/+$/, ''))
     this.db.setSetting('platform.username', input.username.trim())
+    if (input.token?.trim()) this.writeSecret('platform.token', input.token.trim())
+    return this.getAll()
+  }
+
+  saveSystem(input: SystemSettingsInput): AppSettings {
     this.db.setSetting(
       USER_PROPERTY_KEYS_SETTING,
       JSON.stringify(
@@ -113,12 +129,12 @@ export class SettingsService {
           : normalizeUserPropertyKeys(input.userPropertyKeys)
       )
     )
-    if (input.token?.trim()) this.writeSecret('platform.token', input.token.trim())
     return this.getAll()
   }
 
   private getUserPropertyKeys(): string[] {
     const raw = this.db.getSetting(USER_PROPERTY_KEYS_SETTING)
+      ?? this.db.getSetting(LEGACY_USER_PROPERTY_KEYS_SETTING)
     if (!raw) return []
     try {
       return normalizeUserPropertyKeys(JSON.parse(raw))
@@ -136,6 +152,11 @@ export class SettingsService {
     this.db.setSetting('model.model', input.model.trim())
     this.db.setSetting('model.thinking', String(input.thinking))
     if (input.apiKey?.trim()) this.writeSecret(`model.apiKey.${provider}`, input.apiKey.trim())
+    return this.getAll()
+  }
+
+  saveProjectMatching(input: ProjectMatchingSettings): AppSettings {
+    this.db.setSetting(PROJECT_MATCH_SCORE_SETTING, String(normalizeProjectMatchScore(input.minScore)))
     return this.getAll()
   }
 

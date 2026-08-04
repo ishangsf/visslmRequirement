@@ -26,6 +26,9 @@ export default defineConfig({
   renderer: {
     root: resolve(__dirname, 'src/renderer'),
     plugins: [react()],
+    server: {
+      host: '127.0.0.1'
+    },
     resolve: {
       alias: {
         '@renderer': resolve(__dirname, 'src/renderer')

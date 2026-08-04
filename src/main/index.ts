@@ -14,6 +14,8 @@ import type {
   KnowledgeDocumentQuery,
   ModelSettings,
   PlatformSettingsInput,
+  ProjectMatchingSettings,
+  SystemSettingsInput,
   PushConfig,
   RecordQuery,
   SyncProgress,
@@ -57,12 +59,18 @@ import { repairDashboardComponent } from './dashboards/component-repair'
 import { dashboardSpecHash } from './dashboards/spec-hash'
 import { ExpertRouter } from './experts/router'
 import { VisualizationAgent } from './experts/visualization-agent'
+import { resolveVisualizationRequestMode } from './experts/visualization-intent'
 import { OllamaAgent } from './ollama'
 import { SettingsService } from './settings'
 import { PushService, SyncService, VisslmClient } from './visslm'
 import { KnowledgeService } from './knowledge'
 import { ProjectManagementService } from './project-management'
 import { createProjectWorkbook } from './project-export'
+import {
+  createDashboardOfflineArchive,
+  offlineViewerResourceNames,
+  type DashboardOfflineViewerAssets
+} from './dashboards/offline-export'
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url))
 let mainWindow: BrowserWindow | null = null
@@ -90,6 +98,38 @@ const specAuditMetadata = (
   ...metadata,
   ...(spec && typeof spec === 'object' ? { specHash: dashboardSpecHash(spec) } : {})
 })
+
+const readOfflineViewerAssets = (): DashboardOfflineViewerAssets => {
+  const candidateRoots = [
+    join(__dirname, '../offline'),
+    join(app.getAppPath(), 'out/offline'),
+    join(process.cwd(), 'out/offline')
+  ]
+  const root = [...new Set(candidateRoots)].find((candidate) => {
+    try {
+      return statSync(candidate).isDirectory()
+    } catch {
+      return false
+    }
+  })
+  if (!root) throw new Error('离线预览资源尚未构建，请先重新构建应用')
+
+  const readAsset = (name: (typeof offlineViewerResourceNames)[number]): Buffer => {
+    const path = join(root, name)
+    try {
+      if (!statSync(path).isFile()) throw new Error('not a file')
+      return readFileSync(path)
+    } catch {
+      throw new Error(`离线预览资源缺失：${name}`)
+    }
+  }
+
+  return {
+    indexHtml: readAsset('index.html').toString('utf8'),
+    viewerScript: readAsset('dashboard-viewer.js'),
+    viewerStyle: readAsset('dashboard-viewer.css')
+  }
+}
 
 const dashboardPatchErrorCode = (run: VisualizationRunInput | undefined): string => {
   const failedTool = [...(run?.toolCalls ?? [])].reverse().find((call) => call.status === 'failed')?.tool
@@ -158,8 +198,14 @@ const registerIpc = (): void => {
   ipcMain.handle('settings:save-platform', (_event, input: PlatformSettingsInput) =>
     settings.savePlatform(input)
   )
+  ipcMain.handle('settings:save-system', (_event, input: SystemSettingsInput) =>
+    settings.saveSystem(input)
+  )
   ipcMain.handle('settings:save-model', (_event, input: ModelSettings) =>
     settings.saveModel(input)
+  )
+  ipcMain.handle('settings:save-project-matching', (_event, input: ProjectMatchingSettings) =>
+    settings.saveProjectMatching(input)
   )
   ipcMain.handle('settings:save-features', (_event, input: FeatureModuleSettings) =>
     settings.saveFeatures(input)
@@ -245,6 +291,12 @@ const registerIpc = (): void => {
         ...(request.projectId ? { projectIds: [request.projectId] } : {})
       }
       const queryEngine = new QueryEngine(db)
+      const requestMode = resolveVisualizationRequestMode(
+        route.question,
+        Boolean(activeArtifact),
+        focusComponentId
+      )
+      const isPatchRequest = requestMode === 'patch'
       let latestVisualizationRun: VisualizationRunInput | undefined
       const agent = new VisualizationAgent(
         queryEngine,
@@ -258,7 +310,7 @@ const registerIpc = (): void => {
           event
         })
       )
-      const task = activeArtifact
+      const task = activeArtifact && isPatchRequest
         ? agent.patch(
             route.question,
             activeArtifact.dashboard,
@@ -274,7 +326,7 @@ const registerIpc = (): void => {
           dataViews: [],
           expertId: route.expert.id,
           dashboard,
-          ...(activeArtifact && latestVisualizationRun
+          ...(activeArtifact && isPatchRequest && latestVisualizationRun
             ? {
                 dashboardChange: {
                   ...compareDashboardSpecValues(activeArtifact.dashboard, dashboard),
@@ -295,12 +347,14 @@ const registerIpc = (): void => {
             {
               type: 'artifact' as const,
               artifactId: dashboard.id,
-              version: activeArtifact?.version !== undefined ? activeArtifact.version + 1 : 1,
+              version: activeArtifact && isPatchRequest && activeArtifact.version !== undefined
+                ? activeArtifact.version + 1
+                : 1,
               dashboard
             }
           ]
         }))
-        .then((response) => activeArtifact
+        .then((response) => activeArtifact && isPatchRequest
           ? {
               ...response,
               answer: `已完成对“${response.dashboard?.title ?? '当前大屏'}”的修改，结果已通过校验，等待保存为新版本。`
@@ -322,7 +376,7 @@ const registerIpc = (): void => {
               }]
             }
           }
-          if (activeArtifact) {
+          if (activeArtifact && isPatchRequest) {
             const failedTool = [...(latestVisualizationRun?.toolCalls ?? [])]
               .reverse()
               .find((call) => call.status === 'failed')
@@ -517,6 +571,65 @@ const registerIpc = (): void => {
         format: 'json',
         version,
         metadata: specAuditMetadata(spec),
+        errorMessage: error instanceof Error ? error.message : String(error)
+      })
+      throw error
+    }
+  })
+  ipcMain.handle('dashboards:export-offline', async (_event, spec: DashboardSpec, version?: number) => {
+    try {
+      const errors = validateDashboardSpec(spec, new QueryEngine(db), { allowInlineData: true })
+      if (errors.length) throw new Error(`离线导出前校验失败：${errors.join('；')}`)
+      if (!mainWindow) throw new Error('主窗口尚未就绪')
+      const safeTitle = spec.title.replace(/[<>:"/\\|?*\u0000-\u001F]/g, '-').slice(0, 80)
+      const result = await dialog.showSaveDialog(mainWindow, {
+        title: '导出离线预览包',
+        defaultPath: `${safeTitle || 'dashboard'}-offline.zip`,
+        filters: [{ name: '离线预览包', extensions: ['zip'] }]
+      })
+      if (result.canceled || !result.filePath) {
+        recordDashboardAudit({
+          dashboardId: spec.id,
+          action: 'export-offline',
+          status: 'canceled',
+          format: 'offline',
+          version,
+          metadata: specAuditMetadata(spec, {
+            componentCount: spec.components.length,
+            dataMode: 'snapshot'
+          })
+        })
+        return { ok: false, canceled: true, message: '已取消离线预览包导出' }
+      }
+
+      const archive = createDashboardOfflineArchive(
+        spec,
+        version,
+        readOfflineViewerAssets()
+      )
+      writeFileSync(result.filePath, archive)
+      recordDashboardAudit({
+        dashboardId: spec.id,
+        action: 'export-offline',
+        status: 'success',
+        format: 'offline',
+        version,
+        metadata: specAuditMetadata(spec, {
+          componentCount: spec.components.length,
+          dataMode: 'snapshot',
+          byteSize: archive.byteLength,
+          networkAccess: 'none'
+        })
+      })
+      return { ok: true, path: result.filePath, message: '离线预览包已导出，解压后打开 index.html 即可预览' }
+    } catch (error) {
+      recordDashboardAudit({
+        dashboardId: spec?.id,
+        action: 'export-offline',
+        status: 'failed',
+        format: 'offline',
+        version,
+        metadata: specAuditMetadata(spec, { dataMode: 'snapshot' }),
         errorMessage: error instanceof Error ? error.message : String(error)
       })
       throw error
@@ -910,6 +1023,12 @@ const registerIpc = (): void => {
   ipcMain.handle('projects:requirements', (_event, query: ProjectRequirementQuery) =>
     projectManagementService.listRequirements(query)
   )
+  ipcMain.handle('projects:requirements-all', (_event, projectId: string) =>
+    projectManagementService.listAllRequirements(projectId)
+  )
+  ipcMain.handle('projects:requirement', (_event, id: string) =>
+    projectManagementService.getRequirement(id)
+  )
   ipcMain.handle('projects:requirement-set', (_event, projectId: string) =>
     projectManagementService.getRequirementSet(projectId)
   )
@@ -955,11 +1074,14 @@ const registerIpc = (): void => {
   )
   ipcMain.handle('projects:cost-delete', (_event, id: string) => projectManagementService.deleteCostEntry(id))
   ipcMain.handle('projects:assets', (_event, projectId: string) => projectManagementService.listAssets(projectId))
-  ipcMain.handle('projects:asset-link', (_event, projectId: string, recordUid: string) =>
-    projectManagementService.linkAsset(projectId, recordUid)
+  ipcMain.handle('projects:asset-link', (_event, projectId: string, recordUid: string, requirementId?: string) =>
+    projectManagementService.linkAsset(projectId, recordUid, requirementId)
   )
   ipcMain.handle('projects:asset-unlink', (_event, projectId: string, recordUid: string) =>
     projectManagementService.unlinkAsset(projectId, recordUid)
+  )
+  ipcMain.handle('projects:asset-requirement-unlink', (_event, projectId: string, recordUid: string, requirementId: string) =>
+    projectManagementService.unlinkAssetRequirement(projectId, recordUid, requirementId)
   )
   ipcMain.handle('organization:people', (_event, query: OrganizationPersonListQuery) =>
     projectManagementService.listOrganizationPeople(query)
@@ -1032,7 +1154,8 @@ if (!hasSingleInstanceLock) {
       db,
       knowledgeService,
       () => settings.getModelCredentials(),
-      (progress) => mainWindow?.webContents.send('project:progress', progress)
+      (progress) => mainWindow?.webContents.send('project:progress', progress),
+      () => settings.getAll().projectMatching
     )
     syncService = new SyncService(
       db,
