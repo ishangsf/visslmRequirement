@@ -74,6 +74,25 @@ const getColumnKey = <RecordType,>(
   return path
 }
 
+const getRecordValue = (record: unknown, dataIndex: unknown): unknown => {
+  const path = Array.isArray(dataIndex)
+    ? dataIndex
+    : dataIndex === undefined || dataIndex === null
+      ? []
+      : [dataIndex]
+
+  return path.reduce<unknown>((value, key) => {
+    if (value === null || value === undefined || typeof value !== 'object') return undefined
+    return (value as Record<string, unknown>)[String(key)]
+  }, record)
+}
+
+const getCellTitle = (value: unknown): string | undefined => {
+  if (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'bigint') return undefined
+  const text = String(value).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim()
+  return text || undefined
+}
+
 const getDefaultWidth = <RecordType,>(column: TableColumnType<RecordType>): number => {
   if (typeof column.width === 'number' && Number.isFinite(column.width) && column.width > 0) return column.width
   const title = getColumnLabel(column.title, '')
@@ -166,11 +185,18 @@ function ResizableHeaderCell({
     window.addEventListener('pointercancel', handlePointerUp)
   }
 
+  const isFixedCell = className?.includes('ant-table-cell-fix') ?? false
+
   return (
     <th
       {...restProps}
       className={[className, 'project-resizable-header-cell'].filter(Boolean).join(' ')}
-      style={{ ...style, position: 'relative', width: currentWidth, minWidth: currentWidth }}
+      style={{
+        ...style,
+        ...(!style?.position && !isFixedCell ? { position: 'relative' } : {}),
+        width: currentWidth,
+        minWidth: currentWidth
+      }}
     >
       {children}
       {onResize && (
@@ -242,10 +268,19 @@ export function ResizableTable<RecordType = Record<string, unknown>>({
       const width = clampWidth(storedWidths[columnKey] ?? defaultWidth, minWidth, maxWidth)
       const label = getColumnLabel(leaf.title, `第 ${index + 1} 列`)
       const originalOnHeaderCell = leaf.onHeaderCell
+      const originalOnCell = leaf.onCell
 
       return {
         ...leaf,
         width,
+        onCell: (record, rowIndex) => {
+          const baseProps = originalOnCell?.(record, rowIndex) ?? {}
+          const cellTitle = getCellTitle(getRecordValue(record, leaf.dataIndex ?? leaf.key))
+          return {
+            ...baseProps,
+            ...(cellTitle && !baseProps.title ? { title: cellTitle } : {})
+          }
+        },
         onHeaderCell: (headerColumn, headerIndex) => {
           const baseProps = originalOnHeaderCell?.(headerColumn, headerIndex) ?? {}
           const baseResize = (baseProps as ResizeHeaderCellProps).onResize

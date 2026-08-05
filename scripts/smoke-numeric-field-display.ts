@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { AppDatabase } from '../src/main/database'
-import { SyncService, VisslmClient } from '../src/main/visslm'
+import { normalizeText, SyncService, VisslmClient } from '../src/main/visslm'
 import type { SyncScopeConfig } from '../src/shared/types'
 
 const root = mkdtempSync(join(tmpdir(), 'visslm-numeric-field-display-'))
@@ -111,10 +111,26 @@ try {
   assert.deepEqual(db.getStats().byRelease, [{ name: 'V2.00.01.76', value: 1 }])
   assert(stored?.normalizedText?.includes('reference_text: V2.00.01.76'))
 
+  const legacyRaw = structuredClone(stored?.raw ?? {}) as Record<string, unknown>
+  delete legacyRaw.assignee_text
+  delete legacyRaw.reviewer_text
+  if (legacyRaw.owner && typeof legacyRaw.owner === 'object' && !Array.isArray(legacyRaw.owner)) {
+    delete (legacyRaw.owner as Record<string, unknown>).key_text
+  }
+  db.updateRecordRawAndNormalizedText('remote-1', legacyRaw, normalizeText(legacyRaw))
+  const repeated = await service.run(config)
+  assert.equal(repeated.ok, true)
+  const refreshed = db.getRecord('remote-1', false)
+  assert.equal(refreshed?.raw.assignee_text, '顺丰州')
+  assert.equal(refreshed?.raw.reviewer_text, '顺丰州')
+  assert.equal((refreshed?.raw.owner as Record<string, unknown>)?.key_text, '顺丰州')
+  assert(refreshed?.normalizedText?.includes('assignee_text: 顺丰州'))
+
   console.log(JSON.stringify({
     storedDisplayValue: stored?.raw.reference_text,
     nestedDisplayValue: (stored?.raw.nested as Record<string, unknown>)?.key_text,
     userDisplayValue: stored?.raw.assignee_text,
+    refreshedUserDisplayValue: refreshed?.raw.assignee_text,
     lookupCountFor177560: lookupRequests.filter((url) => url.searchParams.get('q._valm_Uid') === '177560').length,
     userLookupCount: userLookupRequests.length,
     decimalSkipped: raw.decimal_text === undefined

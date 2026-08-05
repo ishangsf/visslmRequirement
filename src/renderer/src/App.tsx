@@ -2,12 +2,15 @@ import {
   BarChartOutlined,
   BorderOutlined,
   BulbOutlined,
+  CheckCircleOutlined,
   CloudDownloadOutlined,
   CloseOutlined,
   CloudUploadOutlined,
+  CopyOutlined,
   DatabaseOutlined,
   DeleteOutlined,
   EyeOutlined,
+  ExclamationCircleOutlined,
   ExportOutlined,
   FileExcelOutlined,
   FilePdfOutlined,
@@ -19,6 +22,7 @@ import {
   FullscreenExitOutlined,
   HistoryOutlined,
   HolderOutlined,
+  InfoCircleOutlined,
   ImportOutlined,
   LeftOutlined,
   MessageOutlined,
@@ -1153,7 +1157,12 @@ function DataPage({
               width: 260,
               ellipsis: true,
               render: (name: string, record) => (
-                <Button type="link" className="table-link" onClick={() => void openDetail(record.uid)}>
+                <Button
+                  type="link"
+                  className="table-link"
+                  title={name || '未命名记录'}
+                  onClick={() => void openDetail(record.uid)}
+                >
                   {name}
                 </Button>
               )
@@ -1174,8 +1183,8 @@ function DataPage({
                 )
               }
             },
-            { title: 'UID', dataIndex: 'uid', width: 120 },
-            { title: '项目 UID', dataIndex: 'projectId', width: 120 },
+            { title: 'UID', dataIndex: 'uid', width: 120, ellipsis: true },
+            { title: '项目 UID', dataIndex: 'projectId', width: 120, ellipsis: true },
             {
               title: '数据状态',
               key: 'pushStatus',
@@ -1586,7 +1595,14 @@ function ChatPage({
   activeArtifactVersion,
   dataScope,
   dataScopeSummary,
-  onClearDataScope
+  onClearDataScope,
+  conversationId,
+  onConversationIdChange,
+  modelOnline,
+  modelName,
+  onOpenSettings,
+  onOpenSync,
+  refreshKey
 }: {
   messages: ChatMessage[]
   setMessages: React.Dispatch<React.SetStateAction<ChatMessage[]>>
@@ -1601,12 +1617,20 @@ function ChatPage({
   dataScope: DataScope | null
   dataScopeSummary: string
   onClearDataScope: () => void
+  conversationId: string
+  onConversationIdChange: (id: string) => void
+  modelOnline: boolean | null
+  modelName?: string
+  onOpenSettings: () => void
+  onOpenSync: () => void
+  refreshKey: number
 }): React.JSX.Element {
   const { message, modal } = AntApp.useApp()
   const messageListRef = useRef<HTMLDivElement>(null)
   const [activeDataView, setActiveDataView] = useState<ChatDataView | null>(null)
   const [activeDataGroup, setActiveDataGroup] = useState('')
   const [activeRecordDetail, setActiveRecordDetail] = useState<RecordDetail | null>(null)
+  const [recordDetailModalOpen, setRecordDetailModalOpen] = useState(false)
   const [activeKnowledgeDetail, setActiveKnowledgeDetail] = useState<KnowledgeDocumentDetail | null>(null)
   const [recordDetailLoading, setRecordDetailLoading] = useState(false)
   const [mentionOpen, setMentionOpen] = useState(false)
@@ -1614,11 +1638,13 @@ function ChatPage({
   const [mentionIndex, setMentionIndex] = useState(0)
   const [agentProgress, setAgentProgress] = useState<Array<Extract<AgentEvent, { type: 'status' }>>>([])
   const [artifactAttached, setArtifactAttached] = useState(Boolean(activeArtifact))
-  const conversationId = useRef<string>(crypto.randomUUID())
-  const [activeConversationId, setActiveConversationId] = useState(conversationId.current)
+  const persistQueueRef = useRef<Promise<void>>(Promise.resolve())
   const [historySessions, setHistorySessions] = useState<ChatSessionSummary[]>([])
   const [historyRefreshing, setHistoryRefreshing] = useState(false)
   const [historyLoading, setHistoryLoading] = useState(false)
+  const [workspaceStats, setWorkspaceStats] = useState<KnowledgeStats | null>(null)
+  const [workspaceDataStats, setWorkspaceDataStats] = useState<DashboardStats | null>(null)
+  const [workspaceStatsLoading, setWorkspaceStatsLoading] = useState(true)
   const selectedDataGroup = activeDataView?.groups.find(
     (group) => group.name === activeDataGroup
   ) ?? activeDataView?.groups[0]
@@ -1639,6 +1665,26 @@ function ChatPage({
   }, [refreshHistory])
 
   useEffect(() => {
+    let active = true
+    setWorkspaceStatsLoading(true)
+    void Promise.allSettled([
+      window.visslm.getKnowledgeStats(),
+      window.visslm.getStats()
+    ])
+      .then(([knowledgeResult, dataResult]) => {
+        if (!active) return
+        setWorkspaceStats(knowledgeResult.status === 'fulfilled' ? knowledgeResult.value : null)
+        setWorkspaceDataStats(dataResult.status === 'fulfilled' ? dataResult.value : null)
+      })
+      .finally(() => {
+        if (active) setWorkspaceStatsLoading(false)
+      })
+    return () => {
+      active = false
+    }
+  }, [refreshKey])
+
+  useEffect(() => {
     setArtifactAttached(Boolean(activeArtifact))
   }, [activeArtifact])
 
@@ -1646,35 +1692,40 @@ function ChatPage({
     setActiveDataView(view)
     setActiveDataGroup(view.groups[0]?.name ?? '')
     setActiveRecordDetail(null)
+    setRecordDetailModalOpen(false)
   }
 
   const closeDataView = (): void => {
     setActiveDataView(null)
     setActiveDataGroup('')
     setActiveRecordDetail(null)
+    setRecordDetailModalOpen(false)
     setActiveKnowledgeDetail(null)
     setRecordDetailLoading(false)
   }
 
-  const persistSession = useCallback(async (sessionMessages: ChatMessage[]): Promise<void> => {
-    if (!sessionMessages.length) return
+  const persistSession = useCallback((sessionId: string, sessionMessages: ChatMessage[]): Promise<void> => {
+    if (!sessionMessages.length) return Promise.resolve()
     const firstUserMessage = sessionMessages.find((item) => item.role === 'user')
-    try {
-      await window.visslm.saveChatSession({
-        id: conversationId.current,
-        title: firstUserMessage?.content,
-        messages: sessionMessages
-      })
-      await refreshHistory()
-    } catch (error) {
-      message.warning(`历史会话保存失败：${error instanceof Error ? error.message : String(error)}`)
+    const save = async (): Promise<void> => {
+      try {
+        await window.visslm.saveChatSession({
+          id: sessionId,
+          title: firstUserMessage?.content,
+          messages: sessionMessages
+        })
+        await refreshHistory()
+      } catch (error) {
+        message.warning(`历史会话保存失败：${error instanceof Error ? error.message : String(error)}`)
+      }
     }
+    persistQueueRef.current = persistQueueRef.current.then(save, save)
+    return persistQueueRef.current
   }, [message, refreshHistory])
 
   const resetConversation = (successMessage = '已开始新会话'): void => {
     const nextConversationId = crypto.randomUUID()
-    conversationId.current = nextConversationId
-    setActiveConversationId(nextConversationId)
+    onConversationIdChange(nextConversationId)
     setMessages([])
     setQuestion('')
     setMentionOpen(false)
@@ -1734,8 +1785,7 @@ function ChatPage({
         await refreshHistory()
         return
       }
-      conversationId.current = session.id
-      setActiveConversationId(session.id)
+      onConversationIdChange(session.id)
       setMessages(session.messages)
       setQuestion('')
       setMentionOpen(false)
@@ -1760,7 +1810,7 @@ function ChatPage({
   }
 
   const requestLoadSession = (session: ChatSessionSummary): void => {
-    if (loading || historyLoading || session.id === activeConversationId) return
+    if (loading || historyLoading || session.id === conversationId) return
     const load = (): Promise<void> => loadSessionById(session.id)
     if (!messages.length && !question.trim()) {
       void load()
@@ -1792,7 +1842,7 @@ function ChatPage({
             return
           }
           setHistorySessions((items) => items.filter((item) => item.id !== session.id))
-          if (session.id === activeConversationId) {
+          if (session.id === conversationId) {
             resetConversation('当前会话已删除，已开始新会话')
           } else {
             message.success('历史会话已删除')
@@ -1806,11 +1856,25 @@ function ChatPage({
     })
   }
 
-  const openRecordDetail = async (row: ChatDataRow): Promise<void> => {
+  const openRecordDetail = async (row: ChatDataRow, standalone = false): Promise<void> => {
+    if (standalone) {
+      setActiveDataView(null)
+      setActiveDataGroup('')
+      setRecordDetailModalOpen(true)
+    }
+    setActiveRecordDetail(null)
     setRecordDetailLoading(true)
     try {
       const detail = await window.visslm.getRecord(row.uid)
-      if (detail) setActiveRecordDetail(detail)
+      if (detail) {
+        setActiveRecordDetail(detail)
+      } else {
+        message.warning('回答依据对应的记录不存在或已被删除')
+        if (standalone) setRecordDetailModalOpen(false)
+      }
+    } catch (error) {
+      message.error(`记录详情加载失败：${error instanceof Error ? error.message : String(error)}`)
+      if (standalone) setRecordDetailModalOpen(false)
     } finally {
       setRecordDetailLoading(false)
     }
@@ -1832,14 +1896,19 @@ function ChatPage({
   }, [messages.length, loading])
 
   useEffect(() => window.visslm.onAgentEvent((update) => {
-    if (update.conversationId !== conversationId.current || update.event.type !== 'status') return
+    if (update.conversationId !== conversationId || update.event.type !== 'status') return
     const statusEvent: Extract<AgentEvent, { type: 'status' }> = update.event
     setAgentProgress((items) => [...items, statusEvent].slice(-20))
-  }), [])
+  }), [conversationId])
 
-  const send = async (): Promise<void> => {
-    const text = question.trim()
+  const send = async (overrideQuestion?: string): Promise<void> => {
+    const text = (overrideQuestion ?? question).trim()
     if (!text || loading) return
+    if (modelOnline !== true) {
+      message.warning('模型未连接，请先完成系统配置')
+      return
+    }
+    const sessionId = conversationId
     const userMessage: ChatMessage = {
       id: crypto.randomUUID(),
       role: 'user',
@@ -1864,7 +1933,7 @@ function ChatPage({
         }))
       const response = await window.visslm.askAgent({
         question: text,
-        conversationId: conversationId.current,
+        conversationId: sessionId,
         entrypoint: 'chat',
         expertId: 'general',
         ...(dataScope ? { dataScope } : {}),
@@ -1898,6 +1967,7 @@ function ChatPage({
           id: crypto.randomUUID(),
           role: 'assistant',
           content: response.answer,
+          ...(responseError ? { retryQuestion: text } : {}),
           sources: response.sources,
           dataViews: response.dataViews,
           dashboard: response.dashboard,
@@ -1908,7 +1978,7 @@ function ChatPage({
         }
       ]
       setMessages(completedMessages)
-      void persistSession(completedMessages)
+      void persistSession(sessionId, completedMessages)
     } catch (error) {
       const rawMessage = error instanceof Error ? error.message : String(error)
       const errorMessage = rawMessage.replace(
@@ -1923,16 +1993,45 @@ function ChatPage({
           id: crypto.randomUUID(),
           role: 'assistant',
           content: `请求失败：${errorMessage}`,
+          retryQuestion: text,
           createdAt: new Date().toISOString(),
           contextOutcome: 'failed'
         }
       ]
       setMessages(failedMessages)
-      void persistSession(failedMessages)
+      void persistSession(sessionId, failedMessages)
     } finally {
       setLoading(false)
     }
   }
+
+  const copyAnswer = async (content: string): Promise<void> => {
+    try {
+      await navigator.clipboard.writeText(content)
+      message.success('回答已复制')
+    } catch {
+      message.warning('当前环境无法访问剪贴板，请手动选择文本复制')
+    }
+  }
+
+  const dataRecordCount = workspaceDataStats?.recordCount ?? 0
+  const hasData = dataRecordCount > 0
+  const hasKnowledge = Boolean(workspaceStats?.indexedChunkCount)
+  const latestStatus = agentProgress.at(-1)
+  const agentStageLabel: Record<string, string> = {
+    route: '理解需求',
+    retrieve: '检索依据',
+    plan: '规划查询',
+    query: '执行查询',
+    verify: '核对结果',
+    answer: '整理回答',
+    error: '任务中断'
+  }
+  const visibleAgentProgress = useMemo(() => {
+    const latestByStage = new Map<string, Extract<AgentEvent, { type: 'status' }>>()
+    agentProgress.forEach((event) => latestByStage.set(event.stage, event))
+    return [...latestByStage.values()].slice(-6)
+  }, [agentProgress])
 
   const promptSuggestions = [
     {
@@ -1952,11 +2051,17 @@ function ChatPage({
       title: '统计图片资源',
       description: '了解已采集图片数量',
       icon: <PictureOutlined />
+    },
+    {
+      prompt: '当前数据有哪些可用字段？',
+      title: '查看数据结构',
+      description: '确认字段、覆盖率和样例',
+      icon: <DatabaseOutlined />
     }
   ]
 
   return (
-    <div className="chat-page">
+    <div className="chat-page chat-workspace-v2">
       <aside className="chat-history-panel" aria-label="历史会话">
         <div className="chat-history-panel-header">
           <div className="chat-history-title">
@@ -1984,7 +2089,7 @@ function ChatPage({
                   role="button"
                   tabIndex={loading || historyLoading ? -1 : 0}
                   aria-disabled={loading || historyLoading}
-                  className={`chat-history-item ${session.id === activeConversationId ? 'active' : ''}`}
+                  className={`chat-history-item ${session.id === conversationId ? 'active' : ''}`}
                   key={session.id}
                   onClick={() => requestLoadSession(session)}
                   onKeyDown={(event) => {
@@ -2028,44 +2133,101 @@ function ChatPage({
         </div>
       </aside>
       <Card className="chat-card">
-        <div className="chat-toolbar">
+        <div className="chat-toolbar chat-toolbar-v2">
           <div className="chat-session-label">
             <MessageOutlined />
-            <Text strong>当前会话</Text>
-            {messages.length > 0 && (
-              <Text type="secondary">{messages.length} 条消息</Text>
-            )}
+            <div className="chat-session-copy">
+              <Text strong>{messages.length ? '工作会话' : '新的数据任务'}</Text>
+              <Text type="secondary">
+                {messages.length ? `${messages.length} 条消息` : '从问题开始，让 Agent 执行可核验的查询'}
+              </Text>
+            </div>
           </div>
-          <Button
-            className="new-conversation-button"
-            type="text"
-            icon={<PlusOutlined />}
-            disabled={loading}
-            onClick={startNewConversation}
-          >
-            新建会话
-          </Button>
+          <div className="chat-toolbar-actions">
+            <div className="chat-health-strip" aria-label="AI 工作区状态">
+              <span className={`chat-health-item ${modelOnline === true ? 'success' : modelOnline === false ? 'error' : 'pending'}`}>
+                {modelOnline === true ? <CheckCircleOutlined /> : modelOnline === false ? <ExclamationCircleOutlined /> : <InfoCircleOutlined />}
+                <span>{modelOnline === true ? '模型可用' : modelOnline === false ? '模型离线' : '检测模型'}</span>
+              </span>
+              <span className={`chat-health-item ${hasData ? 'success' : 'warning'}`}>
+                <DatabaseOutlined />
+                <span>{workspaceStatsLoading ? '读取数据' : hasData ? `${dataRecordCount} 条记录` : '暂无数据'}</span>
+              </span>
+            </div>
+            <Button
+              className="new-conversation-button"
+              type="text"
+              icon={<PlusOutlined />}
+              disabled={loading}
+              onClick={startNewConversation}
+            >
+              新建会话
+            </Button>
+          </div>
         </div>
         <div className="message-list" ref={messageListRef}>
           {messages.length === 0 ? (
-            <div className="chat-empty">
-              <div className="assistant-orb">
-                <img src={appIcon} alt="VISSLM AI" />
-                <span className="assistant-orb-status" />
+            <div className="chat-empty chat-welcome">
+              <div className="chat-welcome-hero">
+                <div className="assistant-orb">
+                  <img src={appIcon} alt="VISSLM AI" />
+                  <span className="assistant-orb-status" />
+                </div>
+                <div className="chat-welcome-copy">
+                  <Tag className="knowledge-ready-tag" icon={hasKnowledge ? <CheckCircleOutlined /> : <BulbOutlined />}>
+                    {hasKnowledge ? '知识库可检索' : '知识库待准备'}
+                  </Tag>
+                  <Title level={3}>把数据问题交给 Agent</Title>
+                  <Text type="secondary" className="chat-empty-description">
+                    先确认事实，再给出结论；每个查询都可展开查看原始记录和依据。
+                  </Text>
+                </div>
               </div>
-              <Tag className="knowledge-ready-tag" icon={<BulbOutlined />}>
-                知识库已就绪
-              </Tag>
-              <Title level={3}>今天想从数据中了解什么？</Title>
-              <Text type="secondary" className="chat-empty-description">
-                我会检索本地 VISSLM 数据，进行统计、归纳和内容查询，并提供可查看的数据清单。
-              </Text>
+              <div className="chat-welcome-status-grid">
+                <div className={modelOnline === true ? 'ready' : modelOnline === false ? 'blocked' : 'pending'}>
+                  {modelOnline === true ? <CheckCircleOutlined /> : modelOnline === false ? <ExclamationCircleOutlined /> : <InfoCircleOutlined />}
+                  <span>
+                    <strong>{modelOnline === true ? '模型服务已连接' : modelOnline === false ? '模型服务未连接' : '正在检测模型服务'}</strong>
+                    <small>{modelName || '请在系统配置中选择模型'}</small>
+                  </span>
+                  {modelOnline === false && <Button type="link" size="small" onClick={onOpenSettings}>去配置</Button>}
+                </div>
+                <div className={hasData ? 'ready' : 'blocked'}>
+                  {hasData ? <CheckCircleOutlined /> : <ExclamationCircleOutlined />}
+                  <span>
+                    <strong>{hasData ? '数据资产可用' : '还没有可查询数据'}</strong>
+                    <small>{hasData ? `${dataRecordCount} 条记录 · ${workspaceStats?.indexedChunkCount ?? 0} 个索引分块` : '先完成一次数据采集'}</small>
+                  </span>
+                  {!hasData && <Button type="link" size="small" onClick={onOpenSync}>去采集</Button>}
+                </div>
+              </div>
+              {modelOnline === false && (
+                <Alert
+                  className="chat-welcome-alert"
+                  type="warning"
+                  showIcon
+                  icon={<ExclamationCircleOutlined />}
+                  title="当前不能执行模型任务"
+                  description="请检查模型地址、模型名称和 API Key。"
+                  action={<Button size="small" onClick={onOpenSettings}>打开配置</Button>}
+                />
+              )}
+              <div className="chat-task-prompt-heading">
+                <div>
+                  <Text strong>从一个具体问题开始</Text>
+                  <Text type="secondary">常用任务</Text>
+                </div>
+                <Tag icon={<InfoCircleOutlined />}>支持自然语言追问</Tag>
+              </div>
               <div className="prompt-grid">
                 {promptSuggestions.map((item) => (
                   <Button
                     className="prompt-card"
                     key={item.prompt}
-                    onClick={() => setQuestion(item.prompt)}
+                    onClick={() => {
+                      setQuestion(item.prompt)
+                      requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>('.composer textarea')?.focus())
+                    }}
                   >
                     <span className="prompt-card-icon">{item.icon}</span>
                     <span className="prompt-card-copy">
@@ -2075,6 +2237,10 @@ function ChatPage({
                     <span className="prompt-card-arrow">→</span>
                   </Button>
                 ))}
+              </div>
+              <div className="chat-welcome-footnote">
+                <BulbOutlined />
+                <span>结果会标注数据依据；不确定时会明确说明，而不是补写不存在的结论。</span>
               </div>
             </div>
           ) : (
@@ -2095,11 +2261,41 @@ function ChatPage({
                       })}
                     </Text>
                   </div>
-                  <div className="message-bubble">
+                  <div
+                    className="message-bubble"
+                    role={message.contextOutcome === 'failed' ? 'alert' : undefined}
+                  >
                     {message.role === 'assistant' ? (
                       <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
                     ) : (
                       <Paragraph>{message.content}</Paragraph>
+                    )}
+                    {message.role === 'assistant' && (
+                      <div className="message-tools">
+                        <Tooltip title="复制回答">
+                          <Button
+                            type="text"
+                            size="small"
+                            icon={<CopyOutlined />}
+                            aria-label="复制回答"
+                            onClick={() => void copyAnswer(message.content)}
+                          />
+                        </Tooltip>
+                        {message.retryQuestion && (
+                          <Button
+                            type="link"
+                            size="small"
+                            icon={<ReloadOutlined />}
+                            onClick={() => void send(message.retryQuestion)}
+                            disabled={loading}
+                          >
+                            重试本次任务
+                          </Button>
+                        )}
+                        {message.contextOutcome === 'failed' && (
+                          <Tag color="error">未完成</Tag>
+                        )}
+                      </div>
                     )}
                     {message.dataViews?.length ? (
                       <div className="chat-data-action">
@@ -2133,7 +2329,7 @@ function ChatPage({
                         <div className="source-list-title">
                           <BulbOutlined />
                           <Text strong>回答依据</Text>
-                          <Text type="secondary">{message.sources.length} 条</Text>
+                          <Text type="secondary" className="source-list-count">{message.sources.length} 条</Text>
                         </div>
                         <div className="source-chips">
                           {message.sources.map((source, index) => (
@@ -2141,6 +2337,7 @@ function ChatPage({
                               type="text"
                               className="source-chip"
                               key={`${source.chunkId ?? source.uid}-${index}`}
+                              aria-label={`打开回答依据 ${source.name}`}
                               onClick={() => source.sourceType === 'document' && source.documentId
                                 ? void openKnowledgeDetail(source.documentId)
                                 : void openRecordDetail({
@@ -2149,7 +2346,7 @@ function ChatPage({
                                     nodeType: source.nodeType,
                                     itemId: source.itemId,
                                     values: {}
-                                  })}
+                                  }, true)}
                             >
                               {source.sourceType === 'document' ? <FileTextOutlined /> : <DatabaseOutlined />}
                               <span>
@@ -2177,58 +2374,49 @@ function ChatPage({
                   <Text type="secondary">正在思考</Text>
                 </div>
                 <div className="message-bubble thinking">
-                  {agentProgress.length ? (
-                    <div className="agent-stage-progress">
-                      <div className="agent-stage-current">
-                        <span className="thinking-dots"><i /><i /><i /></span>
-                        <span>{agentProgress.at(-1)?.message}</span>
-                      </div>
-                      <div className="agent-stage-list">
-                        {visualizationStages.map((stage) => {
-                          const latestStage = agentProgress.at(-1)?.stage === 'repair'
-                            ? 'plan'
-                            : agentProgress.at(-1)?.stage
-                          const latestIndex = visualizationStages.findIndex((item) => item.id === latestStage)
-                          const stageIndex = visualizationStages.findIndex((item) => item.id === stage.id)
-                          return (
-                            <span
-                              className={
-                                stageIndex < latestIndex
-                                  ? 'complete'
-                                  : stageIndex === latestIndex
-                                    ? 'active'
-                                    : ''
-                              }
-                              key={stage.id}
-                            >
-                              <i />{stage.label}
-                            </span>
-                          )
-                        })}
-                      </div>
-                    </div>
-                  ) : (
-                    <>
+                  <div className="agent-run-panel" aria-live="polite">
+                    <div className="agent-run-current">
                       <span className="thinking-dots"><i /><i /><i /></span>
-                      <span>正在检索知识库并组织回答</span>
-                    </>
-                  )}
+                      <span>{latestStatus?.message ?? '正在准备任务'}</span>
+                      <Tag>{agentStageLabel[latestStatus?.stage ?? 'route'] ?? '执行中'}</Tag>
+                    </div>
+                    <div className="agent-run-steps" aria-label="Agent 执行阶段">
+                      {(visibleAgentProgress.length ? visibleAgentProgress : [{ stage: 'route', message: '准备执行' }]).map((event, index, items) => (
+                        <span className={index === items.length - 1 ? 'active' : 'complete'} key={`${event.stage}-${index}`}>
+                          {index === items.length - 1 ? <InfoCircleOutlined /> : <CheckCircleOutlined />}
+                          <span>{agentStageLabel[event.stage] ?? event.stage}</span>
+                        </span>
+                      ))}
+                    </div>
+                    <Text type="secondary" className="agent-run-note">
+                      只使用本地数据和已检索依据，完成后可打开查询明细核对。
+                    </Text>
+                  </div>
                 </div>
               </div>
             </div>
           )}
         </div>
         <div className="composer">
-          {dataScope && (
-            <div className="chat-data-scope">
-              <span>
-                <DatabaseOutlined />
-                <strong>可视化数据范围</strong>
-                <Text type="secondary">{dataScopeSummary}</Text>
-              </span>
-              <Button type="text" size="small" onClick={onClearDataScope}>
-                清除范围
-              </Button>
+          {(dataScope || (artifactAttached && activeArtifact)) && (
+            <div className="chat-context-row">
+              {dataScope && (
+                <div className="chat-data-scope">
+                  <span>
+                    <DatabaseOutlined />
+                    <strong>可视化范围</strong>
+                    <Text type="secondary">{dataScopeSummary}</Text>
+                  </span>
+                  <Button type="text" size="small" onClick={onClearDataScope}>
+                    清除
+                  </Button>
+                </div>
+              )}
+              {artifactAttached && activeArtifact && (
+                <Tag className="chat-artifact-context" icon={<FundProjectionScreenOutlined />}>
+                  已附加大屏：{activeArtifact.title}
+                </Tag>
+              )}
             </div>
           )}
           <div className="composer-input">
@@ -2286,6 +2474,10 @@ function ChatPage({
                 }
                 if (event.key === 'Enter' && !event.shiftKey) {
                   event.preventDefault()
+                  if (modelOnline !== true) {
+                    message.warning('模型未连接，请先完成系统配置')
+                    return
+                  }
                   void send()
                 }
               }}
@@ -2314,7 +2506,7 @@ function ChatPage({
                 type="primary"
                 icon={<SendOutlined />}
                 loading={loading}
-                disabled={!question.trim()}
+                disabled={!question.trim() || modelOnline !== true}
                 onClick={() => void send()}
               >
                 发送
@@ -2322,7 +2514,9 @@ function ChatPage({
             </div>
           </div>
           <Text type="secondary" className="composer-disclaimer">
-            AI 回答基于本地采集数据，可通过“查看查询数据”核实关键信息
+            {modelOnline === false
+              ? '模型未连接，发送前请先完成系统配置'
+              : `${modelName || '当前模型'} · 回答可通过“查看查询数据”核实`}
           </Text>
         </div>
       </Card>
@@ -2356,19 +2550,21 @@ function ChatPage({
         width="min(1120px, calc(100vw - 48px))"
         centered
         footer={null}
-        open={Boolean(activeDataView)}
+        open={Boolean(activeDataView || recordDetailModalOpen)}
         onCancel={closeDataView}
         destroyOnHidden
         title={
           <div className="chat-data-modal-title">
             <DatabaseOutlined />
-            <span>
-              {activeRecordDetail?.name ?? activeDataView?.title ?? '查询数据'}
+            <span title={activeRecordDetail?.name ?? activeDataView?.title ?? '查询数据'}>
+              {activeRecordDetail
+                ? `数据中心记录 · ${activeRecordDetail.name}`
+                : activeDataView?.title ?? '查询数据'}
             </span>
           </div>
         }
       >
-        {activeDataView && (
+        {(activeDataView || recordDetailModalOpen) && (
           <Spin spinning={recordDetailLoading}>
             {activeRecordDetail ? (
               <div className="chat-record-detail">
@@ -2376,9 +2572,9 @@ function ChatPage({
                   className="chat-record-back"
                   type="link"
                   icon={<LeftOutlined />}
-                  onClick={() => setActiveRecordDetail(null)}
+                  onClick={() => activeDataView ? setActiveRecordDetail(null) : closeDataView()}
                 >
-                  返回查询列表
+                  {activeDataView ? '返回查询列表' : '关闭详情'}
                 </Button>
                 <Descriptions bordered size="small" column={2}>
                   <Descriptions.Item label="名称" span={2}>
@@ -2423,12 +2619,20 @@ function ChatPage({
                 <pre className="text-preview">
                   {activeRecordDetail.normalizedText || '暂无可索引文本'}
                 </pre>
-                <Divider titlePlacement="start">完整属性</Divider>
-                <pre className="json-preview">
-                  {JSON.stringify(activeRecordDetail.raw, null, 2)}
-                </pre>
+                <Collapse
+                  className="chat-raw-details"
+                  items={[{
+                    key: 'raw',
+                    label: '查看完整属性（原始 JSON）',
+                    children: (
+                      <pre className="json-preview">
+                        {JSON.stringify(activeRecordDetail.raw, null, 2)}
+                      </pre>
+                    )
+                  }]}
+                />
               </div>
-            ) : (
+            ) : activeDataView ? (
               <div className="chat-data-modal-content">
                 <div className="chat-data-summary">
                   <div>
@@ -2519,6 +2723,10 @@ function ChatPage({
                     />
                   </>
                 )}
+              </div>
+            ) : (
+              <div className="chat-record-detail chat-record-detail-loading">
+                <Text type="secondary">正在加载记录详情...</Text>
               </div>
             )}
           </Spin>
@@ -3942,7 +4150,9 @@ function SettingsPage({
             ? '按 Anthropic 模型能力发送 thinking 配置；请使用支持思考模式的模型。'
             : modelProvider === 'minimax'
               ? 'MiniMax M 系列为模型内置思考模型，当前兼容接口不提供通用的关闭参数。'
-            : '在线接口会尽量按标准推理参数传递；是否生效取决于具体服务商和模型。'
+              : modelProvider === 'openai-compatible'
+                ? '通用兼容接口不发送厂商专有思考参数；深度分析由 Agent 提示和独立复核流程保证。'
+                : '当前服务商没有通用思考参数；深度分析能力取决于所选模型。'
 
   useEffect(() => {
     if (!settings) return
@@ -4002,7 +4212,7 @@ function SettingsPage({
     const values = await modelForm.validateFields()
     setModelTesting(true)
     try {
-      const result = await window.visslm.testModel(values)
+      const result = await window.visslm.testModel(values, true)
       result.ok ? message.success(result.message) : message.error(result.message)
     } finally {
       setModelTesting(false)
@@ -4538,6 +4748,7 @@ function AppShell({ themeMode, onThemeModeChange }: AppProps): React.JSX.Element
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
   const [chatQuestion, setChatQuestion] = useState('')
   const [chatLoading, setChatLoading] = useState(false)
+  const [chatConversationId, setChatConversationId] = useState<string>(() => crypto.randomUUID())
   const [generatedDashboard, setGeneratedDashboard] = useState<DashboardSpec | null>(null)
   const [generatedDashboardVersion, setGeneratedDashboardVersion] = useState<number | undefined>(undefined)
   const [chatDataScope, setChatDataScope] = useState<DataScope | null>(null)
@@ -4659,6 +4870,13 @@ function AppShell({ themeMode, onThemeModeChange }: AppProps): React.JSX.Element
           onDashboardUpdate={updateGeneratedDashboard}
           dataScope={chatDataScope}
           dataScopeSummary={chatDataScopeSummary}
+          conversationId={chatConversationId}
+          onConversationIdChange={setChatConversationId}
+          modelOnline={modelOnline}
+          modelName={settings?.model.model}
+          onOpenSettings={() => setPage('settings')}
+          onOpenSync={() => setPage('sync')}
+          refreshKey={refreshKey}
           onClearDataScope={() => {
             setChatDataScope(null)
             setChatDataScopeSummary('')
@@ -4693,10 +4911,12 @@ function AppShell({ themeMode, onThemeModeChange }: AppProps): React.JSX.Element
     chatLoading,
     chatMessages,
     chatQuestion,
+    chatConversationId,
     chatDataScope,
     chatDataScopeSummary,
     generatedDashboard,
     generatedDashboardVersion,
+    modelOnline,
     page,
     progress,
     refreshKey,

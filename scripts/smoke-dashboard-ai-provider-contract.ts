@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage } from 'node:http'
 import { QueryEngine } from '../src/main/analytics/query-engine'
 import type { AnalyticsRecord, AppDatabase } from '../src/main/database'
 import { VisualizationAgent } from '../src/main/experts/visualization-agent'
+import { ModelClient } from '../src/main/model-client'
 import type { DashboardComponentSpec, DashboardSpec, VisualizationRunInput } from '../src/shared/dashboard'
 import type { ModelProvider, ModelSettings } from '../src/shared/types'
 
@@ -75,8 +76,31 @@ const readBody = async (request: IncomingMessage): Promise<string> => {
 const server = createServer(async (request, response) => {
   try {
     const path = request.url ?? ''
+    if (request.method === 'GET' && path.endsWith('/models')) {
+      captured.push({ path, headers: request.headers, body: {} })
+      response.setHeader('Content-Type', 'application/json')
+      response.end(JSON.stringify({ data: [{ id: 'contract-model' }] }))
+      return
+    }
+    if (request.method === 'GET' && path.endsWith('/api/tags')) {
+      captured.push({ path, headers: request.headers, body: {} })
+      response.setHeader('Content-Type', 'application/json')
+      response.end(JSON.stringify({ models: [{ name: 'contract-local' }] }))
+      return
+    }
     const body = JSON.parse(await readBody(request)) as Record<string, unknown>
     captured.push({ path, headers: request.headers, body })
+    if (path === '/ollama/api/chat') {
+      response.setHeader('Content-Type', 'application/json')
+      response.end(JSON.stringify({ message: { role: 'assistant', content: 'OK' }, done_reason: 'stop' }))
+      return
+    }
+    if (path === '/denied/chat/completions') {
+      response.statusCode = 403
+      response.setHeader('Content-Type', 'application/json')
+      response.end(JSON.stringify({ error: 'Codex is not enabled' }))
+      return
+    }
     const attempt = (attempts.get(path) ?? 0) + 1
     attempts.set(path, attempt)
     const operations = attempt === 1
@@ -114,6 +138,46 @@ const providers: Array<{ provider: ModelProvider; prefix: string }> = [
 const providerResults: Array<Record<string, unknown>> = []
 
 try {
+  const probeSettings: ModelSettings = {
+    source: 'online',
+    provider: 'openai-compatible',
+    baseUrl: `${origin}/probe`,
+    model: 'contract-model',
+    thinking: true,
+    apiKey: 'private-probe-key'
+  }
+  const lightweightProbe = await new ModelClient(probeSettings).test()
+  assert.equal(lightweightProbe.ok, true)
+  assert.equal(captured.filter((request) => request.path === '/probe/chat/completions').length, 0)
+  const deepProbe = await new ModelClient(probeSettings).test(true)
+  assert.equal(deepProbe.ok, true)
+  assert.ok(deepProbe.message.includes('最小问答测试通过'))
+  const probeChat = captured.find((request) => request.path === '/probe/chat/completions')
+  assert.ok(probeChat)
+  assert.equal('reasoning_effort' in probeChat.body, false)
+
+  const deniedProbe = await new ModelClient({ ...probeSettings, baseUrl: `${origin}/denied` }).test(true)
+  assert.equal(deniedProbe.ok, false)
+  assert.ok(deniedProbe.message.includes('模型列表可访问，但最小问答测试失败'))
+  assert.ok(deniedProbe.message.includes('当前 API Key 未开通'))
+
+  const localProbeSettings: ModelSettings = {
+    source: 'local',
+    provider: 'ollama',
+    baseUrl: `${origin}/ollama`,
+    model: 'contract-local',
+    thinking: true
+  }
+  const localLightweightProbe = await new ModelClient(localProbeSettings).test()
+  assert.equal(localLightweightProbe.ok, true)
+  assert.equal(captured.filter((request) => request.path === '/ollama/api/chat').length, 0)
+  const localDeepProbe = await new ModelClient(localProbeSettings).test(true)
+  assert.equal(localDeepProbe.ok, true)
+  assert.ok(localDeepProbe.message.includes('最小问答测试通过'))
+  const localProbeChat = captured.find((request) => request.path === '/ollama/api/chat')
+  assert.ok(localProbeChat)
+  assert.equal(localProbeChat.body.think, false)
+
   for (const { provider, prefix } of providers) {
     const runs: VisualizationRunInput[] = []
     const settings: ModelSettings = {
@@ -121,7 +185,7 @@ try {
       provider,
       baseUrl: `${origin}/${prefix}`,
       model: provider === 'openai' ? 'gpt-4.1-mini' : 'contract-model',
-      thinking: false,
+      thinking: provider === 'openai-compatible',
       apiKey: `private-${prefix}-key`
     }
     const agent = new VisualizationAgent(
@@ -173,6 +237,9 @@ try {
         assert.ok(responseFormat.json_schema?.schema?.required?.includes('operations'))
       } else {
         assert.deepEqual(responseFormat, { type: 'json_object' })
+        assert.equal('reasoning_effort' in first.body, false)
+        assert.equal('enable_thinking' in first.body, false)
+        assert.equal('thinking' in first.body, false)
       }
     }
     const retryMessages = retry.body.messages as Array<{ role?: string; content?: string }>
@@ -194,6 +261,10 @@ try {
       'provider-specific authentication headers',
       'OpenAI strict json_schema response format',
       'OpenAI-compatible json_object response format',
+      'OpenAI-compatible provider-neutral thinking transport',
+      'lightweight and deep connection probes',
+      'local Ollama chat capability probe',
+      'actionable compatible-provider permission errors',
       'Anthropic system and message separation',
       'focused component restriction and retry',
       'failed history exclusion'
