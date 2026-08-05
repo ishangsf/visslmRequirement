@@ -6,19 +6,16 @@ const projectPageSource = readFileSync(join(process.cwd(), 'src/renderer/src/pro
 const relationshipGraphSource = readFileSync(join(process.cwd(), 'src/renderer/src/project-management/ProjectRelationshipGraph.tsx'), 'utf8')
 const projectStylesSource = readFileSync(join(process.cwd(), 'src/renderer/src/styles.css'), 'utf8')
 const appSource = readFileSync(join(process.cwd(), 'src/renderer/src/App.tsx'), 'utf8')
-const detailTabsSource = projectPageSource.slice(projectPageSource.indexOf('className="project-detail-tabs"'))
+const detailTabsSource = projectPageSource.slice(projectPageSource.indexOf('project-detail-tabs'))
 const relationshipTabOrderContract = detailTabsSource.lastIndexOf("key: 'relationships'") > detailTabsSource.lastIndexOf("key: 'knowledge'")
-const analysisLogCollapseContract = projectPageSource.includes('aria-expanded={analysisLogsExpanded}')
-  && projectPageSource.includes('aria-controls={`project-analysis-log-list-${current.id}`}')
-  && projectPageSource.includes("setAnalysisLogsExpanded((expanded) => !expanded)")
-  && projectPageSource.includes('const [analysisLogsExpanded, setAnalysisLogsExpanded] = useState(false)')
-  && projectPageSource.includes('const matchingTaskIds = new Set(nextLogs')
-  && projectPageSource.includes('const latestIsAgreementLog = nextLogs[0]?.taskType === \'agreement\'')
-  && projectPageSource.includes('if (hasNewAgreementLog) setAnalysisLogsExpanded(true)')
+const analysisLogAlwaysVisibleContract = !projectPageSource.includes('analysisLogsExpanded')
+  && !projectPageSource.includes('project-analysis-log-toggle')
+  && projectPageSource.includes('className="project-analysis-log-panel project-analysis-log-drawer-panel"')
+  && projectPageSource.includes('className="project-analysis-log-list"')
   && projectPageSource.includes('const agreementAnalysisLogs = analysisLogs.filter((log) => !matchingTaskIds.has(log.taskId))')
   && projectPageSource.includes('project-match-progress')
   && projectPageSource.includes('progress={projectProgress}')
-  && projectStylesSource.includes('.project-analysis-log-panel.is-collapsed')
+  && !projectStylesSource.includes('.project-analysis-log-panel.is-collapsed')
   && projectStylesSource.includes('.project-match-progress')
 const projectMatchingSettingsContract = appSource.includes("key: 'general'")
   && appSource.includes('saveProjectMatchingSettings')
@@ -42,6 +39,11 @@ const linkedAssetListContract = projectPageSource.includes('project-linked-asset
   && projectPageSource.includes('matchScore.toFixed(1)')
   && projectPageSource.includes('excludeProjectAssetProjectId')
   && projectStylesSource.includes('.project-linked-assets-list')
+const taskRequirementContract = projectPageSource.includes("type ProjectTaskColumnKey = 'type' | 'title' | 'requirements'")
+  && projectPageSource.includes('allRequirements={allRequirements}')
+  && projectPageSource.includes('onOpenRequirement={(requirementId) => void openRequirementMatch(requirementId)}')
+  && projectPageSource.includes('requirementIds: task.requirements.map')
+  && projectStylesSource.includes('.project-task-requirement-link')
 const relationshipGraphContract = projectPageSource.includes("import { ProjectRelationshipGraph } from './ProjectRelationshipGraph'")
   && projectPageSource.includes('const [allRequirements, setAllRequirements] = useState<ProjectRequirement[]>([])')
   && projectPageSource.includes('window.visslm.listAllProjectRequirements(project.id)')
@@ -55,6 +57,9 @@ const relationshipGraphContract = projectPageSource.includes("import { ProjectRe
   && relationshipGraphSource.includes("layout: viewMode === 'flow' ? 'none' : 'force'")
   && relationshipGraphSource.includes('上游路径')
   && relationshipGraphSource.includes('下游路径')
+  && relationshipGraphSource.includes("addLink(`requirement:${requirement.requirementId}`, nodeId, '关联下游数据')")
+  && relationshipGraphSource.includes("addLink(`requirement:${requirement.requirementId}`, nodeId, '关联计划任务')")
+  && !relationshipGraphSource.includes("addLink(nodeId, `requirement:${requirement.requirementId}`, '支撑需求')")
   && relationshipGraphSource.includes('const laneOffset')
   && relationshipGraphSource.includes('const buildFlowDisplayGraph')
   && relationshipGraphSource.includes('flow-group:')
@@ -190,10 +195,11 @@ const checks = await evaluate(`(async () => {
     technicalIndicatorMatch: true,
     agreementStatus: true,
     matchStatus: true,
-    analysisLogCollapse: ${analysisLogCollapseContract},
+    analysisLogAlwaysVisible: ${analysisLogAlwaysVisibleContract},
     projectMatchingSettings: ${projectMatchingSettingsContract},
     requirementStatusFilter: ${requirementStatusFilterContract},
     linkedAssetList: ${linkedAssetListContract},
+    taskRequirement: ${taskRequirementContract},
     relationshipGraph: ${relationshipGraphContract},
     projectExport: true,
     projectDelete: true
@@ -284,8 +290,25 @@ const checks = await evaluate(`(async () => {
       .find((item) => item.textContent?.includes('项目计划'))
     planTab?.click()
     const planReady = await waitFor('.project-plan-table-card')
-    const taskGanttReady = await waitFor('.project-task-gantt')
-    const resourceGanttReady = await waitFor('.project-resource-gantt')
+    const ganttTabButtons = [...document.querySelectorAll('.project-gantt-tabs .ant-tabs-tab-btn')]
+    const taskGanttTab = ganttTabButtons.find((item) => item.textContent?.includes('任务甘特图'))
+    const resourceGanttTab = ganttTabButtons.find((item) => item.textContent?.includes('人力资源甘特图'))
+    const ganttTabsReady = Boolean(taskGanttTab && resourceGanttTab)
+    const waitForActiveGanttTab = async (label, timeout = 1000) => {
+      const started = Date.now()
+      while (Date.now() - started < timeout) {
+        if (document.querySelector('.project-gantt-tabs .ant-tabs-tab-active .ant-tabs-tab-btn')?.textContent?.includes(label)) return true
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      }
+      return false
+    }
+    taskGanttTab?.click()
+    const taskGanttReady = ganttTabsReady && await waitFor('.project-task-gantt')
+      && await waitForActiveGanttTab('任务甘特图')
+    resourceGanttTab?.click()
+    const resourceGanttReady = ganttTabsReady && await waitFor('.project-resource-gantt')
+      && await waitForActiveGanttTab('人力资源甘特图')
+    taskGanttTab?.click()
     await waitFor('.project-plan-table-card .project-task-title-cell, .project-plan-table-card .ant-table-placeholder')
     const taskRow = [...document.querySelectorAll('.project-plan-table-card .ant-table-tbody tr')]
       .find((row) => row.classList.contains('ant-table-row') && row.querySelector('.project-task-title-cell'))
@@ -294,6 +317,8 @@ const checks = await evaluate(`(async () => {
     const taskDragHandleStyle = taskDragHandle ? getComputedStyle(taskDragHandle) : null
     const parentColumn = [...document.querySelectorAll('.project-plan-table-card .ant-table-thead th')]
       .some((header) => header.textContent?.includes('父任务'))
+    const requirementColumn = [...document.querySelectorAll('.project-plan-table-card .ant-table-thead th')]
+      .some((header) => header.textContent?.includes('需求清单'))
     taskListFeatures = {
       taskPlanReady: detailReady && planReady,
       taskGanttReady: taskGanttReady && Boolean(document.querySelector('.project-task-gantt')?.textContent?.includes('任务甘特图')),
@@ -302,6 +327,7 @@ const checks = await evaluate(`(async () => {
       subtaskEntry: !taskRow || taskButtons.some((button) => button.textContent?.trim() === '子任务' || button.getAttribute('aria-label')?.includes('新增子任务')),
       inlineCreate: true,
       parentColumnRemoved: !parentColumn,
+      taskRequirement: ${taskRequirementContract} && (!taskRow || requirementColumn),
       dragReady: !taskRow || Boolean(taskDragHandle && taskDragHandle.getAttribute('draggable') === 'false' && taskDragHandleStyle?.touchAction === 'none'),
       costResponsibleField: true,
       requirementReviewPolicy: taskListFeatures.requirementReviewPolicy,
@@ -309,7 +335,7 @@ const checks = await evaluate(`(async () => {
       technicalIndicatorMatch: taskListFeatures.technicalIndicatorMatch,
       agreementStatus: taskListFeatures.agreementStatus,
       matchStatus: taskListFeatures.matchStatus,
-       analysisLogCollapse: taskListFeatures.analysisLogCollapse,
+       analysisLogAlwaysVisible: taskListFeatures.analysisLogAlwaysVisible,
        projectMatchingSettings: taskListFeatures.projectMatchingSettings,
        requirementStatusFilter: taskListFeatures.requirementStatusFilter,
        linkedAssetList: taskListFeatures.linkedAssetList,
@@ -370,7 +396,7 @@ const checks = await evaluate(`(async () => {
   }
 })()`)
 
-  if (!checks.pageReady || !checks.listTable || !checks.organizationPeoplePage || !checks.createButton || !checks.importProjectButton || !checks.formReady || !checks.projectNameField || !checks.contractAmountField || !checks.projectOwnerSelects || !checks.taskPlanReady || !checks.taskGanttReady || !checks.resourceGanttReady || !checks.inlineEdit || !checks.subtaskEntry || !checks.inlineCreate || !checks.parentColumnRemoved || !checks.dragReady || !checks.costResponsibleField || !checks.requirementReviewPolicy || !checks.requirementModuleColumn || !checks.technicalIndicatorMatch || !checks.agreementStatus || !checks.matchStatus || !checks.analysisLogCollapse || !checks.projectMatchingSettings || !checks.requirementStatusFilter || !checks.linkedAssetList || !checks.relationshipGraph || !checks.projectExport || !checks.projectDelete) {
+  if (!checks.pageReady || !checks.listTable || !checks.organizationPeoplePage || !checks.createButton || !checks.importProjectButton || !checks.formReady || !checks.projectNameField || !checks.contractAmountField || !checks.projectOwnerSelects || !checks.taskPlanReady || !checks.taskGanttReady || !checks.resourceGanttReady || !checks.inlineEdit || !checks.subtaskEntry || !checks.inlineCreate || !checks.parentColumnRemoved || !checks.dragReady || !checks.costResponsibleField || !checks.requirementReviewPolicy || !checks.requirementModuleColumn || !checks.technicalIndicatorMatch || !checks.agreementStatus || !checks.matchStatus || !checks.analysisLogAlwaysVisible || !checks.projectMatchingSettings || !checks.requirementStatusFilter || !checks.linkedAssetList || !checks.taskRequirement || !checks.relationshipGraph || !checks.projectExport || !checks.projectDelete) {
   throw new Error(`Project management UI smoke failed: ${JSON.stringify(checks)}`)
 }
 

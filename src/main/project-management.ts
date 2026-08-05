@@ -60,6 +60,7 @@ const requirementCategories = new Set<ProjectRequirementCategory>([
   'functional', 'interface', 'data', 'performance', 'security',
   'deployment', 'operations', 'acceptance', 'business'
 ])
+const projectRequirementAutoLinkScoreThreshold = 80
 
 interface ExtractedProject {
   projectName?: string
@@ -719,6 +720,7 @@ export class ProjectManagementService {
     const normalized = this.normalizeProjectTaskInput(input)
     if (normalized.parentTaskId) this.assertProjectTaskParent(projectId, normalized.parentTaskId)
     if (normalized.ownerPersonId) this.assertPerson(normalized.ownerPersonId)
+    this.assertProjectTaskRequirements(projectId, normalized.requirementIds ?? [])
     return this.db.insertProjectTask(projectId, normalized)
   }
 
@@ -728,6 +730,7 @@ export class ProjectManagementService {
     if (!current) return null
     if (normalized.parentTaskId) this.assertProjectTaskParent(current.projectId, normalized.parentTaskId, id)
     if (normalized.ownerPersonId) this.assertPerson(normalized.ownerPersonId)
+    this.assertProjectTaskRequirements(current.projectId, normalized.requirementIds ?? [])
     return this.db.updateProjectTask(id, normalized)
   }
 
@@ -813,6 +816,15 @@ export class ProjectManagementService {
     if (!this.db.getOrganizationPerson(id)) throw new Error('组织人员不存在')
   }
 
+  private assertProjectTaskRequirements(projectId: string, requirementIds: string[]): void {
+    for (const requirementId of requirementIds) {
+      const requirement = this.db.getProjectRequirement(requirementId)
+      if (!requirement || requirement.projectId !== projectId) {
+        throw new Error('计划任务关联的需求不存在或不属于当前项目')
+      }
+    }
+  }
+
   private findProjectTask(id: string): ProjectPlanTask | null {
     return this.db.getProjectTask(id)
   }
@@ -878,7 +890,10 @@ export class ProjectManagementService {
       ownerPersonId: input.ownerPersonId?.trim() || undefined,
       status: input.status ?? 'not_started',
       progressPercent,
-      sortOrder: Math.max(0, Math.trunc(Number(input.sortOrder ?? 0)))
+      sortOrder: Math.max(0, Math.trunc(Number(input.sortOrder ?? 0))),
+      requirementIds: [...new Set((Array.isArray(input.requirementIds) ? input.requirementIds : [])
+        .map((id) => String(id).trim())
+        .filter(Boolean))]
     }
   }
 
@@ -1765,8 +1780,9 @@ export class ProjectManagementService {
       }
     })
     this.db.replaceRequirementMatches(requirement.id, matches)
+    this.db.linkRequirementMatchesAboveScore(requirement.id, projectRequirementAutoLinkScoreThreshold)
     const highestMatchScore = matches.reduce((value, item) => Math.max(value, item.finalScore), 0)
-    const scoreThreshold = 80
+    const scoreThreshold = projectRequirementAutoLinkScoreThreshold
     const aiStatus: ProjectRequirementStatus = reviewed.status === 'satisfied' && highestMatchScore >= scoreThreshold
       ? 'satisfied'
       : 'unmarked'

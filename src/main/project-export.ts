@@ -23,6 +23,13 @@ const assetRequirementCell = (asset: ProjectDataSnapshot['assets'][number]): str
   }).join('；')
 )
 
+const taskRequirementCell = (task: ProjectDataSnapshot['tasks'][number]): string => (
+  (task.requirements ?? []).map((requirement) => {
+    const number = requirement.requirementNo > 0 ? `REQ-${String(requirement.requirementNo).padStart(3, '0')}` : ''
+    return [number, requirement.title].filter(Boolean).join(' ')
+  }).join('；')
+)
+
 const columnName = (index: number): string => {
   let current = index + 1
   let name = ''
@@ -199,12 +206,12 @@ export const createProjectWorkbook = (snapshot: ProjectDataSnapshot): XLSX.WorkB
   ].map(cell)), [38, 38, 28, 20, 20, 60, 48, 24])
   appendSheet(workbook, '项目计划', [
     '任务 ID', '任务类型', '任务名称', '任务说明', '父任务 ID', '开始日期', '结束日期', '负责人 ID', '负责人',
-    '状态', '进度（%）', '排序', '层级', '包含子任务', '创建时间', '更新时间'
+    '关联需求', '状态', '进度（%）', '排序', '层级', '包含子任务', '创建时间', '更新时间'
   ], snapshot.tasks.map((task) => [
     task.id, task.taskType, task.title, task.description, task.parentTaskId ?? '', task.startDate, task.endDate,
-    task.ownerPersonId ?? '', task.ownerName ?? '', task.status, task.progressPercent, task.sortOrder, task.depth,
+    task.ownerPersonId ?? '', task.ownerName ?? '', taskRequirementCell(task), task.status, task.progressPercent, task.sortOrder, task.depth,
     task.hasChildren ? '是' : '否', task.createdAt, task.updatedAt
-  ].map(cell)), [38, 14, 32, 60, 38, 16, 16, 38, 18, 16, 14, 10, 10, 12, 24, 24])
+  ].map(cell)), [38, 14, 32, 60, 38, 16, 16, 38, 18, 48, 16, 14, 10, 10, 12, 24, 24])
   appendSheet(workbook, '功能需求', [
     '需求 ID', '需求编号', '类别', '模块', '标题', '内容', '关键信息词', '信息词来源', '来源位置', '来源分块 ID',
     '证据摘录', '置信度', '审核状态', '审核备注', '实现状态', '状态来源', '状态原因', '最高匹配分', '匹配数',

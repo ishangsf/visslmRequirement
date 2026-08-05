@@ -320,6 +320,7 @@ try {
   assert.equal(linkedProject.currentDocumentName, document.fileName)
   assert.equal(linkedProject.documentCount, 1)
 
+  let semanticCandidates: KnowledgeRecordMatch[] = []
   const semanticMatchQueries: string[] = []
   const fakeKnowledge = {
     processFiles: async () => ({
@@ -334,7 +335,7 @@ try {
     }),
     rankRecordMatches: async (query: string) => {
       semanticMatchQueries.push(query)
-      return []
+      return semanticCandidates
     }
   } as unknown as KnowledgeService
   const service = new ProjectManagementService(
@@ -495,6 +496,40 @@ try {
       sourceChunkId: 'chunk-2'
     }
   ])
+  const updatedPlanTaskWithRequirement = db.updateProjectTask(planTask.id, {
+    taskType: 'phase',
+    title: planTask.title,
+    description: planTask.description,
+    startDate: planTask.startDate,
+    endDate: planTask.endDate,
+    ownerPersonId: person.id,
+    status: planTask.status,
+    progressPercent: planTask.progressPercent,
+    sortOrder: planTask.sortOrder,
+    requirementIds: ['smoke-requirement-1']
+  })
+  assert(updatedPlanTaskWithRequirement)
+  assert.deepEqual(updatedPlanTaskWithRequirement.requirements.map((item) => item.requirementId), ['smoke-requirement-1'])
+  const requirementTask = db.insertProjectTask(project.id, {
+    taskType: 'task',
+    title: '需求关联 Smoke 任务',
+    startDate: '2026-08-11',
+    endDate: '2026-08-14',
+    requirementIds: ['smoke-requirement-1', 'smoke-requirement-2']
+  })
+  assert.deepEqual(requirementTask.requirements.map((item) => item.requirementId), ['smoke-requirement-1', 'smoke-requirement-2'])
+  const replacedRequirementTask = db.updateProjectTask(requirementTask.id, {
+    taskType: requirementTask.taskType,
+    title: requirementTask.title,
+    startDate: requirementTask.startDate,
+    endDate: requirementTask.endDate,
+    status: requirementTask.status,
+    progressPercent: requirementTask.progressPercent,
+    sortOrder: requirementTask.sortOrder,
+    requirementIds: ['smoke-requirement-2']
+  })
+  assert(replacedRequirementTask)
+  assert.deepEqual(replacedRequirementTask.requirements.map((item) => item.requirementId), ['smoke-requirement-2'])
   const normalizedRequirement = normalizeProjectRequirementText({
     title: '2.1 整体要求 支持按订单号查询订单详情',
     content: '支持按订单号查询订单详情'
@@ -503,6 +538,47 @@ try {
   assert.equal(normalizedRequirement.title, '支持按订单号查询订单详情')
   const initialRequirementPage = db.listProjectRequirements({ projectId: project.id, page: 1, pageSize: 20 })
   assert.equal(initialRequirementPage.rows[0]?.status, 'unmarked')
+  semanticCandidates = [
+    {
+      recordUid: 'smoke-record-2',
+      recordName: '库存同步能力',
+      nodeType: 'record',
+      itemId: 'smoke-record-2',
+      score: 80,
+      chunkId: 'chunk-record-2',
+      snippet: '库存同步能力'
+    },
+    {
+      recordUid: 'smoke-record-1',
+      recordName: '订单查询能力',
+      nodeType: 'record',
+      itemId: 'smoke-record-1',
+      score: 79,
+      chunkId: 'chunk-record-1',
+      snippet: '订单查询能力'
+    }
+  ]
+  const originalMatchingFetch = globalThis.fetch
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    done_reason: 'stop',
+    message: {
+      role: 'assistant',
+      content: '{"status":"unmarked","reason":"测试","matches":[]}'
+    }
+  }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  try {
+    const startedRequirementMatching = service.startRequirementMatching('smoke-requirement-1')
+    assert.equal(startedRequirementMatching.ok, true)
+    for (let attempt = 0; attempt < 50 && db.getManagedProject(project.id)?.matchStatus === 'processing'; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+  } finally {
+    globalThis.fetch = originalMatchingFetch
+  }
+  const automaticallyLinkedAssets = db.listProjectAssets(project.id)
+  assert.equal(automaticallyLinkedAssets.find((item) => item.recordUid === 'smoke-record-2')?.requirements.some((item) => item.requirementId === 'smoke-requirement-1'), true)
+  assert.equal(automaticallyLinkedAssets.find((item) => item.recordUid === 'smoke-record-1')?.requirements.some((item) => item.requirementId === 'smoke-requirement-1'), false)
+  assert.equal(db.unlinkProjectAsset(project.id, 'smoke-record-2').ok, true)
   db.replaceRequirementMatches('smoke-requirement-1', [
     {
       recordUid: 'smoke-record-1',
@@ -584,6 +660,8 @@ try {
   assert.equal(db.listProjectRequirementMatches({ requirementId: 'smoke-requirement-1', page: 1, pageSize: 20 }).total, 0)
   assert.equal(db.listProjectAssets(project.id).find((asset) => asset.recordUid === 'smoke-record-1')?.requirements.length, 1)
   assert.equal(db.listProjectAssets(project.id).find((asset) => asset.recordUid === 'smoke-record-1')?.requirements[0]?.requirementId, 'smoke-requirement-2')
+  assert.equal(db.getProjectTask(planTask.id)?.requirements.length, 0)
+  assert.equal(db.getProjectTask(requirementTask.id)?.requirements[0]?.title, '库存同步')
   const remainingRequirementPage = db.listProjectRequirements({ projectId: project.id, page: 1, pageSize: 20 })
   assert.equal(remainingRequirementPage.total, 1)
   assert.equal(remainingRequirementPage.rows[0]?.id, 'smoke-requirement-2')
@@ -594,7 +672,7 @@ try {
   assert.equal(snapshot.version, 1)
   assert.equal(snapshot.project.baseEstimatedCost, 240)
   assert.equal(snapshot.participants.length, 1)
-  assert.equal(snapshot.tasks.length, 3)
+  assert.equal(snapshot.tasks.length, 4)
   assert.equal(snapshot.requirements.length, 1)
   const imported = db.importManagedProjectSnapshot(snapshot)
   assert(imported.projectId)
@@ -605,8 +683,12 @@ try {
   assert.equal(importedProject.estimatedCost, 1440)
   assert.equal(importedProject.actualCost, 105)
   assert.equal(db.listProjectParticipants(imported.projectId).length, 1)
-  assert.equal(db.listProjectTasks(imported.projectId).length, 3)
+  assert.equal(db.listProjectTasks(imported.projectId).length, 4)
   assert.equal(db.listProjectRequirements({ projectId: imported.projectId, page: 1, pageSize: 20 }).total, 1)
+  const importedRequirementTask = db.listProjectTasks(imported.projectId).find((task) => task.title === requirementTask.title)
+  assert(importedRequirementTask)
+  assert.equal(importedRequirementTask.requirements.length, 1)
+  assert.equal(importedRequirementTask.requirements[0]?.title, '库存同步')
   assert.equal(db.listProjectAssets(imported.projectId).length, 1)
   assert.equal(db.listProjectAssets(imported.projectId)[0]?.requirements[0]?.title, '库存同步')
   assert.equal(db.getKnowledgeDocument(document.id)?.id, document.id)
@@ -625,7 +707,7 @@ try {
   assert.equal(listedProject.unmarkedCount, 0)
   assert.equal(listedProject.assetCount, 1)
   assert.equal(listedProject.participantCount, 1)
-  assert.equal(listedProject.taskCount, 3)
+  assert.equal(listedProject.taskCount, 4)
   assert.equal(listedProject.laborEstimatedCost, 1200)
 
   const reviewSet = db.createProjectRequirementSet({

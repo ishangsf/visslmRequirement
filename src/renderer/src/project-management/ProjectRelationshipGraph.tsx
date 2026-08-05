@@ -303,7 +303,8 @@ const buildRelationshipGraph = (
         { label: '模块', value: requirement.module || '未分类' },
         { label: '状态', value: requirementStatusLabels[requirement.status] },
         { label: '匹配数据', value: `${requirement.matchCount} 条` },
-        { label: '最高匹配度', value: requirement.highestMatchScore ? `${requirement.highestMatchScore.toFixed(1)}%` : '暂无' }
+        { label: '最高匹配度', value: requirement.highestMatchScore ? `${requirement.highestMatchScore.toFixed(1)}%` : '暂无' },
+        { label: '下游数据', value: `${assets.filter((asset) => asset.requirements.some((item) => item.requirementId === requirement.id)).length} 条` }
       ],
       symbolSize: requirement.status === 'satisfied' ? 34 : 30
     })
@@ -329,7 +330,7 @@ const buildRelationshipGraph = (
     })
     addLink(projectNodeId, nodeId, '关联资产')
     asset.requirements.forEach((requirement) => {
-      addLink(nodeId, `requirement:${requirement.requirementId}`, '支撑需求')
+      addLink(`requirement:${requirement.requirementId}`, nodeId, '关联下游数据')
     })
   })
 
@@ -364,11 +365,15 @@ const buildRelationshipGraph = (
         { label: '状态', value: taskStatusLabels[task.status] },
         { label: '进度', value: `${Math.round(task.progressPercent)}%` },
         { label: '时间', value: `${formatGraphDate(task.startDate)} - ${formatGraphDate(task.endDate)}` },
-        { label: '负责人', value: task.ownerName || '未分配' }
+        { label: '负责人', value: task.ownerName || '未分配' },
+        { label: '关联需求', value: `${task.requirements.length} 条` }
       ],
       symbolSize: task.taskType === 'milestone' ? 36 : 28
     })
     addLink(projectNodeId, nodeId, '生成计划')
+    task.requirements.forEach((requirement) => {
+      addLink(`requirement:${requirement.requirementId}`, nodeId, '关联计划任务')
+    })
     if (task.parentTaskId) addLink(`task:${task.parentTaskId}`, nodeId, '分解计划')
     if (task.ownerPersonId) {
       const participant = participants.find((item) => item.personId === task.ownerPersonId)

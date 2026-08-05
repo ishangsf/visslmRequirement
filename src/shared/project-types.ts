@@ -172,6 +172,14 @@ export interface ProjectParticipantInput {
   notes?: string
 }
 
+export interface ProjectPlanTaskRequirement {
+  requirementId: string
+  requirementNo: number
+  title: string
+  status: ProjectRequirementStatus
+  linkedAt: string
+}
+
 export interface ProjectPlanTask {
   id: string
   projectId: string
@@ -188,6 +196,7 @@ export interface ProjectPlanTask {
   sortOrder: number
   depth: number
   hasChildren: boolean
+  requirements: ProjectPlanTaskRequirement[]
   createdAt: string
   updatedAt: string
 }
@@ -203,6 +212,7 @@ export interface ProjectPlanTaskInput {
   status?: ProjectPlanTaskStatus
   progressPercent?: number
   sortOrder?: number
+  requirementIds?: string[]
 }
 
 export interface ProjectPlanTaskMoveInput {

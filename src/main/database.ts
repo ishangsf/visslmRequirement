@@ -58,6 +58,7 @@ import type {
   ProjectParticipant,
   ProjectParticipantInput,
   ProjectPlanTask,
+  ProjectPlanTaskRequirement,
   ProjectPlanTaskInput,
   ProjectPlanTaskMoveInput,
   ProjectRequirement,
@@ -1055,6 +1056,19 @@ export class AppDatabase {
       );
       CREATE INDEX IF NOT EXISTS idx_pm_project_asset_requirements_requirement
         ON pm_project_asset_requirements(requirement_id);
+
+      CREATE TABLE IF NOT EXISTS pm_project_task_requirements (
+        project_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        requirement_id TEXT NOT NULL,
+        linked_at TEXT NOT NULL,
+        PRIMARY KEY(task_id, requirement_id),
+        FOREIGN KEY(project_id) REFERENCES pm_projects(id) ON DELETE CASCADE,
+        FOREIGN KEY(task_id) REFERENCES pm_project_tasks(id) ON DELETE CASCADE,
+        FOREIGN KEY(requirement_id) REFERENCES pm_requirements(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_pm_project_task_requirements_requirement
+        ON pm_project_task_requirements(project_id, requirement_id);
 
       CREATE TABLE IF NOT EXISTS pm_analysis_runs (
         id TEXT PRIMARY KEY,
@@ -2532,6 +2546,19 @@ export class AppDatabase {
           sourceTimestamp(task.createdAt),
           timestamp
         )
+        for (const linkedRequirement of task.requirements ?? []) {
+          const sourceRequirementId = String(linkedRequirement.requirementId ?? '').trim()
+          const targetRequirementId = requirementMap.get(sourceRequirementId)
+          if (!targetRequirementId) {
+            warnings.push(`任务“${String(task.title ?? '未命名任务')}”的关联需求未找到对应记录，已跳过`)
+            continue
+          }
+          this.db.prepare(`
+            INSERT INTO pm_project_task_requirements(project_id, task_id, requirement_id, linked_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(task_id, requirement_id) DO NOTHING
+          `).run(projectId, targetTaskId, targetRequirementId, sourceTimestamp(linkedRequirement.linkedAt || task.updatedAt || task.createdAt))
+        }
       }
 
       const linkedRecordIds = new Set<string>()
@@ -3292,6 +3319,44 @@ export class AppDatabase {
     }
   }
 
+  linkRequirementMatchesAboveScore(requirementId: string, minScore: number): number {
+    const requirement = this.db.prepare(
+      'SELECT id FROM pm_requirements WHERE id = ?'
+    ).get(requirementId) as SqlRow | undefined
+    if (!requirement) return 0
+    const threshold = Math.max(
+      0,
+      Math.min(100, Number.isFinite(Number(minScore)) ? Number(minScore) : 80)
+    )
+    const timestamp = nowIso()
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      this.db.prepare(`
+        INSERT OR IGNORE INTO pm_project_assets(project_id, record_uid, linked_at)
+        SELECT q.project_id, m.record_uid, ?
+        FROM pm_requirement_matches m
+        JOIN pm_requirements q ON q.id = m.requirement_id
+        JOIN records r ON r.uid = m.record_uid
+        WHERE m.requirement_id = ? AND m.final_score >= ?
+      `).run(timestamp, requirementId, threshold)
+      const linked = this.db.prepare(`
+        INSERT OR IGNORE INTO pm_project_asset_requirements(
+          project_id, record_uid, requirement_id, linked_at
+        )
+        SELECT q.project_id, m.record_uid, m.requirement_id, ?
+        FROM pm_requirement_matches m
+        JOIN pm_requirements q ON q.id = m.requirement_id
+        JOIN records r ON r.uid = m.record_uid
+        WHERE m.requirement_id = ? AND m.final_score >= ?
+      `).run(timestamp, requirementId, threshold)
+      this.db.exec('COMMIT')
+      return Number(linked.changes)
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
   listProjectRequirementMatches(query: ProjectRequirementMatchQuery): ProjectRequirementMatchPage {
     const page = Math.max(1, Math.floor(query.page || 1))
     const pageSize = Math.min(200, Math.max(1, Math.floor(query.pageSize || 20)))
@@ -3445,7 +3510,28 @@ export class AppDatabase {
       WHERE pt.project_id = ?
       ORDER BY pt.sort_order ASC, pt.start_date ASC, pt.created_at ASC
     `).all(projectId) as SqlRow[]
-    const tasks = rows.map((row) => this.mapProjectPlanTask(row))
+    const requirementRows = this.db.prepare(`
+      SELECT tr.task_id, tr.linked_at, q.id AS requirement_id,
+             q.requirement_no, q.title, q.status
+      FROM pm_project_task_requirements tr
+      JOIN pm_requirements q ON q.id = tr.requirement_id
+      WHERE tr.project_id = ? AND q.project_id = ?
+      ORDER BY q.requirement_no ASC, q.title COLLATE NOCASE ASC
+    `).all(projectId, projectId) as SqlRow[]
+    const requirementsByTask = new Map<string, ProjectPlanTaskRequirement[]>()
+    for (const row of requirementRows) {
+      const taskId = String(row.task_id ?? '')
+      const requirements = requirementsByTask.get(taskId) ?? []
+      requirements.push({
+        requirementId: String(row.requirement_id ?? ''),
+        requirementNo: Number(row.requirement_no ?? 0),
+        title: String(row.title ?? ''),
+        status: String(row.status ?? 'unmarked') as ProjectPlanTaskRequirement['status'],
+        linkedAt: String(row.linked_at ?? '')
+      })
+      requirementsByTask.set(taskId, requirements)
+    }
+    const tasks = rows.map((row) => this.mapProjectPlanTask(row, requirementsByTask.get(String(row.id)) ?? []))
     const taskMap = new Map(tasks.map((task) => [task.id, task]))
     const childrenMap = new Map<string, ProjectPlanTask[]>()
     for (const task of tasks) {
@@ -3481,29 +3567,37 @@ export class AppDatabase {
     if (durationDays < 1) throw new Error('任务结束时间不能早于开始时间')
     const parentTaskId = input.parentTaskId?.trim() || null
     const timestamp = nowIso()
-    this.db.prepare(`
-      INSERT INTO pm_project_tasks(
-        id, project_id, task_type, title, description, parent_task_id,
-        start_date, end_date, owner_person_id, status, progress_percent,
-        sort_order, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      id,
-      projectId,
-      input.taskType,
-      input.title.trim(),
-      input.description?.trim() ?? '',
-      parentTaskId,
-      input.startDate.trim(),
-      input.endDate.trim(),
-      input.ownerPersonId?.trim() || null,
-      input.status ?? 'not_started',
-      Math.min(100, Math.max(0, Number(input.progressPercent ?? 0))),
-      Math.max(0, Math.trunc(Number(input.sortOrder ?? 0))),
-      timestamp,
-      timestamp
-    )
-    this.refreshProjectTaskDates(projectId, parentTaskId)
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      this.db.prepare(`
+        INSERT INTO pm_project_tasks(
+          id, project_id, task_type, title, description, parent_task_id,
+          start_date, end_date, owner_person_id, status, progress_percent,
+          sort_order, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        id,
+        projectId,
+        input.taskType,
+        input.title.trim(),
+        input.description?.trim() ?? '',
+        parentTaskId,
+        input.startDate.trim(),
+        input.endDate.trim(),
+        input.ownerPersonId?.trim() || null,
+        input.status ?? 'not_started',
+        Math.min(100, Math.max(0, Number(input.progressPercent ?? 0))),
+        Math.max(0, Math.trunc(Number(input.sortOrder ?? 0))),
+        timestamp,
+        timestamp
+      )
+      this.replaceProjectTaskRequirements(projectId, id, input.requirementIds ?? [], timestamp)
+      this.refreshProjectTaskDates(projectId, parentTaskId)
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
     return this.listProjectTasks(projectId).find((item) => item.id === id) as ProjectPlanTask
   }
 
@@ -3515,29 +3609,41 @@ export class AppDatabase {
     const projectId = String(current.project_id)
     const previousParentTaskId = current.parent_task_id ? String(current.parent_task_id) : null
     const parentTaskId = input.parentTaskId?.trim() || null
-    const result = this.db.prepare(`
-      UPDATE pm_project_tasks SET
-        task_type = ?, title = ?, description = ?, parent_task_id = ?,
-        start_date = ?, end_date = ?, owner_person_id = ?, status = ?,
-        progress_percent = ?, sort_order = ?, updated_at = ?
-      WHERE id = ?
-    `).run(
-      input.taskType,
-      input.title.trim(),
-      input.description?.trim() ?? '',
-      parentTaskId,
-      input.startDate.trim(),
-      input.endDate.trim(),
-      input.ownerPersonId?.trim() || null,
-      input.status ?? 'not_started',
-      Math.min(100, Math.max(0, Number(input.progressPercent ?? 0))),
-      Math.max(0, Math.trunc(Number(input.sortOrder ?? 0))),
-      nowIso(),
-      id
-    )
-    if (!Number(result.changes)) return null
-    this.refreshProjectTaskDates(projectId, id)
-    this.refreshProjectTaskDates(projectId, previousParentTaskId)
+    const timestamp = nowIso()
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const result = this.db.prepare(`
+        UPDATE pm_project_tasks SET
+          task_type = ?, title = ?, description = ?, parent_task_id = ?,
+          start_date = ?, end_date = ?, owner_person_id = ?, status = ?,
+          progress_percent = ?, sort_order = ?, updated_at = ?
+        WHERE id = ?
+      `).run(
+        input.taskType,
+        input.title.trim(),
+        input.description?.trim() ?? '',
+        parentTaskId,
+        input.startDate.trim(),
+        input.endDate.trim(),
+        input.ownerPersonId?.trim() || null,
+        input.status ?? 'not_started',
+        Math.min(100, Math.max(0, Number(input.progressPercent ?? 0))),
+        Math.max(0, Math.trunc(Number(input.sortOrder ?? 0))),
+        timestamp,
+        id
+      )
+      if (!Number(result.changes)) {
+        this.db.exec('ROLLBACK')
+        return null
+      }
+      this.replaceProjectTaskRequirements(projectId, id, input.requirementIds ?? [], timestamp)
+      this.refreshProjectTaskDates(projectId, id)
+      this.refreshProjectTaskDates(projectId, previousParentTaskId)
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
     return this.listProjectTasks(projectId).find((item) => item.id === id) ?? null
   }
 
@@ -3589,6 +3695,7 @@ export class AppDatabase {
     if (!current) return { ok: false, message: '项目计划任务不存在' }
     const projectId = String(current.project_id)
     const parentTaskId = current.parent_task_id ? String(current.parent_task_id) : null
+    this.db.prepare('DELETE FROM pm_project_task_requirements WHERE task_id = ?').run(id)
     const result = this.db.prepare('DELETE FROM pm_project_tasks WHERE id = ?').run(id)
     this.refreshProjectTaskDates(projectId, parentTaskId)
     return Number(result.changes)
@@ -3596,7 +3703,7 @@ export class AppDatabase {
       : { ok: false, message: '项目计划任务不存在' }
   }
 
-  private mapProjectPlanTask(row: SqlRow): ProjectPlanTask {
+  private mapProjectPlanTask(row: SqlRow, requirements: ProjectPlanTaskRequirement[] = []): ProjectPlanTask {
     return {
       id: String(row.id),
       projectId: String(row.project_id),
@@ -3613,9 +3720,36 @@ export class AppDatabase {
       sortOrder: Number(row.sort_order ?? 0),
       depth: 0,
       hasChildren: false,
+      requirements,
       createdAt: String(row.created_at ?? ''),
       updatedAt: String(row.updated_at ?? '')
     }
+  }
+
+  private replaceProjectTaskRequirements(
+    projectId: string,
+    taskId: string,
+    requirementIds: string[],
+    linkedAt: string
+  ): void {
+    const normalizedIds = [...new Set(requirementIds.map((id) => String(id).trim()).filter(Boolean))]
+    if (normalizedIds.length) {
+      const placeholders = normalizedIds.map(() => '?').join(', ')
+      const rows = this.db.prepare(`
+        SELECT id
+        FROM pm_requirements
+        WHERE project_id = ? AND id IN (${placeholders})
+      `).all(projectId, ...normalizedIds) as SqlRow[]
+      const validIds = new Set(rows.map((row) => String(row.id)))
+      const invalidId = normalizedIds.find((id) => !validIds.has(id))
+      if (invalidId) throw new Error('计划任务关联的需求不存在或不属于当前项目')
+    }
+    this.db.prepare('DELETE FROM pm_project_task_requirements WHERE project_id = ? AND task_id = ?').run(projectId, taskId)
+    const insert = this.db.prepare(`
+      INSERT INTO pm_project_task_requirements(project_id, task_id, requirement_id, linked_at)
+      VALUES (?, ?, ?, ?)
+    `)
+    for (const requirementId of normalizedIds) insert.run(projectId, taskId, requirementId, linkedAt)
   }
 
   private refreshProjectTaskDates(projectId: string, taskId: string | null): void {
@@ -4583,6 +4717,20 @@ export class AppDatabase {
     `).run(normalizedText, uid)
   }
 
+  updateRecordRawAndNormalizedText(
+    uid: string,
+    raw: Record<string, unknown>,
+    normalizedText: string
+  ): void {
+    const rawJson = JSON.stringify(raw)
+    const contentHash = createHash('sha256').update(rawJson).digest('hex')
+    this.db.prepare(`
+      UPDATE records
+      SET raw_json = ?, normalized_text = ?, content_hash = ?
+      WHERE uid = ?
+    `).run(rawJson, normalizedText, contentHash, uid)
+  }
+
   findRecordByItemId(itemId: string): RecordRow | null {
     const normalized = itemId.trim()
     if (!normalized) return null
@@ -5193,6 +5341,13 @@ export class AppDatabase {
         raw: detail.raw
       }
     })
+  }
+
+  hasRecords(): boolean {
+    const row = this.db
+      .prepare('SELECT EXISTS(SELECT 1 FROM records LIMIT 1) AS present')
+      .get() as SqlRow | undefined
+    return Number(row?.present ?? 0) === 1
   }
 
   getStats(): DashboardStats {

@@ -18,6 +18,7 @@ import {
   FileSearchOutlined,
   FileTextOutlined,
   HolderOutlined,
+  HistoryOutlined,
   ImportOutlined,
   InfoCircleOutlined,
   LinkOutlined,
@@ -30,9 +31,10 @@ import {
   SyncOutlined,
   TeamOutlined,
   DisconnectOutlined,
-  DownOutlined,
   UploadOutlined,
-  WarningOutlined
+  WarningOutlined,
+  ZoomInOutlined,
+  ZoomOutOutlined
 } from '@ant-design/icons'
 import {
   Alert,
@@ -65,7 +67,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import pdfWorkerUrl from 'pdfjs-dist/legacy/build/pdf.worker.mjs?url'
 import { Gantt, Tooltip as GanttTooltip } from '@svar-ui/react-gantt'
 import type { IApi, ILink, IResource, IScaleConfig, ITask } from '@svar-ui/react-gantt'
-import '@svar-ui/react-gantt/style.css'
+import '@svar-ui/react-gantt/all.css'
 import type {
   ManagedProject,
   ManagedProjectInput,
@@ -230,6 +232,11 @@ const documentPreviewText = (document: KnowledgeDocumentDetail): string => [...d
   .filter(Boolean)
   .join('\n\n')
 
+const decodeBase64Bytes = (contentBase64: string): Uint8Array => {
+  const binary = window.atob(contentBase64)
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0))
+}
+
 type PdfPreviewPage = {
   getViewport: (options: { scale: number }) => { width: number; height: number }
   render: (options: { canvasContext: CanvasRenderingContext2D; viewport: { width: number; height: number } }) => { promise: Promise<void> }
@@ -241,7 +248,7 @@ type PdfPreviewDocument = {
   destroy?: () => Promise<void>
 }
 
-function PdfDocumentPreview({ contentBase64, fileName }: { contentBase64: string; fileName: string }): React.JSX.Element {
+function PdfDocumentPreview({ contentBase64, fileName, onPageCount }: { contentBase64: string; fileName: string; onPageCount?: (count: number) => void }): React.JSX.Element {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -260,8 +267,7 @@ function PdfDocumentPreview({ contentBase64, fileName }: { contentBase64: string
           getDocument: (options: Record<string, unknown>) => { promise: Promise<PdfPreviewDocument> }
         }
         pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl
-        const binary = window.atob(contentBase64)
-        const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0))
+        const bytes = decodeBase64Bytes(contentBase64)
         const pdf = await pdfjs.getDocument({
           data: bytes,
           isEvalSupported: false
@@ -287,7 +293,10 @@ function PdfDocumentPreview({ contentBase64, fileName }: { contentBase64: string
           container.appendChild(pageShell)
           await page.render({ canvasContext: context, viewport }).promise
         }
-        if (!disposed) setLoading(false)
+        if (!disposed) {
+          setLoading(false)
+          onPageCount?.(pdf.numPages)
+        }
         await pdf.destroy?.()
       } catch (renderError) {
         if (!disposed) {
@@ -313,6 +322,151 @@ function PdfDocumentPreview({ contentBase64, fileName }: { contentBase64: string
         </div>
       )}
       {!loading && error && <Alert type="error" showIcon title="PDF 预览失败" description={error} />}
+    </div>
+  )
+}
+
+const documentZoomMin = 60
+const documentZoomMax = 160
+const documentZoomStep = 10
+
+function DocxDocumentPreview({ contentBase64, fileName }: { contentBase64: string; fileName: string }): React.JSX.Element {
+  const rendererRef = useRef<HTMLDivElement | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [pageCount, setPageCount] = useState(0)
+  const [zoom, setZoom] = useState(100)
+
+  useEffect(() => {
+    let disposed = false
+    const renderDocx = async (): Promise<void> => {
+      const renderer = rendererRef.current
+      if (!renderer) return
+      renderer.replaceChildren()
+      setLoading(true)
+      setError('')
+      setPageCount(0)
+      try {
+        const { renderAsync } = await import('docx-preview')
+        await renderAsync(decodeBase64Bytes(contentBase64), renderer, renderer, {
+          className: 'visslm-docx',
+          inWrapper: true,
+          breakPages: true,
+          ignoreLastRenderedPageBreak: false,
+          experimental: true,
+          useBase64URL: true,
+          renderHeaders: true,
+          renderFooters: true,
+          renderFootnotes: true,
+          renderEndnotes: true,
+          renderChanges: false,
+          renderComments: false,
+          renderAltChunks: false,
+          debug: false
+        })
+        if (disposed) return
+        renderer.querySelectorAll('script, iframe, object, embed, form').forEach((element) => element.remove())
+        renderer.querySelectorAll<HTMLElement>('*').forEach((element) => {
+          for (const attribute of [...element.attributes]) {
+            if (attribute.name.toLowerCase().startsWith('on')) element.removeAttribute(attribute.name)
+          }
+        })
+        renderer.querySelectorAll<HTMLAnchorElement>('a[href]').forEach((anchor) => {
+          const href = anchor.getAttribute('href')?.trim() ?? ''
+          if (!/^(https?:|mailto:|#)/i.test(href)) anchor.removeAttribute('href')
+          anchor.target = '_blank'
+          anchor.rel = 'noopener noreferrer'
+        })
+        setPageCount(renderer.querySelectorAll('section.visslm-docx').length)
+        setLoading(false)
+      } catch (renderError) {
+        if (!disposed) {
+          renderer.replaceChildren()
+          setLoading(false)
+          setError(renderError instanceof Error ? renderError.message : 'Word 源文件渲染失败')
+        }
+      }
+    }
+
+    void renderDocx()
+    return () => {
+      disposed = true
+      rendererRef.current?.replaceChildren()
+    }
+  }, [contentBase64, fileName])
+
+  const updateZoom = (nextZoom: number): void => {
+    setZoom(Math.max(documentZoomMin, Math.min(documentZoomMax, nextZoom)))
+  }
+
+  return (
+    <div className="project-document-docx-preview" aria-label={`预览 Word 源文件：${fileName}`}>
+      <div className="project-document-preview-toolbar">
+        <div className="project-document-preview-source">
+          <Tag color="purple">DOCX 源文件</Tag>
+          <Text type="secondary" aria-live="polite">
+            {loading ? '正在读取源文件…' : pageCount > 0 ? `${pageCount} 页` : '已按源文件样式渲染'}
+          </Text>
+        </div>
+        <div className="project-document-zoom-controls" role="group" aria-label="文档缩放">
+          <Tooltip title="缩小">
+            <Button
+              type="text"
+              icon={<ZoomOutOutlined />}
+              aria-label="缩小文档"
+              disabled={loading || zoom <= documentZoomMin}
+              onClick={() => updateZoom(zoom - documentZoomStep)}
+            />
+          </Tooltip>
+          <button
+            type="button"
+            className="project-document-zoom-value"
+            aria-label={`当前缩放 ${zoom}%，点击恢复 100%`}
+            onClick={() => updateZoom(100)}
+          >
+            {zoom}%
+          </button>
+          <Tooltip title="放大">
+            <Button
+              type="text"
+              icon={<ZoomInOutlined />}
+              aria-label="放大文档"
+              disabled={loading || zoom >= documentZoomMax}
+              onClick={() => updateZoom(zoom + documentZoomStep)}
+            />
+          </Tooltip>
+        </div>
+      </div>
+      <div className="project-document-docx-viewport">
+        {loading && (
+          <div className="project-document-preview-state" aria-live="polite">
+            <Spin size="small" />
+            <Text type="secondary">正在读取 Word 源文件…</Text>
+          </div>
+        )}
+        {!loading && error && <Alert type="error" showIcon title="Word 预览失败" description={error} />}
+        <div
+          ref={rendererRef}
+          className="project-document-docx-renderer"
+          style={{ '--project-document-zoom': zoom / 100 } as React.CSSProperties}
+        />
+      </div>
+    </div>
+  )
+}
+
+function WordDocumentPreview({ contentBase64, fileName }: { contentBase64: string; fileName: string }): React.JSX.Element {
+  const [pageCount, setPageCount] = useState(0)
+
+  return (
+    <div className="project-document-docx-preview project-document-word-preview" aria-label={`预览 Word 源文件：${fileName}`}>
+      <div className="project-document-preview-toolbar">
+        <div className="project-document-preview-source">
+          <Tag color="purple">DOCX 源文件</Tag>
+          <Text type="secondary">{pageCount > 0 ? `${pageCount} 页 · ` : ''}Word 引擎只读渲染，保留原文档分页与版式</Text>
+        </div>
+      </div>
+      <PdfDocumentPreview contentBase64={contentBase64} fileName={fileName} onPageCount={setPageCount} />
     </div>
   )
 }
@@ -433,7 +587,8 @@ const projectTaskInputFromTask = (task: ProjectPlanTask): ProjectPlanTaskInput =
   ownerPersonId: task.ownerPersonId,
   status: task.status,
   progressPercent: task.progressPercent,
-  sortOrder: task.sortOrder
+  sortOrder: task.sortOrder,
+  requirementIds: task.requirements.map((requirement) => requirement.requirementId)
 })
 
 const projectInputFromValues = (values: Record<string, unknown>): ManagedProjectInput => ({
@@ -739,11 +894,18 @@ function ResizableHeaderCell({
     window.addEventListener('pointercancel', handlePointerUp)
   }
 
+  const isFixedCell = className?.includes('ant-table-cell-fix') ?? false
+
   return (
     <th
       {...restProps}
       className={[className, 'project-resizable-header-cell'].filter(Boolean).join(' ')}
-      style={{ ...style, position: 'relative', width: currentWidth, minWidth: currentWidth }}
+      style={{
+        ...style,
+        ...(!style?.position && !isFixedCell ? { position: 'relative' } : {}),
+        width: currentWidth,
+        minWidth: currentWidth
+      }}
     >
       {children}
       {onResize && (
@@ -1454,12 +1616,12 @@ function ProjectParticipantsPanel({
   )
 }
 
-type ProjectTaskColumnKey = 'type' | 'title' | 'period' | 'owner' | 'status' | 'progress' | 'action'
-const projectTaskColumnStorageKey = 'visslm:project-plan-task-column-widths:v4'
-const projectTaskColumnDefaults: Record<ProjectTaskColumnKey, number> = { type: 120, title: 360, period: 240, owner: 170, status: 130, progress: 110, action: 260 }
-const projectTaskColumnMinWidths: Record<ProjectTaskColumnKey, number> = { type: 100, title: 260, period: 190, owner: 120, status: 110, progress: 90, action: 220 }
-const projectTaskColumnMaxWidths: Record<ProjectTaskColumnKey, number> = { type: 180, title: 620, period: 360, owner: 260, status: 180, progress: 160, action: 340 }
-const projectTaskColumnLabels: Record<ProjectTaskColumnKey, string> = { type: '类型', title: '计划项', period: '计划周期', owner: '负责人', status: '完成状态', progress: '完成度', action: '操作' }
+type ProjectTaskColumnKey = 'type' | 'title' | 'requirements' | 'period' | 'owner' | 'status' | 'progress' | 'action'
+const projectTaskColumnStorageKey = 'visslm:project-plan-task-column-widths:v6'
+const projectTaskColumnDefaults: Record<ProjectTaskColumnKey, number> = { type: 120, title: 360, requirements: 300, period: 240, owner: 170, status: 130, progress: 110, action: 144 }
+const projectTaskColumnMinWidths: Record<ProjectTaskColumnKey, number> = { type: 100, title: 260, requirements: 220, period: 190, owner: 120, status: 110, progress: 90, action: 124 }
+const projectTaskColumnMaxWidths: Record<ProjectTaskColumnKey, number> = { type: 180, title: 620, requirements: 520, period: 360, owner: 260, status: 180, progress: 160, action: 220 }
+const projectTaskColumnLabels: Record<ProjectTaskColumnKey, string> = { type: '类型', title: '计划项', requirements: '需求清单', period: '计划周期', owner: '负责人', status: '完成状态', progress: '完成度', action: '操作' }
 
 type ProjectGanttTask = ITask & {
   statusKey: string
@@ -1480,6 +1642,9 @@ type ProjectGanttTooltipProps = {
   data: ProjectGanttTooltipData
 }
 
+// SVAR supports touch-compatible tooltips at runtime, but its 2.7.1 type omits the prop.
+const GanttTooltipWithTouch = GanttTooltip as React.ComponentType<React.ComponentProps<typeof GanttTooltip> & { touch?: boolean }>
+
 type ProjectGanttTimelineProps = {
   title: string
   description: string
@@ -1498,7 +1663,16 @@ function ProjectGanttTimeline({
   sectionClassName
 }: ProjectGanttTimelineProps): React.JSX.Element {
   const [ganttApi, setGanttApi] = useState<IApi | null>(null)
+  const [themeMode, setThemeMode] = useState<'light' | 'dark'>(() => document.documentElement.dataset.theme === 'light' ? 'light' : 'dark')
   const validRows = rows.filter((row): row is ProjectGanttTask => Boolean(row.start && row.end))
+  useEffect(() => {
+    const root = document.documentElement
+    const syncTheme = (): void => setThemeMode(root.dataset.theme === 'light' ? 'light' : 'dark')
+    syncTheme()
+    const observer = new MutationObserver(syncTheme)
+    observer.observe(root, { attributes: true, attributeFilter: ['data-theme'] })
+    return () => observer.disconnect()
+  }, [])
   const range = validRows.reduce<{ start: Date; end: Date } | null>((current, row) => {
     if (!row.start || !row.end) return current
     if (!current) return { start: row.start, end: row.end }
@@ -1521,9 +1695,10 @@ function ProjectGanttTimeline({
         <Text type="secondary">{range && displayRangeEnd ? `${formatProjectGanttDate(range.start)} 至 ${formatProjectGanttDate(displayRangeEnd)} · ${dayCount} 天` : '暂无时间范围'}</Text>
       </div>
       {validRows.length && range ? (
-        <div className="project-gantt-plugin wx-willow-dark-theme" aria-label={title}>
-          <GanttTooltip api={ganttApi ?? undefined} content={ProjectGanttTooltip}>
+        <div className={`project-gantt-plugin ${themeMode === 'light' ? 'wx-willow-theme' : 'wx-willow-dark-theme'}`} aria-label={title}>
+          <GanttTooltipWithTouch api={ganttApi ?? undefined} content={ProjectGanttTooltip} touch>
             <Gantt
+              key={themeMode}
               tasks={validRows}
               init={(api) => setGanttApi(api)}
               taskTypes={[
@@ -1555,7 +1730,7 @@ function ProjectGanttTimeline({
               highlightTime={projectGanttHighlightTime}
               taskTemplate={ProjectGanttTaskTemplate}
             />
-          </GanttTooltip>
+          </GanttTooltipWithTouch>
         </div>
       ) : <Empty className="project-gantt-empty" description={emptyDescription} />}
     </section>
@@ -1563,9 +1738,23 @@ function ProjectGanttTimeline({
 }
 
 function ProjectGanttTooltip({ data }: ProjectGanttTooltipProps): React.JSX.Element {
-  if (!('task' in data)) return <div className="project-gantt-tooltip">暂无甘特图信息</div>
+  const task = 'task' in data
+    ? data.task as ProjectGanttTask
+    : 'resource' in data
+      ? {
+          ...data.resource,
+          text: data.resource.name,
+          start: data.resource.start instanceof Date ? data.resource.start : undefined,
+          end: data.resource.end instanceof Date ? data.resource.end : undefined,
+          details: [data.resource.employeeNo, data.resource.department, data.resource.role].filter(Boolean).join(' · '),
+          statusKey: 'resource',
+          statusLabel: '项目人员',
+          hourlyRate: Number(data.resource.hourlyRate ?? 0),
+          estimatedCost: Number(data.resource.estimatedCost ?? 0)
+        } as ProjectGanttTask
+      : null
+  if (!task) return <div className="project-gantt-tooltip">暂无甘特图信息</div>
 
-  const task = data.task as ProjectGanttTask
   const endDate = task.displayEnd ?? task.end
   const isResource = task.statusKey === 'resource'
   const dateText = (value: unknown): string => value instanceof Date ? formatProjectGanttDate(value) : '—'
@@ -1647,7 +1836,6 @@ function ProjectResourceGantt({ participants }: { participants: ProjectParticipa
         start,
         end,
         displayEnd: parseProjectDate(participant.endDate) ?? undefined,
-        progress: 100,
         type: 'resource',
         parent: 0,
         open: false,
@@ -1665,21 +1853,25 @@ function ProjectResourceGantt({ participants }: { participants: ProjectParticipa
 function ProjectPlanPanel({
   tasks,
   participants,
+  allRequirements,
   loading,
   onCreate,
   onUpdate,
   onMove,
   organizationPeople,
-  onDelete
+  onDelete,
+  onOpenRequirement
 }: {
   tasks: ProjectPlanTask[]
   participants: ProjectParticipant[]
+  allRequirements: ProjectRequirement[]
   loading: boolean
   onCreate: (input: ProjectPlanTaskInput) => Promise<void>
   onUpdate: (id: string, input: ProjectPlanTaskInput) => Promise<void>
   onMove: (id: string, input: ProjectPlanTaskMoveInput) => Promise<void>
   organizationPeople: OrganizationPerson[]
   onDelete: (id: string) => Promise<void>
+  onOpenRequirement: (requirementId: string) => void
 }): React.JSX.Element {
   const { widths, resize, commitResize } = useProjectColumnWidths(projectTaskColumnStorageKey, projectTaskColumnDefaults, projectTaskColumnMinWidths, projectTaskColumnMaxWidths)
   const [inlineEditingId, setInlineEditingId] = useState<string | null>(null)
@@ -1688,6 +1880,7 @@ function ProjectPlanPanel({
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null)
   const [deletingId, setDeletingId] = useState<string | null>(null)
   const [expandedTaskKeys, setExpandedTaskKeys] = useState<string[]>([])
+  const [activeGanttTab, setActiveGanttTab] = useState<'tasks' | 'resources'>('tasks')
   const [draggingTaskId, setDraggingTaskId] = useState<string | null>(null)
   const [dropTarget, setDropTarget] = useState<ProjectTaskDropTarget | null>(null)
   const [movingTask, setMovingTask] = useState(false)
@@ -1716,6 +1909,7 @@ function ProjectPlanPanel({
       sortOrder: inlineDraft.sortOrder ?? 0,
       depth: draftDepth,
       hasChildren: false,
+      requirements: [],
       createdAt: '',
       updatedAt: ''
     }
@@ -1755,7 +1949,8 @@ function ProjectPlanPanel({
       endDate: parentTask?.endDate ?? parentTask?.startDate ?? today,
       status: 'not_started',
       progressPercent: 0,
-      sortOrder: parentTaskId ? tasks.filter((task) => task.parentTaskId === parentTaskId).length : tasks.length
+      sortOrder: parentTaskId ? tasks.filter((task) => task.parentTaskId === parentTaskId).length : tasks.length,
+      requirementIds: []
     })
   }
   const cancelInlineEdit = (): void => {
@@ -1977,6 +2172,48 @@ function ProjectPlanPanel({
         : <Tag color={projectTaskTypeMeta[value].color}>{projectTaskTypeMeta[value].label}</Tag>
     },
     {
+      title: '需求清单',
+      key: 'requirements',
+      width: widths.requirements,
+      onHeaderCell: header('requirements'),
+      render: (_value, row) => inlineEditingId === row.id && inlineDraft
+        ? <Select
+          mode="multiple"
+          size="small"
+          allowClear
+          showSearch
+          optionFilterProp="label"
+          value={inlineDraft.requirementIds ?? []}
+          options={allRequirements.map((requirement) => ({
+            value: requirement.id,
+            label: `${requirement.requirementNo > 0 ? `REQ-${String(requirement.requirementNo).padStart(3, '0')} · ` : ''}${requirement.title}`
+          }))}
+          maxTagCount="responsive"
+          placeholder="选择关联需求"
+          onChange={(next) => updateInlineDraft('requirementIds', next.map((value) => String(value)))}
+          aria-label="关联需求清单"
+          style={{ width: '100%' }}
+        />
+        : row.requirements.length
+          ? <div className="project-task-requirements">
+            {row.requirements.map((requirement) => (
+              <Button
+                key={requirement.requirementId}
+                type="link"
+                size="small"
+                className="project-task-requirement-link"
+                icon={<FileSearchOutlined />}
+                title={`打开需求匹配明细：${requirement.title}`}
+                aria-label={`打开需求匹配明细：${requirement.title}`}
+                onClick={() => onOpenRequirement(requirement.requirementId)}
+              >
+                <span>{requirement.requirementNo > 0 ? `REQ-${String(requirement.requirementNo).padStart(3, '0')} · ` : ''}{requirement.title}</span>
+              </Button>
+            ))}
+          </div>
+          : <Text type="secondary">未关联需求</Text>
+    },
+    {
       title: '计划周期',
       key: 'period',
       width: widths.period,
@@ -2026,11 +2263,23 @@ function ProjectPlanPanel({
         return <Space size={0} className="project-task-actions">
           {isEditing
             ? <><Button type="link" size="small" loading={inlineSaving} onClick={() => void saveInlineEdit()}>保存</Button><Button type="link" size="small" disabled={inlineSaving} onClick={cancelInlineEdit}>取消</Button></>
-            : !isNewRow && <Button type="link" size="small" icon={<EditOutlined />} aria-label={`编辑任务：${row.title}`} onClick={() => startInlineEdit(row)}>编辑</Button>}
-          {!isNewRow && !isEditing && <Button type="link" size="small" icon={<PlusOutlined />} aria-label={`为任务${row.title}新增子任务`} onClick={() => startNewTask(row.id)}>子任务</Button>}
+            : !isNewRow && (
+              <Tooltip title="编辑任务">
+                <Button className="project-task-icon-button" type="link" size="small" icon={<EditOutlined />} aria-label={`编辑任务：${row.title}`} onClick={() => startInlineEdit(row)} />
+              </Tooltip>
+            )}
+          {!isNewRow && !isEditing && (
+            <Tooltip title="新增子任务">
+              <Button className="project-task-icon-button" type="link" size="small" icon={<PlusOutlined />} aria-label={`为任务${row.title}新增子任务`} onClick={() => startNewTask(row.id)} />
+            </Tooltip>
+          )}
           {!isNewRow && !isEditing && (isDeletePending
             ? <><Button type="link" danger size="small" loading={deletingId === row.id} onClick={() => void requestDelete(row.id)}>确认删除</Button><Button type="link" size="small" disabled={Boolean(deletingId)} onClick={() => setDeleteConfirmId(null)}>取消</Button></>
-            : <Button type="link" danger size="small" icon={<DeleteOutlined />} aria-label={`删除任务：${row.title}`} onClick={() => void requestDelete(row.id)}>删除</Button>)}
+            : (
+              <Tooltip title="删除任务">
+                <Button className="project-task-icon-button" type="link" danger size="small" icon={<DeleteOutlined />} aria-label={`删除任务：${row.title}`} onClick={() => void requestDelete(row.id)} />
+              </Tooltip>
+            ))}
         </Space>
       }
     }
@@ -2055,8 +2304,25 @@ function ProjectPlanPanel({
         {displayTree.length ? <Table<ProjectTaskTreeRow> rowKey="id" loading={loading} dataSource={displayTree} columns={columns} components={{ header: { cell: ResizableHeaderCell } }} expandable={{ expandedRowKeys: expandedTaskKeys, onExpand: (expanded, row) => setExpandedTaskKeys((current) => expanded ? [...new Set([...current, row.id])] : current.filter((id) => id !== row.id)), childrenColumnName: 'children', indentSize: 18 }} scroll={{ x: Object.values(widths).reduce((sum, width) => sum + width, 0), y: projectDetailTableScrollY }} pagination={inlineEditingId === newProjectTaskRowId ? false : { pageSize: 10, showTotal: (count) => `共 ${count} 项` }} rowClassName={taskRowClassName} /> : <Empty description="尚未建立项目计划" />}
       </Card>
       <div className="project-gantt-stack">
-        <ProjectTaskGantt tasks={tasks} />
-        <ProjectResourceGantt participants={participants} />
+        <Tabs
+          className="project-gantt-tabs"
+          activeKey={activeGanttTab}
+          onChange={(key) => setActiveGanttTab(key as 'tasks' | 'resources')}
+          items={[
+            {
+              key: 'tasks',
+              label: <span className="project-gantt-tab-label"><CalendarOutlined aria-hidden="true" /><span>任务甘特图</span></span>,
+              forceRender: true,
+              children: <ProjectTaskGantt tasks={tasks} />
+            },
+            {
+              key: 'resources',
+              label: <span className="project-gantt-tab-label"><TeamOutlined aria-hidden="true" /><span>人力资源甘特图</span></span>,
+              forceRender: true,
+              children: <ProjectResourceGantt participants={participants} />
+            }
+          ]}
+        />
       </div>
     </div>
   )
@@ -2096,7 +2362,7 @@ function ProjectDetail({
   const [assets, setAssets] = useState<ProjectAsset[]>([])
   const [projectDocuments, setProjectDocuments] = useState<ProjectDocumentSnapshot[]>([])
   const [analysisLogs, setAnalysisLogs] = useState<ProjectAnalysisLogEntry[]>([])
-  const [analysisLogsExpanded, setAnalysisLogsExpanded] = useState(false)
+  const [analysisLogDrawerOpen, setAnalysisLogDrawerOpen] = useState(false)
   const [participants, setParticipants] = useState<ProjectParticipant[]>([])
   const [tasks, setTasks] = useState<ProjectPlanTask[]>([])
   const [organizationPeople, setOrganizationPeople] = useState<OrganizationPerson[]>([])
@@ -2123,19 +2389,8 @@ function ProjectDetail({
   const [requirementForm] = Form.useForm<ProjectRequirementInput>()
   const [splitForm] = Form.useForm<{ parts: string }>()
   const analysisLogRequestRef = useRef(0)
-  const analysisLogInitializedRef = useRef(false)
-  const analysisLogLatestIdRef = useRef('')
 
   const applyAnalysisLogs = useCallback((nextLogs: ProjectAnalysisLogEntry[]): void => {
-    const latestId = nextLogs[0]?.id ?? ''
-    const matchingTaskIds = new Set(nextLogs
-      .filter((log) => log.taskType === 'matching' || log.phase === 'matching')
-      .map((log) => log.taskId))
-    const latestIsAgreementLog = nextLogs[0]?.taskType === 'agreement' && !matchingTaskIds.has(nextLogs[0]?.taskId ?? '')
-    const hasNewAgreementLog = analysisLogInitializedRef.current && latestId !== analysisLogLatestIdRef.current && latestIsAgreementLog
-    analysisLogInitializedRef.current = true
-    analysisLogLatestIdRef.current = latestId
-    if (hasNewAgreementLog) setAnalysisLogsExpanded(true)
     setAnalysisLogs(nextLogs)
   }, [])
 
@@ -2186,12 +2441,6 @@ function ProjectDetail({
       setLoading(false)
     }
   }, [applyAnalysisLogs, project.id, requirementPage, requirementPageSize, requirementStatusFilter])
-
-  useEffect(() => {
-    analysisLogInitializedRef.current = false
-    analysisLogLatestIdRef.current = ''
-    setAnalysisLogsExpanded(false)
-  }, [project.id])
 
   useEffect(() => {
     void reload()
@@ -2806,13 +3055,15 @@ function ProjectDetail({
 
   return (
     <div className="project-detail-page page-stack">
-      <div className="project-detail-breadcrumb">
-        <Text>项目管理</Text>
-        <span aria-hidden="true">›</span>
-        <Text type="secondary">项目详情</Text>
-      </div>
       <div className="project-detail-toolbar">
-        <Button className="project-back-button" icon={<ArrowLeftOutlined />} onClick={onBack}>返回项目列表</Button>
+        <div className="project-detail-context">
+          <div className="project-detail-breadcrumb" aria-label="当前位置">
+            <Text>项目管理</Text>
+            <span aria-hidden="true">›</span>
+            <Text type="secondary">项目详情</Text>
+          </div>
+          <Button className="project-back-button" icon={<ArrowLeftOutlined />} onClick={onBack}>返回项目列表</Button>
+        </div>
         <Space wrap className="project-detail-actions">
           {current.lifecycle === 'draft' && <Button type="primary" icon={<CheckCircleOutlined />} disabled={isProcessing} onClick={() => void confirmProject()}>确认创建并匹配</Button>}
           {current.lifecycle === 'active' && <Button type="primary" icon={<SyncOutlined />} disabled={isProcessing} onClick={() => void startMatching()}>重新匹配</Button>}
@@ -2874,6 +3125,20 @@ function ProjectDetail({
           </div>
         </div>
         <div className="project-detail-heading-meta">
+          {agreementAnalysisLogs.length > 0 && (
+            <Button
+              type="text"
+              className="project-analysis-log-trigger"
+              icon={<HistoryOutlined />}
+              onClick={() => setAnalysisLogDrawerOpen(true)}
+              aria-label={`查看技术协议执行日志，共 ${agreementAnalysisLogs.length} 条记录`}
+              aria-haspopup="dialog"
+              aria-expanded={analysisLogDrawerOpen}
+            >
+              <span>执行日志</span>
+              <strong className="project-analysis-log-trigger-count">{agreementAnalysisLogs.length}</strong>
+            </Button>
+          )}
           {delivery && <Tag className="project-status-capsule" color={delivery.color} icon={<WarningOutlined />}>{delivery.label}</Tag>}
           {current.currentDocumentName && (
             <button
@@ -2933,61 +3198,6 @@ function ProjectDetail({
             <div className="project-analysis-eta"><Text strong>已完成 {Math.min(activeStageIndex, analysisStageMeta.length - 1)} / {analysisStageMeta.length - 1} 个阶段</Text><Text type="secondary">请勿重复上传</Text></div>
           </div>
           {current.analysisMessage?.includes('重复') && <div className="project-analysis-detail"><InfoCircleOutlined /><Text>检测到重复文件，将复用现有知识库索引并继续后续分析。</Text></div>}
-        </section>
-      )}
-
-      {agreementAnalysisLogs.length > 0 && (
-        <section className={`project-analysis-log-panel${analysisLogsExpanded ? '' : ' is-collapsed'}`} aria-label="技术协议执行日志">
-          <div className="project-analysis-log-heading">
-            <div>
-              <Text strong>技术协议执行日志</Text>
-              <Text type="secondary">上传、文件解析、知识库索引、需求抽取和失败重试均会持久化记录</Text>
-            </div>
-            <Space size={8}>
-              {latestAnalysisLog && <Tag color={latestAnalysisLog.status === 'failed' ? 'error' : latestAnalysisLog.status === 'success' ? 'success' : 'processing'}>{analysisLogPhaseMeta[latestAnalysisLog.phase]}</Tag>}
-              <Text type="secondary">{agreementAnalysisLogs.length} 条记录</Text>
-              <Tooltip title={analysisLogsExpanded ? '收起执行日志' : '展开执行日志'}>
-                <Button
-                  type="text"
-                  className="project-analysis-log-toggle"
-                  icon={<DownOutlined />}
-                  aria-label={analysisLogsExpanded ? '收起技术协议执行日志' : '展开技术协议执行日志'}
-                  aria-expanded={analysisLogsExpanded}
-                  aria-controls={`project-analysis-log-list-${current.id}`}
-                  onClick={() => setAnalysisLogsExpanded((expanded) => !expanded)}
-                />
-              </Tooltip>
-            </Space>
-          </div>
-          {analysisLogsExpanded && <div id={`project-analysis-log-list-${current.id}`} className="project-analysis-log-list" role="log" aria-live={isProcessing ? 'polite' : 'off'}>
-            {agreementAnalysisLogs.map((log) => (
-              <div key={log.id} className={`project-analysis-log-entry is-${log.status}${log.logKind === 'model_request' ? ' is-model-request' : ''}`}>
-                <span className="project-analysis-log-dot" aria-hidden="true" />
-                <div className="project-analysis-log-copy">
-                  <div className="project-analysis-log-title">
-                    <Text strong>{log.logKind === 'model_request' ? '模型调用' : analysisLogPhaseMeta[log.phase]}</Text>
-                    <Text>{log.message}</Text>
-                    <Text type="secondary">{formatAnalysisLogTime(log.createdAt)}</Text>
-                  </div>
-                  {log.detail && <Text type="secondary" className="project-analysis-log-detail">{log.detail}</Text>}
-                  {(log.fileName || log.total > 0 || log.logKind === 'model_request') && (
-                    <div className="project-analysis-log-meta">
-                      {log.fileName && <span>{log.fileName}</span>}
-                      {log.total > 0 && <span>{Math.min(log.current, log.total)} / {log.total}</span>}
-                      {log.batchNumber && <span>批次 {log.batchNumber}</span>}
-                      {log.attempt !== undefined && <span>第 {log.attempt} 次</span>}
-                      {log.elapsedMs !== undefined && <span>耗时 {formatAnalysisDuration(log.elapsedMs)}</span>}
-                      {log.inputChars !== undefined && <span>输入 {formatAnalysisChars(log.inputChars)}</span>}
-                      {log.outputChars !== undefined && <span>输出 {formatAnalysisChars(log.outputChars)}</span>}
-                      {log.doneReason && <span>结束 {log.doneReason}</span>}
-                      {log.modelName && <span>{log.modelName}</span>}
-                      <span>{log.taskType === 'matching' ? '需求匹配任务' : '协议分析任务'}</span>
-                    </div>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>}
         </section>
       )}
 
@@ -3311,12 +3521,14 @@ function ProjectDetail({
               <ProjectPlanPanel
                 tasks={tasks}
                 participants={participants}
+                allRequirements={allRequirements}
                 loading={loading}
                 onCreate={createTaskFromList}
                 onUpdate={updateTaskFromList}
                 onMove={moveTaskFromList}
                 organizationPeople={organizationPeople}
                 onDelete={deleteTask}
+                onOpenRequirement={(requirementId) => void openRequirementMatch(requirementId)}
               />
             )
           },
@@ -3437,6 +3649,65 @@ function ProjectDetail({
           }
         ]}
       />
+
+      <Drawer
+        className="project-analysis-log-drawer"
+        title={(
+          <div className="drawer-context-title">
+            <HistoryOutlined />
+            <span>技术协议执行日志</span>
+            <strong>{current.projectName}</strong>
+          </div>
+        )}
+        open={analysisLogDrawerOpen}
+        onClose={() => setAnalysisLogDrawerOpen(false)}
+        placement="right"
+        mask={false}
+        size={440}
+        destroyOnHidden
+      >
+        <section className="project-analysis-log-panel project-analysis-log-drawer-panel" aria-label="技术协议执行日志">
+          <div className="project-analysis-log-heading">
+            <div>
+              <Text strong>{latestAnalysisLog ? analysisLogPhaseMeta[latestAnalysisLog.phase] : '执行状态'}</Text>
+              <Text type="secondary">按时间倒序展示协议上传、解析、索引、抽取和失败重试记录</Text>
+            </div>
+            <Space size={8}>
+              {latestAnalysisLog && <Tag color={latestAnalysisLog.status === 'failed' ? 'error' : latestAnalysisLog.status === 'success' ? 'success' : 'processing'}>{analysisLogPhaseMeta[latestAnalysisLog.phase]}</Tag>}
+              <Text type="secondary">{agreementAnalysisLogs.length} 条记录</Text>
+            </Space>
+          </div>
+          <div id={`project-analysis-log-list-${current.id}`} className="project-analysis-log-list" role="log" aria-live={isProcessing ? 'polite' : 'off'}>
+            {agreementAnalysisLogs.map((log) => (
+              <div key={log.id} className={`project-analysis-log-entry is-${log.status}${log.logKind === 'model_request' ? ' is-model-request' : ''}`}>
+                <span className="project-analysis-log-dot" aria-hidden="true" />
+                <div className="project-analysis-log-copy">
+                  <div className="project-analysis-log-title">
+                    <Text strong>{log.logKind === 'model_request' ? '模型调用' : analysisLogPhaseMeta[log.phase]}</Text>
+                    <Text>{log.message}</Text>
+                    <Text type="secondary">{formatAnalysisLogTime(log.createdAt)}</Text>
+                  </div>
+                  {log.detail && <Text type="secondary" className="project-analysis-log-detail">{log.detail}</Text>}
+                  {(log.fileName || log.total > 0 || log.logKind === 'model_request') && (
+                    <div className="project-analysis-log-meta">
+                      {log.fileName && <span>{log.fileName}</span>}
+                      {log.total > 0 && <span>{Math.min(log.current, log.total)} / {log.total}</span>}
+                      {log.batchNumber && <span>批次 {log.batchNumber}</span>}
+                      {log.attempt !== undefined && <span>第 {log.attempt} 次</span>}
+                      {log.elapsedMs !== undefined && <span>耗时 {formatAnalysisDuration(log.elapsedMs)}</span>}
+                      {log.inputChars !== undefined && <span>输入 {formatAnalysisChars(log.inputChars)}</span>}
+                      {log.outputChars !== undefined && <span>输出 {formatAnalysisChars(log.outputChars)}</span>}
+                      {log.doneReason && <span>结束 {log.doneReason}</span>}
+                      {log.modelName && <span>{log.modelName}</span>}
+                      <span>{log.taskType === 'matching' ? '需求匹配任务' : '协议分析任务'}</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      </Drawer>
 
       <MatchDrawer requirement={matchRequirement} open={Boolean(matchRequirement)} assets={assets} progress={projectProgress} onClose={() => setMatchRequirement(null)} onOpenRecord={(uid) => void openRecord(uid)} onLinkAsset={(uid, requirementId) => linkAsset(uid, requirementId)} onUnlinkAssetRequirement={(uid, requirementId) => unlinkAssetRequirement(uid, requirementId)} onSaveKeyInfoTerms={saveRequirementKeyInfoTerms} matchScoreThreshold={matchScoreThreshold} />
 
@@ -3605,7 +3876,7 @@ function ProjectDetail({
         footer={null}
         centered
         destroyOnHidden
-        width={1080}
+        width={1180}
       >
         <div className="project-document-preview">
           {documentPreviewLoading && (
@@ -3628,10 +3899,22 @@ function ProjectDetail({
               fileName={documentPreview.document.fileName}
             />
           )}
-          {!documentPreviewLoading && !documentPreviewError && documentPreview && documentPreview.document.extension !== '.pdf' && (
+          {!documentPreviewLoading && !documentPreviewError && documentPreview?.document.extension === '.docx' && documentPreview.renderFormat === 'pdf' && documentPreview.contentBase64 && (
+            <WordDocumentPreview
+              contentBase64={documentPreview.contentBase64}
+              fileName={documentPreview.document.fileName}
+            />
+          )}
+          {!documentPreviewLoading && !documentPreviewError && documentPreview?.document.extension === '.docx' && documentPreview.renderFormat !== 'pdf' && documentPreview.contentBase64 && (
+            <DocxDocumentPreview
+              contentBase64={documentPreview.contentBase64}
+              fileName={documentPreview.document.fileName}
+            />
+          )}
+          {!documentPreviewLoading && !documentPreviewError && documentPreview && !['.docx', '.pdf'].includes(documentPreview.document.extension) && (
             <div className="project-document-text-preview">
               <div className="project-document-text-preview-meta">
-                <Tag color="purple">文本预览</Tag>
+                <Tag color="purple">索引文本</Tag>
                 <Text type="secondary">已从知识库索引提取正文，原文件格式：{documentPreview.document.extension.toUpperCase()}</Text>
               </div>
               {documentPreviewText(documentPreview.document) ? (
