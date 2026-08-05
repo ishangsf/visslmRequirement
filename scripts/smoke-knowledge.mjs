@@ -171,8 +171,9 @@ const main = async () => {
       raw: { content: 'record evidence' },
       normalizedText: 'record evidence'
     })
-    await service.syncRecordIndex()
+    const recordIndexing = service.syncRecordIndex()
     const recordHits = await service.search('record evidence')
+    await recordIndexing
     assert(recordHits.some((hit) => hit.source.sourceType === 'record'), 'collected records should be searchable')
     db.deleteData(['record-1'])
     await service.syncRecordIndex()

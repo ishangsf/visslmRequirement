@@ -10,8 +10,116 @@ import type {
 import { AppDatabase } from './database'
 import { ModelClient } from './model-client'
 import type { ModelMessage, ModelResponse } from './model-client'
-import type { KnowledgeSearchHit } from './knowledge'
+import type { KnowledgeRecordMatch, KnowledgeSearchHit } from './knowledge'
 import { KnowledgeService } from './knowledge'
+import type { AgentEvent } from '../shared/expert-types'
+
+type AgentStatusEvent = Extract<AgentEvent, { type: 'status' }>
+
+interface RecordSimilarityRequest {
+  itemId?: string
+  limit: number
+}
+
+interface RecordSimilarityCandidate {
+  match: KnowledgeRecordMatch
+  record: NonNullable<ReturnType<AppDatabase['getRecord']>>
+}
+
+type RecordSimilarityVerdict = 'high' | 'medium' | 'low' | 'none'
+
+interface RecordSimilarityReviewItem {
+  recordUid: string
+  score: number
+  verdict: RecordSimilarityVerdict
+  sharedEvidence: string
+  difference: string
+}
+
+interface RecordSimilarityReview {
+  summary: string
+  items: RecordSimilarityReviewItem[]
+}
+
+type RelatedDataRelation = 'direct' | 'indirect' | 'none'
+
+interface RelatedDataRequest {
+  topic: string
+  limit: number
+}
+
+interface RelatedDataReviewItem {
+  sourceIndex: number
+  relation: RelatedDataRelation
+  claim: string
+  evidence: string
+}
+
+interface RelatedDataReview {
+  summary: string
+  items: RelatedDataReviewItem[]
+}
+
+interface ValidatedRelatedDataItem extends RelatedDataReviewItem {
+  hit: KnowledgeSearchHit
+}
+
+const RECORD_SIMILARITY_MIN_SCORE = 40
+const RECORD_SIMILARITY_AI_MIN_SCORE = 50
+const RECORD_SIMILARITY_DEFAULT_LIMIT = 10
+const RECORD_SIMILARITY_MAX_LIMIT = 20
+const RELATED_DATA_DEFAULT_LIMIT = 20
+const RELATED_DATA_MAX_LIMIT = 20
+const RELATED_DATA_SEARCH_LIMIT = 12
+
+const relatedDataReviewFormat = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['summary', 'items'],
+  properties: {
+    summary: { type: 'string' },
+    items: {
+      type: 'array',
+      minItems: 1,
+      maxItems: RELATED_DATA_SEARCH_LIMIT,
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['sourceIndex', 'relation', 'claim', 'evidence'],
+        properties: {
+          sourceIndex: { type: 'integer', minimum: 1, maximum: RELATED_DATA_SEARCH_LIMIT },
+          relation: { type: 'string', enum: ['direct', 'indirect', 'none'] },
+          claim: { type: 'string' },
+          evidence: { type: 'string' }
+        }
+      }
+    }
+  }
+}
+
+const recordSimilarityReviewFormat = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['summary', 'items'],
+  properties: {
+    summary: { type: 'string' },
+    items: {
+      type: 'array',
+      maxItems: RECORD_SIMILARITY_MAX_LIMIT,
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['recordUid', 'score', 'sharedEvidence', 'difference'],
+        properties: {
+          recordUid: { type: 'string' },
+          score: { type: 'number', minimum: 0, maximum: 100 },
+          sharedEvidence: { type: 'string' },
+          difference: { type: 'string' }
+        }
+      }
+    }
+  }
+}
 
 type QuestionPlanIntent =
   | 'conversation'
@@ -300,18 +408,33 @@ export class OllamaAgent {
   constructor(
     private readonly db: AppDatabase,
     private readonly settings: ModelSettings,
-    private readonly knowledge?: KnowledgeService
+    private readonly knowledge?: KnowledgeService,
+    private readonly onProgress?: (event: AgentStatusEvent) => void
   ) {}
 
-  async test(): Promise<ConnectionResult> {
-    return new ModelClient(this.settings).test()
+  async test(probeChat = false): Promise<ConnectionResult> {
+    return new ModelClient(this.settings).test(probeChat)
   }
 
   async ask(request: ChatRequest): Promise<ChatResponse> {
-    if (this.knowledge && !this.isStructuredDataQuestion(request.question)) {
-      const response = await this.askWithKnowledge(request)
-      if (response) return response
+    this.progress('route', '正在判断问题类型')
+    const similarityRequest = this.parseRecordSimilarityRequest(request.question)
+    if (similarityRequest) {
+      return this.answerRecordSimilarity(request, similarityRequest)
     }
+    const relatedDataRequest = this.parseRelatedDataRequest(request.question)
+    if (relatedDataRequest) {
+      return this.answerRelatedData(request, relatedDataRequest)
+    }
+    if (this.knowledge && !this.isStructuredDataQuestion(request.question)) {
+      this.progress('retrieve', '正在检索本地知识库')
+      const response = await this.askWithKnowledge(request)
+      if (response) {
+        this.progress('answer', '正在整理可核验的回答')
+        return response
+      }
+    }
+    this.progress('plan', '正在读取字段目录并生成查询计划')
     let plan: QuestionPlan | undefined
     let planningError: unknown
     for (let attempt = 1; attempt <= 2; attempt += 1) {
@@ -337,6 +460,7 @@ export class OllamaAgent {
       console.info('[Agent] 结构化计划：', JSON.stringify(plan))
     }
     try {
+      this.progress('query', '正在执行本地查询并获取证据')
       return await this.executePlanAndAnswer(request, plan)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
@@ -346,28 +470,693 @@ export class OllamaAgent {
     }
   }
 
+  private progress(stage: string, message: string): void {
+    this.onProgress?.({ type: 'status', stage, message })
+  }
+
   private isStructuredDataQuestion(question: string): boolean {
-    return /总数|数量|多少|统计|排名|分布|前\s*\d+|大于|小于|不小于|不大于|等于|筛选|排序|字段|可视化/.test(question)
+    return Boolean(this.parseRecordSimilarityRequest(question)) ||
+      Boolean(this.parseRelatedDataRequest(question)) ||
+      /总数|数量|多少|统计|排名|分布|前\s*\d+|大于|小于|不小于|不大于|等于|筛选|排序|字段|可视化/.test(question)
+  }
+
+  private parseRelatedDataRequest(question: string): RelatedDataRequest | null {
+    const normalized = question.trim()
+    const asksForList = /(?:哪些|什么|列出|清单|明细|包括|包含)/.test(normalized)
+    const usesExplicitRelation = /(?:与|和|跟|关于|围绕|涉及).*(?:相关|有关|关联)/.test(normalized)
+    if (!normalized || (!asksForList && !usesExplicitRelation)) {
+      return null
+    }
+
+    const kind = '(?:数据|记录|内容|资料|条目|文档|信息)'
+    const topicPart = '[^?？。；;，,\\n]{1,80}?'
+    const matches = [
+      normalized.match(new RegExp('(?:与|和|跟|同)\\s*(' + topicPart + ')\\s*(?:相关|有关|关联)(?:的)?\\s*' + kind)),
+      normalized.match(new RegExp('(?:关于|围绕|涉及)\\s*(' + topicPart + ')\\s*(?:相关|有关|关联)?(?:的)?\\s*' + kind)),
+      normalized.match(new RegExp('(' + topicPart + ')\\s*(?:相关|有关|关联)(?:的)?\\s*' + kind)),
+      normalized.match(new RegExp(kind + '\\s*(?:与|和|跟)\\s*(' + topicPart + ')\\s*(?:相关|有关|关联)'))
+    ]
+    const rawTopic = matches.find((match) => match?.[1])?.[1]
+    const topic = rawTopic
+      ?.replace(/^[\s:：，,、"'“”‘’]+|[\s:：，,、?？。；;！!]+$/g, '')
+      .replace(/^(?:哪些|什么|关于|与|和|跟)\s*/, '')
+      .trim()
+    if (!topic || topic.length < 2 || /^(?:数据|记录|内容|资料|条目|文档|信息|相关|有关|关联)$/.test(topic)) {
+      return null
+    }
+
+    const requestedLimit = Number(
+      normalized.match(/(?:前|最多|返回|列出)\s*(\d+)\s*(?:条|个|项)?/)?.[1] ??
+      RELATED_DATA_DEFAULT_LIMIT
+    )
+    return {
+      topic,
+      limit: Math.min(
+        RELATED_DATA_MAX_LIMIT,
+        Math.max(1, Number.isFinite(requestedLimit) ? Math.trunc(requestedLimit) : RELATED_DATA_DEFAULT_LIMIT)
+      )
+    }
+  }
+
+  private parseRecordSimilarityRequest(question: string): RecordSimilarityRequest | null {
+    const normalized = question.trim()
+    const hasSimilarityCue = /相似|类似|差不多|近似|同类|雷同/.test(normalized)
+    const hasRecordCue = /需求|条目|记录|数据|编号|工单|问题单|\bID\b/i.test(normalized)
+    if (!hasSimilarityCue || !hasRecordCue) return null
+
+    const labeledItemId = normalized.match(
+      /(?:编号|\bID\b)\s*(?:为|是|[:：#])?\s*([A-Za-z][A-Za-z0-9_]*(?:-[A-Za-z0-9_]+)+)/i
+    )?.[1]
+    const itemId = labeledItemId ?? normalized.match(
+      /([A-Za-z][A-Za-z0-9_]*(?:-[A-Za-z0-9_]+)+)/
+    )?.[1]
+    const requestedLimit = Number(
+      normalized.match(/(?:前|最多|返回|列出)?\s*(\d+)\s*(?:条|个)/)?.[1] ??
+      RECORD_SIMILARITY_DEFAULT_LIMIT
+    )
+    return {
+      ...(itemId ? { itemId } : {}),
+      limit: Math.min(
+        RECORD_SIMILARITY_MAX_LIMIT,
+        Math.max(1, Number.isFinite(requestedLimit) ? Math.trunc(requestedLimit) : RECORD_SIMILARITY_DEFAULT_LIMIT)
+      )
+    }
+  }
+
+  private async answerRelatedData(
+    request: ChatRequest,
+    relatedDataRequest: RelatedDataRequest
+  ): Promise<ChatResponse> {
+    const knowledge = this.knowledge
+    if (!knowledge) {
+      return {
+        answer: '当前未启用可核验的本地知识库索引，无法准确列出与“' + relatedDataRequest.topic + '”相关的数据。本次不会根据模型记忆或语义猜测作答。',
+        sources: [],
+        dataViews: []
+      }
+    }
+
+    this.progress('retrieve', '正在围绕主题“' + relatedDataRequest.topic + '”检索知识库')
+    const hits = this.dedupeRelatedDataHits(
+      await knowledge.search(relatedDataRequest.topic, RELATED_DATA_SEARCH_LIMIT)
+    )
+    if (!hits.length) {
+      return {
+        answer: '没有从本地知识库检索到与“' + relatedDataRequest.topic + '”相匹配的证据，因此本次不生成猜测性相关数据清单。',
+        sources: [],
+        dataViews: []
+      }
+    }
+
+    let review: RelatedDataReview
+    try {
+      this.progress('reason', '大模型正在深度判断每条证据与主题的关系')
+      const draft = await this.reviewRelatedData(request.question, relatedDataRequest.topic, hits)
+      this.progress('critique', '独立复核模型正在检查直接关系、间接关系和原文证据')
+      review = await this.reviewRelatedData(request.question, relatedDataRequest.topic, hits, draft)
+    } catch {
+      return {
+        answer: [
+          '已检索到 ' + hits.length + ' 条候选证据，但大模型没有返回可通过校验的结构化关系判断。',
+          '出于准确性要求，本次不把候选内容直接当作与“' + relatedDataRequest.topic + '”相关的数据，请重试。'
+        ].join('\n\n'),
+        sources: [],
+        dataViews: []
+      }
+    }
+
+    const hitByIndex = new Map(hits.map((hit, index) => [index + 1, hit]))
+    const validated = review.items.flatMap((item): ValidatedRelatedDataItem[] => {
+      const hit = hitByIndex.get(item.sourceIndex)
+      if (!hit || item.relation === 'none' || !this.isKnowledgeEvidenceSupported(item.evidence, hit)) {
+        return []
+      }
+      return [{ ...item, hit }]
+    })
+    const direct = validated
+      .filter((item) =>
+        item.relation === 'direct' &&
+        this.hasExplicitRelatedTopicEvidence(relatedDataRequest.topic, item.evidence)
+      )
+      .slice(0, relatedDataRequest.limit)
+    const indirect = validated
+      .filter((item) => item.relation === 'indirect')
+      .slice(0, relatedDataRequest.limit)
+
+    const displayItems = [...direct, ...indirect]
+    const sources = [...new Map(
+      displayItems.map((item) => [item.hit.source.uid, item.hit.source])
+    ).values()]
+    const dataViews = displayItems.length
+      ? [this.createRelatedDataView(relatedDataRequest.topic, direct, indirect)]
+      : []
+
+    if (!direct.length) {
+      const answer = [
+        '没有找到能够从现有证据中确认与“' + relatedDataRequest.topic + '”直接相关的数据。',
+        indirect.length
+          ? [
+              '以下候选最多只能判为可能间接相关，不计入直接结果：',
+              ...indirect.flatMap((item) => [
+                '- **' + item.hit.source.name + '** [' + item.sourceIndex + ']',
+                '  证据：' + item.evidence
+              ]),
+              '',
+              '这些内容没有在证据中明确证明与主题直接相关，请不要将其当作“' + relatedDataRequest.topic + '”本身的数据。'
+            ].join('\n')
+          : '其余候选未通过主题明确命中、原文证据或独立复核，因此没有列入结果。',
+        '判定口径：只有证据原文明确出现主题词或可核验的核心词，并经两次结构化判断后，才会列入直接相关数据。'
+      ].join('\n\n')
+      return { answer, sources, dataViews }
+    }
+
+    const answer = [
+      '与“' + relatedDataRequest.topic + '”直接相关的数据（' + direct.length + ' 条）：',
+      ...direct.flatMap((item, index) => [
+        (index + 1) + '. **' + item.hit.source.name + '** [' + item.sourceIndex + ']',
+        '   证据：' + item.evidence
+      ]),
+      indirect.length
+        ? [
+            '',
+            '可能间接相关的候选（不计入上面的直接结果）：',
+            ...indirect.flatMap((item) => [
+              '- **' + item.hit.source.name + '** [' + item.sourceIndex + ']',
+              '  证据：' + item.evidence
+            ])
+          ].join('\n')
+        : '',
+      '判定口径：直接相关必须同时满足主题明确命中、证据原文可定位和大模型独立复核通过；仅有向量相似或业务上的可能关联不会并入直接结果。'
+    ].filter(Boolean).join('\n\n')
+    return { answer, sources, dataViews }
+  }
+
+  private dedupeRelatedDataHits(hits: KnowledgeSearchHit[]): KnowledgeSearchHit[] {
+    const bestBySource = new Map<string, KnowledgeSearchHit>()
+    for (const hit of hits) {
+      const key = hit.source.uid || hit.chunk.id
+      const existing = bestBySource.get(key)
+      if (!existing || hit.score > existing.score) bestBySource.set(key, hit)
+    }
+    return [...bestBySource.values()]
+      .sort((left, right) => right.score - left.score || left.source.uid.localeCompare(right.source.uid))
+      .slice(0, RELATED_DATA_SEARCH_LIMIT)
+  }
+
+  private createRelatedDataView(
+    topic: string,
+    direct: ValidatedRelatedDataItem[],
+    indirect: ValidatedRelatedDataItem[]
+  ): ChatDataView {
+    const toRows = (items: ValidatedRelatedDataItem[], relation: string): ChatDataRow[] =>
+      items.map((item) => ({
+        uid: item.hit.source.uid,
+        name: item.hit.source.name,
+        nodeType: item.hit.source.nodeType,
+        itemId: item.hit.source.itemId,
+        values: {
+          relation,
+          evidence: item.evidence
+        }
+      }))
+    const groups: ChatDataView['groups'] = []
+    if (direct.length) groups.push({ name: '直接相关', count: direct.length, rows: toRows(direct, '直接相关') })
+    if (indirect.length) groups.push({ name: '可能间接相关', count: indirect.length, rows: toRows(indirect, '可能间接相关') })
+    return {
+      id: 'related-data:' + topic,
+      title: '与“' + topic + '”相关的数据',
+      description: '结果经过主题明确命中、原文证据校验和两次大模型关系复核；间接候选不会并入直接结果。',
+      total: direct.length + indirect.length,
+      fields: ['relation', 'evidence'],
+      fieldLabels: {
+        relation: '关系',
+        evidence: '原文证据'
+      },
+      groups
+    }
+  }
+
+  private async reviewRelatedData(
+    question: string,
+    topic: string,
+    hits: KnowledgeSearchHit[],
+    draft?: RelatedDataReview
+  ): Promise<RelatedDataReview> {
+    const evidence = {
+      question,
+      topic,
+      sources: hits.map((hit, index) => ({
+        sourceIndex: index + 1,
+        uid: hit.source.uid,
+        name: hit.source.name,
+        sourceType: hit.source.sourceType,
+        location: hit.source.location,
+        score: Number(hit.score.toFixed(4)),
+        content: hit.chunk.content.slice(0, 1600)
+      }))
+    }
+    let lastError: unknown
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      try {
+        const response = await this.callModel({
+          messages: [
+            {
+              role: 'system',
+              content: draft
+                ? [
+                    '你是 VISSLM 相关数据结论的独立复核器。请忽略初审的结论，重新阅读当前主题和全部原始证据。',
+                    'direct 只有在证据原文或来源名称明确出现主题词或可核验的核心词，并且证据明确描述该主题的数据时才能使用。',
+                    'indirect 表示最多只能从业务上下游、权限、统计、流程或语义接近性推测有关；它绝不能放入直接相关结果。',
+                    'none 表示没有足够关系。不要因为同属一个系统、模块或业务领域就判为 direct。',
+                    'evidence 必须是 source.name 或 source.content 中逐字出现的短句；不能改写、补全或引用常识。claim 只能忠实概括这段原文。',
+                    '必须为每个 sourceIndex 输出且只输出一项。内部可以充分推理，但不要输出思维过程，只输出 schema 规定的 JSON。'
+                  ].join('\n')
+                : [
+                    '你是 VISSLM 相关数据的意图理解和证据分类器。请先准确理解用户要查找的主题，再逐条判断证据与主题的关系。',
+                    'direct 只有在证据原文或来源名称明确出现主题词或可核验的核心词，并且证据明确描述该主题的数据时才能使用。',
+                    'indirect 表示最多只能从业务上下游、权限、统计、流程或语义接近性推测有关；它绝不能放入直接相关结果。',
+                    'none 表示没有足够关系。向量相似分数只用于召回，不能作为 direct 的依据；同属一个系统、模块或业务领域也不能直接判相关。',
+                    'evidence 必须是 source.name 或 source.content 中逐字出现的短句；不能改写、补全或引用常识。claim 只能忠实概括这段原文。',
+                    '必须为每个 sourceIndex 输出且只输出一项。内部可以充分推理，但不要输出思维过程，只输出 schema 规定的 JSON。'
+                  ].join('\n')
+            },
+            {
+              role: 'user',
+              content: JSON.stringify({
+                ...(draft ? { evidence, draftToVerify: draft } : evidence),
+                validationAttempt: attempt
+              })
+            }
+          ],
+          format: relatedDataReviewFormat,
+          think: true,
+          temperature: 0,
+          numPredict: 3600
+        })
+        return this.parseRelatedDataReview(response.message?.content ?? '', hits)
+      } catch (error) {
+        lastError = error
+      }
+    }
+    const message = lastError instanceof Error ? lastError.message : String(lastError ?? '')
+    throw new Error('相关数据复核连续两次未通过结构化校验' + (message ? '：' + message : ''))
+  }
+
+  private parseRelatedDataReview(
+    content: string,
+    hits: KnowledgeSearchHit[]
+  ): RelatedDataReview {
+    const codeFence = String.fromCharCode(96).repeat(3)
+    const normalized = content.trim()
+      .replace(new RegExp('^' + codeFence + '(?:json)?\\s*', 'i'), '')
+      .replace(new RegExp('\\s*' + codeFence + '$'), '')
+    if (!normalized) throw new Error('相关数据复核模型未返回内容')
+    const start = normalized.indexOf('{')
+    const end = normalized.lastIndexOf('}')
+    if (start < 0 || end <= start) throw new Error('相关数据复核结果不是有效 JSON')
+    const raw = JSON.parse(normalized.slice(start, end + 1)) as Record<string, unknown>
+    const summary = typeof raw.summary === 'string' ? raw.summary.trim() : ''
+    if (!summary) throw new Error('相关数据复核结果缺少总结')
+    if (!Array.isArray(raw.items)) throw new Error('相关数据复核结果缺少证据明细')
+
+    const expectedIndexes = new Set(hits.map((_hit, index) => index + 1))
+    const seenIndexes = new Set<number>()
+    const items = raw.items.map((value): RelatedDataReviewItem => {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error('相关数据复核明细格式无效')
+      }
+      const item = value as Record<string, unknown>
+      const sourceIndex = Number(item.sourceIndex)
+      const relation = String(item.relation ?? '') as RelatedDataRelation
+      const claim = typeof item.claim === 'string' ? item.claim.trim() : ''
+      const evidence = typeof item.evidence === 'string' ? item.evidence.trim() : ''
+      if (!Number.isInteger(sourceIndex) || !expectedIndexes.has(sourceIndex)) {
+        throw new Error('相关数据复核包含未知来源编号')
+      }
+      if (seenIndexes.has(sourceIndex)) throw new Error('相关数据复核重复来源编号')
+      if (!['direct', 'indirect', 'none'].includes(relation)) {
+        throw new Error('相关数据复核包含未知关系类型')
+      }
+      if (!claim) throw new Error('相关数据复核缺少事实归纳')
+      const hit = hits[sourceIndex - 1]
+      if (relation !== 'none' && !this.isKnowledgeEvidenceSupported(evidence, hit)) {
+        throw new Error('相关数据复核的证据不是来源原文')
+      }
+      seenIndexes.add(sourceIndex)
+      return { sourceIndex, relation, claim, evidence: relation === 'none' ? '' : evidence }
+    })
+    if (items.length !== hits.length || seenIndexes.size !== expectedIndexes.size) {
+      throw new Error('相关数据复核没有覆盖全部候选证据')
+    }
+    return { summary, items }
+  }
+
+  private isKnowledgeEvidenceSupported(evidence: string, hit: KnowledgeSearchHit): boolean {
+    const normalizedEvidence = this.normalizeKnowledgeMatchText(evidence)
+    if (normalizedEvidence.length < 2) return false
+    const sourceText = this.normalizeKnowledgeMatchText(
+      hit.source.name + '\n' + hit.chunk.content
+    )
+    return sourceText.includes(normalizedEvidence)
+  }
+
+  private hasExplicitRelatedTopicEvidence(topic: string, evidence: string): boolean {
+    const normalizedTopic = this.normalizeKnowledgeMatchText(topic)
+    const normalizedEvidence = this.normalizeKnowledgeMatchText(evidence)
+    if (!normalizedTopic || !normalizedEvidence) return false
+    if (normalizedEvidence.includes(normalizedTopic)) return true
+    const coreTerms = this.extractRelatedDataCoreTerms(topic)
+    return coreTerms.length > 0 && coreTerms.every((term) => normalizedEvidence.includes(term))
+  }
+
+  private extractRelatedDataCoreTerms(topic: string): string[] {
+    const normalized = this.normalizeKnowledgeMatchText(topic)
+    const stripped = normalized.replace(
+      /功能|数据|记录|内容|资料|信息|条目|文档|事项|相关|有关|关联/g,
+      ' '
+    )
+    const terms = stripped.match(/[a-z0-9][a-z0-9._/-]*|[\u4e00-\u9fff]{2,}/g) ?? []
+    return [...new Set(terms.filter((term) => term.length >= 2))]
+  }
+
+  private normalizeKnowledgeMatchText(value: string): string {
+    return value
+      .toLocaleLowerCase()
+      .replace(/\s+/g, '')
+      .replace(/[，。！？；：、“”‘’"'、（）()【】[\]{}<>《》·,.;:!?]/g, '')
+  }
+
+  private async answerRecordSimilarity(
+    request: ChatRequest,
+    similarityRequest: RecordSimilarityRequest
+  ): Promise<ChatResponse> {
+    const requestedItemId = similarityRequest.itemId?.trim()
+    if (!requestedItemId) {
+      return {
+        answer: '请提供一条作为比较基准的业务编号，例如：`和编号 VISSLM-TSIS-3959 相似的需求有哪些？`。缺少基准记录时，我不会猜测相似对象。',
+        sources: [],
+        dataViews: []
+      }
+    }
+
+    this.progress('locate', `正在定位基准记录 ${requestedItemId}`)
+    const baseRecord = this.db.findRecordByItemId(requestedItemId) ??
+      this.db.findRecordByItemId(requestedItemId.toLocaleUpperCase())
+    if (!baseRecord) {
+      return {
+        answer: `数据中心中不存在编号为 **${requestedItemId}** 的记录。请核对编号或先完成数据采集；本次未执行宽泛检索。`,
+        sources: [],
+        dataViews: []
+      }
+    }
+    if (!this.knowledge) {
+      return {
+        answer: `已定位到 **${baseRecord.itemId}**，但当前记录向量索引服务不可用，暂时无法计算相似记录。`,
+        sources: [],
+        dataViews: []
+      }
+    }
+
+    const baseDetail = this.db.getRecord(baseRecord.uid, false)
+    const baseText = baseDetail?.normalizedText?.trim() ?? ''
+    if (!baseDetail || !baseText) {
+      return {
+        answer: `已定位到 **${baseRecord.itemId}**，但该记录没有可用于语义匹配的正文，无法计算相似记录。`,
+        sources: [],
+        dataViews: []
+      }
+    }
+
+    this.progress('match', `正在计算与 ${baseRecord.itemId} 的记录相似度`)
+    const vectorMatches = await this.knowledge.rankRecordMatches(baseText)
+    const candidates = vectorMatches
+      .map((match) => ({ match, record: this.db.getRecord(match.recordUid, false) }))
+      .filter((candidate): candidate is RecordSimilarityCandidate => Boolean(candidate.record))
+      .filter(({ match, record }) =>
+        record.uid !== baseRecord.uid &&
+        record.nodeType === baseRecord.nodeType &&
+        (!request.projectId || record.projectId === request.projectId) &&
+        Number.isFinite(match.score) &&
+        match.score >= RECORD_SIMILARITY_MIN_SCORE
+      )
+      .sort((left, right) =>
+        right.match.score - left.match.score || left.record.uid.localeCompare(right.record.uid)
+      )
+      .slice(0, similarityRequest.limit)
+
+    this.progress('verify', '正在核对候选记录和真实业务字段')
+    if (!candidates.length) {
+      return {
+        answer: [
+          `已定位基准记录 **${baseRecord.itemId} · ${baseRecord.name}**。`,
+          `未找到相似度达到 **${RECORD_SIMILARITY_MIN_SCORE}%** 的同类型记录。已排除基准记录自身和其他记录类型，没有使用宽泛检索结果凑数。`
+        ].join('\n\n'),
+        sources: [],
+        dataViews: []
+      }
+    }
+
+    let review: RecordSimilarityReview
+    try {
+      this.progress('reason', `大模型正在深度分析 ${candidates.length} 条候选记录`)
+      const draft = await this.reviewRecordSimilarity(request.question, baseDetail, candidates)
+      this.progress('critique', '独立复核模型正在检查结论和证据一致性')
+      review = await this.reviewRecordSimilarity(request.question, baseDetail, candidates, draft)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.progress('answer', '深度复核未通过，停止输出候选结论')
+      return {
+        answer: [
+          `已定位基准记录 **${baseRecord.itemId} · ${baseRecord.name}**，也已完成候选召回。`,
+          '但大模型深度分析或独立复核没有返回可验证的结构化结果。出于准确性要求，本次不输出相似候选，请重试。',
+          `校验信息：${message}`
+        ].join('\n\n'),
+        sources: [],
+        dataViews: []
+      }
+    }
+
+    const reviewByUid = new Map(review.items.map((item) => [item.recordUid, item]))
+    const accepted = candidates
+      .map((candidate) => ({ ...candidate, review: reviewByUid.get(candidate.record.uid)! }))
+      .filter(({ review: item }) =>
+        ['high', 'medium'].includes(item.verdict) && item.score >= RECORD_SIMILARITY_AI_MIN_SCORE
+      )
+      .sort((left, right) =>
+        right.review.score - left.review.score ||
+        right.match.score - left.match.score ||
+        left.record.uid.localeCompare(right.record.uid)
+      )
+
+    if (!accepted.length) {
+      this.progress('answer', '正在生成深度复核结论')
+      return {
+        answer: [
+          `已按编号精确定位基准记录 **${baseRecord.itemId} · ${baseRecord.name}**。`,
+          review.summary,
+          `大模型逐条分析并经第二次独立复核后，没有候选达到 ${RECORD_SIMILARITY_AI_MIN_SCORE}% 的有效相似标准，因此本次不列出相似记录。`
+        ].join('\n\n'),
+        sources: [],
+        dataViews: []
+      }
+    }
+
+    const sources: ChatSource[] = accepted.map(({ match, record, review: item }) => ({
+      uid: record.uid,
+      name: record.name,
+      nodeType: record.nodeType,
+      itemId: record.itemId,
+      sourceType: 'record',
+      chunkId: match.chunkId,
+      snippet: match.snippet,
+      score: Math.round(item.score * 10) / 10
+    }))
+    const rows: ChatDataRow[] = accepted.map(({ match, record, review: item }) => ({
+      uid: record.uid,
+      name: record.name,
+      nodeType: record.nodeType,
+      itemId: record.itemId,
+      values: {
+        aiSimilarity: `${item.score.toFixed(1)}%`,
+        semanticRecall: `${match.score.toFixed(1)}%`,
+        reviewReason: `相同点：${item.sharedEvidence}；差异：${item.difference}`
+      }
+    }))
+    const list = accepted.flatMap(({ record, review: item }, index) => [
+      `${index + 1}. **${record.itemId} · ${record.name}** · AI 复核匹配度 **${item.score.toFixed(1)}%** [UID:${record.uid}]`,
+      `   - 相同点：${item.sharedEvidence}`,
+      `   - 主要差异：${item.difference}`
+    ])
+    const answer = [
+      `已按编号精确定位基准记录 **${baseRecord.itemId} · ${baseRecord.name}**。`,
+      review.summary,
+      `经语义召回、AI 深度分析和第二次独立复核，确认 ${sources.length} 条有效相似记录：`,
+      '',
+      ...list,
+      '',
+      '匹配口径：先以完整标准化正文召回同类型候选，再由大模型逐条比较目标、范围、行为和约束，最后对结论进行独立复核；基准记录自身、其他类型、低分和证据不足的候选均不展示。'
+    ].join('\n')
+    const dataView: ChatDataView = {
+      id: `record-similarity:${baseRecord.uid}`,
+      title: `与 ${baseRecord.itemId} 相似的记录`,
+      description: `基准：${baseRecord.itemId} · ${baseRecord.name} · 已完成语义召回、AI 深度分析和独立复核`,
+      total: rows.length,
+      fields: ['aiSimilarity', 'semanticRecall', 'reviewReason'],
+      fieldLabels: {
+        aiSimilarity: 'AI 复核匹配度',
+        semanticRecall: '语义召回分',
+        reviewReason: '复核依据'
+      },
+      groups: [{
+        name: '相似记录',
+        count: rows.length,
+        rows
+      }]
+    }
+    this.progress('answer', '正在生成可核验的相似记录清单')
+    return { answer, sources, dataViews: [dataView] }
+  }
+
+  private async reviewRecordSimilarity(
+    question: string,
+    baseRecord: NonNullable<ReturnType<AppDatabase['getRecord']>>,
+    candidates: RecordSimilarityCandidate[],
+    draft?: RecordSimilarityReview
+  ): Promise<RecordSimilarityReview> {
+    const evidence = {
+      question,
+      baseRecord: {
+        uid: baseRecord.uid,
+        itemId: baseRecord.itemId,
+        name: baseRecord.name,
+        nodeType: baseRecord.nodeType,
+        content: baseRecord.normalizedText?.slice(0, 6000) ?? ''
+      },
+      candidates: candidates.map(({ match, record }) => ({
+        uid: record.uid,
+        itemId: record.itemId,
+        name: record.name,
+        nodeType: record.nodeType,
+        semanticRecallScore: Number(match.score.toFixed(2)),
+        content: record.normalizedText?.slice(0, 2400) ?? ''
+      }))
+    }
+    let lastError: unknown
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      try {
+        const response = await this.callModel({
+          messages: [
+            {
+              role: 'system',
+              content: draft
+                ? [
+                    '你是 VISSLM 相似记录结论的独立复核器。请重新阅读全部原始证据，检查初审是否误解用户意图、遗漏关键差异或给出无依据结论。',
+                    '必须独立判断并修正初审，不能因为初审给出高分就直接接受。只允许引用输入中的事实，不得补充常识推测或不存在的字段。',
+                    '逐条比较业务目标、作用对象、触发条件、输入输出、功能行为和约束。字面词相同但目标不同不能判为相似；字面不同但能力和约束一致可以判为相似。',
+                    'semanticRecallScore 只用于候选召回，不是最终结论。必须为每个候选 UID 输出且只输出一条复核。',
+                    '在内部完成充分推理，但不要输出思维过程，只输出符合 schema 的结论、相同点和主要差异。'
+                  ].join('\n')
+                : [
+                    '你是 VISSLM 需求与记录相似性深度分析器。请先准确理解用户问题和基准记录，再逐条分析候选。',
+                    '逐条比较业务目标、作用对象、触发条件、输入输出、功能行为和约束。不要只按关键词重合判断，也不要把同属一个模块误判为需求相似。',
+                    'semanticRecallScore 只用于候选召回，不是最终结论。只允许使用输入中的真实证据，不得虚构字段、背景或因果关系。',
+                    '为每个候选给出 0-100 分，必须为每个候选 UID 输出且只输出一条分析。相似等级由系统根据分数统一计算，不要输出 verdict 字段。',
+                    '在内部完成充分推理，但不要输出思维过程，只输出符合 schema 的总结、相同点和主要差异。'
+                  ].join('\n')
+            },
+            {
+              role: 'user',
+              content: JSON.stringify({
+                ...(draft ? { evidence, draftToVerify: draft } : evidence),
+                validationAttempt: attempt
+              })
+            }
+          ],
+          format: recordSimilarityReviewFormat,
+          think: true,
+          temperature: 0,
+          numPredict: 2800
+        })
+        return this.parseRecordSimilarityReview(response.message?.content ?? '', candidates)
+      } catch (error) {
+        lastError = error
+      }
+    }
+    const message = lastError instanceof Error ? lastError.message : String(lastError ?? '')
+    throw new Error(`${draft ? '独立复核' : '深度分析'}连续两次未通过结构化校验${message ? `：${message}` : ''}`)
+  }
+
+  private parseRecordSimilarityReview(
+    content: string,
+    candidates: RecordSimilarityCandidate[]
+  ): RecordSimilarityReview {
+    const normalized = content.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '')
+    if (!normalized) throw new Error('复核模型未返回内容')
+    const start = normalized.indexOf('{')
+    const end = normalized.lastIndexOf('}')
+    if (start < 0 || end <= start) throw new Error('复核结果不是有效 JSON')
+    const raw = JSON.parse(normalized.slice(start, end + 1)) as Record<string, unknown>
+    const summary = typeof raw.summary === 'string' ? raw.summary.trim() : ''
+    if (!summary) throw new Error('复核结果缺少总结')
+    if (!Array.isArray(raw.items)) throw new Error('复核结果缺少候选明细')
+
+    const expectedUids = new Set(candidates.map(({ record }) => record.uid))
+    const seenUids = new Set<string>()
+    const items = raw.items.map((value): RecordSimilarityReviewItem => {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error('复核候选格式无效')
+      }
+      const item = value as Record<string, unknown>
+      const recordUid = typeof item.recordUid === 'string' ? item.recordUid.trim() : ''
+      const score = Number(item.score)
+      const sharedEvidence = typeof item.sharedEvidence === 'string' ? item.sharedEvidence.trim() : ''
+      const difference = typeof item.difference === 'string' ? item.difference.trim() : ''
+      if (!expectedUids.has(recordUid)) throw new Error(`复核结果包含未知 UID：${recordUid || '空'}`)
+      if (seenUids.has(recordUid)) throw new Error(`复核结果重复 UID：${recordUid}`)
+      if (!Number.isFinite(score) || score < 0 || score > 100) {
+        throw new Error(`UID ${recordUid} 的相似分数无效`)
+      }
+      if (!sharedEvidence || !difference) throw new Error(`UID ${recordUid} 缺少相同点或差异说明`)
+      seenUids.add(recordUid)
+      const normalizedScore = Math.round(score * 10) / 10
+      return {
+        recordUid,
+        score: normalizedScore,
+        verdict: normalizedScore >= 75
+          ? 'high'
+          : normalizedScore >= 50
+            ? 'medium'
+            : normalizedScore >= 25
+              ? 'low'
+              : 'none',
+        sharedEvidence,
+        difference
+      }
+    })
+    if (items.length !== candidates.length || seenUids.size !== expectedUids.size) {
+      throw new Error('复核结果未覆盖全部候选记录')
+    }
+    return { summary, items }
   }
 
   private async askWithKnowledge(request: ChatRequest): Promise<ChatResponse | null> {
     if (!this.knowledge) return null
+    this.progress('retrieve', '正在检索本地知识库')
     const hits = await this.knowledge.search(request.question, 8)
     if (!hits.length) {
       const stats = this.db.getKnowledgeStats(this.knowledge.modelVersion)
-      if (!stats.indexedChunkCount) {
+      if (!stats.indexedChunkCount && !stats.documentCount && !this.db.hasRecords()) {
         return {
           answer: '当前知识库还没有完成可用索引，暂时无法基于本地资料回答。请先上传文档或完成数据采集，等待索引完成后再试。',
           sources: [],
           dataViews: []
         }
       }
-      return {
-        answer: '当前问题没有检索到足够的本地依据，因此我不会生成猜测性结论。可以换一个更具体的关键词，或先检查知识库文档是否已完成索引。',
-        sources: [],
-        dataViews: []
-      }
+      // A semantic miss does not mean the structured records are unavailable.
+      // Let the validated query planner answer from the records table instead.
+      return null
     }
+    this.progress('verify', `已找到 ${hits.length} 条知识依据，正在核对引用`)
     const evidence = hits.map((hit, index) => this.formatKnowledgeEvidence(hit, index + 1)).join('\n\n')
     const response = await this.callModel({
       messages: [
@@ -649,6 +1438,7 @@ export class OllamaAgent {
     plan: QuestionPlan
   ): Promise<ChatResponse> {
     if (plan.intent === 'conversation') {
+      this.progress('answer', '正在整理回答')
       const response = await this.callModel({
         messages: [
           {
@@ -729,6 +1519,7 @@ export class OllamaAgent {
       })
     }
 
+    this.progress('verify', '正在核对查询结果与问题口径')
     const sources = new Map<string, ChatSource>()
     this.collectSources(result, sources)
     const dataView = this.createDataView(toolName, args, result, request.projectId)
@@ -901,7 +1692,7 @@ export class OllamaAgent {
     temperature: number
     numPredict: number
   }): Promise<ModelResponse> {
-    return new ModelClient(this.settings).chat(input)
+    return new ModelClient(this.settings).chat({ ...input, forceThinking: true })
   }
 
   private async askWithTools(request: ChatRequest): Promise<ChatResponse> {
@@ -1043,6 +1834,7 @@ export class OllamaAgent {
       messages,
       tools,
       think: this.settings.thinking,
+      forceThinking: true,
       temperature: 0.1,
       numPredict: 2048
     })

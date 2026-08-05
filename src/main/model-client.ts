@@ -21,6 +21,7 @@ export interface ModelChatInput {
   messages: ModelMessage[]
   tools?: unknown[]
   think?: boolean
+  forceThinking?: boolean
   format?: 'json' | Record<string, unknown>
   temperature?: number
   numPredict?: number
@@ -31,9 +32,22 @@ const trimBaseUrl = (value: string): string => value.replace(/\/+$/, '')
 export class ModelClient {
   constructor(private readonly settings: ModelSettings) {}
 
-  async test(): Promise<ConnectionResult> {
+  async test(probeChat = false): Promise<ConnectionResult> {
     try {
-      if (this.settings.source === 'local') return await this.testOllama()
+      if (this.settings.source === 'local') {
+        const connection = await this.testOllama()
+        if (!connection.ok || !probeChat) return connection
+        await this.chatOllama({
+          messages: [
+            { role: 'system', content: '这是模型连通性测试。请只返回 OK。' },
+            { role: 'user', content: 'OK' }
+          ],
+          forceThinking: false,
+          temperature: 0,
+          numPredict: 32
+        })
+        return { ...connection, message: `${connection.message}，最小问答测试通过` }
+      }
       if (!this.settings.apiKey) throw new Error('请输入 API Key')
       const response = await fetch(`${trimBaseUrl(this.settings.baseUrl)}/models`, {
         headers: this.onlineHeaders(),
@@ -52,9 +66,29 @@ export class ModelClient {
           details: { models }
         }
       }
+      if (probeChat) {
+        try {
+          await this.chat({
+            messages: [
+              { role: 'system', content: '这是模型连通性测试。请只返回 OK。' },
+              { role: 'user', content: 'OK' }
+            ],
+            forceThinking: false,
+            temperature: 0,
+            numPredict: 32
+          })
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          return {
+            ok: false,
+            message: `${this.providerName()} 模型列表可访问，但最小问答测试失败：${message}`,
+            details: { models }
+          }
+        }
+      }
       return {
         ok: true,
-        message: `${this.providerName()} 连接成功${models.includes(this.settings.model) ? `，模型 ${this.settings.model} 可用` : ''}`,
+        message: `${this.providerName()} 连接成功${models.includes(this.settings.model) ? `，模型 ${this.settings.model} 可用` : ''}${probeChat ? '，最小问答测试通过' : ''}`,
         details: { models }
       }
     } catch (error) {
@@ -71,6 +105,7 @@ export class ModelClient {
   }
 
   private resolveThinking(input: ModelChatInput): boolean {
+    if (input.forceThinking !== undefined) return input.forceThinking
     // The online switch is a persisted model preference. Local Ollama keeps
     // the existing per-request override used by the agent's tool workflow.
     return this.settings.source === 'online'
@@ -316,9 +351,6 @@ export class ModelClient {
       if (!thinking && !this.supportsOpenAiNoReasoning()) return {}
       return { reasoning_effort: thinking ? 'medium' : 'none' }
     }
-    if (this.settings.provider === 'openai-compatible' && thinking) {
-      return { reasoning_effort: 'medium' }
-    }
     return {}
   }
 
@@ -382,6 +414,11 @@ export class ModelClient {
 
   private async httpError(response: Response): Promise<Error> {
     const body = (await response.text()).slice(0, 500)
+    if (this.settings.provider === 'openai-compatible' && /Codex is not enabled/i.test(body)) {
+      return new Error(
+        `${this.providerName()} HTTP ${response.status}：当前 API Key 未开通该地址对应的 Codex 聊天服务。请在服务商控制台启用相应权限，或改用已开通 Chat Completions 的 API 地址和模型。`
+      )
+    }
     return new Error(`${this.providerName()} HTTP ${response.status}${body ? `: ${body}` : ''}`)
   }
 }

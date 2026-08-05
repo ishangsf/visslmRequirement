@@ -80,8 +80,8 @@ const api: AppApi = {
     ipcRenderer.invoke('settings:save-navigation-order', input),
   testPlatform: (input?: PlatformSettingsInput) =>
     ipcRenderer.invoke('connections:test-platform', input),
-  testModel: (input?: ModelSettings) =>
-    ipcRenderer.invoke('connections:test-model', input),
+  testModel: (input?: ModelSettings, probeChat = false) =>
+    ipcRenderer.invoke('connections:test-model', input, probeChat),
   listProjects: () => ipcRenderer.invoke('data:projects'),
   listNodeTypes: () => ipcRenderer.invoke('data:node-types'),
   listRecords: (query: RecordQuery) => ipcRenderer.invoke('data:records', query),

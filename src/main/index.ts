@@ -1,7 +1,9 @@
 import { app, BrowserWindow, dialog, ipcMain } from 'electron'
-import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { execFile } from 'node:child_process'
+import { mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
 import * as XLSX from 'xlsx'
 import type {
   ChatRequest,
@@ -50,6 +52,7 @@ import type {
   DashboardSpec,
   VisualizationRunInput
 } from '../shared/dashboard'
+import type { AgentEvent } from '../shared/expert-types'
 import { compareDashboardSpecValues } from '../shared/dashboard'
 import { QueryEngine } from './analytics/query-engine'
 import { AppDatabase } from './database'
@@ -82,6 +85,83 @@ let knowledgeService: KnowledgeService
 let projectManagementService: ProjectManagementService
 const expertRouter = new ExpertRouter()
 const maxKnowledgeDocumentPreviewBytes = 50 * 1024 * 1024
+const sourcePreviewExtensions = new Set(['.docx', '.pdf'])
+const execFileAsync = promisify(execFile)
+
+const wordPreviewScript = `
+$ErrorActionPreference = 'Stop'
+$sourcePath = [Environment]::GetEnvironmentVariable('VISSLM_DOCX_PREVIEW_SOURCE')
+$outputPath = [Environment]::GetEnvironmentVariable('VISSLM_DOCX_PREVIEW_OUTPUT')
+$word = $null
+$document = $null
+try {
+  $word = New-Object -ComObject Word.Application
+  $word.Visible = $false
+  $word.DisplayAlerts = 0
+  $word.AutomationSecurity = 3
+  $word.Options.UpdateLinksAtOpen = $false
+  $document = $word.Documents.Open($sourcePath, $false, $true)
+  $document.ExportAsFixedFormat($outputPath, 17)
+} finally {
+  if ($document) {
+    try { $document.Close($false) } catch {}
+    try { [Runtime.InteropServices.Marshal]::FinalReleaseComObject($document) | Out-Null } catch {}
+  }
+  if ($word) {
+    try { $word.Quit() } catch {}
+    try { [Runtime.InteropServices.Marshal]::FinalReleaseComObject($word) | Out-Null } catch {}
+  }
+  [GC]::Collect()
+  [GC]::WaitForPendingFinalizers()
+}
+`
+
+const renderDocxSourceWithWord = async (document: { filePath: string; sha256: string }): Promise<Buffer | null> => {
+  const previewDirectory = join(app.getPath('temp'), 'visslm-word-previews')
+  const cacheId = document.sha256.replace(/[^a-z0-9]/gi, '').slice(0, 80) || 'document'
+  const outputPath = join(previewDirectory, `${cacheId}-word-v1.pdf`)
+  mkdirSync(previewDirectory, { recursive: true })
+
+  try {
+    const cached = statSync(outputPath)
+    if (cached.isFile() && cached.size > 0 && cached.size <= maxKnowledgeDocumentPreviewBytes) {
+      const bytes = readFileSync(outputPath)
+      if (bytes.subarray(0, 5).toString('ascii') === '%PDF-') return bytes
+    }
+  } catch {
+    // A missing or invalid cache is regenerated from the source document below.
+  }
+
+  try {
+    try { unlinkSync(outputPath) } catch {}
+    await execFileAsync('powershell.exe', [
+      '-NoLogo',
+      '-NoProfile',
+      '-NonInteractive',
+      '-ExecutionPolicy',
+      'Bypass',
+      '-Command',
+      wordPreviewScript
+    ], {
+      env: {
+        ...process.env,
+        VISSLM_DOCX_PREVIEW_SOURCE: document.filePath,
+        VISSLM_DOCX_PREVIEW_OUTPUT: outputPath
+      },
+      windowsHide: true,
+      timeout: 90_000,
+      maxBuffer: 1024 * 1024
+    })
+    const stats = statSync(outputPath)
+    if (!stats.isFile() || stats.size === 0 || stats.size > maxKnowledgeDocumentPreviewBytes) return null
+    const bytes = readFileSync(outputPath)
+    return bytes.subarray(0, 5).toString('ascii') === '%PDF-' ? bytes : null
+  } catch (error) {
+    try { unlinkSync(outputPath) } catch {}
+    console.warn('[document-preview] Word rendering unavailable, using direct DOCX preview', error)
+    return null
+  }
+}
 
 const recordDashboardAudit = (input: DashboardAuditLogInput): void => {
   try {
@@ -219,9 +299,9 @@ const registerIpc = (): void => {
     async (_event, input?: PlatformSettingsInput) =>
       new VisslmClient(settings.getPlatformCredentials(input)).test()
   )
-  ipcMain.handle('connections:test-model', async (_event, input?: ModelSettings) => {
+  ipcMain.handle('connections:test-model', async (_event, input?: ModelSettings, probeChat = false) => {
     const model = settings.getModelCredentials(input)
-    return new OllamaAgent(db, model).test()
+    return new OllamaAgent(db, model).test(probeChat)
   })
 
   ipcMain.handle('data:projects', () => db.listProjects())
@@ -398,11 +478,34 @@ const registerIpc = (): void => {
           throw error
         })
     }
-    const agent = new OllamaAgent(db, settings.getModelCredentials(), knowledgeService)
+    const agent = new OllamaAgent(
+      db,
+      settings.getModelCredentials(),
+      knowledgeService,
+      (event: Extract<AgentEvent, { type: 'status' }>) => ipcEvent.sender.send('agent:event', {
+        conversationId: request.conversationId,
+        event
+      })
+    )
     return agent.ask({ ...request, question: route.question }).then((response) => ({
       ...response,
       expertId: route.expert.id
-    }))
+    })).catch((error: unknown) => {
+      const errorMessage = error instanceof Error ? error.message : String(error)
+      return {
+        answer: `本次任务没有完成。\n\n${errorMessage}\n\n你可以检查模型连接、缩小问题范围后重试。`,
+        sources: [],
+        dataViews: [],
+        expertId: route.expert.id,
+        events: [{
+          type: 'error' as const,
+          code: 'AGENT_REQUEST_FAILED',
+          message: errorMessage,
+          recoverable: true,
+          stage: 'error'
+        }]
+      }
+    })
   })
   ipcMain.handle('analytics:field-profiles', (_event, scope?: DataScope) =>
     new QueryEngine(db).profile(scope ?? {})
@@ -866,20 +969,28 @@ const registerIpc = (): void => {
     db.listKnowledgeDocuments(query)
   )
   ipcMain.handle('knowledge:document', (_event, id: string) => db.getKnowledgeDocument(id))
-  ipcMain.handle('knowledge:document-preview', (_event, id: string): KnowledgeDocumentPreview | null => {
+  ipcMain.handle('knowledge:document-preview', async (_event, id: string): Promise<KnowledgeDocumentPreview | null> => {
     const document = db.getKnowledgeDocument(id)
     if (!document) return null
-    if (document.extension !== '.pdf') return { document }
+    if (!sourcePreviewExtensions.has(document.extension)) return { document }
     try {
       const stats = statSync(document.filePath)
-      if (!stats.isFile()) return { document, errorMessage: '原始 PDF 文件不可用，请重新上传协议附件' }
-      if (stats.size === 0) return { document, errorMessage: 'PDF 文件为空，请重新上传协议附件' }
+      if (!stats.isFile()) return { document, errorMessage: '用户上传的源文件不可用，请重新上传协议附件' }
+      if (stats.size === 0) return { document, errorMessage: '用户上传的源文件为空，请重新上传协议附件' }
       if (stats.size > maxKnowledgeDocumentPreviewBytes) {
-        return { document, errorMessage: 'PDF 文件超过 50 MB，暂不支持在线预览，请下载后查看' }
+        return { document, errorMessage: '源文件超过 50 MB，暂不支持在线预览' }
       }
-      return { document, contentBase64: readFileSync(document.filePath).toString('base64') }
+      const sourceBytes = readFileSync(document.filePath)
+      if (document.extension === '.docx') {
+        const wordRenderedPdf = await renderDocxSourceWithWord(document)
+        if (wordRenderedPdf) {
+          return { document, contentBase64: wordRenderedPdf.toString('base64'), renderFormat: 'pdf' }
+        }
+        return { document, contentBase64: sourceBytes.toString('base64'), renderFormat: 'docx' }
+      }
+      return { document, contentBase64: sourceBytes.toString('base64'), renderFormat: 'pdf' }
     } catch {
-      return { document, errorMessage: '原始 PDF 文件不可用，请重新上传协议附件' }
+      return { document, errorMessage: '用户上传的源文件不可用，请重新上传协议附件' }
     }
   })
   ipcMain.handle('knowledge:upload', async () => {

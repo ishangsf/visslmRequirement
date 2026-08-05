@@ -480,6 +480,7 @@ class EmbeddingService {
 export class KnowledgeService {
   private readonly parser = new DocumentParser()
   private readonly embeddings = new EmbeddingService()
+  private initializationPromise: Promise<void> | null = null
   private indexingPromise: Promise<void> | null = null
 
   constructor(
@@ -492,6 +493,11 @@ export class KnowledgeService {
   }
 
   async initialize(): Promise<void> {
+    if (!this.initializationPromise) this.initializationPromise = this.initializeInternal()
+    return this.initializationPromise
+  }
+
+  private async initializeInternal(): Promise<void> {
     await this.embeddings.prepare()
     if (!this.embeddings.available) {
       this.emit({
@@ -710,9 +716,11 @@ export class KnowledgeService {
   async search(question: string, limit = 8): Promise<KnowledgeSearchHit[]> {
     const query = question.trim()
     if (!query) return []
+    await this.waitForIndexReady()
     await this.embeddings.prepare()
     if (!this.embeddings.available) return []
     const [queryVector] = await this.embeddings.embedMany([query])
+    await this.waitForIndexReady()
     const candidates = this.db.listKnowledgeVectorRows(this.modelVersion)
     if (!queryVector || !candidates.length) return []
     const terms = new Set((query.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).filter((term) => term.length > 1))
@@ -754,6 +762,23 @@ export class KnowledgeService {
       .sort((left, right) => right.score - left.score)
       .slice(0, Math.min(20, Math.max(1, limit)))
     return ranked
+  }
+
+  private async waitForIndexReady(): Promise<void> {
+    if (this.initializationPromise) {
+      try {
+        await this.initializationPromise
+      } catch {
+        // A failed startup index should not prevent structured record queries.
+      }
+    }
+    if (this.indexingPromise) {
+      try {
+        await this.indexingPromise
+      } catch {
+        // A failed incremental index should fall back to the records table.
+      }
+    }
   }
 
   async rankRecordMatches(question: string, limit = 100_000): Promise<KnowledgeRecordMatch[]> {

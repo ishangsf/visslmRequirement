@@ -492,6 +492,7 @@ export interface ChatMessage {
   role: 'user' | 'assistant'
   content: string
   createdAt: string
+  retryQuestion?: string
   sources?: ChatSource[]
   dataViews?: ChatDataView[]
   dashboard?: DashboardSpec
@@ -589,6 +590,7 @@ export interface KnowledgeDocumentDetail extends KnowledgeDocument {
 export interface KnowledgeDocumentPreview {
   document: KnowledgeDocumentDetail
   contentBase64?: string
+  renderFormat?: 'docx' | 'pdf'
   errorMessage?: string
 }
 
@@ -713,7 +715,7 @@ export interface AppApi {
   saveFeatureSettings(input: FeatureModuleSettings): Promise<AppSettings>
   saveNavigationOrder(input: FeatureNavigationOrder): Promise<AppSettings>
   testPlatform(input?: PlatformSettingsInput): Promise<ConnectionResult>
-  testModel(input?: ModelSettings): Promise<ConnectionResult>
+  testModel(input?: ModelSettings, probeChat?: boolean): Promise<ConnectionResult>
   listProjects(): Promise<ProjectRow[]>
   listNodeTypes(): Promise<string[]>
   listRecords(query: RecordQuery): Promise<RecordPage>

@@ -279,6 +279,36 @@ const hasDisplayText = (input: unknown): boolean => {
   return String(input).trim() !== ''
 }
 
+const isJsonObject = (input: unknown): input is JsonObject =>
+  Boolean(input) && typeof input === 'object' && !Array.isArray(input)
+
+const mergeDerivedDisplayValues = (target: unknown, source: unknown): boolean => {
+  if (Array.isArray(target) && Array.isArray(source)) {
+    let changed = false
+    source.forEach((value, index) => {
+      if (index >= target.length) return
+      changed = mergeDerivedDisplayValues(target[index], value) || changed
+    })
+    return changed
+  }
+  if (!isJsonObject(target) || !isJsonObject(source)) return false
+
+  let changed = false
+  for (const [key, value] of Object.entries(source)) {
+    if (key.endsWith('_text')) {
+      if (!hasDisplayText(value)) continue
+      if (JSON.stringify(target[key]) === JSON.stringify(value)) continue
+      target[key] = value
+      changed = true
+      continue
+    }
+    if (target[key] !== undefined && value && typeof value === 'object') {
+      changed = mergeDerivedDisplayValues(target[key], value) || changed
+    }
+  }
+  return changed
+}
+
 const userLookupValue = (input: unknown): string[] => {
   if (Array.isArray(input)) return input.flatMap(userLookupValue)
   if (typeof input === 'string' || typeof input === 'number') {
@@ -1266,13 +1296,18 @@ export class SyncService {
             skippedCount += 1
             const existingDetail = this.db.getRecord(existing.uid, false)
             if (existingDetail) {
+              const mergedRaw = structuredClone(existingDetail.raw) as JsonObject
+              mergeDerivedDisplayValues(mergedRaw, record.raw)
               const existingLabels = this.db.getFieldDisplayNames(
                 existingDetail.nodeType,
-                Object.keys(existingDetail.raw)
+                Object.keys(mergedRaw)
               )
-              const refreshedText = normalizeText(existingDetail.raw, existingLabels)
-              if (refreshedText !== existingDetail.normalizedText) {
-                this.db.updateRecordNormalizedText(existing.uid, refreshedText)
+              const refreshedText = normalizeText(mergedRaw, existingLabels)
+              if (
+                JSON.stringify(mergedRaw) !== JSON.stringify(existingDetail.raw) ||
+                refreshedText !== existingDetail.normalizedText
+              ) {
+                this.db.updateRecordRawAndNormalizedText(existing.uid, mergedRaw, refreshedText)
               }
             }
             if (!stagedItemIds.has(itemId)) {
