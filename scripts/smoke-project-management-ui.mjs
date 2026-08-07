@@ -44,6 +44,9 @@ const taskRequirementContract = projectPageSource.includes("type ProjectTaskColu
   && projectPageSource.includes('onOpenRequirement={(requirementId) => void openRequirementMatch(requirementId)}')
   && projectPageSource.includes('requirementIds: task.requirements.map')
   && projectStylesSource.includes('.project-task-requirement-link')
+const themedAppIconContract = appSource.includes("import appIconLight from './assets/visslm-icon-light.png'")
+  && appSource.includes("themeMode === 'light' ? appIconLight : appIconDark")
+  && appSource.includes('<ThemedAppIcon alt="VISSLM Agent" />')
 const relationshipGraphContract = projectPageSource.includes("import { ProjectRelationshipGraph } from './ProjectRelationshipGraph'")
   && projectPageSource.includes('const [allRequirements, setAllRequirements] = useState<ProjectRequirement[]>([])')
   && projectPageSource.includes('window.visslm.listAllProjectRequirements(project.id)')
@@ -159,6 +162,20 @@ const checks = await evaluate(`(async () => {
     .find((item) => item.textContent?.includes('项目管理'))
   menuItem?.click()
   const pageReady = await waitFor('.project-management-page')
+  const initialTheme = document.documentElement.dataset.theme
+  const initialBrandIcon = document.querySelector('.brand-mark img')?.getAttribute('src')
+  const themeToggle = document.querySelector('.window-theme-toggle')
+  themeToggle?.click()
+  await new Promise((resolve) => setTimeout(resolve, 150))
+  const toggledTheme = document.documentElement.dataset.theme
+  const toggledBrandImage = document.querySelector('.brand-mark img')
+  const toggledBrandIcon = toggledBrandImage?.getAttribute('src')
+  const themedAppIcon = ${themedAppIconContract}
+    && Boolean(themeToggle && initialTheme && toggledTheme && initialTheme !== toggledTheme)
+    && Boolean(initialBrandIcon && toggledBrandIcon && initialBrandIcon !== toggledBrandIcon)
+    && Boolean(toggledBrandImage?.complete && toggledBrandImage.naturalWidth > 0)
+  themeToggle?.click()
+  await new Promise((resolve) => setTimeout(resolve, 150))
   const listTable = Boolean(document.querySelector('.project-management-page .ant-table'))
   const peopleTab = [...document.querySelectorAll('.project-module-tabs .ant-tabs-tab')]
     .find((item) => item.textContent?.includes('组织人员'))
@@ -355,8 +372,12 @@ const checks = await evaluate(`(async () => {
       .find((button) => button.textContent?.trim() === '子任务' || button.getAttribute('aria-label')?.includes('新增子任务'))
     subtaskButton?.click()
     const subtaskRowReady = subtaskButton ? await waitFor('.project-plan-new-row') : true
+    const expandedSubtaskParent = !subtaskButton || Boolean(taskRow?.querySelector(
+      '.ant-table-row-expand-icon-expanded, .ant-table-row-expand-icon[aria-expanded="true"]'
+    ))
     taskListFeatures.subtaskEntry = !taskRow || (taskListFeatures.subtaskEntry
       && subtaskRowReady
+      && expandedSubtaskParent
       && Boolean(document.querySelector('.project-plan-new-row input')))
     document.querySelector('.project-plan-new-row button')?.textContent?.trim() === '取消'
       ? [...document.querySelectorAll('.project-plan-new-row button')].find((button) => button.textContent?.trim() === '取消')?.click()
@@ -384,6 +405,7 @@ const checks = await evaluate(`(async () => {
 
   return {
     pageReady,
+    themedAppIcon,
     listTable,
     organizationPeoplePage,
     createButton: Boolean(createButton),
@@ -396,7 +418,7 @@ const checks = await evaluate(`(async () => {
   }
 })()`)
 
-  if (!checks.pageReady || !checks.listTable || !checks.organizationPeoplePage || !checks.createButton || !checks.importProjectButton || !checks.formReady || !checks.projectNameField || !checks.contractAmountField || !checks.projectOwnerSelects || !checks.taskPlanReady || !checks.taskGanttReady || !checks.resourceGanttReady || !checks.inlineEdit || !checks.subtaskEntry || !checks.inlineCreate || !checks.parentColumnRemoved || !checks.dragReady || !checks.costResponsibleField || !checks.requirementReviewPolicy || !checks.requirementModuleColumn || !checks.technicalIndicatorMatch || !checks.agreementStatus || !checks.matchStatus || !checks.analysisLogAlwaysVisible || !checks.projectMatchingSettings || !checks.requirementStatusFilter || !checks.linkedAssetList || !checks.taskRequirement || !checks.relationshipGraph || !checks.projectExport || !checks.projectDelete) {
+  if (!checks.pageReady || !checks.themedAppIcon || !checks.listTable || !checks.organizationPeoplePage || !checks.createButton || !checks.importProjectButton || !checks.formReady || !checks.projectNameField || !checks.contractAmountField || !checks.projectOwnerSelects || !checks.taskPlanReady || !checks.taskGanttReady || !checks.resourceGanttReady || !checks.inlineEdit || !checks.subtaskEntry || !checks.inlineCreate || !checks.parentColumnRemoved || !checks.dragReady || !checks.costResponsibleField || !checks.requirementReviewPolicy || !checks.requirementModuleColumn || !checks.technicalIndicatorMatch || !checks.agreementStatus || !checks.matchStatus || !checks.analysisLogAlwaysVisible || !checks.projectMatchingSettings || !checks.requirementStatusFilter || !checks.linkedAssetList || !checks.taskRequirement || !checks.relationshipGraph || !checks.projectExport || !checks.projectDelete) {
   throw new Error(`Project management UI smoke failed: ${JSON.stringify(checks)}`)
 }
 

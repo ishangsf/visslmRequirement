@@ -75,7 +75,8 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import ReactECharts from 'echarts-for-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import appIcon from './assets/visslm-icon.png'
+import appIconDark from './assets/visslm-icon.png'
+import appIconLight from './assets/visslm-icon-light.png'
 import { DashboardStudio } from './dashboard/DashboardStudio'
 import { RichDescription } from './RichDescription'
 import { ResizableTable } from './ResizableTable'
@@ -135,6 +136,14 @@ type AppProps = {
   themeMode: AppThemeMode
   onThemeModeChange: (next: AppThemeMode) => void
 }
+
+const AppIconThemeContext = React.createContext<AppThemeMode>('dark')
+
+function ThemedAppIcon({ alt }: { alt: string }): React.JSX.Element {
+  const themeMode = React.useContext(AppIconThemeContext)
+  return <img src={themeMode === 'light' ? appIconLight : appIconDark} alt={alt} />
+}
+
 type SystemSettingsTabKey = 'platform' | 'model' | 'general' | 'features'
 type FeatureDropPosition = 'before' | 'after'
 type FeatureDropTarget = {
@@ -344,7 +353,7 @@ function readDashboardToken(name: string, fallback: string): string {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback
 }
 
-function DashboardPage({ refreshKey }: { refreshKey: number }): React.JSX.Element {
+function DashboardPage({ refreshKey, themeMode }: { refreshKey: number; themeMode: AppThemeMode }): React.JSX.Element {
   const [stats, setStats] = useState<DashboardStats | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -408,10 +417,15 @@ function DashboardPage({ refreshKey }: { refreshKey: number }): React.JSX.Elemen
     readDashboardToken('--state-error', '#ef6b73'),
     readDashboardToken('--text-muted', '#929bad')
   ]
+  const releaseOtherColor = readDashboardToken('--surface-soft', '#171b25')
   const releaseChartColors = [
     ...releaseColors,
-    readDashboardToken('--surface-elevated', '#1b202b')
+    releaseOtherColor
   ]
+  const releaseChartData = releaseChartRows.map((item, index) => ({
+    ...item,
+    itemStyle: { color: releaseChartColors[index] ?? releaseOtherColor }
+  }))
   const chartSurface = readDashboardToken('--surface-raised', '#131720')
   const chartOverlay = readDashboardToken('--surface-overlay', '#171b24')
   const chartStroke = readDashboardToken('--stroke-strong', 'rgba(255, 255, 255, 0.13)')
@@ -457,7 +471,7 @@ function DashboardPage({ refreshKey }: { refreshKey: number }): React.JSX.Elemen
           scaleSize: 5,
           label: { show: false }
         },
-        data: releaseChartRows
+        data: releaseChartData
       }
     ]
   }
@@ -2170,7 +2184,7 @@ function ChatPage({
             <div className="chat-empty chat-welcome">
               <div className="chat-welcome-hero">
                 <div className="assistant-orb">
-                  <img src={appIcon} alt="VISSLM AI" />
+                  <ThemedAppIcon alt="VISSLM AI" />
                   <span className="assistant-orb-status" />
                 </div>
                 <div className="chat-welcome-copy">
@@ -2248,7 +2262,7 @@ function ChatPage({
               <div className={`message-row ${message.role}`} key={message.id}>
                 <div className="message-avatar">
                   {message.role === 'assistant'
-                    ? <img src={appIcon} alt="VISSLM AI" />
+                    ? <ThemedAppIcon alt="VISSLM AI" />
                     : <UserOutlined />}
                 </div>
                 <div className="message-content">
@@ -2366,7 +2380,7 @@ function ChatPage({
           {loading && (
             <div className="message-row assistant">
               <div className="message-avatar">
-                <img src={appIcon} alt="VISSLM AI" />
+                <ThemedAppIcon alt="VISSLM AI" />
               </div>
               <div className="message-content">
                 <div className="message-meta">
@@ -4822,7 +4836,7 @@ function AppShell({ themeMode, onThemeModeChange }: AppProps): React.JSX.Element
   }
 
   const currentPage = useMemo(() => {
-    if (page === 'dashboard') return <DashboardPage refreshKey={refreshKey} />
+    if (page === 'dashboard') return <DashboardPage refreshKey={refreshKey} themeMode={themeMode} />
     if (page === 'visualization') {
       return (
         <DashboardStudio
@@ -4922,6 +4936,7 @@ function AppShell({ themeMode, onThemeModeChange }: AppProps): React.JSX.Element
     refreshKey,
     settings,
     syncing,
+    themeMode,
     updateGeneratedDashboard
   ])
 
@@ -4932,7 +4947,7 @@ function AppShell({ themeMode, onThemeModeChange }: AppProps): React.JSX.Element
         <Sider width={224} className="app-sider" theme="light">
           <div className="brand">
             <div className="brand-mark">
-              <img src={appIcon} alt="VISSLM Agent" />
+              <ThemedAppIcon alt="VISSLM Agent" />
             </div>
             <div>
               <div className="brand-title">VISSLM Agent</div>
@@ -4979,8 +4994,10 @@ function AppShell({ themeMode, onThemeModeChange }: AppProps): React.JSX.Element
 
 export default function App({ themeMode, onThemeModeChange }: AppProps): React.JSX.Element {
   return (
-    <AntApp>
-      <AppShell themeMode={themeMode} onThemeModeChange={onThemeModeChange} />
-    </AntApp>
+    <AppIconThemeContext.Provider value={themeMode}>
+      <AntApp>
+        <AppShell themeMode={themeMode} onThemeModeChange={onThemeModeChange} />
+      </AntApp>
+    </AppIconThemeContext.Provider>
   )
 }

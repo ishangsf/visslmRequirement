@@ -356,11 +356,17 @@ function RendererRoot({ themeMode, onThemeModeChange }: { themeMode: AppThemeMod
 
 function Root(): React.JSX.Element {
   const [themeMode, setThemeMode] = React.useState<AppThemeMode>(initialThemeMode)
+  const handleThemeModeChange = React.useCallback((next: AppThemeMode): void => {
+    // Keep CSS tokens in sync before child components render the new theme.
+    document.documentElement.dataset.theme = next
+    document.documentElement.style.colorScheme = next
+    setThemeMode(next)
+  }, [])
 
   return (
     <RendererRoot
       themeMode={themeMode}
-      onThemeModeChange={setThemeMode}
+      onThemeModeChange={handleThemeModeChange}
     />
   )
 }

@@ -1920,8 +1920,8 @@ function ProjectPlanPanel({
     const parentTaskIds = tasks.filter((task) => task.hasChildren).map((task) => task.id)
     setExpandedTaskKeys((current) => {
       const next = current.filter((id) => parentTaskIds.includes(id))
-      if (!current.length) return parentTaskIds
       if (inlineDraft?.parentTaskId && !next.includes(inlineDraft.parentTaskId)) next.push(inlineDraft.parentTaskId)
+      if (!current.length && !inlineDraft?.parentTaskId) return parentTaskIds
       return next
     })
   }, [inlineDraft?.parentTaskId, tasks])

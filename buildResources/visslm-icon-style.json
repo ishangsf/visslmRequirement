@@ -1,0 +1,32 @@
+{
+  "name": "visslm-app-icon",
+  "label": "VISSLM Agent application icon",
+  "preamble": "Polished front-facing application icon tiles for a desktop data and AI workstation. The original brand symbol is a data prism: three broad interlocking rounded panels form an open hexagonal lens around one small diamond-shaped data core. The silhouette is compact, balanced, geometric, premium, and unmistakable at 28px. Use a clean rounded-square tile, no letters, no sparkles, no circuit nodes, no charts, no text, and no fragile thin detail.",
+  "palette": [
+    "#090B10",
+    "#131720",
+    "#F7F8FC",
+    "#E7E9F2",
+    "#4E3FD0",
+    "#7C6CFF",
+    "#A99EFF"
+  ],
+  "cutout": "rembg",
+  "thresh": null,
+  "construction": {
+    "grid": "24-unit keyline; rounded-square tile fills about 82% of each cell; prism symbol fills about 62% of the tile; generous optical padding",
+    "stroke": null,
+    "corner_radius": "one consistent large tile radius; the three prism panels share the same soft corner radius; the core is a softly rounded diamond",
+    "angles": "front-facing geometry constrained to vertical, horizontal, and 60-degree directions",
+    "detail_budget": "three broad interlocking panels and one small diamond data core only",
+    "fill_rule": "solid readable silhouette with restrained internal violet shading; no texture and no external shadow",
+    "color_rule": "locked neutral and violet palette; violet is the only chromatic hue; light-to-dark violet shading stays subordinate to the V silhouette",
+    "shared_parts": "dark and light variants use exactly the same prism silhouette, panel geometry, diamond core, spacing, and optical scale",
+    "perspective": "flat front-facing orthographic view",
+    "shadow": "no ground shadow and no shadow cast onto the grey sheet; only subtle internal form shading",
+    "motif": "three data panels interlock into an open hexagonal lens around a diamond data core",
+    "weight_hierarchy": "the three-panel prism silhouette is dominant; the central diamond core is smaller and lighter"
+  },
+  "fits": "VISSLM Agent desktop application, sidebar brand mark, title bar icon, and Windows executable icon.",
+  "notes": "This concept is intentionally independent of previous VISSLM icons. Generate dark and light variants together so their geometry remains matched. Keep the square tile as part of each transparent cutout."
+}
