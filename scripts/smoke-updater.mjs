@@ -15,6 +15,8 @@ const checks = {
   githubProvider: packageJson.build?.publish?.provider === 'github'
     && packageJson.build.publish.owner === 'ishangsf'
     && packageJson.build.publish.repo === 'visslmRequirement',
+  commonJsInterop: updaterSource.includes("import electronUpdater from 'electron-updater'")
+    && updaterSource.includes('const { autoUpdater } = electronUpdater'),
   stableArtifactName: packageJson.build?.artifactName === 'VISSLM-Agent-Setup-${version}.${ext}',
   manualDownload: updaterSource.includes('autoUpdater.autoDownload = false')
     && updaterSource.includes('autoUpdater.autoInstallOnAppQuit = false'),

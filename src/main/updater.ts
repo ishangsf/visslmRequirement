@@ -1,6 +1,8 @@
 import { app, BrowserWindow } from 'electron'
-import { autoUpdater } from 'electron-updater'
+import electronUpdater from 'electron-updater'
 import type { UpdateStatus } from '../shared/types'
+
+const { autoUpdater } = electronUpdater
 
 const supportedPlatforms = new Set<NodeJS.Platform>(['win32', 'darwin'])
 
