@@ -86,7 +86,7 @@ VISSLM Agent 将 VISSLM 平台数据复制到本地，提供本地检索、文�
 | 数据采集 | FR-SYNC-001 ~ FR-SYNC-009 | `visslm.ts`、`App.tsx:2056` |
 | 资产中心 | FR-DATA-001 ~ FR-DATA-009 | `database.ts`、`App.tsx:469,3856` |
 | 知识库 | FR-KB-001 ~ FR-KB-010 | `knowledge.ts`、`App.tsx:846` |
-| AI 助手 | FR-AI-001 ~ FR-AI-008 | `ollama.ts`、`App.tsx:1138` |
+| AI 助手 | FR-AI-001 ~ FR-AI-009 | `ollama.ts`、`experts/requirement-analysis-agent.ts`、`App.tsx:1138` |
 | 本地分析查询 | FR-ANALYTICS-001 ~ FR-ANALYTICS-006 | `query-engine.ts`、`query-spec.ts` |
 | 可视化大屏 | FR-VIZ-001 ~ FR-VIZ-011 | `DashboardStudio.tsx`、`index.ts` |
 | 项目管理 | FR-PM-001 ~ FR-PM-023 | `project-management.ts`、`project-export.ts`、`ProjectManagementPage.tsx` |
@@ -356,6 +356,13 @@ VISSLM Agent 将 VISSLM 平台数据复制到本地，提供本地检索、文�
 - 在线模型会发送对话上下文、检索结果和生成任务数据；代码提供模型来源配置和项目协议外发确认，但未提供字段级脱敏或企业数据策略。
 - 这是明确安全边界，业务合规要求待确认。
 
+#### FR-AI-009 需求分析专家
+
+- AI 助手支持通过 `@需求分析专家` 和一个或多个需求编号精确定位数据中心记录；每条编号使用完整的分类/模块/名称/描述/信息词文本与全部其他记录进行向量匹配，并按项目管理匹配口径由模型复核候选分数。
+- 返回每条需求编号的名称、描述、模块和匹配度；未找到的编号单独提示，匹配结果以可展开的分组数据视图展示，默认只展示达到 40% 阈值的最高 20 条结果。
+- AI 复核不可用时回退到向量召回分，不使用宽泛知识检索替代编号定位。
+- 依据：`experts/router.ts`、`experts/requirement-analysis-agent.ts`、`index.ts`、`App.tsx`。
+
 ### 6.7 本地分析查询
 
 #### FR-ANALYTICS-001 字段画像
@@ -536,13 +543,6 @@ VISSLM Agent 将 VISSLM 平台数据复制到本地，提供本地检索、文�
 
 - JSON 导出 `format=visslm-project, version=1` 的项目快照，包含文档、人员、参与人、成本、资产、计划、需求和匹配；导入会对不能关联的数据给 warning。
 
-#### FR-PM-023 项目 Excel 报表导出
-
-- 项目详情页支持导出 `.xlsx` 报表，复用同一项目快照但不改变 JSON 导入/导出格式。
-- 工作簿包含“项目概览”“技术协议”“项目人员”“项目参与人”“成本明细”“项目资产”“项目计划”“功能需求”“需求匹配”九个工作表；数组字段转为可读文本，布尔字段显示为“是/否”，数值字段保持数值类型。
-- 导出前弹出系统保存对话框；用户取消、项目不存在或文件写入失败时返回失败结果，不修改数据库。
-- 依据：`src/main/project-export.ts`、`src/main/index.ts:777-805`、`ProjectManagementPage.tsx:1842-1853,2308`、`scripts/smoke-project-export.ts`。
-
 #### FR-PM-021 项目删除
 
 - 分析/匹配 processing 时禁止删除；否则 `pm_projects` 删除并由外键级联项目域数据。
@@ -550,6 +550,13 @@ VISSLM Agent 将 VISSLM 平台数据复制到本地，提供本地检索、文�
 #### FR-PM-022 项目管理访问边界
 
 - 现有实现没有角色校验；按已确认的单机单用户范围，当前本机操作人可以执行项目导入、删除、发布和推送。该行为不构成 RBAC。
+
+#### FR-PM-023 项目 Excel 报表导出
+
+- 项目详情页支持导出 `.xlsx` 报表，复用同一项目快照但不改变 JSON 导入/导出格式。
+- 工作簿包含“项目概览”“技术协议”“项目人员”“项目参与人”“成本明细”“项目资产”“项目计划”“功能需求”“需求匹配”九个工作表；数组字段转为可读文本，布尔字段显示为“是/否”，数值字段保持数值类型。
+- 导出前弹出系统保存对话框；用户取消、项目不存在或文件写入失败时返回失败结果，不修改数据库。
+- 依据：`src/main/project-export.ts`、`src/main/index.ts:777-805`、`ProjectManagementPage.tsx:1842-1853,2308`、`scripts/smoke-project-export.ts`。
 
 ### 6.10 数据推送
 

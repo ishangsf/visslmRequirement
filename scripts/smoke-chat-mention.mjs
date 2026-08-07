@@ -92,7 +92,7 @@ socket.close()
 
 if (
   !menuState.inputPresent ||
-  result.allCandidates !== 2 ||
+  result.allCandidates !== 3 ||
   !result.keyboardSelection?.startsWith('@通用数据助手') ||
   result.filteredCandidates !== 1 ||
   !result.visualizationSelection?.startsWith('@数据可视化专家') ||

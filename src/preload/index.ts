@@ -22,6 +22,7 @@ import type {
   RecordQuery,
   SyncProgress,
   SyncScopeConfig,
+  UpdateStatus,
   KnowledgeDocumentPreview
 } from '../shared/types'
 import type {
@@ -64,6 +65,16 @@ const api: AppApi = {
       callback(maximized)
     ipcRenderer.on('window:maximized-changed', listener)
     return () => ipcRenderer.removeListener('window:maximized-changed', listener)
+  },
+  getUpdateStatus: (): Promise<UpdateStatus> => ipcRenderer.invoke('update:get-status'),
+  checkForUpdates: (): Promise<UpdateStatus> => ipcRenderer.invoke('update:check'),
+  downloadUpdate: (): Promise<UpdateStatus> => ipcRenderer.invoke('update:download'),
+  installUpdate: (): Promise<void> => ipcRenderer.invoke('update:install'),
+  onUpdateStatus: (callback: (status: UpdateStatus) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, status: UpdateStatus): void =>
+      callback(status)
+    ipcRenderer.on('update:status', listener)
+    return () => ipcRenderer.removeListener('update:status', listener)
   },
   getSettings: () => ipcRenderer.invoke('settings:get'),
   savePlatformSettings: (input: PlatformSettingsInput) =>

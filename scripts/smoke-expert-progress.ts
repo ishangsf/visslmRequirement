@@ -98,11 +98,20 @@ try {
   assert.equal(route.expert.id, 'general')
   assert.equal(route.reason, 'explicit-mention')
   assert.equal(route.question, '汇总当前数据')
+  const requirementRoute = new ExpertRouter().route({
+    question: '@需求分析专家 分析需求编号 REQ-1、REQ-2',
+    conversationId: 'requirement-routing-smoke',
+    entrypoint: 'chat',
+    expertId: 'general'
+  })
+  assert.equal(requirementRoute.expert.id, 'requirement-analysis')
+  assert.equal(requirementRoute.question, '分析需求编号 REQ-1、REQ-2')
   console.log(JSON.stringify({
     ok: true,
     stages,
     toolCalls: runs[0].toolCalls.map((call) => call.tool),
-    generalRoute: route.reason
+    generalRoute: route.reason,
+    requirementRoute: requirementRoute.reason
   }, null, 2))
 } finally {
   globalThis.fetch = originalFetch

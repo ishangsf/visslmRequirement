@@ -162,6 +162,31 @@ export interface ConnectionResult {
   details?: Record<string, unknown>
 }
 
+export type UpdateStatusPhase =
+  | 'idle'
+  | 'checking'
+  | 'available'
+  | 'not-available'
+  | 'downloading'
+  | 'downloaded'
+  | 'installing'
+  | 'error'
+  | 'unsupported'
+
+export interface UpdateStatus {
+  phase: UpdateStatusPhase
+  currentVersion: string
+  version?: string
+  releaseDate?: string
+  releaseNotes?: string
+  checkedAt?: string
+  percent?: number
+  bytesPerSecond?: number
+  transferred?: number
+  total?: number
+  message?: string
+}
+
 export interface ProjectRow {
   uid: string
   name: string
@@ -707,6 +732,11 @@ export interface AppApi {
   closeWindow(): Promise<void>
   isWindowMaximized(): Promise<boolean>
   onWindowMaximized(callback: (maximized: boolean) => void): () => void
+  getUpdateStatus(): Promise<UpdateStatus>
+  checkForUpdates(): Promise<UpdateStatus>
+  downloadUpdate(): Promise<UpdateStatus>
+  installUpdate(): Promise<void>
+  onUpdateStatus(callback: (status: UpdateStatus) => void): () => void
   getSettings(): Promise<AppSettings>
   savePlatformSettings(input: PlatformSettingsInput): Promise<AppSettings>
   saveSystemSettings(input: SystemSettingsInput): Promise<AppSettings>

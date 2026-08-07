@@ -1,7 +1,7 @@
 import type { DashboardSpec } from './dashboard'
 import type { DataScope } from './query-spec'
 
-export type ExpertId = 'general' | 'visualization'
+export type ExpertId = 'general' | 'visualization' | 'requirement-analysis'
 
 export interface ExpertDefinition {
   id: ExpertId

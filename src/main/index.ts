@@ -21,7 +21,8 @@ import type {
   PushConfig,
   RecordQuery,
   SyncProgress,
-  SyncScopeConfig
+  SyncScopeConfig,
+  UpdateStatus
 } from '../shared/types'
 import type {
   ManagedProjectInput,
@@ -61,6 +62,7 @@ import { diagnoseDashboard } from './dashboards/diagnostics'
 import { repairDashboardComponent } from './dashboards/component-repair'
 import { dashboardSpecHash } from './dashboards/spec-hash'
 import { ExpertRouter } from './experts/router'
+import { RequirementAnalysisAgent } from './experts/requirement-analysis-agent'
 import { VisualizationAgent } from './experts/visualization-agent'
 import { resolveVisualizationRequestMode } from './experts/visualization-intent'
 import { OllamaAgent } from './ollama'
@@ -68,6 +70,7 @@ import { SettingsService } from './settings'
 import { PushService, SyncService, VisslmClient } from './visslm'
 import { KnowledgeService } from './knowledge'
 import { ProjectManagementService } from './project-management'
+import type { UpdateManager } from './updater'
 import { createProjectWorkbook } from './project-export'
 import {
   createDashboardOfflineArchive,
@@ -77,6 +80,8 @@ import {
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url))
 let mainWindow: BrowserWindow | null = null
+let updateManager: UpdateManager | null = null
+let updateManagerInitError: string | null = null
 let db: AppDatabase
 let settings: SettingsService
 let syncService: SyncService
@@ -87,6 +92,33 @@ const expertRouter = new ExpertRouter()
 const maxKnowledgeDocumentPreviewBytes = 50 * 1024 * 1024
 const sourcePreviewExtensions = new Set(['.docx', '.pdf'])
 const execFileAsync = promisify(execFile)
+
+const updateErrorMessage = (error: unknown): string => {
+  if (error instanceof Error && error.message.trim()) return error.message.trim()
+  return String(error || '未知错误')
+}
+
+const getUpdateFallbackStatus = (): UpdateStatus => ({
+  phase: updateManagerInitError ? 'error' : 'idle',
+  currentVersion: app.getVersion(),
+  message: updateManagerInitError ?? '在线更新服务正在初始化，请稍后重试'
+})
+
+const initializeUpdateManager = async (): Promise<void> => {
+  if (updateManager || updateManagerInitError) return
+
+  try {
+    const { UpdateManager: UpdateManagerClass } = await import('./updater')
+    updateManager = new UpdateManagerClass()
+    updateManager.attachWindow(mainWindow)
+    if (app.isPackaged) {
+      setTimeout(() => void updateManager?.checkForUpdates(), 3000)
+    }
+  } catch (error) {
+    updateManagerInitError = updateErrorMessage(error)
+    console.error('[updater] initialization failed', error)
+  }
+}
 
 const wordPreviewScript = `
 $ErrorActionPreference = 'Stop'
@@ -242,6 +274,12 @@ const createWindow = (): void => {
     }
   })
 
+  mainWindow.on('closed', () => {
+    updateManager?.attachWindow(null)
+    mainWindow = null
+  })
+  updateManager?.attachWindow(mainWindow)
+
   mainWindow.once('ready-to-show', () => mainWindow?.show())
   mainWindow.on('maximize', () =>
     mainWindow?.webContents.send('window:maximized-changed', true)
@@ -273,6 +311,11 @@ const registerIpc = (): void => {
   })
   ipcMain.handle('window:close', () => mainWindow?.close())
   ipcMain.handle('window:is-maximized', () => mainWindow?.isMaximized() ?? false)
+
+  ipcMain.handle('update:get-status', () => updateManager?.getStatus() ?? getUpdateFallbackStatus())
+  ipcMain.handle('update:check', () => updateManager?.checkForUpdates() ?? getUpdateFallbackStatus())
+  ipcMain.handle('update:download', () => updateManager?.downloadUpdate() ?? getUpdateFallbackStatus())
+  ipcMain.handle('update:install', () => updateManager?.installUpdate())
 
   ipcMain.handle('settings:get', () => settings.getAll())
   ipcMain.handle('settings:save-platform', (_event, input: PlatformSettingsInput) =>
@@ -477,6 +520,36 @@ const registerIpc = (): void => {
           }
           throw error
         })
+    }
+    if (route.expert.id === 'requirement-analysis') {
+      const agent = new RequirementAnalysisAgent(
+        db,
+        knowledgeService,
+        settings.getModelCredentials(),
+        (event: Extract<AgentEvent, { type: 'status' }>) => ipcEvent.sender.send('agent:event', {
+          conversationId: request.conversationId,
+          event
+        })
+      )
+      return agent.ask({ ...request, question: route.question }).then((response) => ({
+        ...response,
+        expertId: route.expert.id
+      })).catch((error: unknown) => {
+        const errorMessage = error instanceof Error ? error.message : String(error)
+        return {
+          answer: `需求分析未完成。\n\n${errorMessage}\n\n请检查需求编号和本地数据索引后重试。`,
+          sources: [],
+          dataViews: [],
+          expertId: route.expert.id,
+          events: [{
+            type: 'error' as const,
+            code: 'REQUIREMENT_ANALYSIS_FAILED',
+            message: errorMessage,
+            recoverable: true,
+            stage: 'error'
+          }]
+        }
+      })
     }
     const agent = new OllamaAgent(
       db,
@@ -1282,6 +1355,7 @@ if (!hasSingleInstanceLock) {
       console.error('[knowledge] initialization failed', error)
     })
     createWindow()
+    void initializeUpdateManager()
 
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow()

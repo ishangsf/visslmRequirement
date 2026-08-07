@@ -25,6 +25,16 @@ export const expertRegistry: readonly ExpertDefinition[] = [
     capabilities: ['field-profile', 'query-spec', 'dashboard-spec', 'dashboard-patch'],
     allowedTools: ['list_field_profiles', 'execute_query', 'validate_dashboard_spec', 'patch_dashboard'],
     systemPromptVersion: 'visualization-v1'
+  },
+  {
+    id: 'requirement-analysis',
+    name: '需求分析专家',
+    mention: '@需求分析专家',
+    description: '按需求编号定位数据中心记录并匹配相似数据',
+    icon: 'file-search',
+    capabilities: ['requirement-lookup', 'record-similarity', 'match-explanation'],
+    allowedTools: ['locate_requirement', 'rank_record_matches', 'review_requirement_matches'],
+    systemPromptVersion: 'requirement-analysis-v1'
   }
 ] as const
 
@@ -38,8 +48,10 @@ export class ExpertRouter {
   route(input: ExpertRouteInput): ExpertRouteResult {
     const visualization = byId.get('visualization')!
     const general = byId.get('general')!
+    const requirementAnalysis = byId.get('requirement-analysis')!
     const explicitVisualization = /@数据可视化专家(?:\s|$)/.test(input.question)
     const explicitGeneral = /@通用数据助手(?:\s|$)/.test(input.question)
+    const explicitRequirementAnalysis = /@需求分析专家(?:\s|$)/.test(input.question)
     let result: ExpertRouteResult
     if (explicitVisualization) {
       result = {
@@ -52,6 +64,12 @@ export class ExpertRouter {
         expert: general,
         reason: 'explicit-mention',
         question: input.question.replace(/@通用数据助手\s*/g, '').trim()
+      }
+    } else if (explicitRequirementAnalysis) {
+      result = {
+        expert: requirementAnalysis,
+        reason: 'explicit-mention',
+        question: input.question.replace(/@需求分析专家\s*/g, '').trim()
       }
     } else if (input.entrypoint === 'dashboard') {
       result = { expert: visualization, reason: 'entrypoint', question: input.question.trim() }

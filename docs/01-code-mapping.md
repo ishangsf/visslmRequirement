@@ -92,7 +92,7 @@ flowchart LR
 | `chat:session` | `getChatSession` | `index.ts:183` | `AppDatabase.getChatSession` | `chat_sessions` |
 | `chat:save-session` | `saveChatSession` | `index.ts:184-186` | `AppDatabase.saveChatSession` | `chat_sessions` |
 | `chat:delete-session` | `deleteChatSession` | `index.ts:187-189` | `AppDatabase.deleteChatSession` | `chat_sessions` |
-| `agent:ask` | `askAgent` | `index.ts:190-264` | `ExpertRouter`；通用 `OllamaAgent`，可视化 `VisualizationAgent`；`QueryEngine`/`KnowledgeService`/`AppDatabase` | 模型服务、本地记录/文档、大屏运行记录 |
+| `agent:ask` | `askAgent` | `index.ts:190-264` | `ExpertRouter`；通用 `OllamaAgent`、需求 `RequirementAnalysisAgent`、可视化 `VisualizationAgent`；`QueryEngine`/`KnowledgeService`/`AppDatabase` | 模型服务、本地记录/文档、大屏运行记录 |
 | `agent:event` | `onAgentEvent` | 主进程通过 `webContents.send` | `VisualizationAgent` 事件回调 | 渲染层专家进度事件 |
 | `analytics:field-profiles` | `listFieldProfiles` | `index.ts:266-268` | `QueryEngine.profile` -> `AppDatabase.get/saveFieldProfiles` | `field_profiles`、`query_cache`、`records` |
 | `analytics:field-profile-semantics` | `saveFieldProfileSemantics` | `index.ts:269-273` | `QueryEngine.updateFieldProfileSemantics` -> `AppDatabase.updateFieldProfileSemantics` | `field_profiles` |
@@ -188,7 +188,7 @@ flowchart LR
 | 数据采集 | `platform.*`、`sync.scope` | `SyncService.run`、`sync:progress` | VISSLM 查询/附件下载 |
 | 数据推送 | `platform.*`、`feature.push` | `PushService.push`（无独立进度事件） | VISSLM POST |
 | 知识库 | `VISSLM_RESOURCE_ROOT`、`VISSLM_EMBEDDING_MODEL_PATH`、测试 fallback | `processFiles`、`rebuildIndex`、`syncRecordIndex`、`knowledge:progress` | 本地模型/OCR；无远程运行时下载 |
-| AI 助手 | `model.*` | `agent:ask`、`agent:event`（可视化流） | Ollama/在线模型；本地知识检索 |
+| AI 助手 | `model.*` | `agent:ask`、`agent:event`（专家进度） | Ollama/在线模型；本地知识检索和记录向量匹配 |
 | 大屏 | `model.*`、功能开关 | VisualizationAgent 生成/补丁 | 模型服务；本地 QueryEngine |
 | 项目管理 | `model.*`、`allowExternalProcessing` 请求选项 | 协议解析/需求分析/匹配、`project:progress` | 知识库、本地/在线模型、记录向量索引 |
 | 系统配置 | 全部 settings | 无业务后台任务 | Electron safeStorage |

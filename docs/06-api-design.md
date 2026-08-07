@@ -68,7 +68,7 @@ React 页面 -> window.visslm -> preload/index.ts -> ipcRenderer.invoke(channel)
 
 | 编号 | IPC channel / preload 方法 | 请求参数 | 响应与错误 | 调用页面；Handler / Service / 表 |
 | --- | --- | --- | --- | --- |
-| API-IPC-025 | `agent:ask` / `askAgent` | `ChatRequest {question,projectId?,conversationId?,expertId?,entrypoint?,dataScope?,activeArtifact?,history?}` | `ChatResponse {answer,sources,dataViews,expertId?,dashboard?,events?}`；可视化无数据时返回 event code `NO_ANALYTICS_DATA`，模型/查询校验失败 rejection | `ChatPage`：`App.tsx:1407`；`index.ts:190-265` / `ExpertRouter`、`VisualizationAgent` 或 `OllamaAgent`；`records`,`knowledge_*`,`visualization_runs` |
+| API-IPC-025 | `agent:ask` / `askAgent` | `ChatRequest {question,projectId?,conversationId?,expertId?,entrypoint?,dataScope?,activeArtifact?,history?}` | `ChatResponse {answer,sources,dataViews,expertId?,dashboard?,events?}`；`expertId='requirement-analysis'` 或 `@需求分析专家` 时按编号返回分组匹配数据视图；可视化无数据时返回 event code `NO_ANALYTICS_DATA`，模型/查询校验失败 rejection | `ChatPage`：`App.tsx:1407`；`index.ts:190-265` / `ExpertRouter`、`VisualizationAgent`、`RequirementAnalysisAgent` 或 `OllamaAgent`；`records`,`knowledge_*`,`visualization_runs` |
 | API-IPC-026 | `chat:sessions` / `listChatSessions` | `limit?: number` | `ChatSessionSummary[]` | `ChatPage`：`App.tsx` 会话历史；`index.ts:182` / DB；`chat_sessions` |
 | API-IPC-027 | `chat:session` / `getChatSession` | `id: string` | `ChatSession|null` | `ChatPage` 加载历史；`index.ts:183` / DB；`chat_sessions` |
 | API-IPC-028 | `chat:save-session` / `saveChatSession` | `ChatSessionSaveInput {id,title?,messages}` | `ChatSession`；消息结构会被清洗/截断 | `ChatPage`；`index.ts:184-186` / DB；`chat_sessions` |

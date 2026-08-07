@@ -115,9 +115,9 @@
 1. **模块名称**：AI 助手。
 2. **模块编号**：M-05。
 3. **模块目标**：使用自然语言检索、统计、解释本地记录和知识库。
-4. **业务范围**：会话、工具调用、记录/字段查询、聚合、知识检索、来源引用、数据视图、模型切换。
+4. **业务范围**：会话、工具调用、记录/字段查询、聚合、知识检索、需求编号分析、来源引用、数据视图、模型切换。
 5. **对应前端目录**：`src/renderer/src/App.tsx` 的 `ChatPage`。
-6. **对应后端目录**：`src/main/ollama.ts`、`src/main/model-client.ts`、`src/main/experts/router.ts`。
+6. **对应后端目录**：`src/main/ollama.ts`、`src/main/model-client.ts`、`src/main/experts/router.ts`、`src/main/experts/requirement-analysis-agent.ts`。
 7. **页面入口**：侧栏“AI 助手”；资产中心“可视化”动作可带范围跳转聊天。
 8. **前端路由**：`PageKey='chat'`。
 9. **API 列表**：`agent:ask`、`chat:sessions/session/save-session/delete-session`、`onAgentEvent`；前端点击来源再调用 `getRecord/getKnowledgeDocument`。
@@ -125,7 +125,7 @@
 11. **Service**：`ExpertRouter`、`OllamaAgent`、`ModelClient`、`KnowledgeService`、`QueryEngine`。
 12. **DAO**：`AppDatabase` chat CRUD、`searchForAgent/inspectFields/queryRecordsByFields/aggregate/aggregateByField/getRecord`。
 13. **数据表**：`chat_sessions`、`records`、`knowledge_*`、`field_profiles`、`query_cache`；可视化请求写 `visualization_runs`。
-14. **核心流程**：路由专家 -> 通用助手计划/工具调用或知识检索 -> 本地工具执行 -> 模型综合 -> 返回 answer/sources/dataViews；会话由前端保存。
+14. **核心流程**：路由专家 -> 通用助手计划/工具调用、需求分析专家编号定位与全量向量匹配、或知识检索 -> 本地工具执行/AI 复核 -> 返回 answer/sources/dataViews；会话由前端保存。
 15. **状态变化**：前端 loading；工具循环直到无 tool_calls；可视化路径发送 status/artifact/error 事件。
 16. **业务规则**：指定记录属性必须用字段查询证据；字段不确定先画像；总量和字段聚合不能混用；模型不能直接 SQL。
 17. **权限点**：无；在线模型和本地模型由设置决定。
@@ -134,7 +134,7 @@
 20. **外部依赖**：Ollama 或在线模型服务；在线模型可接收检索上下文。
 21. **扩展点**：增加专家、工具、对话记忆策略、流式文本、权限和敏感字段过滤。
 22. **已知问题**：模型回答依赖外部服务；对话/工具结果无统一可观测 trace；在线数据外发没有统一审批。
-23. **代码依据**：`ollama.ts:62-210,299-1280`、`model-client.ts`、`experts/router.ts`、`App.tsx:1138-2055`。
+23. **代码依据**：`ollama.ts:62-210,299-1280`、`experts/requirement-analysis-agent.ts`、`model-client.ts`、`experts/router.ts`、`App.tsx:1138-2055`。
 
 ## M-06 本地分析查询
 

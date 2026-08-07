@@ -12,9 +12,11 @@
     "build:offline": "vite build --config vite.offline.config.ts && node scripts/prepare-offline-viewer.mjs",
     "preview": "electron-vite preview",
     "typecheck": "tsc --noEmit",
+    "smoke:updater": "node scripts/smoke-updater.mjs",
     "prepare:model": "node scripts/prepare-local-resources.mjs",
     "knowledge:smoke": "node scripts/smoke-knowledge.mjs",
     "smoke:agent-similarity": "npx tsx ./scripts/smoke-agent-similarity.ts",
+    "smoke:agent-requirement-analysis": "npx tsx ./scripts/smoke-agent-requirement-analysis.ts",
     "smoke:agent-rag-fallback": "npx tsx ./scripts/smoke-agent-rag-fallback.ts",
     "smoke:agent-related-data": "npx tsx ./scripts/smoke-agent-related-data.ts",
     "smoke:numeric-field-display": "npx tsx ./scripts/smoke-numeric-field-display.ts",
@@ -57,6 +59,7 @@
     "docx-preview": "^0.4.0",
     "echarts": "^6.0.0",
     "echarts-for-react": "^3.0.5",
+    "electron-updater": "^6.8.9",
     "fflate": "^0.8.3",
     "html-to-image": "^1.11.13",
     "iconv-lite": "^0.7.3",
@@ -86,6 +89,7 @@
   "build": {
     "appId": "com.visslm.agent.desktop",
     "productName": "VISSLM Agent",
+    "artifactName": "VISSLM-Agent-Setup-${version}.${ext}",
     "electronDist": "node_modules/electron/dist",
     "directories": {
       "output": "release"
@@ -132,6 +136,12 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "ishangsf",
+      "repo": "visslmRequirement",
+      "releaseType": "release"
     }
   }
 }

@@ -13020,6 +13020,74 @@ body {
   text-align: center;
 }
 
+.settings-update-body {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  max-width: 820px;
+}
+
+.settings-update-summary {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.settings-update-version-row,
+.settings-update-progress-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+}
+
+.settings-update-alert.ant-alert {
+  margin: 0;
+  border-color: color-mix(in srgb, var(--state-info) 36%, var(--stroke));
+  background: color-mix(in srgb, var(--state-info) 10%, var(--surface-soft));
+}
+
+.settings-update-alert.ant-alert-success {
+  border-color: color-mix(in srgb, var(--state-success) 36%, var(--stroke));
+  background: color-mix(in srgb, var(--state-success) 10%, var(--surface-soft));
+}
+
+.settings-update-alert.ant-alert-error {
+  border-color: color-mix(in srgb, var(--state-error) 36%, var(--stroke));
+  background: color-mix(in srgb, var(--state-error) 10%, var(--surface-soft));
+}
+
+.settings-update-progress,
+.settings-update-notes {
+  padding: 12px;
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.settings-update-progress .ant-progress {
+  margin: 0;
+}
+
+.settings-update-notes {
+  display: flex;
+  max-height: 160px;
+  flex-direction: column;
+  gap: 6px;
+  overflow: auto;
+  color: var(--text-main);
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.settings-update-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .settings-form-actions {
   display: flex;
   align-items: center;
@@ -13065,6 +13133,14 @@ body {
 
   .settings-form-actions {
     flex-wrap: wrap;
+  }
+
+  .settings-update-actions {
+    width: 100%;
+  }
+
+  .settings-update-actions .ant-btn {
+    flex: 1 1 auto;
   }
 }
 

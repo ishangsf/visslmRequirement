@@ -125,7 +125,8 @@ import type {
   SyncPreviewResult,
   SyncProgress,
   SyncResult,
-  SyncScopeConfig
+  SyncScopeConfig,
+  UpdateStatus
 } from '../../shared/types'
 
 const { Content, Sider } = Layout
@@ -292,6 +293,12 @@ const chatExperts: Array<{
     name: '通用数据助手',
     mention: '@通用数据助手',
     description: '检索、统计和解释本地数据'
+  },
+  {
+    id: 'requirement-analysis',
+    name: '需求分析专家',
+    mention: '@需求分析专家',
+    description: '按需求编号匹配数据中心相似需求'
   }
 ]
 
@@ -2034,10 +2041,14 @@ function ChatPage({
   const latestStatus = agentProgress.at(-1)
   const agentStageLabel: Record<string, string> = {
     route: '理解需求',
+    locate: '定位编号',
     retrieve: '检索依据',
+    match: '计算匹配',
     plan: '规划查询',
     query: '执行查询',
     verify: '核对结果',
+    reason: '复核语义',
+    critique: '独立复核',
     answer: '整理回答',
     error: '任务中断'
   }
@@ -2048,6 +2059,12 @@ function ChatPage({
   }, [agentProgress])
 
   const promptSuggestions = [
+    {
+      prompt: '@需求分析专家 分析需求编号 VISSLM-TSIS-3959',
+      title: '分析需求匹配',
+      description: '按编号核对相似数据',
+      icon: <FileSearchOutlined />
+    },
     {
       prompt: '按类型统计当前数据',
       title: '分析数据分布',
@@ -2449,7 +2466,9 @@ function ChatPage({
                     <span className="expert-mention-icon">
                       {expert.id === 'visualization'
                         ? <FundProjectionScreenOutlined />
-                        : <MessageOutlined />}
+                        : expert.id === 'requirement-analysis'
+                          ? <FileSearchOutlined />
+                          : <MessageOutlined />}
                     </span>
                     <span>
                       <strong>{expert.name}</strong>
@@ -4121,6 +4140,49 @@ function SettingsPanelHeading({
   )
 }
 
+const formatUpdateBytes = (value?: number): string => {
+  if (value === undefined || !Number.isFinite(value) || value <= 0) return ''
+  const units = ['B', 'KB', 'MB', 'GB']
+  let amount = value
+  let unitIndex = 0
+  while (amount >= 1024 && unitIndex < units.length - 1) {
+    amount /= 1024
+    unitIndex += 1
+  }
+  return `${amount >= 100 || unitIndex === 0 ? Math.round(amount) : amount.toFixed(1)} ${units[unitIndex]}`
+}
+
+const formatUpdateDate = (value?: string): string => {
+  if (!value) return ''
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? '' : date.toLocaleString('zh-CN')
+}
+
+const updateStatusLabel = (status: UpdateStatus | null): string => {
+  if (!status) return '正在读取更新状态'
+  switch (status.phase) {
+    case 'idle': return '尚未检查更新'
+    case 'checking': return '正在检查更新'
+    case 'available': return `发现新版本 ${status.version ?? ''}`.trim()
+    case 'not-available': return '已是最新版本'
+    case 'downloading': return '正在下载更新'
+    case 'downloaded': return '更新已下载'
+    case 'installing': return '正在重启安装'
+    case 'unsupported': return '当前环境不支持在线更新'
+    case 'error': return '更新检查失败'
+  }
+}
+
+const updateStatusColor = (status: UpdateStatus | null): string => {
+  if (!status) return 'default'
+  if (status.phase === 'available' || status.phase === 'downloaded') return 'success'
+  if (status.phase === 'error') return 'error'
+  if (status.phase === 'checking' || status.phase === 'downloading' || status.phase === 'installing') {
+    return 'processing'
+  }
+  return 'default'
+}
+
 function SettingsPage({
   settings,
   onChanged
@@ -4148,6 +4210,8 @@ function SettingsPage({
   const [navigationSaving, setNavigationSaving] = useState(false)
   const [draggingFeature, setDraggingFeature] = useState<FeatureModuleKey | null>(null)
   const [dragOverFeature, setDragOverFeature] = useState<FeatureDropTarget | null>(null)
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null)
+  const [updateAction, setUpdateAction] = useState<'check' | 'download' | 'install' | null>(null)
   const selectedProvider = onlineModelProviders.find((item) => item.value === modelProvider)
   const hasSavedModelApiKey = Boolean(
     settings?.model.provider === modelProvider && settings.model.hasApiKey
@@ -4190,6 +4254,20 @@ function SettingsPage({
     setNavigationOrder(normalizeFeatureNavigationOrder(settings.navigationOrder))
   }, [settings, settingsTab, platformForm, systemForm, modelForm, matchingForm])
 
+  useEffect(() => {
+    let mounted = true
+    void window.visslm.getUpdateStatus().then((status) => {
+      if (mounted) setUpdateStatus(status)
+    })
+    const unsubscribe = window.visslm.onUpdateStatus((status) => {
+      if (mounted) setUpdateStatus(status)
+    })
+    return () => {
+      mounted = false
+      unsubscribe()
+    }
+  }, [])
+
   const orderedFeatureDefinitions = useMemo(() => {
     const order = normalizeFeatureNavigationOrder(navigationOrder)
     return [...featureDefinitions].sort(
@@ -4220,6 +4298,38 @@ function SettingsPage({
     onChanged(next)
     systemForm.setFieldsValue(next.system)
     message.success('系统配置已保存')
+  }
+
+  const checkForUpdates = async (): Promise<void> => {
+    setUpdateAction('check')
+    try {
+      const next = await window.visslm.checkForUpdates()
+      setUpdateStatus(next)
+      if (next.phase === 'not-available') message.success('当前已是最新版本')
+      if (next.phase === 'error') message.error(`检查更新失败：${next.message ?? '未知错误'}`)
+    } finally {
+      setUpdateAction(null)
+    }
+  }
+
+  const downloadUpdate = async (): Promise<void> => {
+    setUpdateAction('download')
+    try {
+      const next = await window.visslm.downloadUpdate()
+      setUpdateStatus(next)
+      if (next.phase === 'error') message.error(`下载更新失败：${next.message ?? '未知错误'}`)
+    } finally {
+      setUpdateAction(null)
+    }
+  }
+
+  const installUpdate = async (): Promise<void> => {
+    setUpdateAction('install')
+    try {
+      await window.visslm.installUpdate()
+    } finally {
+      setUpdateAction(null)
+    }
   }
 
   const testModel = async (): Promise<void> => {
@@ -4351,6 +4461,12 @@ function SettingsPage({
     nextOrder.splice(targetIndex + (position === 'after' ? 1 : 0), 0, sourceKey)
     void saveNavigationOrder(nextOrder)
   }
+
+  const updateAvailable = updateStatus?.phase === 'available'
+  const updateDownloading = updateStatus?.phase === 'downloading'
+  const updateDownloaded = updateStatus?.phase === 'downloaded'
+  const updateUnsupported = updateStatus?.phase === 'unsupported'
+  const updateBusy = updateAction !== null || updateStatus?.phase === 'checking' || updateDownloading
 
   const changeModelSource = (source: string | number): void => {
     const thinking = Boolean(modelForm.getFieldValue('thinking'))
@@ -4574,6 +4690,122 @@ function SettingsPage({
                         <Button type="primary" htmlType="submit">保存项目匹配配置</Button>
                       </div>
                     </Form>
+                  </section>
+                  <section
+                    className="settings-general-section settings-update-section"
+                    aria-labelledby="online-update-title"
+                  >
+                    <SettingsPanelHeading
+                      title="在线更新"
+                      titleId="online-update-title"
+                      description="从 GitHub Release 检查、下载并安装 VISSLM Agent 的新版本。"
+                      extra={(
+                        <Tag color={updateStatusColor(updateStatus)}>
+                          {updateStatusLabel(updateStatus)}
+                        </Tag>
+                      )}
+                    />
+                    <div className="settings-update-body">
+                      <div className="settings-update-summary" aria-live="polite">
+                        <div className="settings-update-version-row">
+                          <Text strong>当前版本 {updateStatus?.currentVersion ?? '读取中…'}</Text>
+                          {updateStatus?.version && updateStatus.phase !== 'not-available' && (
+                            <Text type="secondary">目标版本 {updateStatus.version}</Text>
+                          )}
+                        </div>
+                        {updateAvailable && (
+                          <Alert
+                            type="info"
+                            showIcon
+                            title={`发现新版本 ${updateStatus?.version ?? ''}`}
+                            description="下载完成后可重启应用安装更新。"
+                            className="settings-update-alert"
+                          />
+                        )}
+                        {updateDownloading && (
+                          <div
+                            className="settings-update-progress"
+                            aria-label={`正在下载 ${updateStatus?.version ?? '新版本'} 更新`}
+                          >
+                            <div className="settings-update-progress-meta">
+                              <Text type="secondary">正在下载更新</Text>
+                              {formatUpdateBytes(updateStatus?.bytesPerSecond) && (
+                                <Text type="secondary">
+                                  {formatUpdateBytes(updateStatus?.bytesPerSecond)}/s
+                                </Text>
+                              )}
+                            </div>
+                            <Progress
+                              percent={Math.round(updateStatus?.percent ?? 0)}
+                              showInfo={false}
+                              strokeColor="var(--accent)"
+                            />
+                          </div>
+                        )}
+                        {updateDownloaded && (
+                          <Alert
+                            type="success"
+                            showIcon
+                            title="更新已下载"
+                            description="重启应用后将完成安装。"
+                            className="settings-update-alert"
+                          />
+                        )}
+                        {updateStatus?.phase === 'not-available' && (
+                          <Text type="secondary">最近检查时间：{formatUpdateDate(updateStatus.checkedAt) || '刚刚'}</Text>
+                        )}
+                        {updateStatus?.phase === 'unsupported' && (
+                          <Text type="secondary">{updateStatus.message}</Text>
+                        )}
+                        {updateStatus?.phase === 'error' && (
+                          <Alert
+                            type="error"
+                            showIcon
+                            title="更新操作失败"
+                            description={updateStatus.message}
+                            className="settings-update-alert"
+                          />
+                        )}
+                        {updateStatus?.releaseNotes && (
+                          <div className="settings-update-notes">
+                            <Text type="secondary">发行说明</Text>
+                            <div>{updateStatus.releaseNotes}</div>
+                          </div>
+                        )}
+                      </div>
+                      <Space className="settings-update-actions" wrap>
+                        <Button
+                          icon={<ReloadOutlined />}
+                          loading={updateAction === 'check'}
+                          disabled={updateBusy || updateUnsupported}
+                          onClick={() => void checkForUpdates()}
+                        >
+                          检查更新
+                        </Button>
+                        {updateAvailable && (
+                          <Button
+                            type="primary"
+                            icon={<CloudDownloadOutlined />}
+                            loading={updateAction === 'download'}
+                            disabled={updateBusy}
+                            onClick={() => void downloadUpdate()}
+                          >
+                            下载更新
+                          </Button>
+                        )}
+                        {updateDownloaded && (
+                          <Button
+                            type="primary"
+                            icon={<SyncOutlined />}
+                            loading={updateAction === 'install'}
+                            disabled={updateBusy}
+                            onClick={() => void installUpdate()}
+                          >
+                            重启并安装
+                          </Button>
+                        )}
+                      </Space>
+                    </div>
                   </section>
                 </div>
               )
