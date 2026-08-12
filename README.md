@@ -27,6 +27,9 @@ VISSLM Agent 是一个面向 Windows 的数据智能工作台，用于采集 VIS
 
 - 通用数据助手通过工具调用检索本地记录、字段、统计结果和知识库内容，不直接执行任意 SQL 或代码。
 - 回答可以附带来源引用、查询数据表和记录详情；无证据时会明确说明未检索到结果。
+- `@需求分析专家` 支持一个或多个需求编号定位数据中心记录；编号先做精确查找，不把自然语言相似度当作编号定位依据。
+- 需求分析会先清洗原始需求文本并构建语义卡片，再执行 Dense、本地 FTS5/BM25 和结构化字段的 RRF 混合召回（保留前 50 条），由本地 Cross-Encoder 重排后交给 AI 做业务关系初审和独立复核（前 20 条）。
+- 复核只允许 `duplicate`、`highly_similar`、`partial_overlap`、`same_pattern`、`topic_only`、`unrelated` 六类关系；结果按“正式匹配”和“参考关联需求”分组，并校验原始证据。必要阶段失败时不回退到向量分，也不输出未经验证的候选结论。
 - 通过 `@数据可视化专家` 或“可视化大屏”入口生成结构化 Dashboard。
 - 支持字段画像、数据范围、指标聚合、趋势分析、全局筛选器、组件数据口径和受限自定义公式。
 - 支持组件编辑、对话式修改、版本保存与恢复、质量诊断、PNG/PDF/JSON 导出和操作审计。
@@ -47,7 +50,7 @@ VISSLM Agent 是一个面向 Windows 的数据智能工作台，用于采集 VIS
 | 操作系统 | Windows x64 |
 | Node.js | Node.js 24，或与 Electron 43 兼容的版本 |
 | 包管理器 | npm |
-| 本地模型 | 使用本地 AI 时需要 Ollama；在线模型模式不需要 Ollama 对话服务 |
+| 本地模型 | 使用本地 AI 时需要 Ollama；需求分析精准匹配还需要本地 Cross-Encoder 资源 |
 | 网络 | 首次准备 embedding/OCR 资源、访问 VISSLM 或使用在线模型时需要网络 |
 
 ### 安装与启动
@@ -58,7 +61,7 @@ npm run typecheck
 npm run dev
 ```
 
-如果要使用知识库或在开发环境中验证本地向量检索，先准备本地 embedding 和 OCR 资源：
+如果要使用知识库或需求分析精准匹配，先准备本地 embedding、Cross-Encoder 和 OCR 资源：
 
 ```powershell
 npm run prepare:model
@@ -119,11 +122,12 @@ npm run package:dir
 `package` 和 `package:dir` 会自动执行 `npm run prepare:model`，完成以下步骤：
 
 1. 从固定 revision 的 `Xenova/bge-small-zh-v1.5` 下载 embedding 文件。
-2. 下载 Tesseract `chi_sim`、`eng` 语言资源。
-3. 将资源写入 `buildResources/models` 和 `buildResources/ocr`。
-4. 通过 Electron Builder 的 `extraResources` 打入安装包。
+2. 从固定 revision 的 `Xenova/bge-reranker-base` 下载本地 Cross-Encoder 文件。
+3. 下载 Tesseract `chi_sim`、`eng` 语言资源。
+4. 将资源写入 `buildResources/models` 和 `buildResources/ocr`，并生成资源 manifest。
+5. 通过 Electron Builder 的 `extraResources` 打入安装包。
 
-因此，打包机器需要能够访问 Hugging Face 和 OCR 资源地址；安装后的应用不会为了 embedding 或 OCR 再次联网下载资源。模型和 OCR 资源目录已加入 `.gitignore`，不应提交到仓库。
+因此，打包机器需要能够访问 Hugging Face 和 OCR 资源地址；安装后的应用不会为了 embedding、Cross-Encoder 或 OCR 再次联网下载资源。模型和 OCR 资源目录已加入 `.gitignore`，不应提交到仓库。
 
 ## 环境变量
 
@@ -131,7 +135,7 @@ npm run package:dir
 
 | 变量 | 用途 |
 | --- | --- |
-| `VISSLM_RESOURCE_ROOT` | 覆盖本地模型和 OCR 资源根目录；资源准备和运行时定位都会读取 |
+| `VISSLM_RESOURCE_ROOT` | 覆盖本地 embedding、Cross-Encoder 和 OCR 资源根目录；资源准备和运行时定位都会读取 |
 | `VISSLM_EMBEDDING_MODEL_PATH` | 指定 embedding 模型目录，目录中应能找到 `config.json` |
 | `VISSLM_HF_ENDPOINT` | 覆盖 Hugging Face 下载地址，适用于镜像或内网代理 |
 | `VISSLM_OCR_ENDPOINT` | 覆盖 Tesseract 语言包下载地址 |
@@ -191,6 +195,24 @@ npm run knowledge:smoke
 
 该脚本验证文档解析、重复文件去重、失败重试、记录增量索引和向量检索。
 
+### 需求分析精准匹配与评测
+
+```powershell
+npm run smoke:agent-requirement-analysis
+```
+
+该命令是需求编号分析的窄范围 smoke 入口，覆盖多编号分组、HTML/IssueType 清洗、双次独立复核、关系过滤、UID/证据严格校验、模型失败关闭和 `VISSLM-TSIS-779` hard-negative 回归。运行真实匹配前应执行 `npm run prepare:model`，使本地 embedding 和 Cross-Encoder 资源可用；模型、当前版本向量索引、FTS5/BM25 或 AI 复核不可用时不会回退到向量分，而是返回失败关闭。Dense、FTS5 和结构化召回都只在当前 embedding `modelVersion` 已建立向量索引的记录 UID 集合内运行。
+
+评测和性能基准命令：
+
+```powershell
+npm run evaluate:requirement-matching -- --report-only
+npm run benchmark:requirement-matching -- --records 5000 --report-only
+npm run compare:requirement-rerankers -- --manifest test-data/requirement-matching/reranker-model-manifest.json --report-only
+```
+
+`test-data/requirement-matching` 只提供金标 schema、双人标注/裁决协议、779 固定回归和空脚手架，未伪造人工标注。正式验收必须准备至少 200 条基准需求和 3,000 对人工金标，再去掉 `--report-only` 执行评测；在标注集和模型对比完成前，匹配百分比只称“综合匹配度”，不代表统计概率。
+
 ### 可视化离线回归
 
 以下测试不需要连接 Ollama：
@@ -240,6 +262,7 @@ src/
 │  ├─ knowledge.ts               # 文档解析、OCR、embedding、向量检索
 │  ├─ ollama.ts                  # 通用数据助手与工具调用
 │  ├─ model-client.ts            # Ollama/在线模型适配
+│  ├─ requirements/              # 需求语义卡片、混合召回和本地重排
 │  └─ experts/                   # 专家路由和可视化生成
 ├─ preload/                      # 安全暴露给渲染进程的 IPC API
 ├─ renderer/src/                 # React 页面和 Dashboard 工作台
@@ -261,6 +284,14 @@ buildResources/                  # 打包时生成的模型与 OCR 资源
 ### 知识库提示 embedding 资源不存在
 
 在项目根目录执行 `npm run prepare:model`。如果使用了自定义资源目录，确认 `VISSLM_RESOURCE_ROOT` 或 `VISSLM_EMBEDDING_MODEL_PATH` 指向包含模型配置文件的目录。
+
+### 需求分析提示精准匹配失败关闭
+
+确认 `buildResources/models/Xenova/bge-reranker-base` 下包含 `config.json`、`onnx/model_int8.onnx`、tokenizer 和 SentencePiece 文件，并检查 `buildResources/models/manifest.json` 的 `crossEncoder` 条目。也可设置 `VISSLM_RESOURCE_ROOT` 指向包含 `models/Xenova/bge-reranker-base` 的资源根目录后重启应用。Cross-Encoder 只允许本地文件加载；资源缺失、模型输出 UID/分数不合法、AI 结构化复核失败或原始证据校验失败时，该需求编号进入失败关闭路径，不使用向量召回分兜底。
+
+### 需求分析没有可验证结果
+
+先确认需求编号确实存在于数据中心，且记录描述或规范化文本不为空；再检查本地 embedding 索引、模型配置和主进程日志。没有通过完整候选覆盖、关系/分数校验和原始证据校验的记录不会进入来源或结果表；可见结果只包含正式匹配或参考关联需求。
 
 ### Ollama 已启动但模型连接测试失败
 

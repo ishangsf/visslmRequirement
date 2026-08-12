@@ -1,0 +1,79 @@
+{
+  "schemaVersion": "1.0",
+  "type": "requirement-reranker-model-comparison",
+  "provenance": "Pinned local ONNX resources for repeatable reranker evaluation. The candidate is evaluation-only and is not part of the shipped buildResources set.",
+  "base": {
+    "type": "cross-encoder-model",
+    "id": "Xenova/bge-reranker-base",
+    "revision": "280bcc27a84e0b898c251e06fddb25171bd9b101",
+    "license": "Apache-2.0",
+    "source": "https://huggingface.co/Xenova/bge-reranker-base",
+    "files": [
+      {
+        "file": "Xenova/bge-reranker-base/config.json",
+        "byteSize": 782,
+        "sha256": "b6575b9d5be20d6747417c8e20c5a0db1636356e0b6d422d7244c628423c4d4c"
+      },
+      {
+        "file": "Xenova/bge-reranker-base/onnx/model_int8.onnx",
+        "byteSize": 278825308,
+        "sha256": "2059d8ef0b6e935b4845e11b38c9af9e9e2e7b91f69fc99efe03254e0a7da8d3"
+      },
+      {
+        "file": "Xenova/bge-reranker-base/sentencepiece.bpe.model",
+        "byteSize": 5069051,
+        "sha256": "cfc8146abe2a0488e9e2a0c56de7952f7c11ab059eca145a0a727afce0db2865"
+      },
+      {
+        "file": "Xenova/bge-reranker-base/special_tokens_map.json",
+        "byteSize": 279,
+        "sha256": "d5469a60db23249c7f8945013d78df30b44b6bf686c6bb4740f4223f77b1b535"
+      },
+      {
+        "file": "Xenova/bge-reranker-base/tokenizer.json",
+        "byteSize": 17098079,
+        "sha256": "48564c5c7d3fa64d85d95e65414a542385f88b0f128fd8d4163fd7a57f2be05c"
+      },
+      {
+        "file": "Xenova/bge-reranker-base/tokenizer_config.json",
+        "byteSize": 443,
+        "sha256": "a1d6bc8734a6f635dc158508bef000f8e2e5a759c7d92f984b2c86e5ff53425b"
+      }
+    ]
+  },
+  "candidate": {
+    "type": "cross-encoder-model",
+    "id": "onnx-community/bge-reranker-v2-m3-ONNX",
+    "revision": "6f5ff65298512715a1e669753bc754d2bc8f367b",
+    "license": "Apache-2.0",
+    "source": "https://huggingface.co/onnx-community/bge-reranker-v2-m3-ONNX",
+    "licenseSource": "https://huggingface.co/BAAI/bge-reranker-v2-m3",
+    "files": [
+      {
+        "file": "onnx-community/bge-reranker-v2-m3-ONNX/config.json",
+        "byteSize": 848,
+        "sha256": "122e922dcfed6503c8721e6fe1daf090340c3d95ca7f3aa3a72730b321a51cfd"
+      },
+      {
+        "file": "onnx-community/bge-reranker-v2-m3-ONNX/onnx/model_int8.onnx",
+        "byteSize": 570727094,
+        "sha256": "912fc1215c2dbff6499700534bd8d31253af01573861abbfc43afd1fab6cce5d"
+      },
+      {
+        "file": "onnx-community/bge-reranker-v2-m3-ONNX/special_tokens_map.json",
+        "byteSize": 964,
+        "sha256": "8c785abebea9ae3257b61681b4e6fd8365ceafde980c21970d001e834cf10835"
+      },
+      {
+        "file": "onnx-community/bge-reranker-v2-m3-ONNX/tokenizer.json",
+        "byteSize": 17082900,
+        "sha256": "8bf8afbfd11306bd872018c53bfdf2e160a56f8edbcf49933324404791c148d3"
+      },
+      {
+        "file": "onnx-community/bge-reranker-v2-m3-ONNX/tokenizer_config.json",
+        "byteSize": 1203,
+        "sha256": "b87c8703482b0300d3da30e201519aa641f6a450f5eb5bf1e624afbf70c74d80"
+      }
+    ]
+  }
+}

@@ -129,6 +129,25 @@ npm run smoke:project-management
 
 `typecheck` 使用 `tsc --noEmit`，`build` 使用 electron-vite 构建 main/preload/renderer，项目管理 smoke 使用 `tsx` 直接验证领域服务和数据库行为。
 
+需求匹配升级的专用检查：
+
+```powershell
+npm run smoke:agent-requirement-analysis
+npm run evaluate:requirement-matching -- --report-only
+npm run benchmark:requirement-matching -- --records 5000 --report-only
+npm run compare:requirement-rerankers -- --manifest test-data/requirement-matching/reranker-model-manifest.json --report-only
+```
+
+评测脚手架当前没有人工金标，`--report-only` 只用于检查输入和输出格式。正式门禁要求金标 `annotationStatus` 为 `ready`、至少 200 个查询和 3,000 个需求对，并执行：
+
+```powershell
+npm run evaluate:requirement-matching -- --gold <gold.json> --predictions <predictions.json> --baseline <baseline.json>
+```
+
+脚本会计算 Recall@50、正式结果精确率、topic-only 误判率、nDCG@10、MRR、hard-negative 和基线增益；缺数据或任一阈值不满足时以非零状态退出。benchmark 默认只覆盖混合召回，使用 `--include-reranker` 才会加载真实本地 Cross-Encoder，不能把 fake 模型或未下载资源的结果当作上线 P95 证据。
+
+`compare:requirement-rerankers` 按 `queryId` 对同一查询下的全部候选分组排序，逐查询计算 nDCG@10、MRR 和排序一致性，并同时报告延迟、内存快照和模型体积。候选模型的固定 revision、哈希和许可清单位于 `test-data/requirement-matching/reranker-model-manifest.json`；没有人工金标时报告只能作为技术测量，不能作为精度优选结论。
+
 ### 7.2 知识库和离线分析
 
 ```powershell
@@ -146,7 +165,7 @@ npx tsx .\scripts\smoke-dashboard-drafts.ts
 npm run smoke:dashboard-editor
 ```
 
-`smoke:project-export` 会实际写出并重新读取 Excel 工作簿，检查 9 个工作表和关键字段。可视化的 golden、性能、视觉矩阵、像素差异和回归脚本也位于 `scripts/`，涉及 renderer 或布局时应按变更范围选择执行。
+`smoke:project-export` 会实际写出并重新读取 Excel 工作簿，检查 9 个工作表和关键字段。需求分析固定回归以 `VISSLM-TSIS-779` 为 hard-negative 合同案例；它不是人工金标。可视化的 golden、性能、视觉矩阵、像素差异和回归脚本也位于 `scripts/`，涉及 renderer 或布局时应按变更范围选择执行。
 
 ### 7.3 外部连接和端到端
 

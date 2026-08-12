@@ -12,7 +12,8 @@ import type {
   KnowledgeDocument,
   KnowledgeIndexProgress,
   KnowledgeRebuildResult,
-  KnowledgeUploadResult
+  KnowledgeUploadResult,
+  RecordDetail
 } from '../shared/types'
 import { AppDatabase, type KnowledgeChunkInput, type KnowledgeVectorInput } from './database'
 
@@ -818,6 +819,53 @@ export class KnowledgeService {
     return [...bestByRecord.values()]
       .sort((left, right) => right.score - left.score || left.recordUid.localeCompare(right.recordUid))
       .slice(0, Math.max(1, Math.trunc(limit)))
+  }
+
+  async rankRequirementRecordMatches(question: string, limit = 100): Promise<KnowledgeRecordMatch[]> {
+    const query = question.trim()
+    if (!query) return []
+    await this.initialize()
+    await this.waitForIndexReady()
+    await this.embeddings.prepare()
+    if (!this.embeddings.available) throw new Error(this.embeddings.unavailableReason)
+    const [queryVector] = await this.embeddings.embedMany([query])
+    if (!queryVector) throw new Error(this.embeddings.unavailableReason || '本地 embedding 未返回查询向量')
+    const candidates = this.db.listKnowledgeVectorRows(this.modelVersion)
+      .filter(({ chunk }) => chunk.sourceType === 'record' && Boolean(chunk.recordUid))
+    if (!candidates.length) {
+      throw new Error(`数据中心记录向量索引不可用或尚未使用模型 ${this.modelVersion} 建立`)
+    }
+    const bestByRecord = new Map<string, KnowledgeRecordMatch>()
+    for (const { chunk, vector } of candidates) {
+      const recordUid = chunk.recordUid as string
+      const score = Math.max(0, Math.min(1, this.cosine(queryVector, vector))) * 100
+      const existing = bestByRecord.get(recordUid)
+      if (existing && existing.score >= score) continue
+      bestByRecord.set(recordUid, {
+        recordUid,
+        recordName: chunk.sourceName,
+        nodeType: 'record',
+        itemId: recordUid,
+        score,
+        chunkId: chunk.id,
+        snippet: chunk.content.slice(0, 600)
+      })
+    }
+    return [...bestByRecord.values()]
+      .sort((left, right) => right.score - left.score || left.recordUid.localeCompare(right.recordUid))
+      .slice(0, Math.min(100, Math.max(1, Math.trunc(limit))))
+  }
+
+  async listRequirementIndexedRecords(): Promise<RecordDetail[]> {
+    await this.initialize()
+    await this.waitForIndexReady()
+    await this.embeddings.prepare()
+    if (!this.embeddings.available) throw new Error(this.embeddings.unavailableReason)
+    const records = this.db.listKnowledgeIndexedRecordDetails(this.modelVersion)
+    if (!records.length) {
+      throw new Error(`数据中心记录向量索引不可用或尚未使用模型 ${this.modelVersion} 建立`)
+    }
+    return records
   }
 
   private async processDocument(

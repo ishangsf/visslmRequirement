@@ -358,10 +358,13 @@ VISSLM Agent 将 VISSLM 平台数据复制到本地，提供本地检索、文�
 
 #### FR-AI-009 需求分析专家
 
-- AI 助手支持通过 `@需求分析专家` 和一个或多个需求编号精确定位数据中心记录；每条编号使用完整的分类/模块/名称/描述/信息词文本与全部其他记录进行向量匹配，并按项目管理匹配口径由模型复核候选分数。
-- 返回每条需求编号的名称、描述、模块和匹配度；未找到的编号单独提示，匹配结果以可展开的分组数据视图展示，默认只展示达到 40% 阈值的最高 20 条结果。
-- AI 复核不可用时回退到向量召回分，不使用宽泛知识检索替代编号定位。
-- 依据：`experts/router.ts`、`experts/requirement-analysis-agent.ts`、`index.ts`、`App.tsx`。
+- AI 助手支持通过 `@需求分析专家` 和一个或多个需求编号精确定位数据中心记录；每条编号先清洗 HTML 实体/标签并构建结构化语义卡片，再在全部已建立索引记录中执行 Dense、SQLite FTS5/BM25 和结构化字段三路召回。
+- 三路各取前 100 条，通过 RRF 合并为最多 50 条候选；本地 `Xenova/bge-reranker-base` INT8 Cross-Encoder 重排后取前 20 条，分别执行 AI 业务关系初审和不读取初审答案的独立复核。
+- 关系只能是 `duplicate`、`highly_similar`、`partial_overlap`、`same_pattern`、`topic_only` 或 `unrelated`。正式匹配展示前两类，后两类参考关联展示中间两类，`topic_only`/`unrelated` 过滤；结果包含双方原文证据、共同点、差异、召回分、重排分和复核状态。
+- 文案修改、权限配置、功能新增、缺陷修复、同模块和同对象不同动作按硬规则降级，不能仅凭关键词或主题判为高度相似。复核、证据、UID 或模型/索引任一失败时失败关闭，不回退到向量分。
+- 没有正式匹配时返回“未发现业务目标一致的高度相似或重复需求。检索到的记录仅存在主题、模块或操作模式上的关联。”分数统一称为“综合匹配度”，未做概率解释。
+- `scripts/smoke-agent-requirement-analysis.ts` 包含多编号、HTML/IssueType、双复核、UID 严格校验、模型失败关闭和 `VISSLM-TSIS-779` 固定回归。`test-data/requirement-matching` 提供双人标注协议和空金标脚手架；未填充真实人工金标前，不得宣称 Recall/Precision 门禁通过。
+- 依据：`experts/router.ts`、`experts/requirement-analysis-agent.ts`、`requirements/semantic-card.ts`、`requirements/hybrid-retrieval.ts`、`requirements/cross-encoder-reranker.ts`、`knowledge.ts`、`database.ts`、`scripts/smoke-agent-requirement-analysis.ts`。
 
 ### 6.7 本地分析查询
 

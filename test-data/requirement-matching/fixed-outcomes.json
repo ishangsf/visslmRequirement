@@ -1,0 +1,33 @@
+{
+  "schemaVersion": "1.0",
+  "fixtureKind": "contract-regression",
+  "provenance": "User-provided VISSLM-TSIS-779 acceptance outcomes; this is not a human-labeled evaluation corpus.",
+  "baseItemId": "VISSLM-TSIS-779",
+  "expected": [
+    {
+      "candidateItemId": "VISSLM-TSIS-889",
+      "allowedRelations": ["topic_only"]
+    },
+    {
+      "candidateItemId": "VISSLM-TSIS-376",
+      "allowedRelations": ["topic_only", "partial_overlap"]
+    },
+    {
+      "candidateItemId": "VISSLM-TSIS-613",
+      "allowedRelations": ["topic_only", "partial_overlap", "same_pattern", "unrelated"]
+    },
+    {
+      "candidateItemId": "VISSLM-TSIS-395",
+      "allowedRelations": ["topic_only", "partial_overlap", "same_pattern", "unrelated"]
+    },
+    {
+      "candidateItemId": "VISSLM-TSIS-528",
+      "allowedRelations": ["topic_only", "partial_overlap", "same_pattern", "unrelated"]
+    },
+    {
+      "candidateItemId": "VISSLM-TSIS-1837",
+      "allowedRelations": ["same_pattern"]
+    }
+  ],
+  "noFormalMatch": true
+}

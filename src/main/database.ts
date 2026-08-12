@@ -218,6 +218,15 @@ export interface KnowledgeRecordIndexRow {
   contentHash: string
 }
 
+export interface RequirementLexicalMatch {
+  recordUid: string
+  recordName: string
+  nodeType: string
+  itemId: string
+  score: number
+  snippet: string
+}
+
 export interface KnowledgeVectorRow {
   chunk: KnowledgeChunk
   vector: Float32Array
@@ -1202,6 +1211,11 @@ export class AppDatabase {
         VALUES (new.rowid, new.name, new.item_id, new.node_type, new.normalized_text);
       END;
     `)
+    const recordCount = Number((this.db.prepare('SELECT COUNT(*) AS count FROM records').get() as SqlRow).count ?? 0)
+    const indexedCount = Number((this.db.prepare('SELECT COUNT(*) AS count FROM records_fts').get() as SqlRow).count ?? 0)
+    if (recordCount !== indexedCount) {
+      this.db.exec("INSERT INTO records_fts(records_fts) VALUES ('rebuild')")
+    }
   }
 
   close(): void {
@@ -1602,12 +1616,53 @@ export class AppDatabase {
     this.db.prepare('DELETE FROM knowledge_chunks WHERE record_uid = ?').run(recordUid)
   }
 
-  listKnowledgeIndexedRecordUids(): string[] {
-    return (this.db.prepare(`
-      SELECT DISTINCT record_uid FROM knowledge_chunks
-      WHERE source_type = 'record' AND record_uid IS NOT NULL
-      ORDER BY record_uid
-    `).all() as SqlRow[]).map((row) => String(row.record_uid))
+  listKnowledgeIndexedRecordUids(modelVersion?: string): string[] {
+    const rows = modelVersion
+      ? this.db.prepare(`
+          SELECT DISTINCT c.record_uid
+          FROM knowledge_chunks c
+          JOIN knowledge_vectors v ON v.chunk_id = c.id
+          WHERE c.source_type = 'record'
+            AND c.record_uid IS NOT NULL
+            AND v.model_version = ?
+          ORDER BY c.record_uid
+        `).all(modelVersion) as SqlRow[]
+      : this.db.prepare(`
+          SELECT DISTINCT record_uid FROM knowledge_chunks
+          WHERE source_type = 'record' AND record_uid IS NOT NULL
+          ORDER BY record_uid
+        `).all() as SqlRow[]
+    return rows.map((row) => String(row.record_uid))
+  }
+
+  listKnowledgeIndexedRecordDetails(modelVersion: string): RecordDetail[] {
+    const rows = this.db.prepare(`
+      SELECT r.*, 0 AS image_count
+      FROM records r
+      WHERE EXISTS (
+        SELECT 1
+        FROM knowledge_chunks c
+        JOIN knowledge_vectors v ON v.chunk_id = c.id
+        WHERE c.source_type = 'record'
+          AND c.record_uid = r.uid
+          AND v.model_version = ?
+      )
+      ORDER BY r.uid
+    `).all(modelVersion) as SqlRow[]
+    return rows.map((row): RecordDetail => {
+      let raw: Record<string, unknown> = {}
+      try {
+        raw = JSON.parse(String(row.raw_json)) as Record<string, unknown>
+      } catch {
+        // A legacy raw payload may be corrupt; normalizedText remains usable for matching.
+      }
+      return {
+        ...this.mapRecord(row),
+        normalizedText: String(row.normalized_text ?? ''),
+        raw,
+        images: []
+      }
+    })
   }
 
   deleteKnowledgeVectors(): void {
@@ -1669,6 +1724,50 @@ export class AppDatabase {
         vector: new Float32Array(bytes.buffer)
       }
     })
+  }
+
+  searchRequirementRecordsLexical(
+    terms: string[],
+    modelVersion: string,
+    limit = 100
+  ): RequirementLexicalMatch[] {
+    const normalizedTerms = [...new Set(terms
+      .map((term) => String(term).trim().replaceAll('"', '""'))
+      .filter((term) => term.length >= 2))].slice(0, 80)
+    if (!normalizedTerms.length) return []
+    const matchQuery = normalizedTerms.map((term) => `"${term}"`).join(' OR ')
+    try {
+      const rows = this.db.prepare(`
+        SELECT r.uid, r.name, r.node_type, r.item_id, r.normalized_text,
+               bm25(records_fts) AS rank
+        FROM records_fts
+        JOIN records r ON r.rowid = records_fts.rowid
+        WHERE records_fts MATCH ?
+          AND EXISTS (
+            SELECT 1
+            FROM knowledge_chunks c
+            JOIN knowledge_vectors v ON v.chunk_id = c.id
+            WHERE c.source_type = 'record'
+              AND c.record_uid = r.uid
+              AND v.model_version = ?
+          )
+        ORDER BY rank ASC, r.uid ASC
+        LIMIT ?
+      `).all(matchQuery, modelVersion, Math.min(100, Math.max(1, Math.trunc(limit)))) as SqlRow[]
+      return rows.map((row) => ({
+        recordUid: String(row.uid),
+        recordName: String(row.name ?? ''),
+        nodeType: String(row.node_type ?? ''),
+        itemId: String(row.item_id ?? ''),
+        score: Number.isFinite(Number(row.rank)) ? Math.max(0, -Number(row.rank)) : 0,
+        snippet: String(row.normalized_text ?? '').slice(0, 600)
+      }))
+    } catch (error) {
+      throw new Error(
+        `需求 FTS5/BM25 召回不可用：${error instanceof Error ? error.message : String(error)}`,
+        { cause: error }
+      )
+    }
   }
 
   getKnowledgeStats(modelVersion: string): KnowledgeStats {
@@ -4739,7 +4838,7 @@ export class AppDatabase {
         `SELECT r.*, COUNT(i.id) AS image_count
          FROM records r
          LEFT JOIN images i ON i.record_uid = r.uid
-         WHERE r.item_id = ?
+         WHERE r.item_id = ? COLLATE NOCASE
          GROUP BY r.uid
          ORDER BY r.synced_at DESC, r.uid DESC
          LIMIT 1`
