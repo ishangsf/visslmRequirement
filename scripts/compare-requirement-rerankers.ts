@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { readFile, readdir, stat } from 'node:fs/promises'
 import { performance } from 'node:perf_hooks'
-import { cpus, rss, totalmem } from 'node:os'
+import { cpus, totalmem } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -38,7 +38,6 @@ interface PairInput {
   candidateId: string
   query: string
   candidate: string
-  relevance?: number
 }
 
 interface InputFile {
@@ -55,7 +54,6 @@ interface Options {
   candidatePath?: string
   manifest?: string
   inputs?: string
-  gold?: string
   output?: string
   resourceRoot: string
   baseRevision?: string
@@ -148,13 +146,6 @@ interface ModelRunReport {
   error?: string
 }
 
-interface GoldMetrics {
-  queryCount: number
-  pairCount: number
-  ndcg10: number
-  mrr: number
-}
-
 const DEFAULT_BASE_MODEL = 'Xenova/bge-reranker-base'
 const DEFAULT_CANDIDATE_MODEL = 'onnx-community/bge-reranker-v2-m3-ONNX'
 const DEFAULT_BASE_REVISION = '280bcc27a84e0b898c251e06fddb25171bd9b101'
@@ -211,7 +202,6 @@ const parseArgs = (): Options => {
     candidatePath: values.get('--candidate-path') ? resolve(values.get('--candidate-path')!) : undefined,
     manifest: values.get('--manifest') ? resolve(values.get('--manifest')!) : undefined,
     inputs: values.get('--inputs') ? resolve(values.get('--inputs')!) : undefined,
-    gold: values.get('--gold') ? resolve(values.get('--gold')!) : undefined,
     output: values.get('--output') ? resolve(values.get('--output')!) : undefined,
     resourceRoot,
     baseRevision: values.get('--base-revision'),
@@ -248,8 +238,7 @@ Model selection:
   --candidate-license <license>   Override candidate license metadata when using CLI model selection
 
 Inputs and execution:
-  --inputs <path>                 JSON pairs with queryId, candidateItemId, query, candidate[, relevance]
-  --gold <path>                   Gold JSON only when it also contains actual query/candidate texts
+  --inputs <path>                 JSON pairs with queryId, candidateItemId, query and candidate
   --run                           Load both local tokenizer/model and score the same pairs
   --iterations <n>                Measured inference iterations (default: 1)
   --warmup <n>                    Warmup inference iterations (default: 0)
@@ -429,30 +418,7 @@ const normalizePairs = (input: unknown): PairInput[] => {
     const slashIndex = id.indexOf('/')
     const queryId = asString(item.queryId) ?? asString(item.baseItemId) ?? (slashIndex > 0 ? id.slice(0, slashIndex) : `query-${createHash('sha256').update(query).digest('hex').slice(0, 16)}`)
     const candidateId = asString(item.candidateItemId) ?? asString(item.candidateId) ?? (slashIndex > 0 ? id.slice(slashIndex + 1) : id)
-    const relevance = asFiniteNumber(item.relevance) ?? asFiniteNumber(item.label)
-    if (relevance !== undefined && (!Number.isInteger(relevance) || relevance < 0)) throw new Error(`inputs[${index}] relevance must be a non-negative integer`)
-    return [{ id, queryId, candidateId, query, candidate, relevance }]
-  })
-}
-
-const normalizeGold = (input: unknown): PairInput[] => {
-  if (Array.isArray(input)) return normalizePairs(input)
-  if (!isObject(input)) throw new Error('gold must be a JSON object or array')
-  if (Array.isArray(input.pairs) || Array.isArray(input.inputs)) return normalizePairs(input)
-  if (!Array.isArray(input.queries)) throw new Error('gold requires queries or pairs')
-  return input.queries.flatMap((query, queryIndex) => {
-    if (!isObject(query) || !Array.isArray(query.pairs)) throw new Error(`gold.queries[${queryIndex}] requires pairs`)
-    return query.pairs.map((pair, pairIndex) => {
-      if (!isObject(pair)) throw new Error(`gold.queries[${queryIndex}].pairs[${pairIndex}] must be an object`)
-      const relevance = asFiniteNumber(pair.relevance)
-      const candidateId = asString(pair.candidateItemId)
-      const queryId = asString(query.queryId) ?? `query-${queryIndex + 1}`
-      const queryText = asString(query.query) ?? asString(query.baseText)
-      const candidateText = asString(pair.candidate) ?? asString(pair.candidateText)
-      if (!queryText || !candidateText || relevance === undefined) throw new Error(`gold.queries[${queryIndex}].pairs[${pairIndex}] lacks actual query/candidate text or relevance; use --inputs with business texts`)
-      const normalizedCandidateId = candidateId ?? `candidate-${pairIndex + 1}`
-      return { id: `${queryId}/${normalizedCandidateId}`, queryId, candidateId: normalizedCandidateId, query: queryText, candidate: candidateText, relevance }
-    })
+    return [{ id, queryId, candidateId, query, candidate }]
   })
 }
 
@@ -619,34 +585,6 @@ export const rankingAgreement = (base: ModelRunReport, candidate: ModelRunReport
   }
 }
 
-const dcg = (values: number[]): number => values.reduce((sum, value, index) => sum + ((2 ** value - 1) / Math.log2(index + 2)), 0)
-
-export const goldMetrics = (inputs: PairInput[], ranking: ModelRunReport): GoldMetrics | null => {
-  const labeled = inputs.filter((input) => input.relevance !== undefined)
-  if (!labeled.length) return null
-  const labelsByQuery = new Map<string, Map<string, number>>()
-  for (const input of labeled) {
-    const labels = labelsByQuery.get(input.queryId) ?? new Map<string, number>()
-    labels.set(input.candidateId, input.relevance ?? 0)
-    labelsByQuery.set(input.queryId, labels)
-  }
-  let ndcgSum = 0
-  let mrrSum = 0
-  let count = 0
-  for (const item of ranking.rankings) {
-    const labels = labelsByQuery.get(item.queryId)
-    if (!labels) continue
-    const ranked = item.ranking.slice(0, 10).map((entry) => labels.get(entry.id) ?? 0)
-    const ideal = [...labels.values()].sort((left, right) => right - left).slice(0, 10)
-    const idealDcg = dcg(ideal)
-    ndcgSum += idealDcg ? dcg(ranked) / idealDcg : 1
-    const firstRelevant = item.ranking.findIndex((entry) => (labels.get(entry.id) ?? 0) > 0)
-    mrrSum += firstRelevant < 0 ? 0 : 1 / (firstRelevant + 1)
-    count += 1
-  }
-  return count ? { queryCount: count, pairCount: labeled.length, ndcg10: Number((ndcgSum / count).toFixed(6)), mrr: Number((mrrSum / count).toFixed(6)) } : null
-}
-
 const writeReport = async (report: JsonObject, output?: string): Promise<void> => {
   const serialized = JSON.stringify(report, null, 2)
   console.log(serialized)
@@ -678,7 +616,6 @@ const main = async (): Promise<void> => {
   let inputs: PairInput[] = []
   try {
     if (options.inputs) inputs = validatePairGroups(normalizePairs(await readJson(options.inputs)))
-    else if (options.gold) inputs = validatePairGroups(normalizeGold(await readJson(options.gold)))
   } catch (error) {
     errors.push(`inputs: ${error instanceof Error ? error.message : String(error)}`)
   }
@@ -693,15 +630,13 @@ const main = async (): Promise<void> => {
   const baseRun = options.run && !errors.length ? await runModel(baseSpec, baseResource, inputs, options) : null
   const candidateRun = options.run && !errors.length ? await runModel(candidateSpec, candidateResource, inputs, options) : null
   const agreement = baseRun?.status === 'PASS' && candidateRun?.status === 'PASS' ? rankingAgreement(baseRun, candidateRun) : null
-  const baseGold = baseRun?.status === 'PASS' ? goldMetrics(inputs, baseRun) : null
-  const candidateGold = candidateRun?.status === 'PASS' ? goldMetrics(inputs, candidateRun) : null
   const status = errors.length || baseResource.errors.length || candidateResource.errors.length || (options.run && (baseRun?.status !== 'PASS' || candidateRun?.status !== 'PASS')) ? 'BLOCKED' : 'PASS'
   const report: JsonObject = {
     schemaVersion: MANIFEST_VERSION,
     status,
     gateMode: options.reportOnly ? 'report-only' : 'enforced',
     execution: options.run ? 'run' : 'dry/report-only',
-    candidateDisposition: status === 'PASS' ? 'UNVERIFIED: measurements only; no promotion conclusion' : 'BLOCKED: no model comparison accepted',
+    candidateDisposition: status === 'PASS' ? 'MEASURED: technical comparison only; no automatic promotion' : 'BLOCKED: no model comparison accepted',
     system,
     options: {
       baseModel: baseSpec.id,
@@ -710,7 +645,6 @@ const main = async (): Promise<void> => {
       candidatePath: candidateSpec.modelPath,
       resourceRoot: options.resourceRoot,
       inputs: options.inputs ?? null,
-      gold: options.gold ?? null,
       manifest: options.manifest ?? null,
       iterations: options.iterations,
       warmup: options.warmup,
@@ -719,14 +653,14 @@ const main = async (): Promise<void> => {
       dtype: options.dtype
     },
     resources: { base: baseResource, candidate: candidateResource, totalByteSize: baseResource.byteSize + candidateResource.byteSize },
-    inputs: { pairCount: inputs.length, queryCount: new Set(inputs.map((input) => input.queryId)).size, labeledCount: inputs.filter((input) => input.relevance !== undefined).length },
+    inputs: { pairCount: inputs.length, queryCount: new Set(inputs.map((input) => input.queryId)).size },
     runs: { base: baseRun, candidate: candidateRun },
-    comparison: { rankingAgreement: agreement, goldMetrics: { base: baseGold, candidate: candidateGold, delta: baseGold && candidateGold ? { ndcg10: Number((candidateGold.ndcg10 - baseGold.ndcg10).toFixed(6)), mrr: Number((candidateGold.mrr - baseGold.mrr).toFixed(6)) } : null } },
+    comparison: { rankingAgreement: agreement },
     errors,
     notes: [
       'This script does not download models and does not modify online matching behavior.',
       'A BLOCKED result is evidence that the comparison cannot be trusted, not a candidate failure measurement.',
-      'The candidate model has not been verified or approved by this report.'
+      'This report records technical measurements and does not automatically switch the production model.'
     ]
   }
   await writeReport(report, options.output)

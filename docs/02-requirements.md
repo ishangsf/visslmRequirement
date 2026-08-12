@@ -363,7 +363,7 @@ VISSLM Agent 将 VISSLM 平台数据复制到本地，提供本地检索、文�
 - 关系只能是 `duplicate`、`highly_similar`、`partial_overlap`、`same_pattern`、`topic_only` 或 `unrelated`。正式匹配展示前两类，后两类参考关联展示中间两类，`topic_only`/`unrelated` 过滤；结果包含双方原文证据、共同点、差异、召回分、重排分和复核状态。
 - 文案修改、权限配置、功能新增、缺陷修复、同模块和同对象不同动作按硬规则降级，不能仅凭关键词或主题判为高度相似。复核、证据、UID 或模型/索引任一失败时失败关闭，不回退到向量分。
 - 没有正式匹配时返回“未发现业务目标一致的高度相似或重复需求。检索到的记录仅存在主题、模块或操作模式上的关联。”分数统一称为“综合匹配度”，未做概率解释。
-- `scripts/smoke-agent-requirement-analysis.ts` 包含多编号、HTML/IssueType、双复核、UID 严格校验、模型失败关闭和 `VISSLM-TSIS-779` 固定回归。`test-data/requirement-matching` 提供双人标注协议和空金标脚手架；未填充真实人工金标前，不得宣称 Recall/Precision 门禁通过。
+- `scripts/smoke-agent-requirement-analysis.ts` 包含多编号、HTML/IssueType、双复核、UID 严格校验、模型失败关闭和 `VISSLM-TSIS-779` 固定回归。`test-data/requirement-matching` 只保留固定行为夹具和模型资源清单；不建设人工标注数据集或人工标签评测流程。
 - 依据：`experts/router.ts`、`experts/requirement-analysis-agent.ts`、`requirements/semantic-card.ts`、`requirements/hybrid-retrieval.ts`、`requirements/cross-encoder-reranker.ts`、`knowledge.ts`、`database.ts`、`scripts/smoke-agent-requirement-analysis.ts`。
 
 ### 6.7 本地分析查询
