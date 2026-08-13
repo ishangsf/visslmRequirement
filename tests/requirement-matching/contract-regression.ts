@@ -16,6 +16,10 @@ import {
   buildRequirementSemanticCard,
   type RequirementSemanticCard
 } from '../../src/main/requirements/semantic-card'
+import {
+  REQUIREMENT_SEMANTIC_ANALYZER_VERSION,
+  requirementSemanticModelSignature
+} from '../../src/main/requirements/semanticization-service'
 import type { HybridRequirementCandidate } from '../../src/main/requirements/hybrid-retrieval'
 import type { ModelSettings, RecordDetail } from '../../src/shared/types'
 
@@ -25,6 +29,11 @@ const settings: ModelSettings = {
   baseUrl: 'http://127.0.0.1:11434',
   model: 'contract-test-model',
   thinking: false
+}
+
+const semanticContext = {
+  analyzerVersion: REQUIREMENT_SEMANTIC_ANALYZER_VERSION,
+  modelSignature: requirementSemanticModelSignature(settings)
 }
 
 const makeRecord = (overrides: Partial<RecordDetail>): RecordDetail => ({
@@ -72,9 +81,13 @@ const upsert = (
 const candidateFor = (db: AppDatabase, uid: string, denseScore = 82): HybridRequirementCandidate => {
   const record = db.getRecord(uid, false)
   assert.ok(record, `missing fixture record ${uid}`)
+  const contentHash = db.getRecordContentHash(uid)
+  assert.ok(contentHash)
+  const card = db.getReadyRequirementSemanticCard({ recordUid: uid, contentHash, ...semanticContext })
+  assert.ok(card, `missing ready semantic card ${uid}`)
   return {
     record,
-    card: buildRequirementSemanticCard(record),
+    card,
     denseScore,
     lexicalScore: denseScore - 3,
     structuralScore: denseScore - 5,
@@ -111,8 +124,53 @@ const semanticCard = (overrides: Partial<RequirementSemanticCard>): RequirementS
   evidence: '测试原文证据',
   matchingText: '测试语义卡',
   lexicalTerms: ['测试'],
+  fieldAssessments: {
+    requirementType: { value: 'Enhancement', confidence: 1, evidence: '测试原文证据' },
+    productDomain: { value: '配置管理', confidence: 1, evidence: '测试原文证据' },
+    module: { value: '配置管理', confidence: 1, evidence: '测试原文证据' },
+    functionalObject: { value: '基线管理页面', confidence: 1, evidence: '测试原文证据' },
+    action: { value: 'unknown', confidence: 0, evidence: '测试原文证据' },
+    currentState: { value: '', confidence: 0, evidence: '测试原文证据' },
+    targetState: { value: '', confidence: 0, evidence: '测试原文证据' },
+    trigger: { value: '', confidence: 0, evidence: '测试原文证据' },
+    input: { value: '', confidence: 0, evidence: '测试原文证据' },
+    output: { value: '', confidence: 0, evidence: '测试原文证据' },
+    behavior: { value: '测试行为', confidence: 1, evidence: '测试原文证据' },
+    constraints: { value: '', confidence: 0, evidence: '测试原文证据' },
+    acceptance: { value: '', confidence: 0, evidence: '测试原文证据' },
+    businessScene: { value: '', confidence: 0, evidence: '测试原文证据' }
+  },
+  analysisStatus: 'ai_adjudicated',
+  analysisSummary: '测试裁决卡片',
   ...overrides
 })
+
+const persistReadyCard = (
+  db: AppDatabase,
+  uid: string,
+  overrides: Partial<RequirementSemanticCard> = {}
+): RequirementSemanticCard => {
+  const record = db.getRecord(uid, false)
+  assert.ok(record, `missing record for semantic card ${uid}`)
+  const source = buildRequirementSemanticCard(record)
+  const card = semanticCard({
+    ...source,
+    functionalObject: record.name,
+    action: 'add_capability',
+    evidence: source.evidence,
+    behavior: source.behavior,
+    matchingText: source.evidence,
+    lexicalTerms: source.lexicalTerms,
+    analysisStatus: 'ai_adjudicated',
+    analysisSummary: '合同测试预置的 AI 裁决卡片',
+    ...overrides
+  })
+  const contentHash = db.getRecordContentHash(uid)
+  assert.ok(contentHash)
+  assert.equal(db.claimRequirementSemanticCard({ recordUid: uid, contentHash, ...semanticContext }), true)
+  db.completeRequirementSemanticCard(uid, card)
+  return card
+}
 
 const reviewItem = (
   base: RequirementSemanticCard,
@@ -149,8 +207,16 @@ const testSemanticCardCleaningAndFieldLookup = (): void => {
 
   assert.equal(card.requirementType, 'Enhancement', 'type lookup should read nested IssueType aliases')
   assert.equal(card.module, '订单管理', 'module lookup should read nested moduleName aliases')
-  assert.equal(card.productDomain, '订单管理', 'product domain lookup should read nested aliases')
-  assert.equal(card.action, 'add_capability', 'cleaned behavior should still infer the business action')
+  assert.equal(card.productDomain, '订单管理', 'product domain lookup should read explicit nested aliases')
+  assert.equal(card.action, 'unknown', 'regex card must not infer action from words in the description')
+  assert.equal(card.functionalObject, '', 'regex card must not infer functionalObject from prose')
+  assert.equal(card.currentState, '', 'regex card must not infer currentState from prose')
+  assert.equal(card.targetState, '', 'regex card must not infer targetState from prose')
+  assert.equal(card.trigger, '', 'regex card must not infer trigger from prose')
+  assert.equal(card.input, '', 'regex card must not infer input from prose')
+  assert.equal(card.output, '', 'regex card must not infer output from prose')
+  assert.equal(card.constraints, '', 'regex card must not infer constraints from prose')
+  assert.equal(card.acceptance, '', 'regex card must not infer acceptance from prose')
   assert.ok(searchableText.includes('"订单" & 展示结果'), 'HTML entities should be decoded in semantic evidence')
   assert.ok(!searchableText.includes('<p>') && !searchableText.includes('&quot;'), 'HTML tags/entities must not reach matching text')
   assert.ok(!searchableText.includes('alert(1)') && !searchableText.includes('.secret'), 'script/style content must be removed')
@@ -172,25 +238,23 @@ const testSemanticCardCleaningAndFieldLookup = (): void => {
   const fallbackCard = buildRequirementSemanticCard(nestedFallback)
   assert.equal(fallbackCard.requirementType, 'Defect', 'type lookup should work when description comes from raw fields')
   assert.equal(fallbackCard.module, '配置管理', 'module lookup should work when description comes from raw fields')
-  assert.equal(fallbackCard.action, 'fix_defect', 'Defect type and failure wording should infer fix_defect')
+  assert.equal(fallbackCard.productDomain, '', 'product domain must not be inferred from the description')
+  assert.equal(fallbackCard.action, 'unknown', 'Defect type and failure wording must not infer fix_defect')
+  assert.equal(fallbackCard.functionalObject, '', 'functionalObject must remain empty without an explicit field')
   assert.ok(fallbackCard.behavior.includes('无法创建基线'), 'nested raw description should be used as behavior')
 }
 
 const testActionAndObjectHardRules = (): void => {
-  const renameBase = buildRequirementSemanticCard(makeRecord({
-    uid: 'rename-base',
-    name: '基线管理名称修改',
-    description: '配置管理中“变更基线”按钮建议改为“创建基线”。',
-    raw: { IssueType: 'Enhancement', _valm_Module: '配置管理' }
-  }))
-  const permissionCandidate = buildRequirementSemanticCard(makeRecord({
-    uid: 'permission-candidate',
-    name: '基线创建权限配置',
-    description: '基线管理预设子页中的“创建基线”按钮支持权限设置。',
-    raw: { IssueType: 'Enhancement', _valm_Module: '配置管理' }
-  }))
-  assert.equal(renameBase.action, 'rename_label', 'button wording change should infer rename_label')
-  assert.equal(permissionCandidate.action, 'configure_permission', 'permission wording should infer configure_permission')
+  const renameBase = semanticCard({
+    action: 'rename_label',
+    functionalObject: '基线管理页面',
+    evidence: '配置管理中“变更基线”按钮建议改为“创建基线”。'
+  })
+  const permissionCandidate = semanticCard({
+    action: 'configure_permission',
+    functionalObject: '基线管理页面',
+    evidence: '基线管理预设子页中的“创建基线”按钮支持权限设置。'
+  })
   const renameResult = enforceRequirementRelationshipRules(
     renameBase,
     permissionCandidate,
@@ -315,13 +379,14 @@ const createAgent = (
   {} as KnowledgeService,
   settings,
   undefined,
-  { retriever, reranker: deterministicReranker, modelClient: model.client }
+  { retriever, reranker: deterministicReranker, modelClient: model.client, semanticContext }
 )
 
 const testMultipleBaseUidExclusion = async (db: AppDatabase): Promise<void> => {
   upsert(db, { uid: 'base-one-uid', itemId: 'BASE-1', name: '订单查询', description: '支持在订单页面查看订单详情。', module: '订单管理' })
   upsert(db, { uid: 'base-two-uid', itemId: 'BASE-2', name: '库存查询', description: '支持在库存页面查看库存详情。', module: '库存管理' })
   upsert(db, { uid: 'shared-candidate-uid', itemId: 'SHARED-CANDIDATE', name: '相关详情查询', description: '支持在需求页面查看相关详情。', module: '需求管理' })
+  for (const uid of ['base-one-uid', 'base-two-uid', 'shared-candidate-uid']) persistReadyCard(db, uid)
 
   const excludedSnapshots: string[][] = []
   const model = createReviewModel('relations', new Map([['shared-candidate-uid', 'partial_overlap']]))
@@ -349,6 +414,8 @@ const testMultipleBaseUidExclusion = async (db: AppDatabase): Promise<void> => {
 const testTopicOnlyIsNotFormalMatch = async (db: AppDatabase): Promise<void> => {
   upsert(db, { uid: 'topic-base-uid', itemId: 'TOPIC-BASE', name: '订单查询', description: '支持在订单页面查看订单详情。', module: '订单管理' })
   upsert(db, { uid: 'topic-candidate-uid', itemId: 'TOPIC-CANDIDATE', name: '订单模块配置', description: '订单管理模块支持配置字段展示。', module: '订单管理' })
+  persistReadyCard(db, 'topic-base-uid')
+  persistReadyCard(db, 'topic-candidate-uid')
   const model = createReviewModel('topic-only')
   const retriever = {
     async retrieve(_base: RequirementSemanticCard, excludedUids: Set<string>): Promise<HybridRequirementCandidate[]> {
@@ -367,6 +434,8 @@ const testTopicOnlyIsNotFormalMatch = async (db: AppDatabase): Promise<void> => 
 const testReviewFailuresCloseResults = async (db: AppDatabase): Promise<void> => {
   upsert(db, { uid: 'failure-base-uid', itemId: 'FAILURE-BASE', name: '失败关闭基准', description: '支持在配置页面查看配置详情。', module: '配置管理' })
   upsert(db, { uid: 'failure-candidate-uid', itemId: 'FAILURE-CANDIDATE', name: '失败关闭候选', description: '支持在配置页面查看相关详情。', module: '配置管理' })
+  persistReadyCard(db, 'failure-base-uid')
+  persistReadyCard(db, 'failure-candidate-uid')
 
   for (const mode of ['invalid-evidence', 'unknown-uid'] as const) {
     const model = createReviewModel(mode)
@@ -385,6 +454,30 @@ const testReviewFailuresCloseResults = async (db: AppDatabase): Promise<void> =>
   }
 }
 
+const testPendingBaseDoesNotEnterMatching = async (db: AppDatabase): Promise<void> => {
+  upsert(db, {
+    uid: 'pending-base-uid',
+    itemId: 'PENDING-BASE',
+    name: '尚未语义化的基准',
+    description: '这条需求尚未生成 AI 语义卡片。'
+  })
+  let retrieveCalls = 0
+  const model = createReviewModel('relations')
+  const agent = createAgent(db, {
+    async retrieve(): Promise<HybridRequirementCandidate[]> {
+      retrieveCalls += 1
+      return []
+    }
+  }, model)
+  const response = await agent.ask({ question: '分析需求编号 PENDING-BASE' })
+  assert.equal(retrieveCalls, 0, 'pending base must stop before retrieval')
+  assert.equal(model.callCount(), 0, 'pending base must not invoke any matching model call')
+  assert.equal(response.dataViews.length, 0)
+  assert.equal(response.sources.length, 0)
+  assert.match(response.answer, /资产中心/)
+  assert.match(response.answer, /AI 语义化|语义卡片/)
+}
+
 const main = async (): Promise<void> => {
   testSemanticCardCleaningAndFieldLookup()
   testActionAndObjectHardRules()
@@ -396,6 +489,7 @@ const main = async (): Promise<void> => {
     await testMultipleBaseUidExclusion(db)
     await testTopicOnlyIsNotFormalMatch(db)
     await testReviewFailuresCloseResults(db)
+    await testPendingBaseDoesNotEnterMatching(db)
     console.log(JSON.stringify({
       ok: true,
       checks: [
@@ -405,6 +499,7 @@ const main = async (): Promise<void> => {
         'all requested base UIDs excluded from every retrieval',
         'topic_only is never promoted to a visible match',
         'invalid evidence and unknown UID fail closed'
+        , 'pending base stops before retrieval and model calls'
       ]
     }))
   } finally {

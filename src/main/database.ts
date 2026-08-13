@@ -37,8 +37,11 @@ import type {
   RecordPage,
   RecordQuery,
   RecordRow,
+  RequirementSemanticizationStatus,
+  RequirementSemanticizationStatusReason,
   SyncRun
 } from '../shared/types'
+import { isAiRequirementSemanticCard, type RequirementSemanticCard } from './requirements/semantic-card'
 import type {
   ManagedProject,
   ManagedProjectInput,
@@ -226,6 +229,36 @@ export interface RequirementLexicalMatch {
   score: number
   snippet: string
 }
+
+export interface RequirementSemanticCardState {
+  recordUid: string
+  contentHash: string
+  analyzerVersion: string
+  modelSignature: string
+  status: RequirementSemanticizationStatus
+  card: RequirementSemanticCard | null
+  errorMessage: string
+  startedAt: string
+  completedAt: string
+  updatedAt: string
+  analysisTrace: Record<string, unknown>
+}
+
+export interface RequirementSemanticizationContext {
+  analyzerVersion: string
+  modelSignature: string
+}
+
+const requirementSemanticContentSql = (alias: string): string => `${alias}.semantic_hash`
+
+const requirementSemanticSourceHash = (input: {
+  name: string
+  lastModifyTime: string
+  rawJson: string
+  normalizedText: string
+}): string => createHash('sha256')
+  .update([input.name, input.lastModifyTime, input.rawJson, input.normalizedText].join('\n'))
+  .digest('hex')
 
 export interface KnowledgeVectorRow {
   chunk: KnowledgeChunk
@@ -571,6 +604,7 @@ export class AppDatabase {
         raw_json TEXT NOT NULL,
         normalized_text TEXT NOT NULL DEFAULT '',
         content_hash TEXT NOT NULL,
+        semantic_hash TEXT NOT NULL DEFAULT '',
         synced_at TEXT NOT NULL,
         push_status TEXT NOT NULL DEFAULT 'pending',
         push_message TEXT NOT NULL DEFAULT '',
@@ -853,6 +887,25 @@ export class AppDatabase {
         updated_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS requirement_semantic_cards (
+        record_uid TEXT PRIMARY KEY,
+        content_hash TEXT NOT NULL,
+        analyzer_version TEXT NOT NULL,
+        model_signature TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        card_json TEXT NOT NULL DEFAULT '',
+        error_message TEXT NOT NULL DEFAULT '',
+        started_at TEXT NOT NULL DEFAULT '',
+        completed_at TEXT NOT NULL DEFAULT '',
+        analysis_trace_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(record_uid) REFERENCES records(uid) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_requirement_semantic_cards_status
+        ON requirement_semantic_cards(status, updated_at DESC);
+
       CREATE TABLE IF NOT EXISTS org_people (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -1126,12 +1179,20 @@ export class AppDatabase {
       CREATE INDEX IF NOT EXISTS idx_pm_analysis_logs_task
         ON pm_analysis_logs(task_id, created_at ASC);
     `)
+    this.db.prepare(`
+      UPDATE requirement_semantic_cards
+      SET status = 'failed', error_message = '应用在语义化处理中断，请重试',
+          completed_at = ?, updated_at = ?
+      WHERE status = 'processing'
+    `).run(nowIso(), nowIso())
 
     for (const statement of [
       "ALTER TABLE records ADD COLUMN push_status TEXT NOT NULL DEFAULT 'pending'",
       "ALTER TABLE records ADD COLUMN push_message TEXT NOT NULL DEFAULT ''",
       "ALTER TABLE records ADD COLUMN pushed_at TEXT NOT NULL DEFAULT ''",
       "ALTER TABLE records ADD COLUMN pushed_uid TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE records ADD COLUMN semantic_hash TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE requirement_semantic_cards ADD COLUMN analysis_trace_json TEXT NOT NULL DEFAULT '{}'",
       "ALTER TABLE field_profiles ADD COLUMN sensitivity TEXT NOT NULL DEFAULT 'normal'",
       "ALTER TABLE visualization_runs ADD COLUMN mode TEXT NOT NULL DEFAULT 'generate'",
       "ALTER TABLE visualization_runs ADD COLUMN tool_calls_json TEXT NOT NULL DEFAULT '[]'",
@@ -1165,6 +1226,19 @@ export class AppDatabase {
       }
     }
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_records_push_status ON records(push_status)')
+    const missingSemanticHashes = this.db.prepare(`
+      SELECT uid, name, last_modify_time, raw_json, normalized_text
+      FROM records WHERE semantic_hash = ''
+    `).all() as SqlRow[]
+    const updateSemanticHash = this.db.prepare('UPDATE records SET semantic_hash = ? WHERE uid = ?')
+    for (const row of missingSemanticHashes) {
+      updateSemanticHash.run(requirementSemanticSourceHash({
+        name: String(row.name ?? ''),
+        lastModifyTime: String(row.last_modify_time ?? ''),
+        rawJson: String(row.raw_json ?? '{}'),
+        normalizedText: String(row.normalized_text ?? '')
+      }), String(row.uid))
+    }
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_pm_cost_entries_responsible ON pm_cost_entries(responsible_participant_id)')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_pm_requirements_set ON pm_requirements(set_id, requirement_no)')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_pm_requirements_review ON pm_requirements(project_id, review_status)')
@@ -1665,6 +1739,155 @@ export class AppDatabase {
     })
   }
 
+  getRequirementSemanticCardState(recordUid: string): RequirementSemanticCardState | null {
+    const row = this.db.prepare(`
+      SELECT * FROM requirement_semantic_cards WHERE record_uid = ? LIMIT 1
+    `).get(recordUid) as SqlRow | undefined
+    if (!row) return null
+    let card: RequirementSemanticCard | null = null
+    try {
+      const parsed = String(row.card_json ?? '').trim() ? JSON.parse(String(row.card_json)) : null
+      card = isAiRequirementSemanticCard(parsed) ? parsed : null
+    } catch {
+      card = null
+    }
+    let analysisTrace: Record<string, unknown> = {}
+    try {
+      const parsed: unknown = JSON.parse(String(row.analysis_trace_json ?? '{}'))
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        analysisTrace = parsed as Record<string, unknown>
+      }
+    } catch {
+      analysisTrace = {}
+    }
+    return {
+      recordUid: String(row.record_uid),
+      contentHash: String(row.content_hash),
+      analyzerVersion: String(row.analyzer_version),
+      modelSignature: String(row.model_signature),
+      status: this.semanticStatus(row.status),
+      card,
+      errorMessage: String(row.error_message ?? ''),
+      startedAt: String(row.started_at ?? ''),
+      completedAt: String(row.completed_at ?? ''),
+      updatedAt: String(row.updated_at ?? ''),
+      analysisTrace
+    }
+  }
+
+  getRecordContentHash(recordUid: string): string | null {
+    const row = this.db.prepare(`
+      SELECT ${requirementSemanticContentSql('r')} AS semantic_content_hash
+      FROM records r WHERE r.uid = ?
+    `).get(recordUid) as SqlRow | undefined
+    return row ? String(row.semantic_content_hash ?? '') : null
+  }
+
+  getReadyRequirementSemanticCard(input: {
+    recordUid: string
+    contentHash: string
+    analyzerVersion: string
+    modelSignature: string
+  }): RequirementSemanticCard | null {
+    const state = this.getRequirementSemanticCardState(input.recordUid)
+    return state?.status === 'ready' && state.card &&
+      state.contentHash === input.contentHash &&
+      state.analyzerVersion === input.analyzerVersion &&
+      state.modelSignature === input.modelSignature
+      ? state.card
+      : null
+  }
+
+  listReadyRequirementSemanticCards(input: {
+    recordUids?: string[]
+    analyzerVersion: string
+    modelSignature: string
+  }): Map<string, RequirementSemanticCard> {
+    const recordUids = [...new Set(input.recordUids ?? [])]
+    if (input.recordUids && !recordUids.length) return new Map()
+    const where = [
+      "s.status = 'ready'",
+      `s.content_hash = ${requirementSemanticContentSql('r')}`,
+      's.analyzer_version = ?',
+      's.model_signature = ?'
+    ]
+    const params: Array<string | number> = [input.analyzerVersion, input.modelSignature]
+    if (recordUids.length) {
+      where.push(`s.record_uid IN (${recordUids.map(() => '?').join(', ')})`)
+      params.push(...recordUids)
+    }
+    const rows = this.db.prepare(`
+      SELECT s.record_uid, s.card_json
+      FROM requirement_semantic_cards s
+      JOIN records r ON r.uid = s.record_uid
+      WHERE ${where.join(' AND ')}
+    `).all(...params) as SqlRow[]
+    return new Map(rows.flatMap((row) => {
+      try {
+        const parsed: unknown = JSON.parse(String(row.card_json))
+        return isAiRequirementSemanticCard(parsed) ? [[String(row.record_uid), parsed]] : []
+      } catch {
+        return []
+      }
+    }))
+  }
+
+  claimRequirementSemanticCard(input: {
+    recordUid: string
+    contentHash: string
+    analyzerVersion: string
+    modelSignature: string
+    force?: boolean
+  }): boolean {
+    const current = this.getRequirementSemanticCardState(input.recordUid)
+    const isValidReady = current?.status === 'ready' && current.card &&
+      current.contentHash === input.contentHash &&
+      current.analyzerVersion === input.analyzerVersion &&
+      current.modelSignature === input.modelSignature
+    if (current?.status === 'processing' || (!input.force && isValidReady)) return false
+    const timestamp = nowIso()
+    this.db.prepare(`
+      INSERT INTO requirement_semantic_cards(
+        record_uid, content_hash, analyzer_version, model_signature, status,
+        card_json, error_message, started_at, completed_at, analysis_trace_json, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, 'processing', '', '', ?, '', '{}', ?, ?)
+      ON CONFLICT(record_uid) DO UPDATE SET
+        content_hash = excluded.content_hash,
+        analyzer_version = excluded.analyzer_version,
+        model_signature = excluded.model_signature,
+        status = 'processing', card_json = '', error_message = '',
+        started_at = excluded.started_at, completed_at = '', analysis_trace_json = '{}',
+        updated_at = excluded.updated_at
+    `).run(
+      input.recordUid, input.contentHash, input.analyzerVersion, input.modelSignature,
+      timestamp, timestamp, timestamp
+    )
+    return true
+  }
+
+  completeRequirementSemanticCard(
+    recordUid: string,
+    card: RequirementSemanticCard,
+    analysisTrace: Record<string, unknown> = {}
+  ): void {
+    const timestamp = nowIso()
+    this.db.prepare(`
+      UPDATE requirement_semantic_cards
+      SET status = 'ready', card_json = ?, analysis_trace_json = ?, error_message = '',
+          completed_at = ?, updated_at = ?
+      WHERE record_uid = ? AND status = 'processing'
+    `).run(JSON.stringify(card), JSON.stringify(analysisTrace), timestamp, timestamp, recordUid)
+  }
+
+  failRequirementSemanticCard(recordUid: string, message: string): void {
+    const timestamp = nowIso()
+    this.db.prepare(`
+      UPDATE requirement_semantic_cards
+      SET status = 'failed', card_json = '', error_message = ?, completed_at = ?, updated_at = ?
+      WHERE record_uid = ? AND status = 'processing'
+    `).run(message.slice(0, 2000), timestamp, timestamp, recordUid)
+  }
+
   deleteKnowledgeVectors(): void {
     this.db.prepare('DELETE FROM knowledge_vectors').run()
   }
@@ -1729,7 +1952,8 @@ export class AppDatabase {
   searchRequirementRecordsLexical(
     terms: string[],
     modelVersion: string,
-    limit = 100
+    limit = 100,
+    semanticContext?: RequirementSemanticizationContext
   ): RequirementLexicalMatch[] {
     const normalizedTerms = [...new Set(terms
       .map((term) => String(term).trim().replaceAll('"', '""'))
@@ -1742,7 +1966,12 @@ export class AppDatabase {
                bm25(records_fts) AS rank
         FROM records_fts
         JOIN records r ON r.rowid = records_fts.rowid
+        ${semanticContext ? 'JOIN requirement_semantic_cards s ON s.record_uid = r.uid' : ''}
         WHERE records_fts MATCH ?
+          ${semanticContext ? `AND s.status = 'ready'
+          AND s.content_hash = ${requirementSemanticContentSql('r')}
+          AND s.analyzer_version = ?
+          AND s.model_signature = ?` : ''}
           AND EXISTS (
             SELECT 1
             FROM knowledge_chunks c
@@ -1753,7 +1982,12 @@ export class AppDatabase {
           )
         ORDER BY rank ASC, r.uid ASC
         LIMIT ?
-      `).all(matchQuery, modelVersion, Math.min(100, Math.max(1, Math.trunc(limit)))) as SqlRow[]
+      `).all(
+        matchQuery,
+        ...(semanticContext ? [semanticContext.analyzerVersion, semanticContext.modelSignature] : []),
+        modelVersion,
+        Math.min(100, Math.max(1, Math.trunc(limit)))
+      ) as SqlRow[]
       return rows.map((row) => ({
         recordUid: String(row.uid),
         recordName: String(row.name ?? ''),
@@ -4759,12 +4993,18 @@ export class AppDatabase {
     }
     const rawJson = JSON.stringify(input.raw)
     const contentHash = createHash('sha256').update(rawJson).digest('hex')
+    const semanticHash = requirementSemanticSourceHash({
+      name: input.name,
+      lastModifyTime: input.lastModifyTime,
+      rawJson,
+      normalizedText: input.normalizedText
+    })
     this.db
       .prepare(
         `INSERT INTO records(
            uid, project_id, node_type, item_id, parent_id, name,
-           last_modify_time, raw_json, normalized_text, content_hash, synced_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           last_modify_time, raw_json, normalized_text, content_hash, semantic_hash, synced_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(uid) DO UPDATE SET
            project_id=excluded.project_id,
            node_type=excluded.node_type,
@@ -4775,6 +5015,7 @@ export class AppDatabase {
            raw_json=excluded.raw_json,
            normalized_text=excluded.normalized_text,
            content_hash=excluded.content_hash,
+           semantic_hash=excluded.semantic_hash,
            push_status=CASE
              WHEN records.content_hash <> excluded.content_hash THEN 'pending'
              ELSE records.push_status
@@ -4804,16 +5045,27 @@ export class AppDatabase {
         rawJson,
         input.normalizedText,
         contentHash,
+        semanticHash,
         nowIso()
       )
   }
 
   updateRecordNormalizedText(uid: string, normalizedText: string): void {
+    const row = this.db.prepare(`
+      SELECT name, last_modify_time, raw_json FROM records WHERE uid = ?
+    `).get(uid) as SqlRow | undefined
+    if (!row) return
+    const semanticHash = requirementSemanticSourceHash({
+      name: String(row.name ?? ''),
+      lastModifyTime: String(row.last_modify_time ?? ''),
+      rawJson: String(row.raw_json ?? '{}'),
+      normalizedText
+    })
     this.db.prepare(`
       UPDATE records
-      SET normalized_text = ?
+      SET normalized_text = ?, semantic_hash = ?
       WHERE uid = ?
-    `).run(normalizedText, uid)
+    `).run(normalizedText, semanticHash, uid)
   }
 
   updateRecordRawAndNormalizedText(
@@ -4823,11 +5075,19 @@ export class AppDatabase {
   ): void {
     const rawJson = JSON.stringify(raw)
     const contentHash = createHash('sha256').update(rawJson).digest('hex')
+    const row = this.db.prepare(`SELECT name, last_modify_time FROM records WHERE uid = ?`).get(uid) as SqlRow | undefined
+    if (!row) return
+    const semanticHash = requirementSemanticSourceHash({
+      name: String(row.name ?? ''),
+      lastModifyTime: String(row.last_modify_time ?? ''),
+      rawJson,
+      normalizedText
+    })
     this.db.prepare(`
       UPDATE records
-      SET raw_json = ?, normalized_text = ?, content_hash = ?
+      SET raw_json = ?, normalized_text = ?, content_hash = ?, semantic_hash = ?
       WHERE uid = ?
-    `).run(rawJson, normalizedText, contentHash, uid)
+    `).run(rawJson, normalizedText, contentHash, semanticHash, uid)
   }
 
   findRecordByItemId(itemId: string): RecordRow | null {
@@ -5056,18 +5316,18 @@ export class AppDatabase {
     ).map((row) => String(row.node_type))
   }
 
-  private recordFilters(query: RecordQuery): {
+  private recordFilters(query: RecordQuery, semanticContext?: RequirementSemanticizationContext): {
     join: string
     where: string
     params: Array<string | number>
   } {
     const clauses: string[] = []
     const params: Array<string | number> = []
-    let join = ''
+    let join = 'LEFT JOIN requirement_semantic_cards s ON s.record_uid = r.uid'
     if (query.search?.trim()) {
       const search = query.search.trim()
       if (search.length >= 3) {
-        join = 'JOIN records_fts f ON f.rowid = r.rowid'
+        join += ' JOIN records_fts f ON f.rowid = r.rowid'
         clauses.push('records_fts MATCH ?')
         params.push(`"${search.replaceAll('"', '""')}"`)
       } else {
@@ -5090,6 +5350,17 @@ export class AppDatabase {
       )`)
       params.push(query.excludeProjectAssetProjectId)
     }
+    if (query.semanticStatus && semanticContext) {
+      const valid = `s.content_hash = ${requirementSemanticContentSql('r')}
+        AND s.analyzer_version = ? AND s.model_signature = ?`
+      if (query.semanticStatus === 'pending') {
+        clauses.push(`(s.record_uid IS NULL OR NOT (${valid}))`)
+      } else {
+        clauses.push(`s.status = ? AND ${valid}`)
+        params.push(query.semanticStatus)
+      }
+      params.push(semanticContext.analyzerVersion, semanticContext.modelSignature)
+    }
     return {
       join,
       where: clauses.length ? `WHERE ${clauses.join(' AND ')}` : '',
@@ -5097,16 +5368,23 @@ export class AppDatabase {
     }
   }
 
-  listRecords(query: RecordQuery): RecordPage {
+  listRecords(query: RecordQuery, semanticContext?: RequirementSemanticizationContext): RecordPage {
     const page = Math.max(1, query.page || 1)
     const pageSize = Math.min(200, Math.max(1, query.pageSize || 20))
-    const filters = this.recordFilters(query)
+    const filters = this.recordFilters(query, semanticContext)
     const totalRow = this.db
       .prepare(`SELECT COUNT(DISTINCT r.uid) AS total FROM records r ${filters.join} ${filters.where}`)
       .get(...filters.params) as SqlRow
     const rows = this.db
       .prepare(
-        `SELECT r.*, COUNT(i.id) AS image_count
+        `SELECT r.*, COUNT(i.id) AS image_count,
+                ${requirementSemanticContentSql('r')} AS semantic_current_content_hash,
+                s.status AS semantic_raw_status,
+                s.content_hash AS semantic_content_hash,
+                s.analyzer_version AS semantic_analyzer_version,
+                s.model_signature AS semantic_model_signature,
+                s.error_message AS semantic_error_message,
+                s.updated_at AS semantic_updated_at
          FROM records r
          ${filters.join}
          LEFT JOIN images i ON i.record_uid = r.uid
@@ -5118,15 +5396,28 @@ export class AppDatabase {
       .all(...filters.params, pageSize, (page - 1) * pageSize) as SqlRow[]
     return {
       total: Number(totalRow.total),
-      rows: rows.map((row) => this.mapRecord(row))
+      rows: rows.map((row) => this.mapRecord(row, semanticContext))
     }
   }
 
-  getRecord(uid: string, includeImages = true): RecordDetail | null {
+  getRecord(
+    uid: string,
+    includeImages = true,
+    semanticContext?: RequirementSemanticizationContext
+  ): RecordDetail | null {
     const row = this.db
       .prepare(
-        `SELECT r.*, COUNT(i.id) AS image_count
-         FROM records r LEFT JOIN images i ON i.record_uid = r.uid
+        `SELECT r.*, COUNT(i.id) AS image_count,
+                ${requirementSemanticContentSql('r')} AS semantic_current_content_hash,
+                s.status AS semantic_raw_status,
+                s.content_hash AS semantic_content_hash,
+                s.analyzer_version AS semantic_analyzer_version,
+                s.model_signature AS semantic_model_signature,
+                s.error_message AS semantic_error_message,
+                s.updated_at AS semantic_updated_at
+         FROM records r
+         LEFT JOIN images i ON i.record_uid = r.uid
+         LEFT JOIN requirement_semantic_cards s ON s.record_uid = r.uid
          WHERE r.uid = ? GROUP BY r.uid`
       )
       .get(uid) as SqlRow | undefined
@@ -5144,7 +5435,7 @@ export class AppDatabase {
         ).map((image) => this.mapImage(image, true))
       : []
     return {
-      ...this.mapRecord(row),
+      ...this.mapRecord(row, semanticContext),
       normalizedText: String(row.normalized_text),
       raw,
       images,
@@ -5386,13 +5677,44 @@ export class AppDatabase {
     }
   }
 
-  private mapRecord(row: SqlRow): RecordRow {
+  private semanticStatus(value: unknown): RequirementSemanticizationStatus {
+    const normalized = String(value ?? '')
+    return ['processing', 'ready', 'failed'].includes(normalized)
+      ? normalized as RequirementSemanticizationStatus
+      : 'pending'
+  }
+
+  private semanticStatusOf(
+    row: SqlRow,
+    context?: RequirementSemanticizationContext
+  ): { status: RequirementSemanticizationStatus; reason: RequirementSemanticizationStatusReason } {
+    if (!row.semantic_raw_status) return { status: 'pending', reason: 'missing' }
+    if (context) {
+      if (String(row.semantic_content_hash ?? '') !== String(row.semantic_current_content_hash ?? '')) {
+        return { status: 'pending', reason: 'content_changed' }
+      }
+      if (String(row.semantic_analyzer_version ?? '') !== context.analyzerVersion) {
+        return { status: 'pending', reason: 'analyzer_changed' }
+      }
+      if (String(row.semantic_model_signature ?? '') !== context.modelSignature) {
+        return { status: 'pending', reason: 'model_changed' }
+      }
+    }
+    const status = this.semanticStatus(row.semantic_raw_status)
+    if (status === 'processing') return { status, reason: 'processing' }
+    if (status === 'ready') return { status, reason: 'ready' }
+    if (status === 'failed') return { status, reason: 'failed' }
+    return { status: 'pending', reason: 'missing' }
+  }
+
+  private mapRecord(row: SqlRow, semanticContext?: RequirementSemanticizationContext): RecordRow {
     let raw: Record<string, unknown> = {}
     try {
       raw = JSON.parse(String(row.raw_json)) as Record<string, unknown>
     } catch {
       // Corrupt legacy raw JSON should not prevent the data table from loading.
     }
+    const semantic = this.semanticStatusOf(row, semanticContext)
     return {
       uid: String(row.uid),
       projectId: String(row.project_id),
@@ -5412,7 +5734,11 @@ export class AppDatabase {
         : 'pending',
       pushMessage: String(row.push_message ?? ''),
       pushedAt: String(row.pushed_at ?? ''),
-      pushedUid: String(row.pushed_uid ?? '')
+      pushedUid: String(row.pushed_uid ?? ''),
+      semanticStatus: semantic.status,
+      semanticStatusReason: semantic.reason,
+      semanticError: semantic.status === 'failed' ? String(row.semantic_error_message ?? '') : '',
+      semanticUpdatedAt: String(row.semantic_updated_at ?? '')
     }
   }
 

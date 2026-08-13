@@ -58,6 +58,12 @@ const checks = await evaluate(`(async () => {
   const tabs = [...document.querySelectorAll('.asset-center-tabs .ant-tabs-tab')]
     .map((item) => item.textContent?.trim())
   const dataPage = Boolean(document.querySelector('.asset-center-page .filter-bar'))
+  const dataPageText = document.querySelector('.asset-center-page')?.textContent ?? ''
+  const semanticFilter = [...document.querySelectorAll('.asset-center-page .filter-bar .ant-select')]
+    .some((item) => item.textContent?.includes('全部') || item.textContent?.includes('语义'))
+  const semanticAction = dataPageText.includes('语义化当前页待处理') || dataPageText.includes('AI 语义化')
+  const semanticColumn = dataPageText.includes('AI 语义化')
+  const selectableRows = Boolean(document.querySelector('.asset-center-page .ant-table-selection-column'))
   const knowledgeTab = [...document.querySelectorAll('.asset-center-tabs .ant-tabs-tab')]
     .find((item) => item.textContent?.includes('知识库'))
   knowledgeTab?.click()
@@ -65,19 +71,38 @@ const checks = await evaluate(`(async () => {
   while (!document.querySelector('.knowledge-page') && Date.now() - knowledgeStarted < 10000) {
     await new Promise((resolve) => setTimeout(resolve, 100))
   }
+  const knowledgePage = Boolean(document.querySelector('.knowledge-page'))
+  const uploadButton = Boolean(document.querySelector('.knowledge-toolbar button'))
+  const metrics = document.querySelectorAll('.knowledge-metric-grid .ant-card').length
+  const filters = Boolean(document.querySelector('.knowledge-filter-bar'))
+  const table = Boolean(document.querySelector('.knowledge-list-card .ant-table'))
+  const dataTab = [...document.querySelectorAll('.asset-center-tabs .ant-tabs-tab')]
+    .find((item) => item.textContent?.includes('数据中心'))
+  dataTab?.click()
+  const dataReturnStarted = Date.now()
+  while (!document.querySelector('.data-workbench-card') && Date.now() - dataReturnStarted < 10000) {
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
   return {
     assetCenter: Boolean(document.querySelector('.asset-center-page')),
     tabs,
     dataPage,
-    knowledgePage: Boolean(document.querySelector('.knowledge-page')),
-    uploadButton: Boolean(document.querySelector('.knowledge-toolbar button')),
-    metrics: document.querySelectorAll('.knowledge-metric-grid .ant-card').length,
-    filters: Boolean(document.querySelector('.knowledge-filter-bar')),
-    table: Boolean(document.querySelector('.knowledge-list-card .ant-table'))
+    semanticFilter,
+    semanticAction,
+    semanticColumn,
+    selectableRows,
+    knowledgePage,
+    uploadButton,
+    metrics,
+    filters,
+    table,
+    dataPageRestored: Boolean(document.querySelector('.data-workbench-card'))
   }
 })()`)
 
-if (!checks.assetCenter || !checks.dataPage || !checks.knowledgePage || !checks.uploadButton || !checks.filters || !checks.table) {
+if (!checks.assetCenter || !checks.dataPage || !checks.semanticFilter || !checks.semanticAction ||
+    !checks.semanticColumn || !checks.selectableRows || !checks.knowledgePage || !checks.uploadButton ||
+    !checks.filters || !checks.table || !checks.dataPageRestored) {
   throw new Error(`Asset center UI smoke failed: ${JSON.stringify(checks)}`)
 }
 
@@ -85,5 +110,27 @@ await call('Page.enable')
 const screenshot = await call('Page.captureScreenshot', { format: 'png', fromSurface: true })
 const screenshotPath = join(process.env.TEMP ?? '.', 'visslm-asset-center.png')
 writeFileSync(screenshotPath, Buffer.from(screenshot.result.data, 'base64'))
-console.log(JSON.stringify({ ...checks, screenshot: screenshotPath }, null, 2))
+const darkChecks = await evaluate(`(async () => {
+  const toggle = document.querySelector('.window-theme-toggle')
+  if (!toggle) return { toggled: false }
+  if (document.documentElement.dataset.theme !== 'dark') toggle.click()
+  await new Promise((resolve) => setTimeout(resolve, 250))
+  const status = document.querySelector('.asset-semantic-status')
+  const card = document.querySelector('.data-workbench-card')
+  return {
+    toggled: document.documentElement.dataset.theme === 'dark',
+    statusBackground: status ? getComputedStyle(status).backgroundColor : '',
+    cardBackground: card ? getComputedStyle(card).backgroundColor : ''
+  }
+})()`)
+const darkScreenshot = await call('Page.captureScreenshot', { format: 'png', fromSurface: true })
+const darkScreenshotPath = join(process.env.TEMP ?? '.', 'visslm-asset-center-dark.png')
+writeFileSync(darkScreenshotPath, Buffer.from(darkScreenshot.result.data, 'base64'))
+if (!darkChecks.toggled) throw new Error(`Asset center dark-theme smoke failed: ${JSON.stringify(darkChecks)}`)
+console.log(JSON.stringify({
+  ...checks,
+  screenshot: screenshotPath,
+  darkTheme: darkChecks,
+  darkScreenshot: darkScreenshotPath
+}, null, 2))
 socket.close()

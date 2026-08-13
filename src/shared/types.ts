@@ -211,6 +211,10 @@ export interface RecordRow {
   pushMessage: string
   pushedAt: string
   pushedUid: string
+  semanticStatus: RequirementSemanticizationStatus
+  semanticStatusReason: RequirementSemanticizationStatusReason
+  semanticError: string
+  semanticUpdatedAt: string
 }
 
 export interface FieldDefinition {
@@ -244,6 +248,39 @@ export interface RecordQuery {
   projectId?: string
   nodeType?: string
   excludeProjectAssetProjectId?: string
+  semanticStatus?: RequirementSemanticizationStatus
+}
+
+export type RequirementSemanticizationStatus = 'pending' | 'processing' | 'ready' | 'failed'
+
+export type RequirementSemanticizationStatusReason =
+  | 'missing'
+  | 'content_changed'
+  | 'analyzer_changed'
+  | 'model_changed'
+  | 'processing'
+  | 'ready'
+  | 'failed'
+
+export interface RequirementSemanticizationStartInput {
+  recordUids: string[]
+  force?: boolean
+}
+
+export interface RequirementSemanticizationStartResult {
+  jobId: string
+  accepted: number
+  skipped: number
+}
+
+export interface RequirementSemanticizationProgress {
+  jobId: string
+  recordUid?: string
+  status: 'processing' | 'ready' | 'failed' | 'completed'
+  completed: number
+  total: number
+  failed: number
+  message?: string
 }
 
 export interface RecordPage {
@@ -750,6 +787,12 @@ export interface AppApi {
   listNodeTypes(): Promise<string[]>
   listRecords(query: RecordQuery): Promise<RecordPage>
   getRecord(uid: string): Promise<RecordDetail | null>
+  startRequirementSemanticization(
+    input: RequirementSemanticizationStartInput
+  ): Promise<RequirementSemanticizationStartResult>
+  onRequirementSemanticizationProgress(
+    callback: (progress: RequirementSemanticizationProgress) => void
+  ): () => void
   getStats(): Promise<DashboardStats>
   getSyncConfig(): Promise<SyncScopeConfig | null>
   saveSyncConfig(config: SyncScopeConfig): Promise<void>

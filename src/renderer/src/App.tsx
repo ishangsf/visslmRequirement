@@ -120,6 +120,8 @@ import type {
   PushResult,
   RecordDetail,
   RecordRow,
+  RequirementSemanticizationProgress,
+  RequirementSemanticizationStatus,
   SystemSettingsInput,
   SyncFieldFilter,
   SyncPreviewResult,
@@ -353,6 +355,62 @@ const renderPushStatus = (record: Pick<
     )
   }
   return <Tag>未推送</Tag>
+}
+
+const semanticStatusMeta: Record<RequirementSemanticizationStatus, {
+  label: string
+  icon: React.ReactNode
+}> = {
+  pending: { label: '待语义化', icon: <BulbOutlined /> },
+  processing: { label: '处理中', icon: <SyncOutlined spin /> },
+  ready: { label: '已完成', icon: <CheckCircleOutlined /> },
+  failed: { label: '失败', icon: <ExclamationCircleOutlined /> }
+}
+
+const semanticStatusReasonLabels: Record<string, string> = {
+  missing: '尚未生成',
+  content_changed: '内容已变化',
+  analyzer_changed: '分析器已变化',
+  model_changed: '模型已变化',
+  processing: '正在生成',
+  ready: '已生成',
+  failed: '上次生成失败'
+}
+
+const normalizeSemanticStatus = (value: unknown): RequirementSemanticizationStatus => {
+  if (value === 'processing' || value === 'ready' || value === 'failed') return value
+  return 'pending'
+}
+
+const semanticStatusReasonLabel = (value: unknown): string => (
+  typeof value === 'string' ? semanticStatusReasonLabels[value] ?? value : ''
+)
+
+const renderSemanticStatus = (record: Pick<
+  RecordRow,
+  'semanticStatus' | 'semanticStatusReason' | 'semanticError'
+>): React.JSX.Element => {
+  const status = normalizeSemanticStatus(record.semanticStatus)
+  const meta = semanticStatusMeta[status]
+  const reason = semanticStatusReasonLabel(record.semanticStatusReason)
+  const label = status === 'failed' && record.semanticError
+    ? `${meta.label}：${record.semanticError}`
+    : reason && status === 'pending'
+      ? `${meta.label}：${reason}`
+      : meta.label
+  const content = (
+    <span
+      className={`asset-semantic-status is-${status}`}
+      aria-label={label}
+      title={status === 'failed' ? undefined : label}
+    >
+      {meta.icon}
+      <span>{meta.label}</span>
+    </span>
+  )
+  return status === 'failed'
+    ? <Tooltip title={record.semanticError || '语义卡片生成失败，可重试'}>{content}</Tooltip>
+    : content
 }
 
 function readDashboardToken(name: string, fallback: string): string {
@@ -928,11 +986,15 @@ function DataPage({
   const [search, setSearch] = useState('')
   const [projectId, setProjectId] = useState<string>()
   const [nodeType, setNodeType] = useState<string>()
+  const [semanticStatusFilter, setSemanticStatusFilter] = useState<RequirementSemanticizationStatus | 'all'>('all')
   const [detail, setDetail] = useState<RecordDetail | null>(null)
   const [selectedRowKeys, setSelectedRowKeys] = useState<string[]>([])
   const [importing, setImporting] = useState(false)
   const [exporting, setExporting] = useState(false)
   const [deleting, setDeleting] = useState(false)
+  const [semanticSubmitting, setSemanticSubmitting] = useState(false)
+  const [semanticActionUids, setSemanticActionUids] = useState<string[]>([])
+  const [semanticProgress, setSemanticProgress] = useState<RequirementSemanticizationProgress | null>(null)
   const [review, setReview] = useState<{ batchId: string; items: DataReviewItem[] } | null>(null)
 
   const load = useCallback(async (): Promise<void> => {
@@ -943,14 +1005,15 @@ function DataPage({
         pageSize,
         search,
         projectId,
-        nodeType
+        nodeType,
+        ...(semanticStatusFilter !== 'all' ? { semanticStatus: semanticStatusFilter } : {})
       })
       setRecords(data.rows)
       setTotal(data.total)
     } finally {
       setLoading(false)
     }
-  }, [page, pageSize, search, projectId, nodeType])
+  }, [page, pageSize, search, projectId, nodeType, semanticStatusFilter])
 
   useEffect(() => {
     void Promise.all([window.visslm.listProjects(), window.visslm.listNodeTypes()]).then(
@@ -965,8 +1028,103 @@ function DataPage({
     void load()
   }, [load, refreshKey])
 
+  useEffect(() => {
+    const unsubscribe = window.visslm.onRequirementSemanticizationProgress((next) => {
+      setSemanticProgress(next)
+      if (next.recordUid && ['processing', 'ready', 'failed'].includes(next.status)) {
+        setRecords((current) => current.map((record) => {
+          if (record.uid !== next.recordUid) return record
+          const status = next.status as RequirementSemanticizationStatus
+          const reason = status === 'processing' ? 'processing' : status === 'ready' ? 'ready' : 'failed'
+          return {
+            ...record,
+            semanticStatus: status,
+            semanticStatusReason: reason,
+            semanticError: status === 'failed' ? next.message || record.semanticError : ''
+          }
+        }))
+      }
+      if (next.status === 'completed') {
+        void load()
+      }
+    })
+    return unsubscribe
+  }, [load])
+
   const openDetail = async (uid: string): Promise<void> => {
     setDetail(await window.visslm.getRecord(uid))
+  }
+
+  const startSemanticization = async (
+    inputUids: string[],
+    force: boolean,
+    source: 'toolbar' | 'row'
+  ): Promise<void> => {
+    const recordUids = [...new Set(inputUids.map((uid) => uid.trim()).filter(Boolean))]
+    if (!recordUids.length) {
+      message.info(source === 'toolbar' ? '当前页没有待处理的记录' : '这条记录当前无法执行 AI 语义化')
+      return
+    }
+    if (source === 'toolbar') setSemanticSubmitting(true)
+    setSemanticActionUids((current) => [...new Set([...current, ...recordUids])])
+    try {
+      const result = await window.visslm.startRequirementSemanticization({
+        recordUids,
+        ...(force ? { force: true } : {})
+      })
+      if (result.accepted > 0) {
+        setRecords((current) => current.map((record) => (
+          recordUids.includes(record.uid) && normalizeSemanticStatus(record.semanticStatus) !== 'processing'
+            ? { ...record, semanticStatus: 'processing', semanticStatusReason: 'processing', semanticError: '' }
+            : record
+        )))
+        setSemanticProgress((current) => current?.jobId === result.jobId
+          ? current
+          : {
+              jobId: result.jobId,
+              status: 'processing',
+              completed: 0,
+              total: result.accepted,
+              failed: 0,
+              message: '已提交 AI 语义化任务'
+            })
+        message.success(`已提交 ${result.accepted} 条记录进行 AI 语义化`)
+      } else {
+        message.info(result.skipped ? `没有新的任务，已跳过 ${result.skipped} 条记录` : '没有记录被提交')
+      }
+      if (result.skipped > 0 && result.accepted > 0) {
+        message.info(`另有 ${result.skipped} 条记录正在处理或已跳过`)
+      }
+      void load()
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : String(error))
+    } finally {
+      if (source === 'toolbar') setSemanticSubmitting(false)
+      setSemanticActionUids((current) => current.filter((uid) => !recordUids.includes(uid)))
+    }
+  }
+
+  const currentPageSemanticizableRows = records.filter((record) => {
+    const status = normalizeSemanticStatus(record.semanticStatus)
+    return status === 'pending' || status === 'failed'
+  })
+
+  const semanticizeSelected = (): void => {
+    void startSemanticization(selectedRowKeys, true, 'toolbar')
+  }
+
+  const semanticizeCurrentPage = (): void => {
+    void startSemanticization(
+      currentPageSemanticizableRows.map((record) => record.uid),
+      false,
+      'toolbar'
+    )
+  }
+
+  const semanticizeRow = (record: RecordRow): void => {
+    const status = normalizeSemanticStatus(record.semanticStatus)
+    if (status === 'processing') return
+    void startSemanticization([record.uid], status === 'ready', 'row')
   }
 
   const importData = async (): Promise<void> => {
@@ -1081,6 +1239,27 @@ function DataPage({
           >
             导出数据
           </Button>
+          {selectedRowKeys.length > 0 ? (
+            <Button
+              type="primary"
+              icon={<BulbOutlined />}
+              loading={semanticSubmitting}
+              disabled={!selectedRowKeys.length}
+              onClick={semanticizeSelected}
+            >
+              AI 语义化（{selectedRowKeys.length}）
+            </Button>
+          ) : (
+            <Button
+              type="primary"
+              icon={<BulbOutlined />}
+              loading={semanticSubmitting}
+              disabled={!currentPageSemanticizableRows.length}
+              onClick={semanticizeCurrentPage}
+            >
+              语义化当前页待处理{currentPageSemanticizableRows.length ? `（${currentPageSemanticizableRows.length}）` : ''}
+            </Button>
+          )}
           <Button
             type="primary"
             icon={<FundProjectionScreenOutlined />}
@@ -1111,6 +1290,34 @@ function DataPage({
           </Button>
         </Space>
       </div>
+      {semanticProgress && (
+        <div
+          className={`asset-semantic-progress is-${semanticProgress.status}`}
+          role="status"
+          aria-live="polite"
+          aria-label={semanticProgress.message || 'AI 语义化进度'}
+        >
+          <div className="asset-semantic-progress-heading">
+            <Text strong>AI 语义化进度</Text>
+            <Text type="secondary">{semanticProgress.message || '正在处理记录'}</Text>
+          </div>
+          <Progress
+            percent={semanticProgress.total > 0
+              ? Math.min(100, Math.round((semanticProgress.completed / semanticProgress.total) * 100))
+              : 0}
+            showInfo={false}
+            status={semanticProgress.status === 'failed'
+              ? 'exception'
+              : semanticProgress.status === 'completed'
+                ? semanticProgress.failed > 0 ? 'exception' : 'success'
+                : 'active'}
+          />
+          <Text type="secondary" className="asset-semantic-progress-count">
+            已处理 {Math.min(semanticProgress.completed, semanticProgress.total)} / {semanticProgress.total} 条
+            {semanticProgress.failed > 0 ? `，失败 ${semanticProgress.failed} 条` : ''}
+          </Text>
+        </div>
+      )}
       <Card className="data-workbench-card">
         <div className="filter-bar">
           <Input.Search
@@ -1144,6 +1351,21 @@ function DataPage({
             }}
             options={nodeTypes.map((type) => ({ label: type, value: type }))}
             style={{ width: 160 }}
+          />
+          <Select<RequirementSemanticizationStatus | 'all'>
+            value={semanticStatusFilter}
+            onChange={(value) => {
+              setSemanticStatusFilter(value)
+              setPage(1)
+            }}
+            options={[
+              { label: '全部', value: 'all' },
+              { label: '待语义化', value: 'pending' },
+              { label: '处理中', value: 'processing' },
+              { label: '已完成', value: 'ready' },
+              { label: '失败', value: 'failed' }
+            ]}
+            style={{ width: 140 }}
           />
         </div>
         <ResizableTable<RecordRow>
@@ -1212,12 +1434,41 @@ function DataPage({
               width: 110,
               render: (_value, record) => renderPushStatus(record)
             },
+            {
+              title: 'AI 语义化',
+              key: 'semanticStatus',
+              width: 130,
+              render: (_value, record) => renderSemanticStatus(record)
+            },
             { title: '图片', dataIndex: 'imageCount', width: 80 },
             {
               title: '最后修改',
               dataIndex: 'lastModifyTime',
               width: 180,
               render: formatDate
+            },
+            {
+              title: '操作',
+              key: 'semanticAction',
+              width: 138,
+              render: (_value, record) => {
+                const status = normalizeSemanticStatus(record.semanticStatus)
+                const isLoading = semanticActionUids.includes(record.uid)
+                if (status === 'processing') {
+                  return <Button type="link" disabled icon={<SyncOutlined spin />}>处理中</Button>
+                }
+                const label = status === 'ready' ? '重新生成' : status === 'failed' ? '重试' : '生成语义卡片'
+                return (
+                  <Button
+                    type="link"
+                    icon={status === 'failed' ? <ReloadOutlined /> : <BulbOutlined />}
+                    loading={isLoading}
+                    onClick={() => semanticizeRow(record)}
+                  >
+                    {label}
+                  </Button>
+                )
+              }
             }
           ]}
         />
@@ -1242,6 +1493,9 @@ function DataPage({
               <Descriptions.Item label="类型">{detail.nodeType}</Descriptions.Item>
               <Descriptions.Item label="对象编号">{detail.itemId || '—'}</Descriptions.Item>
               <Descriptions.Item label="项目 UID">{detail.projectId}</Descriptions.Item>
+              <Descriptions.Item label="AI 语义化">
+                {renderSemanticStatus(detail)}
+              </Descriptions.Item>
               <Descriptions.Item label="最后修改" span={2}>
                 {formatDate(detail.lastModifyTime)}
               </Descriptions.Item>

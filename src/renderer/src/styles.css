@@ -14518,3 +14518,72 @@ html[data-theme='light'] .dashboard-style-color-control .ant-color-picker-trigge
     text-overflow: ellipsis;
   }
 }
+.asset-semantic-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--stroke);
+  border-radius: 999px;
+  color: var(--text-muted);
+  background: var(--surface-soft);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 22px;
+  white-space: nowrap;
+}
+
+.asset-semantic-status.is-processing {
+  border-color: color-mix(in srgb, var(--state-info) 45%, var(--stroke));
+  color: var(--state-info);
+}
+
+.asset-semantic-status.is-ready {
+  border-color: color-mix(in srgb, var(--state-success) 45%, var(--stroke));
+  color: var(--state-success);
+}
+
+.asset-semantic-status.is-failed {
+  border-color: color-mix(in srgb, var(--state-error) 45%, var(--stroke));
+  color: var(--state-error);
+}
+
+.asset-semantic-progress {
+  display: grid;
+  gap: 8px;
+  padding: 12px 16px;
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.asset-semantic-progress-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.asset-semantic-progress-heading > span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.asset-semantic-progress-count {
+  white-space: nowrap;
+}
+
+@media (max-width: 680px) {
+  .asset-semantic-progress-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .asset-semantic-progress-heading > span:last-child {
+    max-width: 100%;
+  }
+}

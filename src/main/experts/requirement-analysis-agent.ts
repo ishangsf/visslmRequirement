@@ -20,11 +20,11 @@ import {
   type RequirementReranker,
   type RequirementRerankItem
 } from '../requirements/cross-encoder-reranker'
+import { semanticTextSimilarity, type RequirementSemanticCard } from '../requirements/semantic-card'
 import {
-  buildRequirementSemanticCard,
-  semanticTextSimilarity,
-  type RequirementSemanticCard
-} from '../requirements/semantic-card'
+  REQUIREMENT_SEMANTIC_ANALYZER_VERSION,
+  requirementSemanticModelSignature
+} from '../requirements/semanticization-service'
 
 type AgentStatusEvent = Extract<AgentEvent, { type: 'status' }>
 
@@ -120,6 +120,7 @@ interface RequirementAnalysisAgentOptions {
   reranker?: RequirementReranker
   retriever?: Pick<HybridRequirementRetriever, 'retrieve'>
   modelClient?: ReviewModelClient
+  semanticContext?: { analyzerVersion: string; modelSignature: string }
 }
 
 const clampScore = (value: number): number => Number(Math.max(0, Math.min(100, value)).toFixed(1))
@@ -202,6 +203,10 @@ export const enforceRequirementRelationshipRules = (
 ): RequirementReviewItem => {
   const objectSimilarity = semanticTextSimilarity(base.functionalObject, candidate.functionalObject)
   const knownActions = base.action !== 'unknown' && candidate.action !== 'unknown'
+  if ((base.action === 'add_capability' && candidate.action === 'fix_defect') ||
+      (base.action === 'fix_defect' && candidate.action === 'add_capability')) {
+    return downgrade(item, 'topic_only', 39, '功能新增不等于缺陷修复')
+  }
   if ((base.action === 'rename_label') !== (candidate.action === 'rename_label')) {
     return downgrade(item, 'topic_only', 39, '文案修改不等于权限配置、功能新增或其他业务动作')
   }
@@ -213,12 +218,6 @@ export const enforceRequirementRelationshipRules = (
   }
   if (knownActions && base.action === candidate.action && objectSimilarity < 0.5) {
     return downgrade(item, 'same_pattern', 59, '需求动作相同但功能对象不同，只能判为同类模式')
-  }
-  if (base.requirementType && candidate.requirementType &&
-      base.requirementType.toLocaleLowerCase() !== candidate.requirementType.toLocaleLowerCase() &&
-      (base.action === 'add_capability' || candidate.action === 'fix_defect' ||
-       base.action === 'fix_defect' || candidate.action === 'add_capability')) {
-    return downgrade(item, 'topic_only', 39, '功能新增不等于缺陷修复')
   }
   return { ...item, score: clampScore(item.score) }
 }
@@ -275,6 +274,7 @@ export class RequirementAnalysisAgent {
   private readonly retriever: Pick<HybridRequirementRetriever, 'retrieve'>
   private readonly reranker: RequirementReranker
   private readonly modelClient: ReviewModelClient
+  private readonly semanticContext: { analyzerVersion: string; modelSignature: string }
 
   constructor(
     private readonly db: AppDatabase,
@@ -283,7 +283,11 @@ export class RequirementAnalysisAgent {
     private readonly onProgress?: (event: AgentStatusEvent) => void,
     options: RequirementAnalysisAgentOptions = {}
   ) {
-    this.retriever = options.retriever ?? new HybridRequirementRetriever(db, knowledge)
+    this.semanticContext = options.semanticContext ?? {
+      analyzerVersion: REQUIREMENT_SEMANTIC_ANALYZER_VERSION,
+      modelSignature: requirementSemanticModelSignature(settings)
+    }
+    this.retriever = options.retriever ?? new HybridRequirementRetriever(db, knowledge, this.semanticContext)
     this.reranker = options.reranker ?? createRequirementReranker()
     this.modelClient = options.modelClient ?? new ModelClient(settings)
   }
@@ -311,16 +315,32 @@ export class RequirementAnalysisAgent {
         entries.push({ requestedItemId, formal: [], references: [], error: '数据中心不存在该需求编号' })
         continue
       }
-      const record = this.db.getRecord(row.uid, false)
+      const record = this.db.getRecord(row.uid, false, this.semanticContext)
       if (!record) {
         entries.push({ requestedItemId, formal: [], references: [], error: '对应记录详情无法读取' })
         continue
       }
-      const base = { record, card: buildRequirementSemanticCard(record) }
-      if (!base.card.behavior.trim()) {
-        entries.push({ requestedItemId, base, formal: [], references: [], error: '对应记录没有可用于匹配的需求内容' })
+      const contentHash = this.db.getRecordContentHash(record.uid)
+      const card = contentHash === null ? null : this.db.getReadyRequirementSemanticCard({
+        recordUid: record.uid,
+        contentHash,
+        ...this.semanticContext
+      })
+      if (!card) {
+        const statusText = record.semanticStatus === 'failed'
+          ? `AI 语义化失败${record.semanticError ? `：${record.semanticError}` : ''}`
+          : record.semanticStatus === 'processing'
+            ? 'AI 语义化正在处理中'
+            : '尚未完成 AI 语义化或语义卡片已失效'
+        entries.push({
+          requestedItemId,
+          formal: [],
+          references: [],
+          error: `${statusText}。请前往“资产中心”对该记录执行 AI 语义化，完成后再发起匹配`
+        })
         continue
       }
+      const base = { record, card }
       try {
         this.progress('match', `正在对 ${record.itemId} 执行 Dense、BM25 和结构化字段混合召回`)
         const candidates = (await this.retriever.retrieve(base.card, excludedUids)).slice(0, HYBRID_CANDIDATE_LIMIT)
@@ -437,6 +457,7 @@ export class RequirementAnalysisAgent {
           ],
           format: requirementReviewFormat,
           think: true,
+          forceThinking: true,
           temperature: 0,
           numPredict: 3200
         })

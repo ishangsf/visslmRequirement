@@ -20,6 +20,8 @@ import type {
   SystemSettingsInput,
   PushConfig,
   RecordQuery,
+  RequirementSemanticizationProgress,
+  RequirementSemanticizationStartInput,
   SyncProgress,
   SyncScopeConfig,
   UpdateStatus,
@@ -97,6 +99,14 @@ const api: AppApi = {
   listNodeTypes: () => ipcRenderer.invoke('data:node-types'),
   listRecords: (query: RecordQuery) => ipcRenderer.invoke('data:records', query),
   getRecord: (uid: string) => ipcRenderer.invoke('data:record', uid),
+  startRequirementSemanticization: (input: RequirementSemanticizationStartInput) =>
+    ipcRenderer.invoke('requirements:semanticize', input),
+  onRequirementSemanticizationProgress: (callback: (progress: RequirementSemanticizationProgress) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, progress: RequirementSemanticizationProgress): void =>
+      callback(progress)
+    ipcRenderer.on('requirements:semanticization-progress', listener)
+    return () => ipcRenderer.removeListener('requirements:semanticization-progress', listener)
+  },
   getStats: () => ipcRenderer.invoke('data:stats'),
   getSyncConfig: () => ipcRenderer.invoke('sync:get-config'),
   saveSyncConfig: (config: SyncScopeConfig) => ipcRenderer.invoke('sync:save-config', config),

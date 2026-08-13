@@ -10,6 +10,29 @@ const mainSource = read('src/main/index.ts')
 const appSource = read('src/renderer/src/App.tsx')
 const stylesSource = read('src/renderer/src/styles.css')
 
+const errorNormalizerMatch = updaterSource.match(
+  /(?:const|function)\s+((?:normalize|sanitize)\w*(?:error|failure|exception|message)\w*)\s*(?:=|\()/i
+)
+const errorNormalizerName = errorNormalizerMatch?.[1] ?? ''
+const errorNormalizerStart = errorNormalizerName
+  ? updaterSource.indexOf(errorNormalizerName)
+  : -1
+const errorNormalizerSource = errorNormalizerStart >= 0
+  ? updaterSource.slice(errorNormalizerStart, errorNormalizerStart + 3000)
+  : ''
+const errorStatusBlocks = [...updaterSource.matchAll(
+  /phase:\s*['"]error['"][\s\S]{0,320}?message:\s*([^\n,}]+)/g
+)].map((match) => match[0])
+const normalizedErrorStatusBlocks = errorStatusBlocks.filter((block) =>
+  errorNormalizerName && block.includes(errorNormalizerName)
+)
+const errorStatusMessages = normalizedErrorStatusBlocks.map((block) =>
+  block.match(/message:\s*([^\n,}]+)/)?.[1]?.trim() ?? ''
+)
+const normalizerCall = errorNormalizerName
+  ? new RegExp(`\\b${errorNormalizerName}\\s*\\(`)
+  : null
+
 const checks = {
   dependency: Boolean(packageJson.dependencies?.['electron-updater']),
   githubProvider: packageJson.build?.publish?.provider === 'github'
@@ -29,7 +52,24 @@ const checks = {
     && preloadSource.includes("ipcRenderer.invoke('update:download')"),
   settingsUi: appSource.includes('settings-update-section')
     && appSource.includes('重启并安装')
-    && stylesSource.includes('.settings-update-progress')
+    && stylesSource.includes('.settings-update-progress'),
+  errorMessageNormalizer: Boolean(errorNormalizerName),
+  errorNormalizerHandlesNotFound: Boolean(errorNormalizerName)
+    && /\b(?:statusCode|status|httpStatus|response\.status|code)\b[\s\S]{0,80}\b404\b|\b404\b[\s\S]{0,80}\b(?:statusCode|status|httpStatus|response\.status|code)\b/i.test(errorNormalizerSource)
+    && /(?:no[-_]?releases?|no(?:[-_\s]+\w+){1,3}[-_\s]+releases?)/i.test(errorNormalizerSource)
+    && errorNormalizerSource.includes('latest.yml'),
+  errorNormalizerSeparatesFailureCategories: errorNormalizerSource.includes('statusCode === 401')
+    && errorNormalizerSource.includes('statusCode === 403')
+    && errorNormalizerSource.includes('statusCode >= 500')
+    && errorNormalizerSource.includes('isNetworkError'),
+  errorNormalizerDoesNotReturnRawInput: !errorNormalizerSource.includes('return message')
+    && !errorNormalizerSource.includes('return String(error)')
+    && errorNormalizerSource.includes('当前没有可访问的正式 Release'),
+  errorStatusUsesNormalizer: Boolean(normalizerCall)
+    && normalizedErrorStatusBlocks.length >= 3
+    && errorStatusMessages.every((message) => normalizerCall.test(message)),
+  errorMessageDoesNotExposeResponseMetadata: normalizedErrorStatusBlocks.length >= 3
+    && normalizedErrorStatusBlocks.every((block) => !/(?:responseHeaders|response\s*\.\s*headers?|set[-_]cookie|JSON\.stringify\s*\(\s*error\s*\))/i.test(block))
 }
 
 console.log(JSON.stringify(checks, null, 2))

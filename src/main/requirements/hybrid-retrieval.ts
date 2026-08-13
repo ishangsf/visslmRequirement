@@ -1,11 +1,8 @@
 import type { RecordDetail } from '../../shared/types'
 import { AppDatabase } from '../database'
 import type { KnowledgeRecordMatch } from '../knowledge'
-import {
-  buildRequirementSemanticCard,
-  structuralRequirementScore,
-  type RequirementSemanticCard
-} from './semantic-card'
+import { structuralRequirementScore, type RequirementSemanticCard } from './semantic-card'
+import type { RequirementSemanticizationContext } from '../database'
 
 export interface HybridRequirementCandidate {
   record: RecordDetail
@@ -24,7 +21,11 @@ const RRF_K = 60
 export interface RequirementDenseRetriever {
   readonly modelVersion: string
   listRequirementIndexedRecords(): Promise<RecordDetail[]>
-  rankRequirementRecordMatches(question: string, limit?: number): Promise<KnowledgeRecordMatch[]>
+  rankRequirementRecordMatches(
+    question: string,
+    limit?: number,
+    allowedRecordUids?: ReadonlySet<string>
+  ): Promise<KnowledgeRecordMatch[]>
 }
 
 const rankMap = <T extends { recordUid: string }>(items: T[]): Map<string, number> =>
@@ -33,29 +34,37 @@ const rankMap = <T extends { recordUid: string }>(items: T[]): Map<string, numbe
 export class HybridRequirementRetriever {
   constructor(
     private readonly db: AppDatabase,
-    private readonly knowledge: RequirementDenseRetriever
+    private readonly knowledge: RequirementDenseRetriever,
+    private readonly semanticContext: RequirementSemanticizationContext
   ) {}
 
   async retrieve(base: RequirementSemanticCard, excludedUids: Set<string>): Promise<HybridRequirementCandidate[]> {
     const indexedRecords = await this.knowledge.listRequirementIndexedRecords()
-    const recordByUid = new Map(indexedRecords.map((record) => [record.uid, record]))
+    const readyCards = this.db.listReadyRequirementSemanticCards({
+      recordUids: indexedRecords.map((record) => record.uid),
+      ...this.semanticContext
+    })
+    const recordByUid = new Map(indexedRecords
+      .filter((record) => readyCards.has(record.uid))
+      .map((record) => [record.uid, record]))
     if (!recordByUid.size) throw new Error(`当前模型 ${this.knowledge.modelVersion} 没有可用的数据中心记录索引`)
-    const dense = (await this.knowledge.rankRequirementRecordMatches(base.matchingText, ROUTE_LIMIT))
+    const allowedRecordUids = new Set(recordByUid.keys())
+    const dense = (await this.knowledge.rankRequirementRecordMatches(base.evidence, ROUTE_LIMIT, allowedRecordUids))
       .filter((item) => recordByUid.has(item.recordUid) && !excludedUids.has(item.recordUid))
       .slice(0, ROUTE_LIMIT)
     const lexical = this.db.searchRequirementRecordsLexical(
       base.lexicalTerms,
       this.knowledge.modelVersion,
-      ROUTE_LIMIT
+      ROUTE_LIMIT,
+      this.semanticContext
     )
       .filter((item) => recordByUid.has(item.recordUid) && !excludedUids.has(item.recordUid))
       .slice(0, ROUTE_LIMIT)
     const structuredRows: Array<{ recordUid: string; score: number }> = []
-    const cardsByUid = new Map<string, RequirementSemanticCard>()
     for (const record of indexedRecords) {
       if (excludedUids.has(record.uid)) continue
-      const card = buildRequirementSemanticCard(record)
-      cardsByUid.set(record.uid, card)
+      const card = readyCards.get(record.uid)
+      if (!card) continue
       const score = structuralRequirementScore(base, card)
       if (score > 0) structuredRows.push({ recordUid: record.uid, score })
     }
@@ -82,7 +91,8 @@ export class HybridRequirementRetriever {
       if (!record) return []
       const denseMatch = denseByUid.get(recordUid)
       const lexicalMatch = lexicalByUid.get(recordUid)
-      const card = cardsByUid.get(recordUid) ?? buildRequirementSemanticCard(record)
+      const card = readyCards.get(recordUid)
+      if (!card) return []
       return [{
         record,
         card,

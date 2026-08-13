@@ -821,7 +821,11 @@ export class KnowledgeService {
       .slice(0, Math.max(1, Math.trunc(limit)))
   }
 
-  async rankRequirementRecordMatches(question: string, limit = 100): Promise<KnowledgeRecordMatch[]> {
+  async rankRequirementRecordMatches(
+    question: string,
+    limit = 100,
+    allowedRecordUids?: ReadonlySet<string>
+  ): Promise<KnowledgeRecordMatch[]> {
     const query = question.trim()
     if (!query) return []
     await this.initialize()
@@ -838,6 +842,7 @@ export class KnowledgeService {
     const bestByRecord = new Map<string, KnowledgeRecordMatch>()
     for (const { chunk, vector } of candidates) {
       const recordUid = chunk.recordUid as string
+      if (allowedRecordUids && !allowedRecordUids.has(recordUid)) continue
       const score = Math.max(0, Math.min(1, this.cosine(queryVector, vector))) * 100
       const existing = bestByRecord.get(recordUid)
       if (existing && existing.score >= score) continue

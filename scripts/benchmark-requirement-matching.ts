@@ -4,7 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { AppDatabase } from '../src/main/database'
 import { HybridRequirementRetriever, type RequirementDenseRetriever } from '../src/main/requirements/hybrid-retrieval'
-import { buildRequirementSemanticCard } from '../src/main/requirements/semantic-card'
+import { buildRequirementSemanticCard, type RequirementSemanticCard } from '../src/main/requirements/semantic-card'
 import type { KnowledgeRecordMatch } from '../src/main/knowledge'
 import type { RequirementReranker } from '../src/main/requirements/cross-encoder-reranker'
 
@@ -77,14 +77,44 @@ const main = async (): Promise<void> => {
     }
     const base = db.getRecord('benchmark-0', false)
     if (!base) throw new Error('benchmark base record missing')
-    const card = buildRequirementSemanticCard(base)
+    const semanticContext = {
+      analyzerVersion: 'requirement-benchmark-semantic-v1',
+      modelSignature: 'requirement-benchmark-model-v1'
+    }
+    const readyCard = (record: NonNullable<typeof base>): RequirementSemanticCard => {
+      const source = buildRequirementSemanticCard(record)
+      return {
+        ...source,
+        functionalObject: record.name,
+        matchingText: source.evidence,
+        fieldAssessments: {
+          ...source.fieldAssessments,
+          functionalObject: { value: record.name, confidence: 0.95, evidence: source.evidence.slice(0, 32) }
+        },
+        analysisStatus: 'ai_adjudicated',
+        analysisSummary: '性能基准预置语义卡片'
+      }
+    }
+    const persistCard = (record: NonNullable<typeof base>): RequirementSemanticCard => {
+      const card = readyCard(record)
+      const contentHash = db!.getRecordContentHash(record.uid)
+      if (!contentHash) throw new Error(`benchmark semantic hash missing: ${record.uid}`)
+      db!.claimRequirementSemanticCard({ recordUid: record.uid, contentHash, ...semanticContext })
+      db!.completeRequirementSemanticCard(record.uid, card)
+      return card
+    }
+    const card = persistCard(base)
     let indexedRecords: ReturnType<AppDatabase['listKnowledgeIndexedRecordDetails']> = []
     const dense: RequirementDenseRetriever = {
       modelVersion: 'requirement-benchmark-index-v1',
       async listRequirementIndexedRecords() {
         return indexedRecords
       },
-      async rankRequirementRecordMatches(_question: string, limit = 100): Promise<KnowledgeRecordMatch[]> {
+      async rankRequirementRecordMatches(
+        _question: string,
+        limit = 100,
+        allowedRecordUids?: ReadonlySet<string>
+      ): Promise<KnowledgeRecordMatch[]> {
         return Array.from({ length: Math.min(limit, options.records - 1) }, (_, index) => ({
           recordUid: `benchmark-${index + 1}`,
           recordName: `配置管理需求 ${index + 1}`,
@@ -92,12 +122,13 @@ const main = async (): Promise<void> => {
           itemId: `BENCH-${index + 1}`,
           score: 100 - index / 10,
           snippet: 'benchmark'
-        }))
+        })).filter((item) => !allowedRecordUids || allowedRecordUids.has(item.recordUid))
       }
     }
     for (let index = 1; index < options.records; index += 1) {
       const record = db.getRecord(`benchmark-${index}`, false)
       if (!record) throw new Error(`benchmark record missing: ${index}`)
+      persistCard(record)
       const chunkId = `benchmark-chunk-${index}`
       db.replaceKnowledgeRecordChunks(record.uid, [{
         id: chunkId,
@@ -114,7 +145,7 @@ const main = async (): Promise<void> => {
       }])
     }
     indexedRecords = db.listKnowledgeIndexedRecordDetails(dense.modelVersion)
-    const retriever = new HybridRequirementRetriever(db, dense)
+    const retriever = new HybridRequirementRetriever(db, dense, semanticContext)
     const times: number[] = []
     const reranker: RequirementReranker | null = options.includeReranker ? (await import('../src/main/requirements/cross-encoder-reranker')).createRequirementReranker() : null
     for (let index = 0; index < options.warmup + options.iterations; index += 1) {

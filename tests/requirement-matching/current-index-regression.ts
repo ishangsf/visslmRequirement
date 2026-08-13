@@ -10,9 +10,14 @@ import {
   type RequirementDenseRetriever
 } from '../../src/main/requirements/hybrid-retrieval'
 import { buildRequirementSemanticCard } from '../../src/main/requirements/semantic-card'
+import type { RequirementSemanticCard } from '../../src/main/requirements/semantic-card'
 import type { RecordDetail } from '../../src/shared/types'
 
 const TEST_MODEL_VERSION = 'test-current-index-v1'
+const semanticContext = {
+  analyzerVersion: 'current-index-semantic-v1',
+  modelSignature: 'current-index-model-v1'
+}
 
 type RecordFixture = {
   uid: string
@@ -73,6 +78,26 @@ const addVectorIndex = (
   )
 }
 
+const persistReadySemanticCard = (db: AppDatabase, record: RecordDetail): RequirementSemanticCard => {
+  const source = buildRequirementSemanticCard(record)
+  const card: RequirementSemanticCard = {
+    ...source,
+    functionalObject: record.name,
+    matchingText: source.evidence,
+    fieldAssessments: {
+      ...source.fieldAssessments,
+      functionalObject: { value: record.name, confidence: 0.95, evidence: source.evidence.slice(0, 32) }
+    },
+    analysisStatus: 'ai_adjudicated',
+    analysisSummary: '当前索引测试预置的 AI 语义卡片'
+  }
+  const contentHash = db.getRecordContentHash(record.uid)
+  assert.ok(contentHash)
+  assert.equal(db.claimRequirementSemanticCard({ recordUid: record.uid, contentHash, ...semanticContext }), true)
+  db.completeRequirementSemanticCard(record.uid, card)
+  return card
+}
+
 const createControlledDenseRetriever = (
   db: AppDatabase,
   indexedUids: string[]
@@ -89,9 +114,14 @@ const createControlledDenseRetriever = (
         return record
       })
     },
-    async rankRequirementRecordMatches(question: string, limit = 100): Promise<KnowledgeRecordMatch[]> {
+    async rankRequirementRecordMatches(
+      question: string,
+      limit = 100,
+      allowedRecordUids?: ReadonlySet<string>
+    ): Promise<KnowledgeRecordMatch[]> {
       calls.push(question)
       return [...indexed]
+        .filter((uid) => !allowedRecordUids || allowedRecordUids.has(uid))
         .map((uid, index) => {
           const record = db.getRecord(uid, false)
           assert.ok(record, `indexed fixture record was not persisted: ${uid}`)
@@ -118,8 +148,12 @@ const retrieveUids = async (
 ): Promise<string[]> => {
   const base = db.getRecord(baseUid, false)
   assert.ok(base, `base fixture record was not persisted: ${baseUid}`)
-  const candidates = await new HybridRequirementRetriever(db, dense).retrieve(
-    buildRequirementSemanticCard(base),
+  const contentHash = db.getRecordContentHash(baseUid)
+  assert.ok(contentHash)
+  const baseCard = db.getReadyRequirementSemanticCard({ recordUid: baseUid, contentHash, ...semanticContext })
+  assert.ok(baseCard, `base semantic card was not persisted: ${baseUid}`)
+  const candidates = await new HybridRequirementRetriever(db, dense, semanticContext).retrieve(
+    baseCard,
     excludedUids
   )
   return candidates.map((candidate) => candidate.record.uid)
@@ -142,6 +176,15 @@ const testCurrentIndexScopeAndSingleBaseExclusion = async (db: AppDatabase): Pro
     itemId: 'INDEXED-CROSS-SCOPE',
     name: '订单明细导出增强',
     description: '其他项目的发布节点支持导出订单明细。',
+    module: '订单管理'
+  })
+  const indexedPendingSemantic = addRecord(db, {
+    uid: 'indexed-pending-semantic-uid',
+    projectId: 'project-other',
+    nodeType: 'Requirement',
+    itemId: 'INDEXED-PENDING-SEMANTIC',
+    name: '已有向量但未语义化的订单需求',
+    description: '订单管理页面支持查询订单明细，但尚未生成 AI 语义卡片。',
     module: '订单管理'
   })
   const unindexedLexical = addRecord(db, {
@@ -172,18 +215,21 @@ const testCurrentIndexScopeAndSingleBaseExclusion = async (db: AppDatabase): Pro
     module: '订单管理'
   })
   addVectorIndex(db, indexedCrossScope)
+  addVectorIndex(db, indexedPendingSemantic)
   addVectorIndex(db, staleModelMatch, 'test-legacy-index-v1')
+  persistReadySemanticCard(db, base)
+  persistReadySemanticCard(db, indexedCrossScope)
 
   const indexedRows = db.listKnowledgeVectorRows(TEST_MODEL_VERSION)
   assert.deepEqual(
-    indexedRows.map(({ chunk }) => chunk.recordUid),
-    [indexedCrossScope.uid],
-    'fixture must contain only the intended current vector-index record'
+    indexedRows.map(({ chunk }) => chunk.recordUid).sort(),
+    [indexedCrossScope.uid, indexedPendingSemantic.uid],
+    'fixture must contain ready and pending-semantic current-index records'
   )
   const indexedDetails = db.listKnowledgeIndexedRecordDetails(TEST_MODEL_VERSION)
   assert.deepEqual(
-    indexedDetails.map((record) => record.uid),
-    [indexedCrossScope.uid],
+    indexedDetails.map((record) => record.uid).sort(),
+    [indexedCrossScope.uid, indexedPendingSemantic.uid],
     'current index details must exclude records that only have an older model version'
   )
 
@@ -200,6 +246,7 @@ const testCurrentIndexScopeAndSingleBaseExclusion = async (db: AppDatabase): Pro
   assert.ok(!candidateUids.includes(unindexedStructured.uid), 'an unindexed structured match must be excluded')
   assert.ok(!candidateUids.includes(staleModelMatch.uid), 'a lexical/structured match indexed only by an older model version must be excluded')
   assert.ok(candidateUids.includes(indexedCrossScope.uid), 'an indexed record from another project/node type remains eligible')
+  assert.ok(!candidateUids.includes(indexedPendingSemantic.uid), 'an indexed record without a ready semantic card must be excluded before ranking')
 }
 
 const testMultipleBaseUidExclusion = async (db: AppDatabase): Promise<void> => {
@@ -231,6 +278,9 @@ const testMultipleBaseUidExclusion = async (db: AppDatabase): Promise<void> => {
     module: '库存管理'
   })
   addVectorIndex(db, indexedCandidate)
+  persistReadySemanticCard(db, baseOne)
+  persistReadySemanticCard(db, baseTwo)
+  persistReadySemanticCard(db, indexedCandidate)
 
   const dense = createControlledDenseRetriever(db, [
     baseOne.uid,

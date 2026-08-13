@@ -24,9 +24,88 @@ const normalizeReleaseNotes = (notes: unknown): string | undefined => {
   return normalized || undefined
 }
 
-const errorMessage = (error: unknown): string => {
-  if (error instanceof Error && error.message.trim()) return error.message.trim()
-  return String(error || '未知错误')
+type UpdateOperation = 'check' | 'download'
+
+const asErrorRecord = (value: unknown): Record<string, unknown> | undefined =>
+  typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : undefined
+
+const toStatusCode = (value: unknown): number | undefined => {
+  const statusCode =
+    typeof value === 'number'
+      ? value
+      : typeof value === 'string' && /^\d{3}$/.test(value)
+        ? Number(value)
+        : undefined
+
+  return statusCode !== undefined && statusCode >= 100 && statusCode <= 599
+    ? statusCode
+    : undefined
+}
+
+const statusCodeFromText = (value: string): number | undefined => {
+  const match = value.match(/(?:^|\b(?:status|http|response|error|code))\D*([45]\d{2})\b/i)
+  return match ? Number(match[1]) : undefined
+}
+
+const normalizeUpdaterError = (error: unknown, operation: UpdateOperation): string => {
+  const record = asErrorRecord(error)
+  const response = asErrorRecord(record?.response)
+  const code = typeof record?.code === 'string' ? record.code.toUpperCase() : ''
+  const message =
+    typeof record?.message === 'string'
+      ? record.message
+      : typeof error === 'string'
+        ? error
+        : ''
+  const statusCode =
+    toStatusCode(record?.statusCode) ??
+    toStatusCode(record?.status) ??
+    toStatusCode(response?.statusCode) ??
+    toStatusCode(response?.status) ??
+    statusCodeFromText(code) ??
+    statusCodeFromText(message)
+
+  const isNoReleaseError =
+    code === 'ERR_UPDATER_NO_PUBLISHED_VERSIONS' ||
+    (operation === 'check' && statusCode === 404) ||
+    (code === 'ERR_UPDATER_LATEST_VERSION_NOT_FOUND' && statusCode === 404) ||
+    (code !== 'ERR_UPDATER_LATEST_VERSION_NOT_FOUND' &&
+      /no published (?:versions|release)/i.test(message))
+  if (code === 'ERR_UPDATER_CHANNEL_FILE_NOT_FOUND' || /channel file.*not found/i.test(message)) {
+    return '已找到正式 Release，但缺少更新元数据（latest.yml），请重新发布完整版本后重试'
+  }
+  if (isNoReleaseError) {
+    return '当前没有可访问的正式 Release，请管理员发布正式 Release 后重试'
+  }
+
+  const isAuthError =
+    statusCode === 401 ||
+    statusCode === 403 ||
+    /(?:AUTH|UNAUTHORIZED|FORBIDDEN|PERMISSION|ACCESS_DENIED)/.test(code) ||
+    /unauthorized|forbidden|authentication|authorization|permission|access denied/i.test(message)
+  if (isAuthError) {
+    return '更新服务认证失败，请联系管理员检查发布权限后重试'
+  }
+
+  const isServerError =
+    (statusCode !== undefined && statusCode >= 500) ||
+    /HTTP_ERROR_5\d{2}/.test(code) ||
+    /internal server|service unavailable|bad gateway|gateway timeout|server error/i.test(message)
+  if (isServerError) {
+    return '更新服务暂时不可用，请稍后重试'
+  }
+
+  const isNetworkError =
+    /^(?:EAI_AGAIN|ECONNABORTED|ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENETUNREACH|ENOTFOUND|EPIPE|EPROTO|ETIMEDOUT|CERT_HAS_EXPIRED|UNABLE_TO_VERIFY_LEAF_SIGNATURE)$/.test(
+      code
+    ) ||
+    /ERR_(?:CONNECTION|INTERNET_DISCONNECTED|NETWORK|SOCKET|TLS)/.test(code) ||
+    /network|offline|internet|timed out|timeout|connection|socket|dns|certificate|tls|ssl/i.test(message)
+  if (isNetworkError) {
+    return '更新网络连接失败，请检查网络后重试'
+  }
+
+  return operation === 'download' ? '更新文件下载失败，请检查网络后重试' : '检查更新失败，请稍后重试'
 }
 
 const clampPercent = (value: number): number =>
@@ -100,7 +179,7 @@ export class UpdateManager {
       this.publish({
         phase: 'error',
         currentVersion: app.getVersion(),
-        message: errorMessage(error)
+        message: normalizeUpdaterError(error, this.status.phase === 'downloading' ? 'download' : 'check')
       })
     })
   }
@@ -152,7 +231,7 @@ export class UpdateManager {
         this.publish({
           phase: 'error',
           currentVersion: app.getVersion(),
-          message: errorMessage(error)
+          message: normalizeUpdaterError(error, 'check')
         })
       }
     })()
@@ -209,7 +288,7 @@ export class UpdateManager {
           phase: 'error',
           currentVersion: app.getVersion(),
           version,
-          message: errorMessage(error)
+          message: normalizeUpdaterError(error, 'download')
         })
       }
     })()

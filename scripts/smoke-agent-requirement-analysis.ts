@@ -6,7 +6,11 @@ import { AppDatabase } from '../src/main/database'
 import { RequirementAnalysisAgent, extractRequirementAnalysisIds } from '../src/main/experts/requirement-analysis-agent'
 import type { RequirementReranker, RequirementRerankItem } from '../src/main/requirements/cross-encoder-reranker'
 import type { HybridRequirementCandidate } from '../src/main/requirements/hybrid-retrieval'
-import { buildRequirementSemanticCard } from '../src/main/requirements/semantic-card'
+import { buildRequirementSemanticCard, type RequirementSemanticCard } from '../src/main/requirements/semantic-card'
+import {
+  REQUIREMENT_SEMANTIC_ANALYZER_VERSION,
+  requirementSemanticModelSignature
+} from '../src/main/requirements/semanticization-service'
 import type { KnowledgeService } from '../src/main/knowledge'
 import type { ModelChatInput, ModelResponse } from '../src/main/model-client'
 import type { ModelSettings, RecordDetail } from '../src/shared/types'
@@ -30,6 +34,11 @@ const settings: ModelSettings = {
   baseUrl: 'http://127.0.0.1:11434',
   model: 'test-model',
   thinking: false
+}
+
+const semanticContext = {
+  analyzerVersion: REQUIREMENT_SEMANTIC_ANALYZER_VERSION,
+  modelSignature: requirementSemanticModelSignature(settings)
 }
 
 const readFixedOutcomes = async (): Promise<FixedOutcomeFixture> => {
@@ -60,14 +69,42 @@ const upsert = (db: AppDatabase, input: {
     },
     normalizedText: `${input.name}\n${input.description}\n${input.module ?? '需求管理'}`
   })
+  persistReadySemanticCard(db, input.uid)
+}
+
+const persistReadySemanticCard = (db: AppDatabase, uid: string): RequirementSemanticCard => {
+  const record = db.getRecord(uid, false)
+  assert.ok(record, `missing fixture record ${uid}`)
+  const source = buildRequirementSemanticCard(record)
+  const object = record.name || record.itemId
+  const card: RequirementSemanticCard = {
+    ...source,
+    functionalObject: object,
+    matchingText: source.evidence,
+    fieldAssessments: {
+      ...source.fieldAssessments,
+      functionalObject: { value: object, confidence: 0.95, evidence: source.evidence.slice(0, 32) }
+    },
+    analysisStatus: 'ai_adjudicated',
+    analysisSummary: '需求分析 smoke 预置的 AI 语义裁决卡片'
+  }
+  const contentHash = db.getRecordContentHash(uid)
+  assert.ok(contentHash)
+  assert.equal(db.claimRequirementSemanticCard({ recordUid: uid, contentHash, ...semanticContext }), true)
+  db.completeRequirementSemanticCard(uid, card)
+  return card
 }
 
 const candidateFor = (db: AppDatabase, uid: string, denseScore = 82): HybridRequirementCandidate => {
   const record = db.getRecord(uid, false)
   assert.ok(record, `missing fixture record ${uid}`)
+  const contentHash = db.getRecordContentHash(uid)
+  assert.ok(contentHash)
+  const card = db.getReadyRequirementSemanticCard({ recordUid: uid, contentHash, ...semanticContext })
+  assert.ok(card, `missing ready semantic card ${uid}`)
   return {
     record,
-    card: buildRequirementSemanticCard(record),
+    card,
     denseScore,
     lexicalScore: denseScore - 3,
     structuralScore: denseScore - 5,
@@ -181,7 +218,7 @@ const runHappyPath = async (db: AppDatabase): Promise<void> => {
     {} as KnowledgeService,
     settings,
     undefined,
-    { retriever, reranker, modelClient: model.client }
+    { retriever, reranker, modelClient: model.client, semanticContext }
   )
   const response = await agent.ask({ question: '@需求分析专家 分析需求编号 REQ-1、REQ-2' })
 
@@ -227,7 +264,7 @@ const runFixedOutcomes = async (db: AppDatabase, fixture: FixedOutcomeFixture): 
     {} as KnowledgeService,
     settings,
     undefined,
-    { retriever, reranker: deterministicReranker(new Map()), modelClient: model.client }
+    { retriever, reranker: deterministicReranker(new Map()), modelClient: model.client, semanticContext }
   )
   const response = await agent.ask({ question: `分析需求编号 ${fixture.baseItemId}` })
   assert.equal(model.getCallCount(), 4, 'fixed outcome should use two independent passes across two candidate batches')
@@ -288,7 +325,7 @@ const runInvalidReview = async (db: AppDatabase, mode: 'missing' | 'unknown' | '
     {} as KnowledgeService,
     settings,
     undefined,
-    { retriever, reranker: deterministicReranker(new Map()), modelClient: model }
+    { retriever, reranker: deterministicReranker(new Map()), modelClient: model, semanticContext }
   )
   const response = await agent.ask({ question: '分析需求编号 UNKNOWN-BASE' })
   assert.equal(callCount, 0, 'unknown base IDs must not call the model')
@@ -326,7 +363,8 @@ const runRerankerFailure = async (db: AppDatabase): Promise<void> => {
           modelCallCount += 1
           throw new Error('model must not be called after reranker validation failure')
         }
-      }
+      },
+      semanticContext
     }
   )
   const response = await agent.ask({ question: '分析需求编号 RERANKER-BASE' })

@@ -20,6 +20,7 @@ import type {
   SystemSettingsInput,
   PushConfig,
   RecordQuery,
+  RequirementSemanticizationStartInput,
   SyncProgress,
   SyncScopeConfig,
   UpdateStatus
@@ -63,6 +64,7 @@ import { repairDashboardComponent } from './dashboards/component-repair'
 import { dashboardSpecHash } from './dashboards/spec-hash'
 import { ExpertRouter } from './experts/router'
 import { RequirementAnalysisAgent } from './experts/requirement-analysis-agent'
+import { RequirementSemanticizationService } from './requirements/semanticization-service'
 import { VisualizationAgent } from './experts/visualization-agent'
 import { resolveVisualizationRequestMode } from './experts/visualization-intent'
 import { OllamaAgent } from './ollama'
@@ -88,6 +90,7 @@ let syncService: SyncService
 let pushService: PushService
 let knowledgeService: KnowledgeService
 let projectManagementService: ProjectManagementService
+let requirementSemanticizationService: RequirementSemanticizationService
 const expertRouter = new ExpertRouter()
 const maxKnowledgeDocumentPreviewBytes = 50 * 1024 * 1024
 const sourcePreviewExtensions = new Set(['.docx', '.pdf'])
@@ -349,8 +352,14 @@ const registerIpc = (): void => {
 
   ipcMain.handle('data:projects', () => db.listProjects())
   ipcMain.handle('data:node-types', () => db.listNodeTypes())
-  ipcMain.handle('data:records', (_event, query: RecordQuery) => db.listRecords(query))
-  ipcMain.handle('data:record', (_event, uid: string) => db.getRecord(uid))
+  ipcMain.handle('data:records', (_event, query: RecordQuery) =>
+    db.listRecords(query, requirementSemanticizationService.context()))
+  ipcMain.handle('data:record', (_event, uid: string) =>
+    db.getRecord(uid, true, requirementSemanticizationService.context()))
+  ipcMain.handle(
+    'requirements:semanticize',
+    (_event, input: RequirementSemanticizationStartInput) => requirementSemanticizationService.start(input)
+  )
   ipcMain.handle('data:stats', () => db.getStats())
   ipcMain.handle('sync:get-config', () => settings.getSyncConfig())
   ipcMain.handle('sync:save-config', (_event, config: SyncScopeConfig) => {
@@ -1330,6 +1339,11 @@ if (!hasSingleInstanceLock) {
     mkdirSync(dataDir, { recursive: true })
     db = new AppDatabase(join(dataDir, 'visslm-agent.db'), join(dataDir, 'assets', 'base64'))
     settings = new SettingsService(db)
+    requirementSemanticizationService = new RequirementSemanticizationService(
+      db,
+      () => settings.getModelCredentials(),
+      (progress) => mainWindow?.webContents.send('requirements:semanticization-progress', progress)
+    )
     knowledgeService = new KnowledgeService(
       db,
       (progress) => mainWindow?.webContents.send('knowledge:progress', progress)
