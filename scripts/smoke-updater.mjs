@@ -62,6 +62,10 @@ const checks = {
     && errorNormalizerSource.includes('无法读取 GitHub 正式 Release')
     && errorNormalizerSource.includes("code === 'ERR_UPDATER_LATEST_VERSION_NOT_FOUND' || code === ''")
     && errorNormalizerSource.includes('statusCode === 404'),
+  releaseNotesAreReadableText: updaterSource.includes('normalizeReleaseNoteText')
+    && updaterSource.includes(".replace(/<[^>]*>/g, '')")
+    && updaterSource.includes(".replace(/<\\s*li\\b[^>]*>/gi, '\\n- ')")
+    && updaterSource.includes('decodeReleaseNoteEntities'),
   errorNormalizerSeparatesFailureCategories: errorNormalizerSource.includes('statusCode === 401')
     && errorNormalizerSource.includes('statusCode === 403')
     && errorNormalizerSource.includes('statusCode >= 500')

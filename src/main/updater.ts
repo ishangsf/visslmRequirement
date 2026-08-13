@@ -6,20 +6,64 @@ const { autoUpdater } = electronUpdater
 
 const supportedPlatforms = new Set<NodeJS.Platform>(['win32', 'darwin'])
 
-const normalizeReleaseNotes = (notes: unknown): string | undefined => {
-  if (typeof notes === 'string') return notes.trim() || undefined
-  if (!Array.isArray(notes)) return undefined
+const decodeReleaseNoteEntities = (value: string): string => value
+  .replace(
+    /&(?:amp|lt|gt|quot|apos|nbsp|#39|#x27);/gi,
+    (entity) => ({
+      '&amp;': '&',
+      '&lt;': '<',
+      '&gt;': '>',
+      '&quot;': '"',
+      '&apos;': "'",
+      '&#39;': "'",
+      '&#x27;': "'",
+      '&nbsp;': ' '
+    }[entity.toLowerCase()] ?? entity)
+  )
+  .replace(/&#(x[0-9a-f]+|\d+);/gi, (_entity, code: string) => {
+    const number = code.toLowerCase().startsWith('x')
+      ? Number.parseInt(code.slice(1), 16)
+      : Number.parseInt(code, 10)
+    return Number.isFinite(number) && number >= 0 && number <= 0x10ffff
+      ? String.fromCodePoint(number)
+      : ''
+  })
 
-  const normalized = notes
-    .map((entry) => {
-      if (typeof entry === 'string') return entry
-      if (entry && typeof entry === 'object' && 'note' in entry) {
-        return String(entry.note ?? '')
-      }
-      return ''
-    })
+const normalizeReleaseNoteText = (value: string): string => {
+  const source = /&lt;\s*\/?\s*(?:h[1-6]|ul|ol|li|p|div|br)\b/i.test(value)
+    ? decodeReleaseNoteEntities(value)
+    : value
+  const withLineBreaks = source
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<\s*br\s*\/?>/gi, '\n')
+    .replace(/<\s*li\b[^>]*>/gi, '\n- ')
+    .replace(/<\s*\/\s*li\s*>/gi, '\n')
+    .replace(/<\s*\/?\s*(?:p|div|h[1-6]|ul|ol|blockquote|pre|section|article)\b[^>]*>/gi, '\n')
+    .replace(/<[^>]*>/g, '')
+
+  return decodeReleaseNoteEntities(withLineBreaks)
+    .replace(/\r\n?/g, '\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
+const normalizeReleaseNotes = (notes: unknown): string | undefined => {
+  const entries = typeof notes === 'string'
+    ? [notes]
+    : Array.isArray(notes)
+      ? notes.map((entry) => {
+          if (typeof entry === 'string') return entry
+          if (entry && typeof entry === 'object' && 'note' in entry) {
+            return String(entry.note ?? '')
+          }
+          return ''
+        })
+      : []
+  const normalized = entries
+    .map(normalizeReleaseNoteText)
     .filter(Boolean)
-    .join('\n')
+    .join('\n\n')
 
   return normalized || undefined
 }
