@@ -1,11 +1,19 @@
 import { createHash, randomUUID } from 'node:crypto'
 import type {
   ModelSettings,
+  RequirementSemanticizationAnalysisTrace,
+  RequirementSemanticizationControl,
+  RequirementSemanticizationDivergence,
   RequirementSemanticizationProgress,
+  RequirementSemanticizationRecentItem,
   RequirementSemanticizationStartInput,
-  RequirementSemanticizationStartResult
+  RequirementSemanticizationStartResult,
+  RequirementSemanticizationTaskSnapshot,
+  RequirementSemanticizationTraceEvent,
+  RequirementSemanticizationTraceField,
+  RequirementSemanticizationAnalysisStage
 } from '../../shared/types'
-import { AppDatabase } from '../database'
+import { AppDatabase, type RequirementSemanticizationCandidate } from '../database'
 import { ModelClient, type ModelChatInput } from '../model-client'
 import {
   buildRequirementMatchingText,
@@ -29,6 +37,16 @@ type SemanticAnalysisOutput = {
 
 export interface RequirementSemanticizationModelClient {
   chat(input: ModelChatInput): ReturnType<ModelClient['chat']>
+}
+
+const activeTaskStatuses = new Set(['queued', 'running', 'pausing', 'paused', 'stopping'])
+const recentItemLimit = 12
+const maximumRecordsPerTask = 5
+
+class SemanticizationStoppedError extends Error {
+  constructor() {
+    super('语义化任务已停止')
+  }
 }
 
 const fieldSchema = {
@@ -79,12 +97,16 @@ export const requirementSemanticModelSignature = (settings: ModelSettings): stri
     provider: settings.provider,
     baseUrl: settings.baseUrl.replace(/\/+$/, ''),
     model: settings.model,
-    thinking: true
+    thinking: true,
+    forceThinking: true
   }))
   .digest('hex')
 
 export class RequirementSemanticizationService {
-  private queue: Promise<void> = Promise.resolve()
+  private task: RequirementSemanticizationTaskSnapshot | null = null
+  private candidates: RequirementSemanticizationCandidate[] = []
+  private resumeWaiters: Array<() => void> = []
+  private currentTrace: RequirementSemanticizationAnalysisTrace | null = null
 
   constructor(
     private readonly db: AppDatabase,
@@ -102,74 +124,305 @@ export class RequirementSemanticizationService {
   }
 
   start(input: RequirementSemanticizationStartInput): RequirementSemanticizationStartResult {
-    const recordUids = [...new Set(input.recordUids.map((uid) => uid.trim()).filter(Boolean))]
-    if (!recordUids.length) throw new Error('请选择至少一条需要 AI 语义化的数据')
-    if (recordUids.length > 200) throw new Error('单次最多处理 200 条数据，请分批执行')
+    if (this.task && activeTaskStatuses.has(this.task.status)) {
+      throw new Error('当前已有 AI 语义化任务，请先等待完成或终止当前任务')
+    }
+    if (input.scope !== undefined && input.scope !== 'selected' && input.scope !== 'all_unready') {
+      throw new Error('未知的 AI 语义化任务范围')
+    }
     const settings = this.getSettings()
     const context = {
       analyzerVersion: REQUIREMENT_SEMANTIC_ANALYZER_VERSION,
       modelSignature: requirementSemanticModelSignature(settings)
     }
-    const accepted: string[] = []
-    for (const recordUid of recordUids) {
-      const contentHash = this.db.getRecordContentHash(recordUid)
-      if (contentHash === null) continue
-      if (this.db.claimRequirementSemanticCard({
-        recordUid,
-        contentHash,
-        ...context,
-        force: input.force
-      })) accepted.push(recordUid)
+    const requestedMaximum: unknown = input.maxRecords
+    const maxRecords = requestedMaximum === undefined ? maximumRecordsPerTask : requestedMaximum
+    if (typeof maxRecords !== 'number' || !Number.isFinite(maxRecords) || !Number.isInteger(maxRecords)) {
+      throw new Error('单任务处理条数必须是 1–5 的整数')
+    }
+    if (maxRecords < 1 || maxRecords > maximumRecordsPerTask) {
+      throw new Error('单任务处理条数必须在 1–5 之间')
+    }
+    let available = 0
+    let candidates: RequirementSemanticizationCandidate[] = []
+    if (input.scope === 'all_unready') {
+      const result = this.db.listRequirementSemanticizationCandidates({ ...context, limit: maxRecords })
+      available = result.available
+      candidates = result.candidates
+    } else {
+      const recordUids = [...new Set((input.recordUids ?? []).map((uid) => uid.trim()).filter(Boolean))]
+      if (!recordUids.length) throw new Error('请选择至少一条需要 AI 语义化的数据')
+      available = recordUids.length
+      for (const recordUid of recordUids) {
+        const record = this.db.getRecord(recordUid, false)
+        const contentHash = this.db.getRecordContentHash(recordUid)
+        if (!record || contentHash === null) continue
+        const state = this.db.getRequirementSemanticCardState(recordUid)
+        if (state?.status === 'processing') continue
+        const validReady = this.db.getReadyRequirementSemanticCard({ recordUid, contentHash, ...context })
+        if (validReady && !input.force) continue
+        candidates.push({ recordUid, itemId: record.itemId, name: record.name, contentHash })
+      }
+      candidates = candidates.slice(0, maxRecords)
     }
     const jobId = randomUUID()
-    if (accepted.length) {
-      this.queue = this.queue
-        .catch(() => undefined)
-        .then(() => this.runJob(jobId, accepted, settings))
+    if (!candidates.length) {
+      const timestamp = new Date().toISOString()
+      this.candidates = []
+      this.task = {
+        jobId,
+        status: 'completed',
+        currentStage: 'idle',
+        total: 0,
+        available,
+        completed: 0,
+        succeeded: 0,
+        failed: 0,
+        remaining: 0,
+        startedAt: timestamp,
+        updatedAt: timestamp,
+        message: available > 0 ? `没有新任务，已跳过 ${available} 条记录` : '当前没有需要生成或更新的 AI 语义卡片',
+        recentItems: []
+      }
+      this.emit()
+      return { jobId, accepted: 0, skipped: available, available }
     }
-    return { jobId, accepted: accepted.length, skipped: recordUids.length - accepted.length }
+    const timestamp = new Date().toISOString()
+    this.candidates = candidates
+    this.task = {
+      jobId,
+      status: 'queued',
+      currentStage: 'queued',
+      total: candidates.length,
+      available,
+      completed: 0,
+      succeeded: 0,
+      failed: 0,
+      remaining: candidates.length,
+      startedAt: timestamp,
+      updatedAt: timestamp,
+      message: `已创建任务，将逐条处理 ${candidates.length} 条记录`,
+      recentItems: []
+    }
+    this.emit()
+    void this.runJob(settings).catch((error) => {
+      if (!this.task || this.task.status === 'stopped') return
+      this.finishStopped(`任务异常结束：${error instanceof Error ? error.message : String(error)}`)
+    })
+    return {
+      jobId,
+      accepted: candidates.length,
+      skipped: Math.max(0, available - candidates.length),
+      available
+    }
   }
 
-  private async runJob(jobId: string, recordUids: string[], settings: ModelSettings): Promise<void> {
-    let completed = 0
-    let failed = 0
-    const total = recordUids.length
+  getTask(): RequirementSemanticizationTaskSnapshot | null {
+    return this.task ? structuredClone(this.task) : null
+  }
+
+  control(action: RequirementSemanticizationControl): RequirementSemanticizationTaskSnapshot | null {
+    if (action !== 'pause' && action !== 'resume' && action !== 'stop') {
+      throw new Error('未知的 AI 语义化任务控制指令')
+    }
+    if (!this.task) return null
+    if (action === 'pause') {
+      if (this.task.status === 'queued') {
+        this.task.status = 'paused'
+        this.task.message = '任务已暂停，可随时继续'
+      } else if (this.task.status === 'running') {
+        this.task.status = 'pausing'
+        this.task.message = '正在等待当前 AI 阶段安全结束后暂停'
+      }
+    } else if (action === 'resume') {
+      if (this.task.status === 'paused' || this.task.status === 'pausing') {
+        this.task.status = 'running'
+        this.task.message = '任务已继续，按记录逐条执行'
+        this.resolveWaiters()
+      }
+    } else if (activeTaskStatuses.has(this.task.status)) {
+      this.task.status = 'stopping'
+      this.task.message = this.task.currentRecord
+        ? '正在等待当前 AI 阶段安全结束后停止'
+        : '正在停止任务'
+      this.resolveWaiters()
+    }
+    this.touch()
+    this.emit()
+    return this.getTask()
+  }
+
+  private async runJob(settings: ModelSettings): Promise<void> {
+    if (!this.task) return
+    if (this.task.status === 'stopping' || this.task.status === 'stopped') {
+      this.finishStopped()
+      return
+    }
     const client = this.createModelClient(settings)
-    for (const recordUid of recordUids) {
-      this.emit({ jobId, recordUid, status: 'processing', completed, total, failed, message: '正在执行三阶段 AI 深度语义分析' })
+    this.task.status = this.task.status === 'paused' ? 'paused' : 'running'
+    this.task.currentStage = 'idle'
+    this.task.message = this.task.status === 'paused' ? '任务已暂停，可随时继续' : '任务已开始，按记录逐条执行'
+    this.touch()
+    this.emit()
+    for (let index = 0; index < this.candidates.length; index += 1) {
+      const candidate = this.candidates[index]
       try {
-        const record = this.db.getRecord(recordUid, false)
+        await this.checkpoint()
+      } catch (error) {
+        if (error instanceof SemanticizationStoppedError) break
+        throw error
+      }
+      if (!this.task) return
+      const currentHash = this.db.getRecordContentHash(candidate.recordUid)
+      if (currentHash === null || !this.db.claimRequirementSemanticCard({
+        recordUid: candidate.recordUid,
+        contentHash: currentHash,
+        analyzerVersion: REQUIREMENT_SEMANTIC_ANALYZER_VERSION,
+        modelSignature: requirementSemanticModelSignature(settings),
+        force: true
+      })) {
+        this.addResult(candidate, 'failed', 0, '记录状态已变化，未能开始处理')
+        this.emit(candidate.recordUid, 'failed')
+        continue
+      }
+      const startedAt = Date.now()
+      this.task.currentRecord = {
+        uid: candidate.recordUid,
+        itemId: candidate.itemId,
+        name: candidate.name,
+        index: index + 1
+      }
+      this.task.status = 'running'
+      this.task.currentStage = 'initial'
+      this.task.message = `正在分析 ${candidate.itemId || candidate.name}`
+      this.currentTrace = this.createTrace(candidate.recordUid, settings)
+      this.startTraceStage('initial')
+      this.touch()
+      this.emit(candidate.recordUid, 'processing')
+      try {
+        const record = this.db.getRecord(candidate.recordUid, false)
         if (!record) throw new Error('数据中心记录不存在或已被删除')
         const source = buildRequirementSemanticCard(record)
         if (!source.evidence.trim()) throw new Error('记录没有可供 AI 分析的文本内容')
-        const initial = await this.analyze(client, recordUid, source, 'initial')
-        const independent = await this.analyze(client, recordUid, source, 'independent')
-        const adjudicated = await this.adjudicate(client, recordUid, source, initial, independent)
+        const initial = await this.analyze(client, candidate.recordUid, source, 'initial')
+        await this.checkpoint()
+        this.setStage('independent', '正在执行独立语义复核')
+        const independent = await this.analyze(client, candidate.recordUid, source, 'independent')
+        await this.checkpoint()
+        this.setStage('adjudication', '正在裁决两轮分析结果')
+        const adjudicated = await this.adjudicate(client, candidate.recordUid, source, initial, independent)
+        await this.checkpoint()
+        this.setStage('persisting', '正在校验并保存语义卡片')
         const card = this.toCard(source, adjudicated)
-        this.db.completeRequirementSemanticCard(recordUid, card, {
-          initialSummary: initial.analysisSummary,
-          independentSummary: independent.analysisSummary,
-          adjudicationSummary: adjudicated.analysisSummary,
-          completedWithAnalyzerVersion: REQUIREMENT_SEMANTIC_ANALYZER_VERSION
-        })
-        completed += 1
-        this.emit({ jobId, recordUid, status: 'ready', completed, total, failed, message: 'AI 语义卡片已生成' })
+        this.completeTraceStage('persisting', adjudicated, '结构化字段、置信度和原文证据校验通过，正在写入语义资产')
+        this.db.completeRequirementSemanticCard(candidate.recordUid, card, this.finishTrace('completed'))
+        this.addResult(candidate, 'ready', Date.now() - startedAt)
+        this.emit(candidate.recordUid, 'ready')
       } catch (error) {
-        failed += 1
-        completed += 1
+        if (error instanceof SemanticizationStoppedError) {
+          this.finishStopped()
+          return
+        }
         const message = error instanceof Error ? error.message : String(error)
-        this.db.failRequirementSemanticCard(recordUid, message)
-        this.emit({ jobId, recordUid, status: 'failed', completed, total, failed, message })
+        this.failTraceStage(message)
+        this.db.failRequirementSemanticCard(candidate.recordUid, message, this.finishTrace('failed'))
+        this.addResult(candidate, 'failed', Date.now() - startedAt, message)
+        this.emit(candidate.recordUid, 'failed')
       }
     }
-    this.emit({
-      jobId,
-      status: 'completed',
-      completed,
-      total,
-      failed,
-      message: failed ? `处理完成，成功 ${completed - failed} 条，失败 ${failed} 条` : `处理完成，共 ${completed} 条`
-    })
+    if (!this.task) return
+    if (this.getTask()?.status === 'stopping') {
+      this.finishStopped()
+      return
+    }
+    this.task.status = 'completed'
+    this.task.currentStage = 'idle'
+    this.task.currentRecord = undefined
+    this.task.message = this.task.failed
+      ? `处理完成，成功 ${this.task.succeeded} 条，失败 ${this.task.failed} 条`
+      : `处理完成，共 ${this.task.succeeded} 条`
+    this.touch()
+    this.emit()
+  }
+
+  private async checkpoint(): Promise<void> {
+    // Yield before reading task control so pause/stop requests queued in the same turn
+    // are observed before another AI stage or record can begin.
+    await Promise.resolve()
+    if (!this.task) throw new SemanticizationStoppedError()
+    if (this.task.status === 'stopping' || this.task.status === 'stopped') {
+      throw new SemanticizationStoppedError()
+    }
+    if (this.task.status !== 'pausing' && this.task.status !== 'paused') return
+    this.task.status = 'paused'
+    this.task.message = '任务已暂停，可随时继续'
+    this.touch()
+    this.emit()
+    await new Promise<void>((resolve) => this.resumeWaiters.push(resolve))
+    const resumedStatus = this.getTask()?.status
+    if (!this.task || resumedStatus === 'stopping' || resumedStatus === 'stopped') {
+      throw new SemanticizationStoppedError()
+    }
+  }
+
+  private setStage(stage: RequirementSemanticizationTaskSnapshot['currentStage'], message: string): void {
+    if (!this.task) return
+    this.task.currentStage = stage
+    this.task.message = message
+    if (stage === 'initial' || stage === 'independent' || stage === 'adjudication' || stage === 'persisting') {
+      this.startTraceStage(stage)
+    }
+    this.touch()
+    this.emit(this.task.currentRecord?.uid, 'processing')
+  }
+
+  private addResult(
+    candidate: RequirementSemanticizationCandidate,
+    status: RequirementSemanticizationRecentItem['status'],
+    durationMs: number,
+    error?: string
+  ): void {
+    if (!this.task) return
+    this.task.completed += 1
+    this.task.succeeded += status === 'ready' ? 1 : 0
+    this.task.failed += status === 'failed' ? 1 : 0
+    this.task.remaining = Math.max(0, this.task.total - this.task.completed)
+    this.task.recentItems = [{
+      uid: candidate.recordUid,
+      itemId: candidate.itemId,
+      name: candidate.name,
+      status,
+      ...(error ? { error } : {}),
+      durationMs
+    }, ...this.task.recentItems].slice(0, recentItemLimit)
+    this.task.currentRecord = undefined
+    this.task.currentStage = 'idle'
+    this.task.message = status === 'ready'
+      ? `${candidate.itemId || candidate.name} 语义卡片已生成`
+      : `${candidate.itemId || candidate.name} 处理失败：${error ?? '未知错误'}`
+    this.touch()
+  }
+
+  private finishStopped(message?: string): void {
+    if (!this.task) return
+    const currentUid = this.task.currentRecord?.uid
+    if (currentUid) this.db.releaseRequirementSemanticCard(currentUid, this.finishTrace('stopped'))
+    this.task.status = 'stopped'
+    this.task.currentStage = 'idle'
+    this.task.currentRecord = undefined
+    this.task.remaining = Math.max(0, this.task.total - this.task.completed)
+    this.task.message = message ?? `任务已停止，已完成 ${this.task.completed} 条，剩余 ${this.task.remaining} 条未处理`
+    this.touch()
+    this.emit()
+  }
+
+  private resolveWaiters(): void {
+    const waiters = this.resumeWaiters.splice(0)
+    waiters.forEach((resolve) => resolve())
+  }
+
+  private touch(): void {
+    if (this.task) this.task.updatedAt = new Date().toISOString()
   }
 
   private async analyze(
@@ -181,7 +434,7 @@ export class RequirementSemanticizationService {
     const role = pass === 'initial'
       ? '你是资深需求工程师。请深入理解原文，生成可用于精准匹配的结构化语义，不要仅做关键词摘抄。'
       : '你是独立的需求审查专家。不要参考其他分析结论，从原文重新推理每个语义字段，主动识别歧义与缺失。'
-    return this.callAndValidate(client, recordUid, source.evidence, {
+    return this.callAndValidate(client, recordUid, source.evidence, pass, {
       messages: [
         {
           role: 'system',
@@ -206,7 +459,14 @@ export class RequirementSemanticizationService {
     initial: SemanticAnalysisOutput,
     independent: SemanticAnalysisOutput
   ): Promise<SemanticAnalysisOutput> {
-    return this.callAndValidate(client, recordUid, source.evidence, {
+    const divergence = this.compareDivergence(initial, independent)
+    if (divergence.hasDivergence) this.recordTraceEvent({
+      stage: 'adjudication',
+      kind: 'divergence',
+      message: '初步分析与独立复核存在字段分歧，已交由最终裁决',
+      divergence
+    })
+    return this.callAndValidate(client, recordUid, source.evidence, 'adjudication', {
       messages: [
         {
           role: 'system',
@@ -236,10 +496,16 @@ export class RequirementSemanticizationService {
     client: RequirementSemanticizationModelClient,
     recordUid: string,
     sourceText: string,
+    stage: RequirementSemanticizationAnalysisStage,
     input: Pick<ModelChatInput, 'messages'>
   ): Promise<SemanticAnalysisOutput> {
     let lastError: unknown
     for (let attempt = 0; attempt < 2; attempt += 1) {
+      const traceStage = this.currentTrace?.stages[stage]
+      if (traceStage) {
+        traceStage.attempts = Math.max(traceStage.attempts, attempt + 1)
+        if (this.task && this.currentTrace) this.task.analysisTrace = structuredClone(this.currentTrace)
+      }
       try {
         const response = await client.chat({
           ...input,
@@ -251,12 +517,156 @@ export class RequirementSemanticizationService {
         })
         const content = response.message?.content?.trim()
         if (!content) throw new Error('模型未返回语义分析结果')
-        return this.validateOutput(JSON.parse(content) as unknown, recordUid, sourceText)
+        const output = this.validateOutput(JSON.parse(content) as unknown, recordUid, sourceText)
+        this.recordTraceEvent({
+          stage,
+          kind: 'validation_passed',
+          message: `${stage} 阶段第 ${attempt + 1} 次输出已通过 JSON 结构、字段、置信度和原文证据校验`,
+          attempt: attempt + 1,
+          maxAttempts: 2
+        })
+        this.completeTraceStage(stage, output)
+        return output
       } catch (error) {
+        if (error instanceof SemanticizationStoppedError) throw error
         lastError = error
+        this.recordTraceEvent({
+          stage,
+          kind: 'validation_failed',
+          message: `${stage} 阶段第 ${attempt + 1} 次输出未通过校验：${error instanceof Error ? error.message : String(error)}`.slice(0, 500),
+          attempt: attempt + 1,
+          maxAttempts: 2
+        })
+        if (attempt === 0) {
+          await this.checkpoint()
+          this.recordTraceEvent({
+            stage,
+            kind: 'retry',
+            message: `${stage} 阶段准备进行第 2 次模型调用`,
+            attempt: 2,
+            maxAttempts: 2
+          })
+        }
       }
     }
     throw new Error(`AI 语义分析校验失败：${lastError instanceof Error ? lastError.message : String(lastError)}`)
+  }
+
+  private createTrace(recordUid: string, settings: ModelSettings): RequirementSemanticizationAnalysisTrace {
+    return {
+      version: 1,
+      recordUid,
+      analyzerVersion: REQUIREMENT_SEMANTIC_ANALYZER_VERSION,
+      modelSignature: requirementSemanticModelSignature(settings),
+      events: [],
+      stages: {}
+    }
+  }
+
+  private startTraceStage(stage: RequirementSemanticizationAnalysisStage): void {
+    if (!this.currentTrace) return
+    const startedAt = new Date().toISOString()
+    this.currentTrace.stages[stage] = {
+      status: 'running',
+      startedAt,
+      attempts: stage === 'persisting' ? 0 : 1
+    }
+    this.recordTraceEvent({ stage, kind: 'stage_started', message: `${stage} 阶段开始` })
+  }
+
+  private completeTraceStage(
+    stage: RequirementSemanticizationAnalysisStage,
+    output: SemanticAnalysisOutput,
+    summary = output.analysisSummary
+  ): void {
+    if (!this.currentTrace) return
+    const current = this.currentTrace.stages[stage]
+    this.currentTrace.stages[stage] = {
+      status: 'completed',
+      startedAt: current?.startedAt ?? new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+      attempts: current?.attempts ?? 1,
+      summary,
+      fields: this.toTraceFields(output.fields)
+    }
+    this.recordTraceEvent({
+      stage,
+      kind: 'stage_completed',
+      message: `${stage} 阶段完成`,
+      summary,
+      fields: this.toTraceFields(output.fields)
+    })
+  }
+
+  private failTraceStage(message: string): void {
+    if (!this.currentTrace) return
+    const stage = this.task?.currentStage
+    if (stage !== 'initial' && stage !== 'independent' && stage !== 'adjudication' && stage !== 'persisting') return
+    const current = this.currentTrace.stages[stage]
+    this.currentTrace.stages[stage] = {
+      status: 'failed',
+      startedAt: current?.startedAt ?? new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+      attempts: current?.attempts ?? 0,
+      summary: message.slice(0, 300)
+    }
+  }
+
+  private finishTrace(outcome: RequirementSemanticizationAnalysisTrace['outcome']): RequirementSemanticizationAnalysisTrace {
+    const trace = this.currentTrace ?? this.createTrace(this.task?.currentRecord?.uid ?? '', this.getSettings())
+    trace.outcome = outcome
+    trace.completedAt = new Date().toISOString()
+    if (outcome === 'completed') {
+      const adjudication = trace.stages.adjudication
+      if (adjudication?.fields) {
+        trace.finalAdjudication = {
+          completedAt: adjudication.completedAt ?? trace.completedAt,
+          summary: adjudication.summary ?? '',
+          fields: adjudication.fields
+        }
+      }
+    }
+    if (this.task) this.task.analysisTrace = structuredClone(trace)
+    return structuredClone(trace)
+  }
+
+  private recordTraceEvent(input: Omit<RequirementSemanticizationTraceEvent, 'id' | 'recordUid' | 'timestamp'>): void {
+    if (!this.currentTrace) return
+    const event: RequirementSemanticizationTraceEvent = {
+      ...input,
+      id: randomUUID(),
+      recordUid: this.currentTrace.recordUid,
+      timestamp: new Date().toISOString()
+    }
+    this.currentTrace.events.push(event)
+    const stage = this.currentTrace.stages[input.stage]
+    if (stage && input.kind === 'retry') stage.attempts = Math.max(stage.attempts, input.attempt ?? 0)
+    if (this.task) this.task.analysisTrace = structuredClone(this.currentTrace)
+    this.db.updateRequirementSemanticCardTrace(this.currentTrace.recordUid, this.currentTrace)
+    this.touch()
+    this.emit(this.task?.currentRecord?.uid, 'processing')
+  }
+
+  private toTraceFields(fields: Record<RequirementSemanticFieldName, RequirementSemanticFieldAssessment>): Record<string, RequirementSemanticizationTraceField> {
+    return Object.fromEntries(REQUIREMENT_SEMANTIC_FIELDS.map((field) => [field, {
+      value: fields[field].value,
+      confidence: fields[field].confidence,
+      evidence: fields[field].evidence
+    }]))
+  }
+
+  private compareDivergence(initial: SemanticAnalysisOutput, independent: SemanticAnalysisOutput): RequirementSemanticizationDivergence {
+    const fields = REQUIREMENT_SEMANTIC_FIELDS.flatMap((field) => {
+      const left = initial.fields[field]
+      const right = independent.fields[field]
+      const leftTrace = { value: left.value, confidence: left.confidence, evidence: left.evidence }
+      const rightTrace = { value: right.value, confidence: right.confidence, evidence: right.evidence }
+      return left.value !== right.value || left.confidence !== right.confidence || left.evidence !== right.evidence
+        ? [{ field, initial: leftTrace, independent: rightTrace }]
+        : []
+    })
+    if (this.currentTrace) this.currentTrace.divergence = { hasDivergence: fields.length > 0, fields }
+    return { hasDivergence: fields.length > 0, fields }
   }
 
   private validateOutput(value: unknown, recordUid: string, sourceText: string): SemanticAnalysisOutput {
@@ -329,7 +739,12 @@ export class RequirementSemanticizationService {
     return card
   }
 
-  private emit(progress: RequirementSemanticizationProgress): void {
-    this.onProgress?.(progress)
+  private emit(recordUid?: string, recordStatus?: RequirementSemanticizationProgress['recordStatus']): void {
+    if (!this.task) return
+    this.onProgress?.({
+      ...structuredClone(this.task),
+      ...(recordUid ? { recordUid } : {}),
+      ...(recordStatus ? { recordStatus } : {})
+    })
   }
 }

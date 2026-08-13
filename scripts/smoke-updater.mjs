@@ -58,6 +58,10 @@ const checks = {
     && /\b(?:statusCode|status|httpStatus|response\.status|code)\b[\s\S]{0,80}\b404\b|\b404\b[\s\S]{0,80}\b(?:statusCode|status|httpStatus|response\.status|code)\b/i.test(errorNormalizerSource)
     && /(?:no[-_]?releases?|no(?:[-_\s]+\w+){1,3}[-_\s]+releases?)/i.test(errorNormalizerSource)
     && errorNormalizerSource.includes('latest.yml'),
+  releaseAccessErrorIsActionable: errorNormalizerSource.includes('isReleaseAccessError')
+    && errorNormalizerSource.includes('无法读取 GitHub 正式 Release')
+    && errorNormalizerSource.includes("code === 'ERR_UPDATER_LATEST_VERSION_NOT_FOUND' || code === ''")
+    && errorNormalizerSource.includes('statusCode === 404'),
   errorNormalizerSeparatesFailureCategories: errorNormalizerSource.includes('statusCode === 401')
     && errorNormalizerSource.includes('statusCode === 403')
     && errorNormalizerSource.includes('statusCode >= 500')

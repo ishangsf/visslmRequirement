@@ -228,6 +228,7 @@ export interface RecordDetail extends RecordRow {
   raw: Record<string, unknown>
   images: ImageAsset[]
   fieldLabels?: Record<string, string>
+  semanticAnalysisTrace?: RequirementSemanticizationAnalysisTrace
 }
 
 export interface ImageAsset {
@@ -262,8 +263,98 @@ export type RequirementSemanticizationStatusReason =
   | 'ready'
   | 'failed'
 
+export type RequirementSemanticizationScope = 'selected' | 'all_unready'
+
+export type RequirementSemanticizationTaskStatus =
+  | 'queued'
+  | 'running'
+  | 'pausing'
+  | 'paused'
+  | 'stopping'
+  | 'stopped'
+  | 'completed'
+
+export type RequirementSemanticizationStage =
+  | 'queued'
+  | 'initial'
+  | 'independent'
+  | 'adjudication'
+  | 'persisting'
+  | 'idle'
+
+export type RequirementSemanticizationControl = 'pause' | 'resume' | 'stop'
+
+export type RequirementSemanticizationAnalysisStage = 'initial' | 'independent' | 'adjudication' | 'persisting'
+
+export type RequirementSemanticizationTraceEventKind =
+  | 'stage_started'
+  | 'stage_completed'
+  | 'retry'
+  | 'validation_passed'
+  | 'validation_failed'
+  | 'divergence'
+
+export interface RequirementSemanticizationTraceField {
+  value: string
+  confidence: number
+  evidence: string
+}
+
+export interface RequirementSemanticizationDivergenceField {
+  field: string
+  initial: RequirementSemanticizationTraceField
+  independent: RequirementSemanticizationTraceField
+}
+
+export interface RequirementSemanticizationDivergence {
+  hasDivergence: boolean
+  fields: RequirementSemanticizationDivergenceField[]
+}
+
+export interface RequirementSemanticizationTraceEvent {
+  id: string
+  recordUid: string
+  stage: RequirementSemanticizationAnalysisStage
+  kind: RequirementSemanticizationTraceEventKind
+  timestamp: string
+  message: string
+  attempt?: number
+  maxAttempts?: number
+  summary?: string
+  fields?: Record<string, RequirementSemanticizationTraceField>
+  divergence?: RequirementSemanticizationDivergence
+}
+
+export interface RequirementSemanticizationTraceStage {
+  status: 'running' | 'completed' | 'failed'
+  startedAt: string
+  completedAt?: string
+  attempts: number
+  summary?: string
+  fields?: Record<string, RequirementSemanticizationTraceField>
+}
+
+export interface RequirementSemanticizationAnalysisTrace {
+  version: 1
+  recordUid: string
+  analyzerVersion: string
+  modelSignature: string
+  outcome?: 'completed' | 'failed' | 'stopped'
+  events: RequirementSemanticizationTraceEvent[]
+  stages: Partial<Record<RequirementSemanticizationAnalysisStage, RequirementSemanticizationTraceStage>>
+  divergence?: RequirementSemanticizationDivergence
+  finalAdjudication?: {
+    completedAt: string
+    summary: string
+    fields: Record<string, RequirementSemanticizationTraceField>
+  }
+  completedAt?: string
+}
+
 export interface RequirementSemanticizationStartInput {
-  recordUids: string[]
+  recordUids?: string[]
+  scope?: RequirementSemanticizationScope
+  maxRecords?: number
   force?: boolean
 }
 
@@ -271,16 +362,48 @@ export interface RequirementSemanticizationStartResult {
   jobId: string
   accepted: number
   skipped: number
+  available: number
 }
 
-export interface RequirementSemanticizationProgress {
+export interface RequirementSemanticizationCurrentRecord {
+  uid: string
+  itemId: string
+  name: string
+  index: number
+}
+
+export interface RequirementSemanticizationRecentItem {
+  uid: string
+  itemId: string
+  name: string
+  status: 'ready' | 'failed'
+  error?: string
+  durationMs?: number
+}
+
+export interface RequirementSemanticizationTaskSnapshot {
   jobId: string
-  recordUid?: string
-  status: 'processing' | 'ready' | 'failed' | 'completed'
-  completed: number
+  status: RequirementSemanticizationTaskStatus
+  currentStage: RequirementSemanticizationStage
   total: number
+  available: number
+  completed: number
+  succeeded: number
   failed: number
-  message?: string
+  remaining: number
+  currentRecord?: RequirementSemanticizationCurrentRecord
+  startedAt: string
+  updatedAt: string
+  message: string
+  recentItems: RequirementSemanticizationRecentItem[]
+  /** Structured audit result only; model hidden reasoning is never included. */
+  analysisTrace?: RequirementSemanticizationAnalysisTrace
+}
+
+export interface RequirementSemanticizationProgress extends RequirementSemanticizationTaskSnapshot {
+  /** Retained for existing record-level progress consumers. */
+  recordUid?: string
+  recordStatus?: 'processing' | 'ready' | 'failed'
 }
 
 export interface RecordPage {
@@ -790,6 +913,10 @@ export interface AppApi {
   startRequirementSemanticization(
     input: RequirementSemanticizationStartInput
   ): Promise<RequirementSemanticizationStartResult>
+  getRequirementSemanticizationTask(): Promise<RequirementSemanticizationTaskSnapshot | null>
+  controlRequirementSemanticization(
+    action: RequirementSemanticizationControl
+  ): Promise<RequirementSemanticizationTaskSnapshot | null>
   onRequirementSemanticizationProgress(
     callback: (progress: RequirementSemanticizationProgress) => void
   ): () => void

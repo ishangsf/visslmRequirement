@@ -21,6 +21,7 @@ import type {
   PushConfig,
   RecordQuery,
   RequirementSemanticizationStartInput,
+  RequirementSemanticizationControl,
   SyncProgress,
   SyncScopeConfig,
   UpdateStatus
@@ -359,6 +360,11 @@ const registerIpc = (): void => {
   ipcMain.handle(
     'requirements:semanticize',
     (_event, input: RequirementSemanticizationStartInput) => requirementSemanticizationService.start(input)
+  )
+  ipcMain.handle('requirements:semanticization-task', () => requirementSemanticizationService.getTask())
+  ipcMain.handle(
+    'requirements:semanticization-control',
+    (_event, action: RequirementSemanticizationControl) => requirementSemanticizationService.control(action)
   )
   ipcMain.handle('data:stats', () => db.getStats())
   ipcMain.handle('sync:get-config', () => settings.getSyncConfig())

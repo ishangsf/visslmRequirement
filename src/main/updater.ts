@@ -65,10 +65,15 @@ const normalizeUpdaterError = (error: unknown, operation: UpdateOperation): stri
     statusCodeFromText(code) ??
     statusCodeFromText(message)
 
+  const isReleaseAccessError =
+    (operation === 'check' && statusCode === 404) &&
+    (code === 'ERR_UPDATER_LATEST_VERSION_NOT_FOUND' || code === '')
+  if (isReleaseAccessError) {
+    return '无法读取 GitHub 正式 Release，请确认仓库可访问且已发布正式 Release 后重试'
+  }
+
   const isNoReleaseError =
     code === 'ERR_UPDATER_NO_PUBLISHED_VERSIONS' ||
-    (operation === 'check' && statusCode === 404) ||
-    (code === 'ERR_UPDATER_LATEST_VERSION_NOT_FOUND' && statusCode === 404) ||
     (code !== 'ERR_UPDATER_LATEST_VERSION_NOT_FOUND' &&
       /no published (?:versions|release)/i.test(message))
   if (code === 'ERR_UPDATER_CHANNEL_FILE_NOT_FOUND' || /channel file.*not found/i.test(message)) {

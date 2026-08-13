@@ -20,8 +20,10 @@ import type {
   SystemSettingsInput,
   PushConfig,
   RecordQuery,
+  RequirementSemanticizationControl,
   RequirementSemanticizationProgress,
   RequirementSemanticizationStartInput,
+  RequirementSemanticizationTaskSnapshot,
   SyncProgress,
   SyncScopeConfig,
   UpdateStatus,
@@ -101,9 +103,17 @@ const api: AppApi = {
   getRecord: (uid: string) => ipcRenderer.invoke('data:record', uid),
   startRequirementSemanticization: (input: RequirementSemanticizationStartInput) =>
     ipcRenderer.invoke('requirements:semanticize', input),
-  onRequirementSemanticizationProgress: (callback: (progress: RequirementSemanticizationProgress) => void) => {
-    const listener = (_event: Electron.IpcRendererEvent, progress: RequirementSemanticizationProgress): void =>
-      callback(progress)
+  getRequirementSemanticizationTask: (): Promise<RequirementSemanticizationTaskSnapshot | null> =>
+    ipcRenderer.invoke('requirements:semanticization-task'),
+  controlRequirementSemanticization: (
+    action: RequirementSemanticizationControl
+  ): Promise<RequirementSemanticizationTaskSnapshot | null> =>
+    ipcRenderer.invoke('requirements:semanticization-control', action),
+  onRequirementSemanticizationProgress: (
+    callback: (snapshot: RequirementSemanticizationProgress) => void
+  ) => {
+    const listener = (_event: Electron.IpcRendererEvent, snapshot: RequirementSemanticizationProgress): void =>
+      callback(snapshot)
     ipcRenderer.on('requirements:semanticization-progress', listener)
     return () => ipcRenderer.removeListener('requirements:semanticization-progress', listener)
   },

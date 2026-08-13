@@ -11992,7 +11992,10 @@ body {
   white-space: nowrap;
 }
 
-.record-detail-drawer .ant-drawer-content-wrapper,
+.record-detail-drawer-shell .ant-drawer-content-wrapper {
+  width: min(960px, calc(100vw - 32px)) !important;
+}
+
 .knowledge-detail-drawer .ant-drawer-content-wrapper {
   width: min(720px, calc(100vw - 32px)) !important;
 }
@@ -14549,41 +14552,627 @@ html[data-theme='light'] .dashboard-style-color-control .ant-color-picker-trigge
   color: var(--state-error);
 }
 
-.asset-semantic-progress {
+.asset-semantic-task-config {
+  display: inline-flex;
+  align-items: center;
+  min-height: 36px;
+  gap: 4px;
+  padding: 0 4px 0 12px;
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  color: var(--text-muted);
+  background: var(--surface-soft);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.asset-semantic-task-config .ant-input-number {
+  width: 84px;
+  border-color: var(--stroke-strong);
+  background: var(--surface-raised);
+}
+
+.asset-semantic-task-help {
+  margin-inline: 4px;
+  color: var(--text-muted);
+  cursor: help;
+}
+
+.asset-semantic-task-help:focus-visible {
+  border-radius: 4px;
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.asset-semantic-task-panel {
   display: grid;
+  min-height: 0;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--stroke);
+  border-left: 3px solid var(--accent);
+  border-radius: 12px;
+  color: var(--text-main);
+  background: var(--surface-raised);
+}
+
+.asset-semantic-task-panel.is-completed {
+  border-left-color: var(--state-success);
+}
+
+.asset-semantic-task-panel.is-paused,
+.asset-semantic-task-panel.is-pausing {
+  border-left-color: var(--state-warning);
+}
+
+.asset-semantic-task-panel.is-stopped,
+.asset-semantic-task-panel.is-stopping {
+  border-left-color: var(--state-error);
+}
+
+.asset-semantic-task-heading,
+.asset-semantic-task-controls,
+.asset-semantic-task-title,
+.asset-semantic-task-actions,
+.asset-semantic-task-recent-heading {
+  display: flex;
+  align-items: center;
+}
+
+.asset-semantic-task-heading,
+.asset-semantic-task-controls,
+.asset-semantic-task-recent-heading {
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.asset-semantic-task-title,
+.asset-semantic-task-actions {
   gap: 8px;
-  padding: 12px 16px;
+}
+
+.asset-semantic-task-heading {
+  min-width: 0;
+}
+
+.asset-semantic-task-message {
+  overflow: hidden;
+  max-width: min(720px, 60vw);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.asset-semantic-task-badge,
+.asset-semantic-recent-status {
+  display: inline-flex;
+  align-items: center;
+  height: 24px;
+  gap: 4px;
+  padding-inline: 8px;
+  border: 1px solid color-mix(in srgb, var(--accent) 42%, var(--stroke));
+  border-radius: 999px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.asset-semantic-task-badge.is-completed,
+.asset-semantic-recent-status.is-success {
+  border-color: color-mix(in srgb, var(--state-success) 42%, var(--stroke));
+  color: var(--state-success);
+  background: color-mix(in srgb, var(--state-success) 10%, var(--surface-soft));
+}
+
+.asset-semantic-task-badge.is-paused,
+.asset-semantic-task-badge.is-pausing {
+  border-color: color-mix(in srgb, var(--state-warning) 42%, var(--stroke));
+  color: var(--state-warning);
+  background: color-mix(in srgb, var(--state-warning) 10%, var(--surface-soft));
+}
+
+.asset-semantic-task-badge.is-stopped,
+.asset-semantic-task-badge.is-stopping,
+.asset-semantic-recent-status.is-error {
+  border-color: color-mix(in srgb, var(--state-error) 42%, var(--stroke));
+  color: var(--state-error);
+  background: color-mix(in srgb, var(--state-error) 10%, var(--surface-soft));
+}
+
+.asset-semantic-task-current {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(160px, 1fr);
+  gap: 12px;
+}
+
+.asset-semantic-task-current > div {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  min-width: 0;
+  gap: 8px;
+  padding: 10px 12px;
   border: 1px solid var(--stroke);
   border-radius: 8px;
   background: var(--surface-soft);
 }
 
-.asset-semantic-progress-heading {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  min-width: 0;
+.asset-semantic-task-current > div:last-child {
+  grid-template-columns: auto minmax(0, 1fr);
 }
 
-.asset-semantic-progress-heading > span:last-child {
+.asset-semantic-task-current strong {
   overflow: hidden;
+  min-width: 0;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.asset-semantic-progress-count {
+.asset-semantic-task-label,
+.asset-semantic-task-index,
+.asset-semantic-recent-duration,
+.asset-semantic-task-empty {
+  color: var(--text-muted);
+  font-size: 11px;
   white-space: nowrap;
 }
 
-@media (max-width: 680px) {
-  .asset-semantic-progress-heading {
+.asset-semantic-task-metrics {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(72px, 1fr));
+  overflow: hidden;
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.asset-semantic-task-metrics > span {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  min-width: 0;
+  gap: 6px;
+  padding: 8px 12px;
+  white-space: nowrap;
+}
+
+.asset-semantic-task-metrics > span + span {
+  border-left: 1px solid var(--stroke);
+}
+
+.asset-semantic-task-metrics strong {
+  color: var(--text-main);
+  font-size: 16px;
+}
+
+.asset-semantic-task-metrics small {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.asset-semantic-task-metrics .is-success strong {
+  color: var(--state-success);
+}
+
+.asset-semantic-task-metrics .is-error strong {
+  color: var(--state-error);
+}
+
+.asset-semantic-task-recent {
+  min-height: 0;
+  padding-top: 4px;
+  border-top: 1px solid var(--stroke);
+}
+
+.asset-semantic-task-recent-heading {
+  margin-bottom: 8px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.asset-semantic-task-recent ul {
+  display: grid;
+  overflow-y: auto;
+  max-height: clamp(80px, calc(100vh - 680px), 160px);
+  min-height: 40px;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.asset-semantic-task-recent li {
+  display: grid;
+  grid-template-columns: auto minmax(160px, 1fr) auto minmax(0, 2fr);
+  align-items: center;
+  min-width: 0;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.asset-semantic-recent-name,
+.asset-semantic-recent-message {
+  overflow: hidden;
+  min-width: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.asset-semantic-recent-message {
+  color: var(--state-error);
+  font-size: 11px;
+}
+
+.asset-semantic-audit {
+  display: grid;
+  overflow: auto;
+  max-height: clamp(360px, calc(100vh - 320px), 680px);
+  min-height: 0;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--stroke));
+  border-radius: 12px;
+  background: var(--surface-soft);
+  scrollbar-color: var(--stroke-strong) transparent;
+  container-type: inline-size;
+}
+
+.asset-semantic-audit-heading,
+.asset-semantic-audit-section-heading,
+.asset-semantic-audit-line,
+.asset-semantic-audit-field-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-width: 0;
+  gap: 8px;
+}
+
+.asset-semantic-audit-heading > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.asset-semantic-audit-disclaimer,
+.asset-semantic-audit-status,
+.asset-semantic-audit-event-kind {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding-inline: 8px;
+  border: 1px solid var(--stroke);
+  border-radius: 999px;
+  color: var(--text-muted);
+  background: var(--surface-raised);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.asset-semantic-audit-disclaimer {
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--stroke));
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.asset-semantic-audit-grid,
+.asset-semantic-audit-review-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  min-height: 0;
+  gap: 12px;
+}
+
+.asset-semantic-audit-section,
+.asset-semantic-audit-review,
+.asset-semantic-audit-output {
+  min-width: 0;
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  background: var(--surface-raised);
+}
+
+.asset-semantic-audit-section,
+.asset-semantic-audit-review {
+  padding: 12px;
+}
+
+.asset-semantic-audit-section-heading {
+  margin-bottom: 8px;
+  color: var(--text-main);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.asset-semantic-audit-timeline-list,
+.asset-semantic-audit-event-list,
+.asset-semantic-audit-comparison-list {
+  display: grid;
+  overflow: auto;
+  max-height: 240px;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+}
+
+.asset-semantic-audit-timeline-list {
+  list-style: none;
+}
+
+.asset-semantic-audit-timeline-list li {
+  position: relative;
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr);
+  gap: 8px;
+}
+
+.asset-semantic-audit-timeline-list li:not(:last-child)::after {
+  position: absolute;
+  top: 13px;
+  bottom: -9px;
+  left: 5px;
+  width: 1px;
+  background: var(--stroke);
+  content: '';
+}
+
+.asset-semantic-audit-timeline-marker,
+.asset-semantic-audit-event-dot {
+  z-index: 1;
+  width: 10px;
+  height: 10px;
+  margin-top: 5px;
+  border: 2px solid var(--stroke-strong);
+  border-radius: 50%;
+  background: var(--surface-raised);
+}
+
+.asset-semantic-audit-timeline-list .is-active .asset-semantic-audit-timeline-marker,
+.asset-semantic-audit-status.is-active,
+.asset-semantic-audit-event.is-running .asset-semantic-audit-event-dot {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.asset-semantic-audit-timeline-list .is-completed .asset-semantic-audit-timeline-marker,
+.asset-semantic-audit-status.is-completed,
+.asset-semantic-audit-event.is-success .asset-semantic-audit-event-dot {
+  border-color: var(--state-success);
+  color: var(--state-success);
+  background: color-mix(in srgb, var(--state-success) 12%, var(--surface-raised));
+}
+
+.asset-semantic-audit-timeline-list .is-failed .asset-semantic-audit-timeline-marker,
+.asset-semantic-audit-status.is-failed,
+.asset-semantic-audit-event.is-error .asset-semantic-audit-event-dot {
+  border-color: var(--state-error);
+  color: var(--state-error);
+  background: color-mix(in srgb, var(--state-error) 12%, var(--surface-raised));
+}
+
+.asset-semantic-audit-event.is-warning .asset-semantic-audit-event-dot {
+  border-color: var(--state-warning);
+  background: color-mix(in srgb, var(--state-warning) 12%, var(--surface-raised));
+}
+
+.asset-semantic-audit-line strong,
+.asset-semantic-audit-field-heading strong {
+  overflow: hidden;
+  min-width: 0;
+  color: var(--text-main);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.asset-semantic-audit-timeline-list .ant-typography,
+.asset-semantic-audit-event .ant-typography {
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.asset-semantic-audit-event {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr);
+  min-width: 0;
+  gap: 8px;
+  padding: 8px;
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.asset-semantic-audit-event time {
+  grid-column: 2;
+  color: var(--text-muted);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.asset-semantic-audit-output-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.asset-semantic-audit-output > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 40px;
+  gap: 8px;
+  padding: 8px 12px;
+  color: var(--text-main);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.asset-semantic-audit-output > summary:focus-visible {
+  border-radius: 8px;
+  outline: 2px solid var(--focus-ring, var(--accent));
+  outline-offset: 2px;
+}
+
+.asset-semantic-audit-output[open] > summary {
+  border-bottom: 1px solid var(--stroke);
+}
+
+.asset-semantic-audit-output-body {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+}
+
+.asset-semantic-audit-output-body > p,
+.asset-semantic-audit-field > div,
+.asset-semantic-audit-field blockquote,
+.asset-semantic-audit-comparison p,
+.asset-semantic-audit-comparison blockquote,
+.asset-semantic-audit-final-summary,
+.asset-semantic-audit-evidence p {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.asset-semantic-audit-output-body > p,
+.asset-semantic-audit-field blockquote,
+.asset-semantic-audit-comparison p,
+.asset-semantic-audit-final-summary,
+.asset-semantic-audit-evidence p {
+  margin: 0;
+}
+
+.asset-semantic-audit-fields {
+  display: grid;
+  overflow: auto;
+  max-height: 260px;
+  gap: 8px;
+}
+
+.asset-semantic-audit-field,
+.asset-semantic-audit-comparison,
+.asset-semantic-audit-evidence {
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.asset-semantic-audit-field-heading span,
+.asset-semantic-audit-comparison > div > span {
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.asset-semantic-audit-field blockquote,
+.asset-semantic-audit-comparison blockquote {
+  padding-left: 8px;
+  border-left: 2px solid var(--accent);
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.asset-semantic-audit-comparison > div {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr);
+  gap: 8px;
+}
+
+.asset-semantic-audit-final-summary,
+.asset-semantic-audit-evidence p,
+.asset-semantic-audit-empty {
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.asset-semantic-audit-evidence {
+  margin-top: 8px;
+}
+
+@container (max-width: 760px) {
+  .asset-semantic-audit-grid,
+  .asset-semantic-audit-review-grid,
+  .asset-semantic-audit-output-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 1000px) {
+  .asset-semantic-task-heading,
+  .asset-semantic-task-controls {
     align-items: flex-start;
     flex-direction: column;
-    gap: 4px;
   }
 
-  .asset-semantic-progress-heading > span:last-child {
+  .asset-semantic-task-message {
     max-width: 100%;
+  }
+
+  .asset-semantic-task-recent li {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+  }
+
+  .asset-semantic-recent-message {
+    grid-column: 2 / -1;
+  }
+
+  .asset-semantic-audit-grid,
+  .asset-semantic-audit-review-grid,
+  .asset-semantic-audit-output-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 680px) {
+  .asset-semantic-task-config {
+    width: 100%;
+  }
+
+  .asset-semantic-task-panel {
+    padding: 12px;
+  }
+
+  .asset-semantic-task-current {
+    grid-template-columns: 1fr;
+  }
+
+  .asset-semantic-task-metrics {
+    grid-template-columns: repeat(2, minmax(96px, 1fr));
+  }
+
+  .asset-semantic-task-metrics > span + span {
+    border-left: 0;
+  }
+
+  .asset-semantic-task-metrics > span:nth-child(even) {
+    border-left: 1px solid var(--stroke);
+  }
+
+  .asset-semantic-task-metrics > span:nth-child(n + 3) {
+    border-top: 1px solid var(--stroke);
+  }
+
+  .asset-semantic-task-actions {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .asset-semantic-audit-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .asset-semantic-audit {
+    max-height: min(600px, calc(100vh - 180px));
+    padding: 8px;
   }
 }

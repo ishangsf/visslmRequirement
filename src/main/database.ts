@@ -39,6 +39,7 @@ import type {
   RecordRow,
   RequirementSemanticizationStatus,
   RequirementSemanticizationStatusReason,
+  RequirementSemanticizationAnalysisTrace,
   SyncRun
 } from '../shared/types'
 import { isAiRequirementSemanticCard, type RequirementSemanticCard } from './requirements/semantic-card'
@@ -242,6 +243,13 @@ export interface RequirementSemanticCardState {
   completedAt: string
   updatedAt: string
   analysisTrace: Record<string, unknown>
+}
+
+export interface RequirementSemanticizationCandidate {
+  recordUid: string
+  itemId: string
+  name: string
+  contentHash: string
 }
 
 export interface RequirementSemanticizationContext {
@@ -1179,12 +1187,23 @@ export class AppDatabase {
       CREATE INDEX IF NOT EXISTS idx_pm_analysis_logs_task
         ON pm_analysis_logs(task_id, created_at ASC);
     `)
+    try {
+      this.db.exec("ALTER TABLE requirement_semantic_cards ADD COLUMN analysis_trace_json TEXT NOT NULL DEFAULT '{}'")
+    } catch {
+      // Existing databases may already contain the audit trace column.
+    }
+    const interruptedAt = nowIso()
     this.db.prepare(`
       UPDATE requirement_semantic_cards
       SET status = 'failed', error_message = '应用在语义化处理中断，请重试',
+          analysis_trace_json = CASE
+            WHEN json_valid(analysis_trace_json) AND json_extract(analysis_trace_json, '$.version') = 1
+              THEN json_set(analysis_trace_json, '$.outcome', 'failed', '$.completedAt', ?)
+            ELSE analysis_trace_json
+          END,
           completed_at = ?, updated_at = ?
       WHERE status = 'processing'
-    `).run(nowIso(), nowIso())
+    `).run(interruptedAt, interruptedAt, interruptedAt)
 
     for (const statement of [
       "ALTER TABLE records ADD COLUMN push_status TEXT NOT NULL DEFAULT 'pending'",
@@ -1192,7 +1211,6 @@ export class AppDatabase {
       "ALTER TABLE records ADD COLUMN pushed_at TEXT NOT NULL DEFAULT ''",
       "ALTER TABLE records ADD COLUMN pushed_uid TEXT NOT NULL DEFAULT ''",
       "ALTER TABLE records ADD COLUMN semantic_hash TEXT NOT NULL DEFAULT ''",
-      "ALTER TABLE requirement_semantic_cards ADD COLUMN analysis_trace_json TEXT NOT NULL DEFAULT '{}'",
       "ALTER TABLE field_profiles ADD COLUMN sensitivity TEXT NOT NULL DEFAULT 'normal'",
       "ALTER TABLE visualization_runs ADD COLUMN mode TEXT NOT NULL DEFAULT 'generate'",
       "ALTER TABLE visualization_runs ADD COLUMN tool_calls_json TEXT NOT NULL DEFAULT '[]'",
@@ -1832,6 +1850,49 @@ export class AppDatabase {
     }))
   }
 
+  listRequirementSemanticizationCandidates(input: {
+    analyzerVersion: string
+    modelSignature: string
+    limit?: number | null
+  }): { available: number; candidates: RequirementSemanticizationCandidate[] } {
+    const rows = this.db.prepare(`
+      SELECT r.uid, r.item_id, r.name,
+             ${requirementSemanticContentSql('r')} AS semantic_content_hash,
+             s.status AS semantic_status, s.content_hash, s.analyzer_version,
+             s.model_signature, s.card_json
+      FROM records r
+      LEFT JOIN requirement_semantic_cards s ON s.record_uid = r.uid
+      WHERE s.record_uid IS NULL OR s.status <> 'processing'
+      ORDER BY r.last_modify_time ASC, r.uid ASC
+    `).all() as SqlRow[]
+    const candidates = rows.flatMap((row): RequirementSemanticizationCandidate[] => {
+      let validCard = false
+      try {
+        validCard = isAiRequirementSemanticCard(JSON.parse(String(row.card_json ?? '')))
+      } catch {
+        validCard = false
+      }
+      const contentHash = String(row.semantic_content_hash ?? '')
+      const validReady = String(row.semantic_status ?? '') === 'ready' && validCard &&
+        String(row.content_hash ?? '') === contentHash &&
+        String(row.analyzer_version ?? '') === input.analyzerVersion &&
+        String(row.model_signature ?? '') === input.modelSignature
+      return validReady ? [] : [{
+        recordUid: String(row.uid),
+        itemId: String(row.item_id ?? ''),
+        name: String(row.name ?? ''),
+        contentHash
+      }]
+    })
+    const limit = input.limit === null || input.limit === undefined
+      ? null
+      : Math.max(1, Math.trunc(input.limit))
+    return {
+      available: candidates.length,
+      candidates: limit === null ? candidates : candidates.slice(0, limit)
+    }
+  }
+
   claimRequirementSemanticCard(input: {
     recordUid: string
     contentHash: string
@@ -1868,7 +1929,7 @@ export class AppDatabase {
   completeRequirementSemanticCard(
     recordUid: string,
     card: RequirementSemanticCard,
-    analysisTrace: Record<string, unknown> = {}
+    analysisTrace: object = {}
   ): void {
     const timestamp = nowIso()
     this.db.prepare(`
@@ -1879,13 +1940,39 @@ export class AppDatabase {
     `).run(JSON.stringify(card), JSON.stringify(analysisTrace), timestamp, timestamp, recordUid)
   }
 
-  failRequirementSemanticCard(recordUid: string, message: string): void {
+  updateRequirementSemanticCardTrace(
+    recordUid: string,
+    analysisTrace: RequirementSemanticizationAnalysisTrace
+  ): void {
+    this.db.prepare(`
+      UPDATE requirement_semantic_cards
+      SET analysis_trace_json = ?, updated_at = ?
+      WHERE record_uid = ? AND status = 'processing'
+    `).run(JSON.stringify(analysisTrace), nowIso(), recordUid)
+  }
+
+  failRequirementSemanticCard(
+    recordUid: string,
+    message: string,
+    analysisTrace: object = {}
+  ): void {
     const timestamp = nowIso()
     this.db.prepare(`
       UPDATE requirement_semantic_cards
-      SET status = 'failed', card_json = '', error_message = ?, completed_at = ?, updated_at = ?
+      SET status = 'failed', card_json = '', analysis_trace_json = ?, error_message = ?,
+          completed_at = ?, updated_at = ?
       WHERE record_uid = ? AND status = 'processing'
-    `).run(message.slice(0, 2000), timestamp, timestamp, recordUid)
+    `).run(JSON.stringify(analysisTrace), message.slice(0, 2000), timestamp, timestamp, recordUid)
+  }
+
+  releaseRequirementSemanticCard(recordUid: string, analysisTrace?: object): void {
+    const timestamp = nowIso()
+    this.db.prepare(`
+      UPDATE requirement_semantic_cards
+      SET status = 'pending', card_json = '', error_message = '',
+          started_at = '', completed_at = '', analysis_trace_json = ?, updated_at = ?
+      WHERE record_uid = ? AND status = 'processing'
+    `).run(JSON.stringify(analysisTrace ?? {}), timestamp, recordUid)
   }
 
   deleteKnowledgeVectors(): void {
@@ -5354,7 +5441,7 @@ export class AppDatabase {
       const valid = `s.content_hash = ${requirementSemanticContentSql('r')}
         AND s.analyzer_version = ? AND s.model_signature = ?`
       if (query.semanticStatus === 'pending') {
-        clauses.push(`(s.record_uid IS NULL OR NOT (${valid}))`)
+        clauses.push(`(s.record_uid IS NULL OR s.status = 'pending' OR NOT (${valid}))`)
       } else {
         clauses.push(`s.status = ? AND ${valid}`)
         params.push(query.semanticStatus)
@@ -5414,6 +5501,7 @@ export class AppDatabase {
                 s.analyzer_version AS semantic_analyzer_version,
                 s.model_signature AS semantic_model_signature,
                 s.error_message AS semantic_error_message,
+                s.analysis_trace_json AS semantic_analysis_trace_json,
                 s.updated_at AS semantic_updated_at
          FROM records r
          LEFT JOIN images i ON i.record_uid = r.uid
@@ -5434,11 +5522,22 @@ export class AppDatabase {
             .all(uid) as SqlRow[]
         ).map((image) => this.mapImage(image, true))
       : []
+    let semanticAnalysisTrace: RequirementSemanticizationAnalysisTrace | undefined
+    try {
+      const parsed: unknown = JSON.parse(String(row.semantic_analysis_trace_json ?? '{}'))
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) &&
+        Number((parsed as Record<string, unknown>).version) === 1) {
+        semanticAnalysisTrace = parsed as RequirementSemanticizationAnalysisTrace
+      }
+    } catch {
+      semanticAnalysisTrace = undefined
+    }
     return {
       ...this.mapRecord(row, semanticContext),
       normalizedText: String(row.normalized_text),
       raw,
       images,
+      ...(semanticAnalysisTrace ? { semanticAnalysisTrace } : {}),
       ...(Object.keys(fieldLabels).length ? { fieldLabels } : {})
     }
   }

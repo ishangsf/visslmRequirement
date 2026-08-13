@@ -29,12 +29,15 @@ import {
   MoonOutlined,
   MinusOutlined,
   PictureOutlined,
+  PauseOutlined,
+  PlayCircleOutlined,
   PlusOutlined,
   ProjectOutlined,
   ReloadOutlined,
   SearchOutlined,
   SendOutlined,
   SettingOutlined,
+  StopOutlined,
   SyncOutlined,
   SunOutlined,
   UserOutlined
@@ -120,8 +123,12 @@ import type {
   PushResult,
   RecordDetail,
   RecordRow,
-  RequirementSemanticizationProgress,
+  RequirementSemanticizationControl as SemanticizationControlAction,
+  RequirementSemanticizationStage as SemanticizationTaskStage,
+  RequirementSemanticizationStartInput as SemanticizationStartInput,
   RequirementSemanticizationStatus,
+  RequirementSemanticizationTaskSnapshot as SemanticizationTaskSnapshot,
+  RequirementSemanticizationTaskStatus as SemanticizationTaskStatus,
   SystemSettingsInput,
   SyncFieldFilter,
   SyncPreviewResult,
@@ -169,6 +176,624 @@ const artifactVersionOf = (events: AgentEvent[] | undefined): number | undefined
 
 const appTableScrollY = 'min(560px, max(260px, calc(100vh - 300px)))'
 const compactTableScrollY = 'min(360px, max(180px, calc(100vh - 420px)))'
+
+const semanticTaskStatusLabels: Record<SemanticizationTaskStatus, string> = {
+  queued: '排队中',
+  running: '执行中',
+  pausing: '暂停中',
+  paused: '已暂停',
+  stopping: '停止中',
+  stopped: '已停止',
+  completed: '已完成'
+}
+
+const semanticTaskStageLabels: Record<SemanticizationTaskStage, string> = {
+  queued: '等待开始',
+  initial: '初步分析',
+  independent: '独立复核',
+  adjudication: '结果裁决',
+  persisting: '保存语义卡片',
+  idle: '空闲'
+}
+
+const semanticTaskActiveStatuses: SemanticizationTaskStatus[] = [
+  'queued',
+  'running',
+  'pausing',
+  'paused',
+  'stopping'
+]
+
+const semanticTaskSizeStorageKey = 'visslm:asset-center-semantic-task-size:v2'
+const semanticTaskSizeMaximum = 5
+const semanticTaskSizeDefault = 5
+
+const normalizeSemanticTaskSize = (value: unknown): number => {
+  if (value === null || value === undefined || value === '') return semanticTaskSizeDefault
+  const parsed = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(parsed)) return semanticTaskSizeDefault
+  return Math.min(semanticTaskSizeMaximum, Math.max(1, Math.round(parsed)))
+}
+
+const readSemanticTaskSize = (): number => {
+  if (typeof window === 'undefined') return semanticTaskSizeDefault
+  try {
+    const raw = window.localStorage.getItem(semanticTaskSizeStorageKey)
+    if (!raw) return semanticTaskSizeDefault
+    const parsed: unknown = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return semanticTaskSizeDefault
+    const stored = parsed as { version?: unknown; maxRecords?: unknown }
+    return stored.version === 2 ? normalizeSemanticTaskSize(stored.maxRecords) : semanticTaskSizeDefault
+  } catch {
+    return semanticTaskSizeDefault
+  }
+}
+
+const writeSemanticTaskSize = (value: number): void => {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(semanticTaskSizeStorageKey, JSON.stringify({
+      version: 2,
+      maxRecords: normalizeSemanticTaskSize(value)
+    }))
+  } catch {
+    // Local preferences are optional; the task remains usable when storage is unavailable.
+  }
+}
+
+const semanticTaskCurrentUid = (task: SemanticizationTaskSnapshot | null): string | undefined => {
+  return task?.currentRecord?.uid
+}
+
+const semanticTaskCurrentName = (task: SemanticizationTaskSnapshot | null): string => {
+  if (task?.currentRecord) return task.currentRecord.name || task.currentRecord.itemId
+  if (task?.status === 'paused') return '等待恢复任务'
+  if (task?.status === 'completed' || task?.status === 'stopped') return '无正在处理的记录'
+  return '等待下一条记录'
+}
+
+const semanticTaskCurrentIndex = (task: SemanticizationTaskSnapshot): number => {
+  if (task.currentRecord) return task.currentRecord.index
+  return Math.min(task.total || 1, task.completed + 1)
+}
+
+type SemanticAuditStageKey = 'queued' | 'initial' | 'independent' | 'adjudication' | 'persisting'
+type SemanticAuditStageStatus = 'pending' | 'active' | 'completed' | 'failed' | 'skipped'
+type SemanticAuditEventKind = 'stage' | 'validation' | 'retry' | 'info'
+type SemanticAuditEventStatus = 'running' | 'success' | 'warning' | 'error' | 'info'
+
+type SemanticAuditFieldView = {
+  key: string
+  label: string
+  value: string
+  evidence: string
+  confidence?: number
+}
+
+type SemanticAuditStageView = {
+  key: SemanticAuditStageKey
+  label: string
+  hint: string
+  status: SemanticAuditStageStatus
+  summary: string
+  evidence: string
+  fields: SemanticAuditFieldView[]
+}
+
+type SemanticAuditEventView = {
+  id: string
+  kind: SemanticAuditEventKind
+  status: SemanticAuditEventStatus
+  title: string
+  detail: string
+  timestamp?: string
+  attempt?: number
+}
+
+type SemanticAuditComparisonView = {
+  field: string
+  label: string
+  initial: string
+  independent: string
+  resolution: string
+  evidence: string
+}
+
+const semanticAuditStageDefinitions: Array<{
+  key: SemanticAuditStageKey
+  label: string
+  hint: string
+}> = [
+  { key: 'queued', label: '任务排队', hint: '确认任务范围并等待执行' },
+  { key: 'initial', label: '初步分析', hint: '基于原文生成第一份结构化分析' },
+  { key: 'independent', label: '独立复核', hint: '不参考初步结论，重新核对字段' },
+  { key: 'adjudication', label: '结果裁决', hint: '按原文证据逐字段形成终稿' },
+  { key: 'persisting', label: '校验与保存', hint: '校验字段、置信度和证据引用后保存' }
+]
+
+const semanticAuditFieldLabels: Record<string, string> = {
+  requirementType: '需求类型',
+  productDomain: '产品域',
+  module: '业务模块',
+  functionalObject: '功能对象',
+  action: '需求动作',
+  currentState: '当前状态',
+  targetState: '目标状态',
+  trigger: '触发条件',
+  input: '输入',
+  output: '输出',
+  behavior: '功能行为',
+  constraints: '业务约束',
+  acceptance: '验收结果',
+  businessScene: '业务场景'
+}
+
+const semanticAuditStatusLabels: Record<SemanticAuditStageStatus, string> = {
+  pending: '待执行',
+  active: '进行中',
+  completed: '已完成',
+  failed: '需关注',
+  skipped: '未执行'
+}
+
+const semanticAuditEventStatusLabels: Record<SemanticAuditEventStatus, string> = {
+  running: '进行中',
+  success: '通过',
+  warning: '需关注',
+  error: '失败',
+  info: '记录'
+}
+
+const auditRecordOf = (value: unknown): Record<string, unknown> | null => (
+  value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null
+)
+
+const auditTextOf = (value: unknown): string => {
+  if (typeof value === 'string') return value.trim()
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  return ''
+}
+
+const firstAuditText = (record: Record<string, unknown> | null, keys: readonly string[]): string => {
+  if (!record) return ''
+  for (const key of keys) {
+    const value = auditTextOf(record[key])
+    if (value) return value
+  }
+  return ''
+}
+
+const auditNumberOf = (value: unknown): number | undefined => {
+  const number = typeof value === 'number' ? value : Number(value)
+  return Number.isFinite(number) ? number : undefined
+}
+
+const plainAuditText = (value: unknown): string => auditTextOf(value)
+  .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, ' ')
+  .replace(/<style\b[^>]*>[\s\S]*?<\/style\s*>/gi, ' ')
+  .replace(/<br\s*\/?>/gi, '\n')
+  .replace(/<\/p\s*>/gi, '\n')
+  .replace(/<[^>]*>/g, ' ')
+  .replace(/[ \t]+/g, ' ')
+  .replace(/\n{3,}/g, '\n\n')
+  .trim()
+
+const semanticAuditPayloadOf = (task: SemanticizationTaskSnapshot): Record<string, unknown> => {
+  const taskRecord = task as unknown as Record<string, unknown>
+  const candidates = [
+    taskRecord.audit,
+    taskRecord.auditTrace,
+    taskRecord.analysisTrace,
+    taskRecord.trace,
+    taskRecord.analysis
+  ]
+  const payload = candidates.map(auditRecordOf).find((value): value is Record<string, unknown> => Boolean(value)) ?? {}
+  if (Array.isArray(payload)) return { events: payload }
+  return payload
+}
+
+const semanticAuditStagePayloadOf = (
+  payload: Record<string, unknown>,
+  key: SemanticAuditStageKey
+): Record<string, unknown> => {
+  const stages = payload.stages
+  const stageRecord = auditRecordOf(stages)
+  if (stageRecord) {
+    const nested = auditRecordOf(stageRecord[key])
+    if (nested) return nested
+  }
+  if (Array.isArray(stages)) {
+    const nested = stages
+      .map(auditRecordOf)
+      .find((value) => value && firstAuditText(value, ['stage', 'key', 'name', 'type']) === key)
+    if (nested) return nested
+  }
+  const direct = auditRecordOf(payload[key])
+    ?? auditRecordOf(payload[`${key}Analysis`])
+    ?? auditRecordOf(payload[`${key}Result`])
+  const summary = firstAuditText(payload, [
+    `${key}Summary`,
+    key === 'adjudication' ? 'finalSummary' : '',
+    key === 'adjudication' ? 'decisionSummary' : ''
+  ].filter(Boolean))
+  return direct || summary ? { ...(direct ?? {}), ...(summary ? { summary } : {}) } : {}
+}
+
+const semanticAuditFieldsOf = (stage: Record<string, unknown>): SemanticAuditFieldView[] => {
+  const fieldSource = stage.fields
+    ?? stage.structuredFields
+    ?? stage.fieldAssessments
+    ?? stage.output
+    ?? stage.result
+  const entries: Array<[string, unknown]> = Array.isArray(fieldSource)
+    ? fieldSource.flatMap((item): Array<[string, unknown]> => {
+        const itemRecord = auditRecordOf(item)
+        const key = firstAuditText(itemRecord, ['field', 'key', 'name', 'label'])
+        return key ? [[key, item]] : []
+      })
+    : Object.entries(auditRecordOf(fieldSource) ?? {})
+  return entries.map(([key, value]) => {
+    const item = auditRecordOf(value)
+    const fieldValue = item
+      ? firstAuditText(item, ['value', 'text', 'result', 'finalValue', 'resolvedValue'])
+      : auditTextOf(value)
+    return {
+      key,
+      label: semanticAuditFieldLabels[key] ?? key,
+      value: fieldValue || (item ? '未确认' : '—'),
+      evidence: item
+        ? firstAuditText(item, ['evidence', 'sourceQuote', 'quote', 'originalEvidence', 'evidenceText'])
+        : '',
+      ...(item && auditNumberOf(item.confidence) !== undefined
+        ? { confidence: auditNumberOf(item.confidence) }
+        : {})
+    }
+  }).filter((field) => field.value || field.evidence).slice(0, 24)
+}
+
+const semanticAuditStageStatusOf = (
+  task: SemanticizationTaskSnapshot,
+  key: SemanticAuditStageKey,
+  stage: Record<string, unknown>,
+  currentIndex: number
+): SemanticAuditStageStatus => {
+  const explicit = firstAuditText(stage, ['status', 'state']).toLocaleLowerCase()
+  const tracePayload = semanticAuditPayloadOf(task)
+  const traceOutcome = firstAuditText(tracePayload, ['outcome']).toLocaleLowerCase()
+  if ((traceOutcome === 'failed' || traceOutcome === 'stopped') && ['active', 'running', 'processing'].includes(explicit)) {
+    return 'failed'
+  }
+  if (['pending', 'queued', 'waiting'].includes(explicit)) return 'pending'
+  if (['active', 'running', 'processing'].includes(explicit)) return 'active'
+  if (['completed', 'complete', 'success', 'succeeded', 'done'].includes(explicit)) return 'completed'
+  if (['failed', 'error'].includes(explicit)) return 'failed'
+  if (['skipped', 'cancelled', 'canceled'].includes(explicit)) return 'skipped'
+  if (traceOutcome === 'completed') return 'completed'
+  if (traceOutcome === 'failed' || traceOutcome === 'stopped') {
+    return key === 'queued' ? 'completed' : 'skipped'
+  }
+  if (!Object.keys(tracePayload).length && task.total === 0) {
+    return key === 'queued' ? 'completed' : 'skipped'
+  }
+  if (task.status === 'completed') return 'completed'
+  if (task.status === 'stopped') {
+    if (currentIndex < 0) return key === 'queued' ? 'completed' : 'skipped'
+    if (key === task.currentStage) return 'failed'
+    const stageIndex = semanticAuditStageDefinitions.findIndex((item) => item.key === key)
+    return stageIndex < currentIndex ? 'completed' : 'skipped'
+  }
+  if (task.currentStage === 'idle') return key === 'queued' ? 'active' : 'pending'
+  if (task.currentStage === key) return 'active'
+  const stageIndex = semanticAuditStageDefinitions.findIndex((item) => item.key === key)
+  return currentIndex >= 0 && stageIndex < currentIndex ? 'completed' : 'pending'
+}
+
+const semanticAuditEventKindOf = (value: unknown, fallback: SemanticAuditEventKind): SemanticAuditEventKind => {
+  const text = auditTextOf(value).toLocaleLowerCase()
+  if (text.includes('retry') || text.includes('重试')) return 'retry'
+  if (text.includes('valid') || text.includes('校验') || text.includes('验证')) return 'validation'
+  if (text.includes('stage') || text.includes('阶段')) return 'stage'
+  return fallback
+}
+
+const semanticAuditEventStatusOf = (value: unknown, fallback: SemanticAuditEventStatus): SemanticAuditEventStatus => {
+  const text = auditTextOf(value).toLocaleLowerCase()
+  if (['running', 'active', 'processing'].includes(text) || text.includes('进行')) return 'running'
+  if (['success', 'succeeded', 'passed', 'complete', 'completed'].includes(text) || text.includes('通过')) return 'success'
+  if (['warning', 'warn', 'pending'].includes(text) || text.includes('关注')) return 'warning'
+  if (['error', 'failed', 'failure'].includes(text) || text.includes('失败')) return 'error'
+  return fallback
+}
+
+const semanticAuditEventsOf = (payload: Record<string, unknown>): SemanticAuditEventView[] => {
+  const eventSources: Array<{ value: unknown; fallback: SemanticAuditEventKind }> = [
+    { value: payload.events, fallback: 'info' },
+    { value: payload.auditEvents, fallback: 'info' },
+    { value: payload.validationEvents, fallback: 'validation' },
+    { value: payload.retryEvents, fallback: 'retry' }
+  ]
+  const events: SemanticAuditEventView[] = []
+  eventSources.forEach(({ value, fallback }) => {
+    if (!Array.isArray(value)) return
+    value.forEach((item, index) => {
+      const record = auditRecordOf(item)
+      if (!record) return
+      const rawKind = firstAuditText(record, ['kind', 'type', 'event']).toLocaleLowerCase()
+      const kind = semanticAuditEventKindOf(rawKind, fallback)
+      const inferredStatus: SemanticAuditEventStatus = rawKind === 'stage_started'
+        ? 'running'
+        : rawKind === 'stage_completed' || rawKind === 'validation_passed'
+          ? 'success'
+          : rawKind === 'validation_failed'
+            ? 'error'
+            : rawKind === 'retry' || rawKind === 'divergence'
+              ? 'warning'
+              : kind === 'retry' ? 'warning' : 'info'
+      const title = firstAuditText(record, ['title', 'label', 'name', 'event']) || (
+        rawKind === 'stage_started' ? '阶段开始'
+          : rawKind === 'stage_completed' ? '阶段完成'
+            : rawKind === 'divergence' ? '检测到字段分歧'
+              : kind === 'retry' ? '模型重试' : kind === 'validation' ? '结果校验' : '审计事件'
+      )
+      const detail = firstAuditText(record, ['detail', 'message', 'description', 'reason', 'summary'])
+      const attempt = auditNumberOf(record.attempt ?? record.retryCount)
+      events.push({
+        id: `payload-${kind}-${index}-${title}`,
+        kind,
+        status: semanticAuditEventStatusOf(record.status ?? record.state, inferredStatus),
+        title,
+        detail: detail || '事件已记录，当前快照未提供更多说明。',
+        timestamp: firstAuditText(record, ['timestamp', 'createdAt', 'updatedAt', 'at']),
+        ...(attempt !== undefined ? { attempt } : {})
+      })
+    })
+  })
+  return events.slice(-32)
+}
+
+const semanticAuditComparisonsOf = (
+  payload: Record<string, unknown>,
+  initial: SemanticAuditStageView,
+  independent: SemanticAuditStageView
+): SemanticAuditComparisonView[] => {
+  const divergenceRecord = auditRecordOf(payload.divergence)
+  const explicitSource = payload.disagreements ?? payload.divergences ?? payload.comparisons ?? divergenceRecord?.fields
+  const finalFields = auditRecordOf(auditRecordOf(payload.finalAdjudication)?.fields)
+  const explicit = Array.isArray(explicitSource)
+    ? explicitSource.flatMap((item, index): SemanticAuditComparisonView[] => {
+        const record = auditRecordOf(item)
+        if (!record) return []
+        const field = firstAuditText(record, ['field', 'key', 'name', 'label']) || `difference-${index + 1}`
+        const initialField = auditRecordOf(record.initial)
+        const independentField = auditRecordOf(record.independent)
+        return [{
+          field,
+          label: semanticAuditFieldLabels[field] ?? field,
+          initial: firstAuditText(record, ['initialValue', 'first', 'left'])
+            || firstAuditText(initialField, ['value']) || '未提供',
+          independent: firstAuditText(record, ['independentValue', 'second', 'right'])
+            || firstAuditText(independentField, ['value']) || '未提供',
+          resolution: firstAuditText(record, ['resolution', 'decision', 'adjudicated', 'finalValue'])
+            || firstAuditText(auditRecordOf(finalFields?.[field]), ['value'])
+            || '等待裁决',
+          evidence: firstAuditText(record, ['evidence', 'sourceQuote', 'reason'])
+            || firstAuditText(auditRecordOf(finalFields?.[field]), ['evidence'])
+            || firstAuditText(initialField, ['evidence'])
+            || firstAuditText(independentField, ['evidence'])
+        }]
+      })
+    : []
+  if (explicit.length) return explicit.slice(0, 24)
+  const initialMap = new Map(initial.fields.map((field) => [field.key, field]))
+  const independentMap = new Map(independent.fields.map((field) => [field.key, field]))
+  return [...new Set([...initialMap.keys(), ...independentMap.keys()])]
+    .flatMap((field): SemanticAuditComparisonView[] => {
+      const first = initialMap.get(field)
+      const second = independentMap.get(field)
+      if (!first || !second || !first.value || !second.value || first.value === second.value) return []
+      return [{
+        field,
+        label: semanticAuditFieldLabels[field] ?? field,
+        initial: first.value,
+        independent: second.value,
+        resolution: '等待裁决输出',
+        evidence: first.evidence || second.evidence
+      }]
+    }).slice(0, 24)
+}
+
+const buildSemanticAuditView = (
+  task: SemanticizationTaskSnapshot,
+  records: RecordRow[],
+  history: SemanticAuditEventView[]
+): {
+  timeline: SemanticAuditStageView[]
+  outputs: SemanticAuditStageView[]
+  events: SemanticAuditEventView[]
+  comparisons: SemanticAuditComparisonView[]
+  finalSummary: string
+  evidence: string
+} => {
+  const payload = semanticAuditPayloadOf(task)
+  const currentIndex = semanticAuditStageDefinitions.findIndex((stage) => stage.key === task.currentStage)
+  const taskRecord = task as unknown as Record<string, unknown>
+  const recentUid = task.currentRecord?.uid || task.recentItems[0]?.uid
+  const sourceRecord = recentUid ? records.find((record) => record.uid === recentUid) : undefined
+  const finalAdjudicationFields = semanticAuditFieldsOf({
+    fields: auditRecordOf(auditRecordOf(payload.finalAdjudication)?.fields) ?? {}
+  })
+  const adjudicationEvidence = [...new Set(finalAdjudicationFields.map((field) => field.evidence).filter(Boolean))].join('；')
+  const evidence = firstAuditText(payload, ['sourceEvidence', 'originalEvidence', 'evidence', 'sourceText'])
+    || adjudicationEvidence
+    || plainAuditText(sourceRecord?.normalizedText || sourceRecord?.description || sourceRecord?.name)
+  const timeline = semanticAuditStageDefinitions.map((definition) => {
+    const stagePayload = semanticAuditStagePayloadOf(payload, definition.key)
+    const summary = firstAuditText(stagePayload, ['summary', 'analysisSummary', 'decisionSummary', 'message'])
+      || (definition.key === task.currentStage ? task.message : '')
+    return {
+      ...definition,
+      status: semanticAuditStageStatusOf(task, definition.key, stagePayload, currentIndex),
+      summary,
+      evidence: firstAuditText(stagePayload, ['evidence', 'sourceQuote', 'originalEvidence', 'evidenceText']) || evidence,
+      fields: semanticAuditFieldsOf(stagePayload)
+    }
+  })
+  const outputs = timeline.filter((stage): stage is SemanticAuditStageView => (
+    stage.key === 'initial' || stage.key === 'independent' || stage.key === 'adjudication'
+  ))
+  const initial = outputs.find((stage) => stage.key === 'initial') ?? outputs[0]
+  const independent = outputs.find((stage) => stage.key === 'independent') ?? outputs[1]
+  const adjudication = outputs.find((stage) => stage.key === 'adjudication') ?? outputs[2]
+  const finalSummary = firstAuditText(payload, ['finalSummary', 'adjudicationSummary', 'decisionSummary', 'analysisSummary', 'summary'])
+    || firstAuditText(auditRecordOf(payload.finalAdjudication), ['summary'])
+    || adjudication?.summary
+    || ''
+  const explicitEvents = semanticAuditEventsOf(payload)
+  const events = [...explicitEvents, ...history.filter((event) => event.kind === 'validation' || event.kind === 'retry')]
+  const currentMessage = `${task.message} ${firstAuditText(taskRecord, ['error', 'errorMessage'])}`
+  if (task.currentStage === 'persisting' || /校验|验证|valid/i.test(currentMessage)) {
+    events.push({
+      id: `live-validation-${task.updatedAt}`,
+      kind: 'validation',
+      status: task.currentStage === 'persisting' ? 'running' : 'error',
+      title: '结构化结果校验',
+      detail: task.currentStage === 'persisting'
+        ? '正在检查字段完整性、置信度范围和原文证据引用。'
+        : task.message || '当前快照报告了校验相关状态。',
+      timestamp: task.updatedAt
+    })
+  }
+  if (/重试|retry/i.test(currentMessage)) {
+    events.push({
+      id: `live-retry-${task.updatedAt}`,
+      kind: 'retry',
+      status: 'warning',
+      title: '模型重试',
+      detail: task.message || '当前快照报告了重试事件。',
+      timestamp: task.updatedAt
+    })
+  }
+  task.recentItems.filter((item) => item.error).forEach((item) => {
+    events.push({
+      id: `recent-error-${item.uid}-${item.error}`,
+      kind: 'validation',
+      status: 'error',
+      title: `${item.name || item.itemId || item.uid} · 校验/处理失败`,
+      detail: item.error || '记录处理失败。'
+    })
+  })
+  const dedupedEvents = [...new Map(events.map((event) => [event.id, event])).values()].slice(-32)
+  return {
+    timeline,
+    outputs,
+    events: dedupedEvents,
+    comparisons: initial && independent ? semanticAuditComparisonsOf(payload, initial, independent) : [],
+    finalSummary,
+    evidence
+  }
+}
+
+const persistedSemanticAuditTask = (detail: RecordDetail): SemanticizationTaskSnapshot | null => {
+  const trace = detail.semanticAnalysisTrace
+  if (!trace) return null
+  const completed = trace.outcome === 'completed'
+  return {
+    jobId: `persisted-${detail.uid}`,
+    status: 'completed',
+    currentStage: 'idle',
+    total: 1,
+    available: 1,
+    completed: 1,
+    succeeded: completed ? 1 : 0,
+    failed: completed ? 0 : 1,
+    remaining: 0,
+    startedAt: trace.stages.initial?.startedAt || detail.semanticUpdatedAt,
+    updatedAt: trace.completedAt || detail.semanticUpdatedAt,
+    message: completed ? '语义化审计轨迹已完成' : '语义化审计轨迹记录了异常或终止',
+    recentItems: [],
+    analysisTrace: trace
+  }
+}
+
+function SemanticAuditPanel({
+  task,
+  records = [],
+  history = []
+}: {
+  task: SemanticizationTaskSnapshot
+  records?: RecordRow[]
+  history?: SemanticAuditEventView[]
+}): React.JSX.Element {
+  const view = buildSemanticAuditView(task, records, history)
+  return (
+    <section className="asset-semantic-audit" aria-label="AI 语义化可审计分析过程">
+      <div className="asset-semantic-audit-heading">
+        <div>
+          <Text strong>可审计分析过程</Text>
+          <Text type="secondary">展示阶段、校验事件和可追溯证据，不展示模型内部思维链。</Text>
+        </div>
+        <span className="asset-semantic-audit-disclaimer">过程记录 ≠ 内部思维链</span>
+      </div>
+      <div className="asset-semantic-audit-grid">
+        <section className="asset-semantic-audit-section" aria-label="阶段时间线">
+          <div className="asset-semantic-audit-section-heading"><span>阶段时间线</span><Text type="secondary">实时更新</Text></div>
+          <ol className="asset-semantic-audit-timeline-list">
+            {view.timeline.map((stage) => (
+              <li className={`is-${stage.status}`} key={stage.key}>
+                <span className="asset-semantic-audit-timeline-marker" aria-hidden="true" />
+                <div><div className="asset-semantic-audit-line"><strong>{stage.label}</strong><span className={`asset-semantic-audit-status is-${stage.status}`}>{semanticAuditStatusLabels[stage.status]}</span></div><Text type="secondary">{stage.summary || stage.hint}</Text></div>
+              </li>
+            ))}
+          </ol>
+        </section>
+        <section className="asset-semantic-audit-section" aria-label="校验与重试事件">
+          <div className="asset-semantic-audit-section-heading"><span>校验与重试事件</span><Text type="secondary">{view.events.length} 条</Text></div>
+          <div className="asset-semantic-audit-event-list" role="log" aria-live="polite">
+            {view.events.length ? view.events.map((event) => (
+              <div className={`asset-semantic-audit-event is-${event.status}`} key={event.id}>
+                <span className="asset-semantic-audit-event-dot" aria-hidden="true" />
+                <div><div className="asset-semantic-audit-line"><strong>{event.title}</strong><span>{event.attempt ? `第 ${event.attempt} 次 · ` : ''}{semanticAuditEventStatusLabels[event.status]}</span></div><Text type="secondary">{event.detail}</Text></div>
+                {event.timestamp && <time dateTime={event.timestamp}>{formatDate(event.timestamp)}</time>}
+              </div>
+            )) : <div className="asset-semantic-audit-empty">任务运行中的校验、重试和异常会记录在这里。</div>}
+          </div>
+        </section>
+      </div>
+      <div className="asset-semantic-audit-output-grid">
+        {view.outputs.map((stage) => (
+          <details className="asset-semantic-audit-output" key={stage.key} open={stage.key === task.currentStage}>
+            <summary><span>{stage.label}</span><span className={`asset-semantic-audit-status is-${stage.status}`}>{semanticAuditStatusLabels[stage.status]}</span></summary>
+            <div className="asset-semantic-audit-output-body">
+              <p>{stage.summary || '该阶段尚未提供结构化摘要。'}</p>
+              {stage.fields.length ? <div className="asset-semantic-audit-fields">{stage.fields.map((field) => (
+                <div className="asset-semantic-audit-field" key={`${stage.key}-${field.key}`}>
+                  <div className="asset-semantic-audit-field-heading"><strong>{field.label}</strong>{field.confidence !== undefined && <span>{Math.round(field.confidence * 100)}%</span>}</div>
+                  <div>{field.value}</div>
+                  {field.evidence && <blockquote>原文证据：{field.evidence}</blockquote>}
+                </div>
+              ))}</div> : <div className="asset-semantic-audit-empty">阶段完成后展示已校验字段和原文证据。</div>}
+            </div>
+          </details>
+        ))}
+      </div>
+      <div className="asset-semantic-audit-review-grid">
+        <section className="asset-semantic-audit-section">
+          <div className="asset-semantic-audit-section-heading"><span>初步 / 独立分歧</span><Text type="secondary">{view.comparisons.length} 项</Text></div>
+          {view.comparisons.length ? <div className="asset-semantic-audit-comparison-list">{view.comparisons.map((item) => (
+            <div className="asset-semantic-audit-comparison" key={item.field}><strong>{item.label}</strong><div><span>初步</span><p>{item.initial}</p></div><div><span>独立</span><p>{item.independent}</p></div><div><span>裁决</span><p>{item.resolution}</p></div>{item.evidence && <blockquote>依据：{item.evidence}</blockquote>}</div>
+          ))}</div> : <div className="asset-semantic-audit-empty">两轮输出一致，或尚未完成独立复核。</div>}
+        </section>
+        <section className="asset-semantic-audit-section">
+          <div className="asset-semantic-audit-section-heading"><span>最终裁决摘要</span><Text type="secondary">可追溯结论</Text></div>
+          <p className="asset-semantic-audit-final-summary">{view.finalSummary || '裁决完成后展示最终摘要。'}</p>
+          <div className="asset-semantic-audit-evidence"><strong>原文证据</strong><p>{view.evidence || '当前记录尚未提供可引用原文。'}</p></div>
+        </section>
+      </div>
+    </section>
+  )
+}
 
 const featureNavigationItems: Array<{
   key: Exclude<PageKey, 'settings'>
@@ -994,8 +1619,15 @@ function DataPage({
   const [deleting, setDeleting] = useState(false)
   const [semanticSubmitting, setSemanticSubmitting] = useState(false)
   const [semanticActionUids, setSemanticActionUids] = useState<string[]>([])
-  const [semanticProgress, setSemanticProgress] = useState<RequirementSemanticizationProgress | null>(null)
+  const [semanticTask, setSemanticTask] = useState<SemanticizationTaskSnapshot | null>(null)
+  const [semanticTaskSize, setSemanticTaskSize] = useState<number>(() => readSemanticTaskSize())
+  const [semanticControlPending, setSemanticControlPending] = useState<SemanticizationControlAction | null>(null)
+  const [semanticAuditHistory, setSemanticAuditHistory] = useState<SemanticAuditEventView[]>([])
   const [review, setReview] = useState<{ batchId: string; items: DataReviewItem[] } | null>(null)
+
+  const semanticTaskIsActive = Boolean(
+    semanticTask && semanticTaskActiveStatuses.includes(semanticTask.status)
+  )
 
   const load = useCallback(async (): Promise<void> => {
     setLoading(true)
@@ -1028,73 +1660,153 @@ function DataPage({
     void load()
   }, [load, refreshKey])
 
+  const updateRecordsFromSemanticTask = useCallback((snapshot: SemanticizationTaskSnapshot): void => {
+    const updates = new Map<string, { status: RequirementSemanticizationStatus; error: string }>()
+    snapshot.recentItems.forEach((item) => {
+      const uid = item.uid.trim()
+      if (!uid) return
+      if (item.status === 'failed') {
+        updates.set(uid, { status: 'failed', error: item.error || '语义化失败' })
+      } else {
+        updates.set(uid, { status: 'ready', error: '' })
+      }
+    })
+    const currentUid = semanticTaskCurrentUid(snapshot)
+    if (currentUid && semanticTaskActiveStatuses.includes(snapshot.status)) {
+      updates.set(currentUid, { status: 'processing', error: '' })
+    }
+    if (!updates.size) return
+    setRecords((current) => current.map((record) => {
+      const update = updates.get(record.uid)
+      if (!update) return record
+      return {
+        ...record,
+        semanticStatus: update.status,
+        semanticStatusReason: update.status === 'processing'
+          ? 'processing'
+          : update.status === 'ready'
+            ? 'ready'
+            : 'failed',
+        semanticError: update.error
+      }
+    }))
+  }, [])
+
+  const applySemanticTaskSnapshot = useCallback((snapshot: SemanticizationTaskSnapshot): void => {
+    setSemanticTask(snapshot)
+    const messageText = snapshot.message || '任务状态已更新'
+    const isRetry = /重试|retry/i.test(messageText)
+    const isValidation = snapshot.currentStage === 'persisting' || /校验|验证|valid/i.test(messageText)
+    const kind: SemanticAuditEventKind = isRetry ? 'retry' : isValidation ? 'validation' : 'stage'
+    const status: SemanticAuditEventStatus = snapshot.status === 'completed'
+      ? 'success'
+      : snapshot.status === 'stopped'
+        ? 'error'
+        : isRetry
+          ? 'warning'
+          : snapshot.currentStage === 'persisting'
+            ? 'running'
+            : 'info'
+    const event: SemanticAuditEventView = {
+      id: `${snapshot.jobId}-${snapshot.updatedAt}-${snapshot.currentStage}-${messageText}`,
+      kind,
+      status,
+      title: isRetry ? '模型重试' : isValidation ? '结构化结果校验' : semanticTaskStageLabels[snapshot.currentStage],
+      detail: messageText,
+      timestamp: snapshot.updatedAt
+    }
+    setSemanticAuditHistory((current) => current.some((item) => item.id === event.id)
+      ? current
+      : [...current, event].slice(-32))
+    updateRecordsFromSemanticTask(snapshot)
+  }, [updateRecordsFromSemanticTask])
+
+  const hydrateSemanticTask = useCallback(async (): Promise<void> => {
+    try {
+      const snapshot = await window.visslm.getRequirementSemanticizationTask()
+      if (snapshot === null) {
+        setSemanticTask(null)
+        return
+      }
+      applySemanticTaskSnapshot(snapshot)
+    } catch {
+      // Task hydration is supplementary; record listing remains available if it fails.
+    }
+  }, [applySemanticTaskSnapshot])
+
+  useEffect(() => {
+    void hydrateSemanticTask()
+  }, [hydrateSemanticTask, refreshKey])
+
   useEffect(() => {
     const unsubscribe = window.visslm.onRequirementSemanticizationProgress((next) => {
-      setSemanticProgress(next)
-      if (next.recordUid && ['processing', 'ready', 'failed'].includes(next.status)) {
-        setRecords((current) => current.map((record) => {
-          if (record.uid !== next.recordUid) return record
-          const status = next.status as RequirementSemanticizationStatus
-          const reason = status === 'processing' ? 'processing' : status === 'ready' ? 'ready' : 'failed'
-          return {
-            ...record,
-            semanticStatus: status,
-            semanticStatusReason: reason,
-            semanticError: status === 'failed' ? next.message || record.semanticError : ''
-          }
-        }))
-      }
-      if (next.status === 'completed') {
+      applySemanticTaskSnapshot(next)
+      if (next.status === 'completed' || next.status === 'stopped') {
         void load()
       }
     })
     return unsubscribe
-  }, [load])
+  }, [applySemanticTaskSnapshot, load])
 
   const openDetail = async (uid: string): Promise<void> => {
     setDetail(await window.visslm.getRecord(uid))
   }
 
+  const updateSemanticTaskSize = (value: number | null): void => {
+    const next = normalizeSemanticTaskSize(value)
+    setSemanticTaskSize(next)
+    writeSemanticTaskSize(next)
+  }
+
   const startSemanticization = async (
-    inputUids: string[],
-    force: boolean,
+    input: SemanticizationStartInput,
     source: 'toolbar' | 'row'
   ): Promise<void> => {
-    const recordUids = [...new Set(inputUids.map((uid) => uid.trim()).filter(Boolean))]
-    if (!recordUids.length) {
-      message.info(source === 'toolbar' ? '当前页没有待处理的记录' : '这条记录当前无法执行 AI 语义化')
+    const recordUids = [...new Set((input.recordUids ?? []).map((uid) => uid.trim()).filter(Boolean))]
+    if (input.scope !== 'all_unready' && !recordUids.length) {
+      message.info(source === 'toolbar' ? '当前范围没有待处理的记录' : '这条记录当前无法执行 AI 语义化')
+      return
+    }
+    if (semanticTaskIsActive) {
+      message.info('当前已有语义化任务，请等待任务结束或先停止当前任务')
       return
     }
     if (source === 'toolbar') setSemanticSubmitting(true)
     setSemanticActionUids((current) => [...new Set([...current, ...recordUids])])
+    setSemanticAuditHistory([])
     try {
       const result = await window.visslm.startRequirementSemanticization({
-        recordUids,
-        ...(force ? { force: true } : {})
+        ...input,
+        ...(input.scope === 'selected' || input.scope === undefined ? { recordUids } : {}),
+        maxRecords: semanticTaskSize
       })
       if (result.accepted > 0) {
-        setRecords((current) => current.map((record) => (
-          recordUids.includes(record.uid) && normalizeSemanticStatus(record.semanticStatus) !== 'processing'
-            ? { ...record, semanticStatus: 'processing', semanticStatusReason: 'processing', semanticError: '' }
-            : record
-        )))
-        setSemanticProgress((current) => current?.jobId === result.jobId
-          ? current
-          : {
-              jobId: result.jobId,
-              status: 'processing',
-              completed: 0,
-              total: result.accepted,
-              failed: 0,
-              message: '已提交 AI 语义化任务'
-            })
+        const timestamp = new Date().toISOString()
+        setSemanticTask((current) => current?.jobId === result.jobId ? current : {
+            jobId: result.jobId,
+            status: 'queued',
+            currentStage: 'queued',
+            total: result.accepted,
+            available: result.available,
+            completed: 0,
+            succeeded: 0,
+            failed: 0,
+            remaining: result.accepted,
+            startedAt: timestamp,
+            updatedAt: timestamp,
+            message: `已提交 ${result.accepted} 条记录，将逐条执行`,
+            recentItems: []
+          })
         message.success(`已提交 ${result.accepted} 条记录进行 AI 语义化`)
+      } else if (result.skipped > 0) {
+        message.info(`没有新的任务，已跳过 ${result.skipped} 条记录`)
       } else {
-        message.info(result.skipped ? `没有新的任务，已跳过 ${result.skipped} 条记录` : '没有记录被提交')
+        message.info('当前没有未语义化、失败或已失效的记录')
       }
       if (result.skipped > 0 && result.accepted > 0) {
-        message.info(`另有 ${result.skipped} 条记录正在处理或已跳过`)
+        message.info(`任务上限之外还有 ${result.skipped} 条记录，可在本任务结束后继续处理`)
       }
+      await hydrateSemanticTask()
       void load()
     } catch (error) {
       message.error(error instanceof Error ? error.message : String(error))
@@ -1110,21 +1822,59 @@ function DataPage({
   })
 
   const semanticizeSelected = (): void => {
-    void startSemanticization(selectedRowKeys, true, 'toolbar')
+    void startSemanticization({
+      scope: 'selected',
+      recordUids: selectedRowKeys,
+      force: true
+    }, 'toolbar')
   }
 
   const semanticizeCurrentPage = (): void => {
-    void startSemanticization(
-      currentPageSemanticizableRows.map((record) => record.uid),
-      false,
-      'toolbar'
-    )
+    void startSemanticization({
+      scope: 'selected',
+      recordUids: currentPageSemanticizableRows.map((record) => record.uid)
+    }, 'toolbar')
+  }
+
+  const semanticizeAllUnready = (): void => {
+    void startSemanticization({ scope: 'all_unready' }, 'toolbar')
   }
 
   const semanticizeRow = (record: RecordRow): void => {
     const status = normalizeSemanticStatus(record.semanticStatus)
-    if (status === 'processing') return
-    void startSemanticization([record.uid], status === 'ready', 'row')
+    if (status === 'processing' || semanticTaskIsActive) return
+    void startSemanticization({
+      scope: 'selected',
+      recordUids: [record.uid],
+      force: status === 'ready'
+    }, 'row')
+  }
+
+  const controlSemanticization = async (action: SemanticizationControlAction): Promise<void> => {
+    if (!semanticTask || semanticControlPending) return
+    setSemanticControlPending(action)
+    try {
+      const next = await window.visslm.controlRequirementSemanticization(action)
+      if (next) applySemanticTaskSnapshot(next)
+      if (action === 'pause') message.info('已请求暂停，当前 AI 阶段完成后生效')
+      if (action === 'resume') message.success('已恢复语义化任务')
+      if (action === 'stop') message.info('已请求停止，当前 AI 阶段完成后安全退出')
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : String(error))
+    } finally {
+      setSemanticControlPending(null)
+    }
+  }
+
+  const confirmStopSemanticization = (): void => {
+    modal.confirm({
+      title: '停止当前语义化任务？',
+      content: '停止请求会在当前 AI 阶段安全完成后生效，已完成的记录会保留。',
+      okText: '确认停止',
+      okType: 'danger',
+      cancelText: '继续执行',
+      onOk: () => controlSemanticization('stop')
+    })
   }
 
   const importData = async (): Promise<void> => {
@@ -1221,6 +1971,15 @@ function DataPage({
     onVisualize(scope, parts.join(' · '))
   }
 
+  const semanticTaskPercent = semanticTask && semanticTask.total > 0
+    ? Math.min(100, Math.round((semanticTask.completed / semanticTask.total) * 100))
+    : 0
+  const semanticTaskCanPause = semanticTask?.status === 'queued' || semanticTask?.status === 'running'
+  const semanticTaskCanResume = semanticTask?.status === 'paused'
+  const semanticTaskCanStop = Boolean(
+    semanticTask && semanticTaskActiveStatuses.includes(semanticTask.status) && semanticTask.status !== 'stopping'
+  )
+
   return (
     <div className="page-stack">
       <div className="page-toolbar">
@@ -1239,27 +1998,53 @@ function DataPage({
           >
             导出数据
           </Button>
-          {selectedRowKeys.length > 0 ? (
+          <div className="asset-semantic-task-config">
+            <span>单任务条数</span>
+            <InputNumber
+              aria-label="单个语义化任务最多处理记录数"
+              min={1}
+              max={semanticTaskSizeMaximum}
+              precision={0}
+              controls
+              value={semanticTaskSize}
+              disabled={semanticTaskIsActive}
+              onChange={(value) => updateSemanticTaskSize(value === null ? null : Number(value))}
+            />
+            <Tooltip title="单个任务可处理 1–5 条记录；系统始终逐条执行，不会并发调用 AI">
+              <InfoCircleOutlined className="asset-semantic-task-help" aria-label="任务条数说明" tabIndex={0} />
+            </Tooltip>
+          </div>
+          <Tooltip title={semanticTaskIsActive ? '当前任务结束或停止后才能启动新任务' : '只处理当前选中的记录，可按任务上限限制总数'}>
             <Button
-              type="primary"
               icon={<BulbOutlined />}
               loading={semanticSubmitting}
-              disabled={!selectedRowKeys.length}
+              disabled={!selectedRowKeys.length || semanticTaskIsActive}
               onClick={semanticizeSelected}
             >
-              AI 语义化（{selectedRowKeys.length}）
+              语义化所选（{selectedRowKeys.length}）
             </Button>
-          ) : (
+          </Tooltip>
+          <Tooltip title={semanticTaskIsActive ? '当前任务结束或停止后才能启动新任务' : '处理当前页中尚未就绪或上次失败的记录'}>
+            <Button
+              icon={<BulbOutlined />}
+              loading={semanticSubmitting}
+              disabled={!currentPageSemanticizableRows.length || semanticTaskIsActive}
+              onClick={semanticizeCurrentPage}
+            >
+              当前页待处理{currentPageSemanticizableRows.length ? `（${currentPageSemanticizableRows.length}）` : ''}
+            </Button>
+          </Tooltip>
+          <Tooltip title={semanticTaskIsActive ? '当前任务结束或停止后才能启动新任务' : '处理全局所有未语义化、失败或因内容/模型变化而失效的记录'}>
             <Button
               type="primary"
               icon={<BulbOutlined />}
               loading={semanticSubmitting}
-              disabled={!currentPageSemanticizableRows.length}
-              onClick={semanticizeCurrentPage}
+              disabled={semanticTaskIsActive}
+              onClick={semanticizeAllUnready}
             >
-              语义化当前页待处理{currentPageSemanticizableRows.length ? `（${currentPageSemanticizableRows.length}）` : ''}
+              语义化全部未处理数据
             </Button>
-          )}
+          </Tooltip>
           <Button
             type="primary"
             icon={<FundProjectionScreenOutlined />}
@@ -1290,32 +2075,128 @@ function DataPage({
           </Button>
         </Space>
       </div>
-      {semanticProgress && (
+      {semanticTask && (
         <div
-          className={`asset-semantic-progress is-${semanticProgress.status}`}
-          role="status"
-          aria-live="polite"
-          aria-label={semanticProgress.message || 'AI 语义化进度'}
+          className={`asset-semantic-task-panel is-${semanticTask.status}`}
+          role="region"
+          aria-label={semanticTask.message || 'AI 语义化任务状态'}
         >
-          <div className="asset-semantic-progress-heading">
-            <Text strong>AI 语义化进度</Text>
-            <Text type="secondary">{semanticProgress.message || '正在处理记录'}</Text>
+          <div className="asset-semantic-task-heading">
+            <div className="asset-semantic-task-title">
+              <Text strong>AI 语义化任务</Text>
+              <span className={`asset-semantic-task-badge is-${semanticTask.status}`}>
+                {semanticTask.status === 'running' && <SyncOutlined spin />}
+                {semanticTask.status === 'completed' && <CheckCircleOutlined />}
+                {semanticTask.status === 'stopped' && <StopOutlined />}
+                {semanticTask.status === 'paused' && <PauseOutlined />}
+                <span>{semanticTaskStatusLabels[semanticTask.status]}</span>
+              </span>
+            </div>
+            <Text type="secondary" className="asset-semantic-task-message" aria-live="polite">
+              {semanticTask.message || '任务按单条记录顺序处理'}
+            </Text>
           </div>
-          <Progress
-            percent={semanticProgress.total > 0
-              ? Math.min(100, Math.round((semanticProgress.completed / semanticProgress.total) * 100))
-              : 0}
-            showInfo={false}
-            status={semanticProgress.status === 'failed'
-              ? 'exception'
-              : semanticProgress.status === 'completed'
-                ? semanticProgress.failed > 0 ? 'exception' : 'success'
-                : 'active'}
-          />
-          <Text type="secondary" className="asset-semantic-progress-count">
-            已处理 {Math.min(semanticProgress.completed, semanticProgress.total)} / {semanticProgress.total} 条
-            {semanticProgress.failed > 0 ? `，失败 ${semanticProgress.failed} 条` : ''}
-          </Text>
+          <div className="asset-semantic-task-controls">
+            <div className="asset-semantic-task-actions">
+              <Tooltip title="暂停请求会在当前 AI 阶段安全完成后生效">
+                <Button
+                  size="small"
+                  icon={<PauseOutlined />}
+                  disabled={!semanticTaskCanPause || semanticControlPending !== null}
+                  loading={semanticControlPending === 'pause'}
+                  onClick={() => void controlSemanticization('pause')}
+                >
+                  暂停
+                </Button>
+              </Tooltip>
+              <Tooltip title="恢复已暂停的任务，并继续按单条记录处理">
+                <Button
+                  size="small"
+                  icon={<PlayCircleOutlined />}
+                  disabled={!semanticTaskCanResume || semanticControlPending !== null}
+                  loading={semanticControlPending === 'resume'}
+                  onClick={() => void controlSemanticization('resume')}
+                >
+                  恢复
+                </Button>
+              </Tooltip>
+              <Tooltip title="停止请求会在当前 AI 阶段安全完成后生效，已完成记录会保留">
+                <Button
+                  danger
+                  size="small"
+                  icon={<StopOutlined />}
+                  disabled={!semanticTaskCanStop || semanticControlPending !== null}
+                  loading={semanticControlPending === 'stop'}
+                  onClick={confirmStopSemanticization}
+                >
+                  停止
+                </Button>
+              </Tooltip>
+            </div>
+          </div>
+          <div className="asset-semantic-task-current">
+            <div>
+              <span className="asset-semantic-task-label">当前记录</span>
+              <strong title={semanticTaskCurrentName(semanticTask)}>
+                {semanticTaskCurrentName(semanticTask)}
+              </strong>
+              <span className="asset-semantic-task-index">
+                {semanticTask.total > 0 ? `${semanticTaskCurrentIndex(semanticTask)} / ${semanticTask.total}` : '—'}
+              </span>
+            </div>
+            <div>
+              <span className="asset-semantic-task-label">当前阶段</span>
+              <strong>{semanticTaskStageLabels[semanticTask.currentStage]}</strong>
+            </div>
+          </div>
+          <Tooltip title={`已完成 ${semanticTask.completed} / ${semanticTask.total} 条`}>
+            <Progress
+              percent={semanticTaskPercent}
+              showInfo={false}
+              status={semanticTask.status === 'completed'
+                ? semanticTask.failed > 0 ? 'exception' : 'success'
+                : semanticTask.status === 'stopped' ? 'exception' : 'active'}
+              aria-label={`任务进度 ${semanticTaskPercent}%`}
+            />
+          </Tooltip>
+          <div className="asset-semantic-task-metrics" aria-label="语义化任务统计">
+            <span><strong>{semanticTask.completed}</strong><small>已处理</small></span>
+            <span className="is-success"><strong>{semanticTask.succeeded}</strong><small>成功</small></span>
+            <span className="is-error"><strong>{semanticTask.failed}</strong><small>失败</small></span>
+            <span><strong>{semanticTask.remaining}</strong><small>剩余</small></span>
+            <span><strong>{semanticTask.available}</strong><small>可用</small></span>
+          </div>
+          <div className="asset-semantic-task-recent">
+            <div className="asset-semantic-task-recent-heading">
+              <span>最近记录结果</span>
+              <Text type="secondary">按最新进度更新</Text>
+            </div>
+            {semanticTask.recentItems.length ? (
+              <ul>
+                {semanticTask.recentItems.map((item, index) => {
+                  const itemFailed = item.status === 'failed'
+                  return (
+                    <li key={`${item.uid}-${index}`}>
+                      <span className={`asset-semantic-recent-status ${itemFailed ? 'is-error' : 'is-success'}`}>
+                        {itemFailed ? <ExclamationCircleOutlined /> : <CheckCircleOutlined />}
+                        {itemFailed ? '失败' : '成功'}
+                      </span>
+                      <span className="asset-semantic-recent-name" title={item.name || item.itemId || item.uid}>
+                        {item.name || item.itemId || item.uid}
+                      </span>
+                      {typeof item.durationMs === 'number' && (
+                        <span className="asset-semantic-recent-duration">{(item.durationMs / 1000).toFixed(1)} 秒</span>
+                      )}
+                      {item.error && <span className="asset-semantic-recent-message" title={item.error}>{item.error}</span>}
+                    </li>
+                  )
+                })}
+              </ul>
+            ) : (
+              <span className="asset-semantic-task-empty">任务完成一条记录后，这里会显示结果和错误信息。</span>
+            )}
+          </div>
+          <SemanticAuditPanel task={semanticTask} records={records} history={semanticAuditHistory} />
         </div>
       )}
       <Card className="data-workbench-card">
@@ -1454,7 +2335,7 @@ function DataPage({
               render: (_value, record) => {
                 const status = normalizeSemanticStatus(record.semanticStatus)
                 const isLoading = semanticActionUids.includes(record.uid)
-                if (status === 'processing') {
+                if (status === 'processing' || semanticTaskCurrentUid(semanticTask) === record.uid) {
                   return <Button type="link" disabled icon={<SyncOutlined spin />}>处理中</Button>
                 }
                 const label = status === 'ready' ? '重新生成' : status === 'failed' ? '重试' : '生成语义卡片'
@@ -1463,6 +2344,7 @@ function DataPage({
                     type="link"
                     icon={status === 'failed' ? <ReloadOutlined /> : <BulbOutlined />}
                     loading={isLoading}
+                    disabled={semanticTaskIsActive}
                     onClick={() => semanticizeRow(record)}
                   >
                     {label}
@@ -1474,6 +2356,7 @@ function DataPage({
         />
       </Card>
       <Drawer
+        rootClassName="record-detail-drawer-shell"
         className="record-detail-drawer"
         title={detail ? (
           <div className="drawer-context-title">
@@ -1482,7 +2365,7 @@ function DataPage({
             <strong title={detail.name}>{detail.name}</strong>
           </div>
         ) : '数据中心记录'}
-        size={720}
+        size={960}
         open={Boolean(detail)}
         onClose={() => setDetail(null)}
       >
@@ -1500,6 +2383,12 @@ function DataPage({
                 {formatDate(detail.lastModifyTime)}
               </Descriptions.Item>
             </Descriptions>
+            {detail.semanticAnalysisTrace && (
+              <>
+                <Divider titlePlacement="start">AI 分析审计轨迹</Divider>
+                <SemanticAuditPanel task={persistedSemanticAuditTask(detail)!} records={[detail]} />
+              </>
+            )}
             <Divider titlePlacement="start">描述</Divider>
             <RichDescription html={detail.description} images={detail.images} />
             {detail.images.length > 0 && (
