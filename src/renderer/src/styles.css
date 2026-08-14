@@ -13220,14 +13220,49 @@ body {
 
 .settings-update-notes {
   display: flex;
-  max-height: 160px;
+  min-height: 0;
+  max-height: min(220px, max(160px, calc(100vh - 360px)));
   flex-direction: column;
   gap: 6px;
+  overflow: hidden;
+  border-color: color-mix(in srgb, var(--accent) 24%, var(--stroke));
+  color: var(--text-main);
+}
+
+.settings-update-notes-content {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  gap: 8px;
   overflow: auto;
   color: var(--text-main);
   line-height: 1.55;
-  white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.settings-update-notes-content > p,
+.settings-update-note-heading {
+  margin: 0;
+}
+
+.settings-update-note-heading {
+  color: var(--text-main);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.settings-update-note-heading:first-child {
+  font-size: 15px;
+}
+
+.settings-update-note-list {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.settings-update-note-list li + li {
+  margin-top: 4px;
 }
 
 .settings-update-actions {
@@ -15042,6 +15077,169 @@ html[data-theme='light'] .dashboard-style-color-control .ant-color-picker-trigge
   background: var(--accent-soft);
 }
 
+.asset-semantic-result-summary {
+  display: grid;
+  min-width: 0;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 42%, var(--stroke));
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface-raised));
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text-main) 5%, transparent);
+}
+
+.asset-semantic-result-summary.is-completed {
+  border-color: color-mix(in srgb, var(--state-success) 56%, var(--stroke));
+  background: color-mix(in srgb, var(--state-success) 8%, var(--surface-raised));
+}
+
+.asset-semantic-result-heading,
+.asset-semantic-result-title,
+.asset-semantic-result-field-heading {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 8px;
+}
+
+.asset-semantic-result-heading {
+  justify-content: space-between;
+}
+
+.asset-semantic-result-heading > div:first-child {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.asset-semantic-result-title {
+  color: var(--text-main);
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.asset-semantic-result-title > .anticon {
+  flex: 0 0 auto;
+  color: var(--accent);
+  font-size: 16px;
+}
+
+.asset-semantic-result-summary.is-completed .asset-semantic-result-title > .anticon {
+  color: var(--state-success);
+}
+
+.asset-semantic-result-heading .ant-typography {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.5;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.asset-semantic-result-state {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  min-height: 24px;
+  padding-inline: 8px;
+  border: 1px solid var(--stroke);
+  border-radius: 999px;
+  color: var(--text-muted);
+  background: var(--surface-soft);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.asset-semantic-result-state.is-active {
+  border-color: color-mix(in srgb, var(--accent) 48%, var(--stroke));
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.asset-semantic-result-state.is-completed {
+  border-color: color-mix(in srgb, var(--state-success) 56%, var(--stroke));
+  color: var(--state-success);
+  background: color-mix(in srgb, var(--state-success) 12%, var(--surface-raised));
+}
+
+.asset-semantic-result-state.is-failed {
+  border-color: color-mix(in srgb, var(--state-error) 56%, var(--stroke));
+  color: var(--state-error);
+  background: color-mix(in srgb, var(--state-error) 12%, var(--surface-raised));
+}
+
+.asset-semantic-result-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  min-width: 0;
+  gap: 8px;
+}
+
+.asset-semantic-result-field {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+  padding: 8px;
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.asset-semantic-result-field-heading {
+  justify-content: space-between;
+}
+
+.asset-semantic-result-label,
+.asset-semantic-result-confidence {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.asset-semantic-result-confidence {
+  flex: 0 0 auto;
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.asset-semantic-result-value {
+  min-width: 0;
+  color: var(--text-main);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.asset-semantic-result-text,
+.asset-semantic-result-empty {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.asset-semantic-result-text {
+  padding-top: 8px;
+  border-top: 1px solid var(--stroke);
+}
+
+.asset-semantic-result-empty {
+  padding: 8px;
+  border: 1px dashed var(--stroke);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
 .asset-semantic-audit-grid,
 .asset-semantic-audit-review-grid {
   display: grid;
@@ -15287,6 +15485,25 @@ html[data-theme='light'] .dashboard-style-color-control .ant-color-picker-trigge
   .asset-semantic-audit-output-grid {
     grid-template-columns: 1fr;
   }
+
+  .asset-semantic-result-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@container (max-width: 520px) {
+  .asset-semantic-result-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .asset-semantic-result-state {
+    align-self: flex-start;
+  }
+
+  .asset-semantic-result-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 1000px) {
@@ -15358,5 +15575,478 @@ html[data-theme='light'] .dashboard-style-color-control .ant-color-picker-trigge
   .asset-semantic-audit {
     max-height: min(600px, calc(100vh - 180px));
     padding: 8px;
+  }
+}
+
+/* Data-center record maintenance keeps preview, execution, and recovery in one
+ * theme-aware surface so the table and record context remain available behind it. */
+.record-maintenance-drawer-shell .ant-drawer-content-wrapper {
+  width: min(640px, calc(100vw - 32px)) !important;
+}
+
+.record-maintenance-drawer .ant-drawer-body {
+  min-height: 0;
+  max-height: calc(100vh - 40px);
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+
+.record-maintenance-panel {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.record-maintenance-section {
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid var(--stroke);
+  border-radius: 10px;
+  background: var(--surface-raised);
+}
+
+.record-maintenance-section-heading,
+.record-maintenance-readiness-heading,
+.record-maintenance-task-heading,
+.record-maintenance-task-title,
+.record-maintenance-failed-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.record-maintenance-section-heading > div,
+.record-maintenance-readiness-heading > div,
+.record-maintenance-task-heading > div:first-child {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.record-maintenance-section-heading .ant-typography-secondary,
+.record-maintenance-readiness-heading .ant-typography-secondary,
+.record-maintenance-task-heading .ant-typography-secondary {
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.record-maintenance-preview-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.record-maintenance-preview-grid > div {
+  display: flex;
+  min-width: 0;
+  min-height: 64px;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.record-maintenance-preview-grid span,
+.record-maintenance-task-metrics small {
+  color: var(--text-muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.record-maintenance-preview-grid strong {
+  color: var(--accent);
+  font-size: 20px;
+  line-height: 1;
+}
+
+.record-maintenance-preview-versions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  margin-top: 12px;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.record-maintenance-preview-versions span {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.record-maintenance-empty {
+  margin-top: 16px;
+  padding: 12px;
+  border: 1px dashed var(--stroke);
+  color: var(--text-muted);
+  background: var(--surface-soft);
+  text-align: center;
+}
+
+.record-maintenance-scope-section .ant-segmented {
+  max-width: 100%;
+  margin-top: 16px;
+  color: var(--text-muted);
+  background: var(--surface-soft);
+}
+
+.record-maintenance-scope-section .ant-segmented-item-selected {
+  color: var(--text-main);
+  background: var(--surface-elevated);
+  box-shadow: 0 0 0 1px var(--accent-soft);
+}
+
+.record-maintenance-action-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.record-maintenance-action-grid .ant-btn {
+  min-width: 0;
+  width: 100%;
+}
+
+.record-maintenance-task-panel {
+  border-color: color-mix(in srgb, var(--accent) 34%, var(--stroke));
+  background: color-mix(in srgb, var(--accent) 5%, var(--surface-raised));
+}
+
+.record-maintenance-task-panel.is-completed_with_errors,
+.record-maintenance-task-panel.is-failed {
+  border-color: color-mix(in srgb, var(--state-warning) 42%, var(--stroke));
+}
+
+.record-maintenance-task-panel.is-stopped {
+  border-color: var(--stroke-strong);
+}
+
+.record-maintenance-task-title {
+  justify-content: flex-start;
+}
+
+.record-maintenance-task-current {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.record-maintenance-task-current > div {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.record-maintenance-task-current span,
+.record-maintenance-readiness-item dt {
+  color: var(--text-muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.record-maintenance-task-current strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-main);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.record-maintenance-task-panel > .ant-progress {
+  margin-top: 16px;
+}
+
+.record-maintenance-task-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin-top: 12px;
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.record-maintenance-task-metrics > span {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 10px 8px;
+}
+
+.record-maintenance-task-metrics > span + span {
+  border-left: 1px solid var(--stroke);
+}
+
+.record-maintenance-task-metrics strong {
+  color: var(--text-main);
+  font-size: 18px;
+  line-height: 1;
+}
+
+.record-maintenance-task-metrics .is-success strong {
+  color: var(--state-success);
+}
+
+.record-maintenance-task-metrics .is-error strong {
+  color: var(--state-error);
+}
+
+.record-maintenance-task-panel > .ant-alert {
+  margin-top: 12px;
+  border-color: var(--stroke);
+  background: var(--surface-soft);
+}
+
+.record-maintenance-failed-items {
+  min-width: 0;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--stroke);
+}
+
+.record-maintenance-failed-items ul {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.record-maintenance-failed-items li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 2px 10px;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.record-maintenance-failed-items li > span,
+.record-maintenance-failed-items li > .ant-typography {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.record-maintenance-failed-items li small {
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.record-maintenance-failed-items li > .ant-typography {
+  grid-column: 1 / -1;
+  font-size: 11px;
+}
+
+.record-maintenance-readiness {
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid var(--stroke);
+  border-radius: 10px;
+  background: var(--surface-soft);
+}
+
+.record-maintenance-readiness-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.record-maintenance-readiness-item {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  background: var(--surface-raised);
+}
+
+.record-maintenance-readiness-item-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.record-maintenance-readiness-item-heading strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.record-maintenance-readiness-item .ant-tag {
+  flex: 0 0 auto;
+  margin-inline-end: 0;
+  white-space: nowrap;
+}
+
+.record-maintenance-readiness-item dl {
+  display: grid;
+  gap: 6px;
+  margin: 12px 0 0;
+}
+
+.record-maintenance-readiness-item dl > div {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 8px;
+  min-width: 0;
+}
+
+.record-maintenance-readiness-item dd {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: var(--text-main);
+  font-size: 11px;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.record-maintenance-index-error {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 10px 0 0;
+  color: var(--state-error);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.record-maintenance-index-error span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.matching-text-preview {
+  max-height: min(320px, calc(100vh - 340px));
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  color: var(--text-main);
+  background: var(--surface-soft);
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.record-detail-raw-collapse {
+  overflow: hidden;
+  border-color: var(--stroke) !important;
+  border-radius: 8px !important;
+  background: var(--surface-soft) !important;
+}
+
+.record-detail-raw-collapse .ant-collapse-header {
+  color: var(--text-main) !important;
+  background: var(--surface-soft);
+}
+
+.record-detail-raw-collapse .ant-collapse-content {
+  border-top-color: var(--stroke);
+  background: var(--surface-soft);
+}
+
+.record-detail-raw-collapse .ant-collapse-content-box {
+  padding: 0 12px 12px;
+}
+
+.record-detail-raw-collapse .json-preview {
+  max-height: min(320px, calc(100vh - 380px));
+  margin: 0;
+  overflow: auto;
+}
+
+@media (max-width: 900px) {
+  .record-maintenance-preview-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .record-maintenance-readiness-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 680px) {
+  .record-maintenance-drawer-shell .ant-drawer-content-wrapper {
+    width: calc(100vw - 32px) !important;
+  }
+
+  .record-maintenance-section,
+  .record-maintenance-readiness {
+    padding: 12px;
+  }
+
+  .record-maintenance-preview-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .record-maintenance-action-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .record-maintenance-task-heading,
+  .record-maintenance-readiness-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .record-maintenance-task-heading > .ant-btn,
+  .record-maintenance-readiness-heading > .ant-btn {
+    align-self: flex-start;
+  }
+
+  .record-maintenance-task-current {
+    grid-template-columns: 1fr;
+  }
+
+  .record-maintenance-task-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .record-maintenance-task-metrics > span + span {
+    border-left: 0;
+  }
+
+  .record-maintenance-task-metrics > span:nth-child(even) {
+    border-left: 1px solid var(--stroke);
+  }
+
+  .record-maintenance-task-metrics > span:nth-child(n + 3) {
+    border-top: 1px solid var(--stroke);
+  }
+
+  .record-maintenance-failed-heading {
+    align-items: flex-start;
+    flex-direction: column;
   }
 }

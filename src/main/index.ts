@@ -20,6 +20,7 @@ import type {
   SystemSettingsInput,
   PushConfig,
   RecordQuery,
+  RecordMaintenanceStartInput,
   RequirementSemanticizationStartInput,
   RequirementSemanticizationControl,
   SyncProgress,
@@ -72,6 +73,8 @@ import { OllamaAgent } from './ollama'
 import { SettingsService } from './settings'
 import { PushService, SyncService, VisslmClient } from './visslm'
 import { KnowledgeService } from './knowledge'
+import { RecordMaintenanceService } from './record-maintenance'
+import { AsyncMutex } from './record-index-lock'
 import { ProjectManagementService } from './project-management'
 import type { UpdateManager } from './updater'
 import { createProjectWorkbook } from './project-export'
@@ -90,6 +93,8 @@ let settings: SettingsService
 let syncService: SyncService
 let pushService: PushService
 let knowledgeService: KnowledgeService
+let recordMaintenanceService: RecordMaintenanceService
+let recordIndexLock: AsyncMutex
 let projectManagementService: ProjectManagementService
 let requirementSemanticizationService: RequirementSemanticizationService
 const expertRouter = new ExpertRouter()
@@ -370,7 +375,24 @@ const registerIpc = (): void => {
   ipcMain.handle('data:records', (_event, query: RecordQuery) =>
     db.listRecords(query, requirementSemanticizationService.context()))
   ipcMain.handle('data:record', (_event, uid: string) =>
-    db.getRecord(uid, true, requirementSemanticizationService.context()))
+    db.getRecord(uid, true, requirementSemanticizationService.context(), knowledgeService.modelVersion))
+  ipcMain.handle(
+    'data:maintenance-preview',
+    (_event, input: Pick<RecordMaintenanceStartInput, 'scope' | 'recordUids'>) =>
+      recordMaintenanceService.preview(input)
+  )
+  ipcMain.handle(
+    'data:maintenance-start',
+    (_event, input: RecordMaintenanceStartInput) => recordMaintenanceService.start(input)
+  )
+  ipcMain.handle(
+    'data:maintenance-task',
+    () => recordMaintenanceService.getTask()
+  )
+  ipcMain.handle(
+    'data:maintenance-stop',
+    () => recordMaintenanceService.stop()
+  )
   ipcMain.handle(
     'requirements:semanticize',
     (_event, input: RequirementSemanticizationStartInput) => requirementSemanticizationService.start(input)
@@ -392,24 +414,28 @@ const registerIpc = (): void => {
   })
   ipcMain.handle('sync:start', async (_event, config?: SyncScopeConfig) => {
     if (config) settings.saveSyncConfig(config)
-    const result = await syncService.run(config ?? settings.getSyncConfig() ?? undefined)
-    if (result.ok) {
-      await knowledgeService.syncRecordIndex()
-      projectManagementService.markMatchesStale()
-    }
-    return result
+    return recordIndexLock.runExclusive(async () => {
+      const result = await syncService.run(config ?? settings.getSyncConfig() ?? undefined)
+      if (result.ok) {
+        await knowledgeService.syncRecordIndexInLock()
+        projectManagementService.markMatchesStale()
+      }
+      return result
+    })
   })
   ipcMain.handle(
     'data:apply-review',
     async (_event, input: DataReviewApplyInput) => {
-      const result = input.source === 'sync'
-        ? await syncService.applyDataReviews(input.batchId, input.reviewIds)
-        : db.applyImportDataReviews(input.batchId, input.reviewIds)
-      if (result.updatedCount > 0) {
-        await knowledgeService.syncRecordIndex()
-        projectManagementService.markMatchesStale()
-      }
-      return result
+      return recordIndexLock.runExclusive(async () => {
+        const result = input.source === 'sync'
+          ? await syncService.applyDataReviews(input.batchId, input.reviewIds)
+          : db.applyImportDataReviews(input.batchId, input.reviewIds)
+        if (result.updatedCount > 0) {
+          await knowledgeService.syncRecordIndexInLock()
+          projectManagementService.markMatchesStale()
+        }
+        return result
+      })
     }
   )
   ipcMain.handle('sync:request-logs', (_event, page?: number, pageSize?: number) =>
@@ -1042,30 +1068,34 @@ const registerIpc = (): void => {
           })
       }
     }
-    const imported = db.importRows(rows)
-    await knowledgeService.syncRecordIndex()
-    projectManagementService.markMatchesStale()
-    imported.path = filePath
-    imported.skippedCount += parseErrors.length
-    imported.errors = [...parseErrors, ...imported.errors].slice(0, 50)
-    imported.ok =
-      imported.recordCount > 0 ||
-      imported.duplicates.length > 0 ||
-      (rows.length === 0 && !parseErrors.length)
-    imported.message =
-      `导入完成：${imported.recordCount} 条记录，${imported.imageCount} 张图片，` +
-      `跳过 ${imported.skippedCount} 条` +
-      (imported.duplicates.length
-        ? `，发现 ${imported.duplicates.length} 条已有 _valm_ItemID，待审查覆盖`
-        : '')
-    return imported
+    return recordIndexLock.runExclusive(async () => {
+      const imported = db.importRows(rows)
+      await knowledgeService.syncRecordIndexInLock()
+      projectManagementService.markMatchesStale()
+      imported.path = filePath
+      imported.skippedCount += parseErrors.length
+      imported.errors = [...parseErrors, ...imported.errors].slice(0, 50)
+      imported.ok =
+        imported.recordCount > 0 ||
+        imported.duplicates.length > 0 ||
+        (rows.length === 0 && !parseErrors.length)
+      imported.message =
+        `导入完成：${imported.recordCount} 条记录，${imported.imageCount} 张图片，` +
+        `跳过 ${imported.skippedCount} 条` +
+        (imported.duplicates.length
+          ? `，发现 ${imported.duplicates.length} 条已有 _valm_ItemID，待审查覆盖`
+          : '')
+      return imported
+    })
   })
 
   ipcMain.handle('data:delete', async (_event, uids?: string[]) => {
-    const result = db.deleteData(uids)
-    await knowledgeService.syncRecordIndex()
-    projectManagementService.markMatchesStale()
-    return result
+    return recordIndexLock.runExclusive(async () => {
+      const result = db.deleteData(uids)
+      await knowledgeService.syncRecordIndexInLock()
+      projectManagementService.markMatchesStale()
+      return result
+    })
   })
   ipcMain.handle('knowledge:documents', (_event, query: KnowledgeDocumentQuery) =>
     db.listKnowledgeDocuments(query)
@@ -1358,6 +1388,7 @@ if (!hasSingleInstanceLock) {
     const dataDir = app.getPath('userData')
     mkdirSync(dataDir, { recursive: true })
     db = new AppDatabase(join(dataDir, 'visslm-agent.db'), join(dataDir, 'assets', 'base64'))
+    recordIndexLock = new AsyncMutex()
     settings = new SettingsService(db)
     requirementSemanticizationService = new RequirementSemanticizationService(
       db,
@@ -1366,7 +1397,8 @@ if (!hasSingleInstanceLock) {
     )
     knowledgeService = new KnowledgeService(
       db,
-      (progress) => mainWindow?.webContents.send('knowledge:progress', progress)
+      (progress) => mainWindow?.webContents.send('knowledge:progress', progress),
+      recordIndexLock
     )
     projectManagementService = new ProjectManagementService(
       db,
@@ -1374,6 +1406,13 @@ if (!hasSingleInstanceLock) {
       () => settings.getModelCredentials(),
       (progress) => mainWindow?.webContents.send('project:progress', progress),
       () => settings.getAll().projectMatching
+    )
+    recordMaintenanceService = new RecordMaintenanceService(
+      db,
+      knowledgeService,
+      recordIndexLock,
+      (snapshot) => mainWindow?.webContents.send('data:maintenance-progress', snapshot),
+      () => projectManagementService.markMatchesStale()
     )
     syncService = new SyncService(
       db,

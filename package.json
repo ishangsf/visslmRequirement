@@ -1,6 +1,6 @@
 {
   "name": "visslm-agent-desktop",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "private": true,
   "author": "VISSLM Agent Team",
   "description": "VISSLM data collection, knowledge search and local AI agent desktop app",
@@ -15,6 +15,7 @@
     "smoke:updater": "node scripts/smoke-updater.mjs",
     "prepare:model": "node scripts/prepare-local-resources.mjs",
     "knowledge:smoke": "node scripts/smoke-knowledge.mjs",
+    "test:record-maintenance": "npx tsx ./tests/record-maintenance.ts",
     "smoke:agent-similarity": "npx tsx ./scripts/smoke-agent-similarity.ts",
     "smoke:agent-requirement-analysis": "npx tsx ./scripts/smoke-agent-requirement-analysis.ts",
     "test:requirement-semanticization": "npx tsx ./tests/model-client-ollama-streaming-regression.ts && npx tsx ./tests/requirement-matching/semantic-card-analyzer-regression.ts",

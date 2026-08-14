@@ -32,6 +32,27 @@ const errorStatusMessages = normalizedErrorStatusBlocks.map((block) =>
 const normalizerCall = errorNormalizerName
   ? new RegExp(`\\b${errorNormalizerName}\\s*\\(`)
   : null
+const updateNotesStart = appSource.indexOf('settings-update-notes')
+const updateActionsStart = updateNotesStart >= 0
+  ? appSource.indexOf('settings-update-actions', updateNotesStart)
+  : -1
+const updateNotesSource = updateNotesStart >= 0
+  ? appSource.slice(
+    updateNotesStart,
+    updateActionsStart >= 0 ? updateActionsStart : updateNotesStart + 2400
+  )
+  : ''
+const directReleaseNotesInterpolation = /<[A-Za-z][\w.:-]*(?:\s[^>]*)?>\s*\{\s*updateStatus(?:\?\.)?\.releaseNotes\s*\}\s*<\/[A-Za-z][\w.:-]*>/.test(updateNotesSource)
+const releaseNotesStyleStart = stylesSource.indexOf('.settings-update-notes')
+const releaseNotesActionsStyleStart = releaseNotesStyleStart >= 0
+  ? stylesSource.indexOf('.settings-update-actions', releaseNotesStyleStart)
+  : -1
+const releaseNotesStyleSource = releaseNotesStyleStart >= 0
+  ? stylesSource.slice(
+    releaseNotesStyleStart,
+    releaseNotesActionsStyleStart >= 0 ? releaseNotesActionsStyleStart : releaseNotesStyleStart + 2400
+  )
+  : ''
 
 const checks = {
   dependency: Boolean(packageJson.dependencies?.['electron-updater']),
@@ -66,6 +87,17 @@ const checks = {
     && updaterSource.includes(".replace(/<[^>]*>/g, '')")
     && updaterSource.includes(".replace(/<\\s*li\\b[^>]*>/gi, '\\n- ')")
     && updaterSource.includes('decodeReleaseNoteEntities'),
+  rendererReleaseNotesAreStructured: updateNotesStart >= 0
+    && /updateStatus(?:\?\.)?\.releaseNotes/.test(updateNotesSource)
+    && /(?:ReactMarkdown|releaseNotes(?:Lines|Items)|(?:format|render|parse)\w*ReleaseNotes|\.split\s*\(|\.map\s*\()/.test(updateNotesSource)
+    && !directReleaseNotesInterpolation,
+  rendererReleaseNotesDoNotInjectRawHtml: updateNotesStart >= 0
+    && !/dangerouslySetInnerHTML|rehypeRaw/.test(updateNotesSource),
+  rendererReleaseNotesKeepThemeSafeScrolling: releaseNotesStyleSource.length > 0
+    && /max-height\s*:[^;]+/.test(releaseNotesStyleSource)
+    && /overflow(?:-y)?\s*:\s*(?:auto|scroll)/.test(releaseNotesStyleSource)
+    && /background(?:-color)?\s*:[^;]*var\(--surface-(?:base|soft|raised|elevated)\)/.test(releaseNotesStyleSource)
+    && /(?:border|color)\s*:[^;]*var\(--(?:stroke|text-main|text-muted)\)/.test(releaseNotesStyleSource),
   errorNormalizerSeparatesFailureCategories: errorNormalizerSource.includes('statusCode === 401')
     && errorNormalizerSource.includes('statusCode === 403')
     && errorNormalizerSource.includes('statusCode >= 500')

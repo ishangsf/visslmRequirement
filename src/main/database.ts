@@ -34,6 +34,15 @@ import type {
   PushLogRow,
   PushLogStatus,
   RecordDetail,
+  RecordMaintenanceFailedItem,
+  RecordMaintenanceIndexStatus,
+  RecordMaintenanceOperation,
+  RecordMaintenancePreview,
+  RecordMaintenanceScope,
+  RecordMaintenanceStage,
+  RecordMaintenanceState,
+  RecordMaintenanceTaskSnapshot,
+  RecordMaintenanceTaskStatus,
   RecordPage,
   RecordQuery,
   RecordRow,
@@ -85,6 +94,11 @@ import type {
   ProjectRequirementStatusSource
 } from '../shared/project-types'
 import { normalizeProjectRequirementText } from '../shared/project-requirement-utils'
+import {
+  RECORD_LEXICAL_INDEX_VERSION,
+  RECORD_NORMALIZER_VERSION,
+  RECORD_VECTOR_INDEX_VERSION
+} from './record-maintenance-constants'
 import type {
   DataScope,
   FieldProfile,
@@ -215,6 +229,19 @@ export interface KnowledgeVectorInput {
   chunkId: string
   vector: Float32Array
   modelVersion: string
+}
+
+export interface RecordMaintenanceTarget {
+  uid: string
+  name: string
+}
+
+export interface RecordMaintenanceTaskItem {
+  uid: string
+  name: string
+  status: 'pending' | 'running' | 'succeeded' | 'failed' | 'stopped'
+  stage: RecordMaintenanceStage
+  error?: string
 }
 
 export interface KnowledgeRecordIndexRow {
@@ -1069,6 +1096,72 @@ export class AppDatabase {
       CREATE INDEX IF NOT EXISTS idx_requirement_match_cache_lookup
         ON requirement_match_cache(base_record_uid, candidate_record_uid, query_hash, updated_at DESC);
 
+      CREATE TABLE IF NOT EXISTS record_maintenance_states (
+        record_uid TEXT PRIMARY KEY,
+        clean_status TEXT NOT NULL DEFAULT 'pending',
+        clean_version TEXT NOT NULL DEFAULT '',
+        clean_updated_at TEXT NOT NULL DEFAULT '',
+        clean_error TEXT NOT NULL DEFAULT '',
+        lexical_status TEXT NOT NULL DEFAULT 'pending',
+        lexical_version TEXT NOT NULL DEFAULT '',
+        lexical_updated_at TEXT NOT NULL DEFAULT '',
+        lexical_error TEXT NOT NULL DEFAULT '',
+        vector_status TEXT NOT NULL DEFAULT 'pending',
+        vector_version TEXT NOT NULL DEFAULT '',
+        vector_model_version TEXT NOT NULL DEFAULT '',
+        vector_chunk_count INTEGER NOT NULL DEFAULT 0,
+        vector_updated_at TEXT NOT NULL DEFAULT '',
+        vector_error TEXT NOT NULL DEFAULT '',
+        last_task_id TEXT NOT NULL DEFAULT '',
+        last_operation TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(record_uid) REFERENCES records(uid) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_record_maintenance_states_status
+        ON record_maintenance_states(clean_status, lexical_status, vector_status);
+
+      CREATE TABLE IF NOT EXISTS record_maintenance_tasks (
+        task_id TEXT PRIMARY KEY,
+        scope TEXT NOT NULL,
+        record_uids_json TEXT NOT NULL DEFAULT '[]',
+        operation TEXT NOT NULL,
+        status TEXT NOT NULL,
+        stage TEXT NOT NULL,
+        message TEXT NOT NULL DEFAULT '',
+        current_count INTEGER NOT NULL DEFAULT 0,
+        total_count INTEGER NOT NULL DEFAULT 0,
+        succeeded_count INTEGER NOT NULL DEFAULT 0,
+        failed_count INTEGER NOT NULL DEFAULT 0,
+        current_uid TEXT NOT NULL DEFAULT '',
+        current_name TEXT NOT NULL DEFAULT '',
+        failed_items_json TEXT NOT NULL DEFAULT '[]',
+        started_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        finished_at TEXT NOT NULL DEFAULT ''
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_record_maintenance_tasks_updated
+        ON record_maintenance_tasks(updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_record_maintenance_tasks_status
+        ON record_maintenance_tasks(status, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS record_maintenance_items (
+        task_id TEXT NOT NULL,
+        record_uid TEXT NOT NULL,
+        record_name TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'pending',
+        stage TEXT NOT NULL DEFAULT 'scanning',
+        error_message TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(task_id, record_uid),
+        FOREIGN KEY(task_id) REFERENCES record_maintenance_tasks(task_id) ON DELETE CASCADE,
+        FOREIGN KEY(record_uid) REFERENCES records(uid) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_record_maintenance_items_status
+        ON record_maintenance_items(task_id, status, updated_at);
+
       CREATE TABLE IF NOT EXISTS org_people (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -1347,6 +1440,30 @@ export class AppDatabase {
     } catch {
       // Existing databases may already contain the audit trace column.
     }
+    const maintenanceTimestamp = nowIso()
+    this.db.prepare(`
+      INSERT OR IGNORE INTO record_maintenance_states(
+        record_uid, updated_at
+      )
+      SELECT uid, ? FROM records
+    `).run(maintenanceTimestamp)
+    this.db.prepare(`
+      UPDATE record_maintenance_tasks
+      SET status = 'stopped', stage = 'idle',
+          message = '应用在数据维护任务中断，未处理记录可重新选择重试',
+          current_uid = '', current_name = '', updated_at = ?, finished_at = ?
+      WHERE status IN ('queued', 'scanning', 'running', 'stopping')
+    `).run(maintenanceTimestamp, maintenanceTimestamp)
+    this.db.prepare(`
+      UPDATE record_maintenance_items
+      SET status = 'stopped', stage = 'idle',
+          error_message = CASE WHEN status = 'running' THEN '应用在数据维护任务中断' ELSE error_message END,
+          updated_at = ?
+      WHERE status IN ('pending', 'running')
+        AND task_id IN (
+          SELECT task_id FROM record_maintenance_tasks WHERE status = 'stopped'
+        )
+    `).run(maintenanceTimestamp)
     const interruptedAt = nowIso()
     this.db.prepare(`
       UPDATE requirement_semantic_cards
@@ -1528,6 +1645,604 @@ export class AppDatabase {
 
   close(): void {
     this.db.close()
+  }
+
+  getRecordMaintenanceTargets(
+    scope: RecordMaintenanceScope,
+    recordUids?: string[]
+  ): RecordMaintenanceTarget[] {
+    if (scope === 'all') {
+      return (this.db.prepare(`
+        SELECT uid, name FROM records ORDER BY uid
+      `).all() as SqlRow[]).map((row) => ({
+        uid: String(row.uid),
+        name: String(row.name ?? '')
+      }))
+    }
+    const selected = [...new Set((recordUids ?? [])
+      .map((uid) => String(uid).trim())
+      .filter(Boolean))]
+    if (!selected.length) return []
+    const placeholders = selected.map(() => '?').join(', ')
+    const rows = this.db.prepare(`
+      SELECT uid, name FROM records
+      WHERE uid IN (${placeholders})
+      ORDER BY uid
+    `).all(...selected) as SqlRow[]
+    const byUid = new Map(rows.map((row) => [String(row.uid), String(row.name ?? '')]))
+    return selected.flatMap((uid) => {
+      const name = byUid.get(uid)
+      return name === undefined ? [] : [{ uid, name }]
+    })
+  }
+
+  getRecordMaintenancePreview(
+    scope: RecordMaintenanceScope,
+    recordUids: string[] | undefined,
+    modelVersion: string
+  ): RecordMaintenancePreview {
+    const targets = this.getRecordMaintenanceTargets(scope, recordUids)
+    let cleanPendingCount = 0
+    let lexicalPendingCount = 0
+    let vectorPendingCount = 0
+    let semanticInvalidationCount = 0
+    for (const target of targets) {
+      const state = this.getRecordMaintenanceState(target.uid, modelVersion)
+      if (state.clean.status !== 'ready') cleanPendingCount += 1
+      if (state.lexical.status !== 'ready') lexicalPendingCount += 1
+      if (state.vector.status !== 'ready') vectorPendingCount += 1
+      const semantic = this.db.prepare(`
+        SELECT r.semantic_hash, s.record_uid, s.content_hash, s.status
+        FROM records r
+        LEFT JOIN requirement_semantic_cards s ON s.record_uid = r.uid
+        WHERE r.uid = ?
+      `).get(target.uid) as SqlRow | undefined
+      if (semantic && semantic.record_uid &&
+        String(semantic.status ?? '') === 'ready' &&
+        String(semantic.content_hash ?? '') !== String(semantic.semantic_hash ?? '')) {
+        semanticInvalidationCount += 1
+      }
+    }
+    return {
+      scope,
+      totalCount: targets.length,
+      cleanPendingCount,
+      lexicalPendingCount,
+      vectorPendingCount,
+      semanticInvalidationCount,
+      modelVersion,
+      normalizerVersion: RECORD_NORMALIZER_VERSION,
+      lexicalVersion: RECORD_LEXICAL_INDEX_VERSION,
+      scannedAt: nowIso()
+    }
+  }
+
+  getRecordMaintenanceState(uid: string, modelVersion = ''): RecordMaintenanceState {
+    const recordUid = uid.trim()
+    const row = this.db.prepare(`
+      SELECT * FROM record_maintenance_states WHERE record_uid = ?
+    `).get(recordUid) as SqlRow | undefined
+    const stateRow = row ?? {
+      clean_status: 'pending',
+      clean_version: '',
+      clean_updated_at: '',
+      clean_error: '',
+      lexical_status: 'pending',
+      lexical_version: '',
+      lexical_updated_at: '',
+      lexical_error: '',
+      vector_status: 'pending',
+      vector_version: '',
+      vector_model_version: '',
+      vector_chunk_count: 0,
+      vector_updated_at: '',
+      vector_error: '',
+      last_task_id: '',
+      last_operation: ''
+    } as SqlRow
+    const record = this.db.prepare(`
+      SELECT name, raw_json, semantic_hash FROM records WHERE uid = ?
+    `).get(recordUid) as SqlRow | undefined
+    const currentBusinessText = record ? this.requirementBusinessTextFromRow(record) : ''
+    const currentVectorSourceHash = record
+      ? createHash('sha256')
+        .update(`${String(record.semantic_hash ?? '')}\n${currentBusinessText}`)
+        .digest('hex')
+      : ''
+    const vector = this.db.prepare(`
+      SELECT COUNT(*) AS chunk_count,
+             COUNT(DISTINCT v.model_version) AS model_count,
+             MAX(v.model_version) AS model_version,
+             COUNT(DISTINCT c.source_hash) AS source_hash_count,
+             MAX(c.source_hash) AS source_hash
+      FROM knowledge_chunks c
+      JOIN knowledge_vectors v ON v.chunk_id = c.id
+      WHERE c.source_type = 'record' AND c.record_uid = ?
+    `).get(recordUid) as SqlRow
+    const vectorChunkCount = Number(vector.chunk_count ?? 0)
+    const actualVectorModel = String(vector.model_version ?? '')
+    const vectorModelCount = Number(vector.model_count ?? 0)
+    const vectorSourceHashCount = Number(vector.source_hash_count ?? 0)
+    const actualVectorSourceHash = String(vector.source_hash ?? '')
+    const effectiveModelVersion = actualVectorModel || String(stateRow.vector_model_version ?? '') || modelVersion.trim()
+    const cleanStatus = this.maintenanceVersionedStatus(
+      stateRow.clean_status,
+      String(stateRow.clean_version ?? ''),
+      RECORD_NORMALIZER_VERSION
+    )
+    const lexicalStatus = this.maintenanceVersionedStatus(
+      stateRow.lexical_status,
+      String(stateRow.lexical_version ?? ''),
+      RECORD_LEXICAL_INDEX_VERSION
+    )
+    let vectorStatus = this.maintenanceVersionedStatus(
+      stateRow.vector_status,
+      String(stateRow.vector_version ?? ''),
+      RECORD_VECTOR_INDEX_VERSION
+    )
+    if (vectorStatus !== 'failed' && vectorStatus !== 'running') {
+      if (!vectorChunkCount || vectorModelCount !== 1 || vectorSourceHashCount !== 1 ||
+        !currentVectorSourceHash || actualVectorSourceHash !== currentVectorSourceHash) {
+        vectorStatus = 'pending'
+      } else if (modelVersion.trim() && actualVectorModel !== modelVersion.trim()) {
+        vectorStatus = 'stale'
+      } else if (vectorStatus !== 'pending' && vectorStatus !== 'stale') {
+        vectorStatus = 'ready'
+      }
+    }
+    const statuses = [cleanStatus, lexicalStatus, vectorStatus]
+    const overallStatus: RecordMaintenanceIndexStatus = statuses.includes('failed')
+      ? 'failed'
+      : statuses.includes('running')
+        ? 'running'
+        : statuses.includes('stale')
+          ? 'stale'
+          : statuses.includes('pending')
+            ? 'pending'
+            : 'ready'
+    const operation = String(stateRow.last_operation ?? '')
+    const lastOperation = operation === 'clean' || operation === 'rebuild_indexes' || operation === 'optimize'
+      ? operation as RecordMaintenanceOperation
+      : undefined
+    return {
+      overallStatus,
+      clean: {
+        status: cleanStatus,
+        version: RECORD_NORMALIZER_VERSION,
+        updatedAt: String(stateRow.clean_updated_at ?? ''),
+        ...(String(stateRow.clean_error ?? '') ? { error: String(stateRow.clean_error) } : {})
+      },
+      lexical: {
+        status: lexicalStatus,
+        version: RECORD_LEXICAL_INDEX_VERSION,
+        updatedAt: String(stateRow.lexical_updated_at ?? ''),
+        ...(String(stateRow.lexical_error ?? '') ? { error: String(stateRow.lexical_error) } : {})
+      },
+      vector: {
+        status: vectorStatus,
+        version: RECORD_VECTOR_INDEX_VERSION,
+        modelVersion: effectiveModelVersion,
+        chunkCount: vectorChunkCount || Number(stateRow.vector_chunk_count ?? 0),
+        updatedAt: String(stateRow.vector_updated_at ?? ''),
+        ...(String(stateRow.vector_error ?? '') ? { error: String(stateRow.vector_error) } : {})
+      },
+      ...(String(stateRow.last_task_id ?? '') ? { lastTaskId: String(stateRow.last_task_id) } : {}),
+      ...(lastOperation ? { lastOperation } : {})
+    }
+  }
+
+  invalidateRequirementMatchCacheForRecords(recordUids: string[]): number {
+    const selected = [...new Set(recordUids.map((uid) => uid.trim()).filter(Boolean))]
+    if (!selected.length) return 0
+    const placeholders = selected.map(() => '?').join(', ')
+    const result = this.db.prepare(`
+      DELETE FROM requirement_match_cache
+      WHERE base_record_uid IN (${placeholders})
+         OR candidate_record_uid IN (${placeholders})
+    `).run(...selected, ...selected)
+    return Number(result.changes)
+  }
+
+  private maintenanceVersionedStatus(
+    rawStatus: unknown,
+    version: string,
+    expectedVersion: string
+  ): RecordMaintenanceIndexStatus {
+    const status = String(rawStatus ?? '') as RecordMaintenanceIndexStatus
+    if (status === 'failed') return 'failed'
+    if (status === 'running') return 'running'
+    if (status === 'ready' && version === expectedVersion) return 'ready'
+    return version && version !== expectedVersion ? 'stale' : 'pending'
+  }
+
+  createRecordMaintenanceTask(
+    snapshot: RecordMaintenanceTaskSnapshot,
+    targets: RecordMaintenanceTarget[]
+  ): void {
+    const timestamp = nowIso()
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      this.db.prepare(`
+        INSERT INTO record_maintenance_tasks(
+          task_id, scope, record_uids_json, operation, status, stage, message,
+          current_count, total_count, succeeded_count, failed_count,
+          current_uid, current_name, failed_items_json, started_at, updated_at, finished_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        snapshot.taskId,
+        snapshot.scope,
+        JSON.stringify(targets.map((target) => target.uid)),
+        snapshot.operation,
+        snapshot.status,
+        snapshot.stage,
+        snapshot.message,
+        snapshot.current,
+        snapshot.total,
+        snapshot.succeeded,
+        snapshot.failed,
+        snapshot.currentUid ?? '',
+        snapshot.currentName ?? '',
+        JSON.stringify(snapshot.failedItems),
+        snapshot.startedAt,
+        timestamp,
+        snapshot.finishedAt ?? ''
+      )
+      const insertItem = this.db.prepare(`
+        INSERT INTO record_maintenance_items(
+          task_id, record_uid, record_name, status, stage, error_message, updated_at
+        ) VALUES (?, ?, ?, 'pending', 'scanning', '', ?)
+      `)
+      for (const target of targets) insertItem.run(snapshot.taskId, target.uid, target.name, timestamp)
+      this.db.exec('COMMIT')
+    } catch (error) {
+      try { this.db.exec('ROLLBACK') } catch {}
+      throw error
+    }
+  }
+
+  getRecordMaintenanceTask(activeOnly = false): RecordMaintenanceTaskSnapshot | null {
+    const activeClause = activeOnly
+      ? "WHERE status IN ('queued', 'scanning', 'running', 'stopping')"
+      : ''
+    const row = this.db.prepare(`
+      SELECT * FROM record_maintenance_tasks
+      ${activeClause}
+      ORDER BY updated_at DESC, task_id DESC
+      LIMIT 1
+    `).get() as SqlRow | undefined
+    return row ? this.mapRecordMaintenanceTask(row) : null
+  }
+
+  saveRecordMaintenanceTask(snapshot: RecordMaintenanceTaskSnapshot): void {
+    this.db.prepare(`
+      UPDATE record_maintenance_tasks
+      SET status = ?, stage = ?, message = ?, current_count = ?, total_count = ?,
+          succeeded_count = ?, failed_count = ?, current_uid = ?, current_name = ?,
+          failed_items_json = ?, updated_at = ?, finished_at = ?
+      WHERE task_id = ?
+    `).run(
+      snapshot.status,
+      snapshot.stage,
+      snapshot.message,
+      snapshot.current,
+      snapshot.total,
+      snapshot.succeeded,
+      snapshot.failed,
+      snapshot.currentUid ?? '',
+      snapshot.currentName ?? '',
+      JSON.stringify(snapshot.failedItems),
+      snapshot.updatedAt,
+      snapshot.finishedAt ?? '',
+      snapshot.taskId
+    )
+  }
+
+  saveRecordMaintenanceItem(
+    taskId: string,
+    item: RecordMaintenanceTaskItem
+  ): void {
+    this.db.prepare(`
+      UPDATE record_maintenance_items
+      SET status = ?, stage = ?, error_message = ?, updated_at = ?
+      WHERE task_id = ? AND record_uid = ?
+    `).run(
+      item.status,
+      item.stage,
+      item.error ?? '',
+      nowIso(),
+      taskId,
+      item.uid
+    )
+  }
+
+  getRecordMaintenanceItems(taskId: string): RecordMaintenanceTaskItem[] {
+    const rows = this.db.prepare(`
+      SELECT record_uid, record_name, status, stage, error_message
+      FROM record_maintenance_items
+      WHERE task_id = ? ORDER BY rowid
+    `).all(taskId) as SqlRow[]
+    return rows.map((row) => ({
+      uid: String(row.record_uid),
+      name: String(row.record_name ?? ''),
+      status: ['pending', 'running', 'succeeded', 'failed', 'stopped'].includes(String(row.status))
+        ? String(row.status) as RecordMaintenanceTaskItem['status']
+        : 'pending',
+      stage: this.recordMaintenanceStage(row.stage),
+      ...(String(row.error_message ?? '') ? { error: String(row.error_message) } : {})
+    }))
+  }
+
+  private mapRecordMaintenanceTask(row: SqlRow): RecordMaintenanceTaskSnapshot {
+    const failedFromItems = this.getRecordMaintenanceItems(String(row.task_id))
+      .filter((item) => item.status === 'failed')
+      .map((item): RecordMaintenanceFailedItem => ({
+        uid: item.uid,
+        name: item.name,
+        stage: item.stage,
+        error: item.error ?? ''
+      }))
+    const parsedFailed = parseJsonValue(row.failed_items_json, [])
+    const persistedFailedItems: unknown[] = Array.isArray(parsedFailed) ? parsedFailed : []
+    const failedItems = failedFromItems.length
+      ? failedFromItems
+      : persistedFailedItems.flatMap((item: unknown): RecordMaintenanceFailedItem[] => {
+          if (!item || typeof item !== 'object' || Array.isArray(item)) return []
+          const value = item as Record<string, unknown>
+          const uid = String(value.uid ?? '').trim()
+          const name = String(value.name ?? '')
+          const error = String(value.error ?? '')
+          if (!uid || !error) return []
+          return [{ uid, name, stage: this.recordMaintenanceStage(value.stage), error }]
+        })
+    const status = String(row.status) as RecordMaintenanceTaskStatus
+    return {
+      taskId: String(row.task_id),
+      scope: String(row.scope) === 'selected' ? 'selected' : 'all',
+      operation: ['clean', 'rebuild_indexes', 'optimize'].includes(String(row.operation))
+        ? String(row.operation) as RecordMaintenanceOperation
+        : 'clean',
+      status: ['queued', 'scanning', 'running', 'stopping', 'stopped', 'completed', 'completed_with_errors', 'failed'].includes(status)
+        ? status
+        : 'failed',
+      stage: this.recordMaintenanceStage(row.stage),
+      message: String(row.message ?? ''),
+      current: Number(row.current_count ?? 0),
+      total: Number(row.total_count ?? 0),
+      succeeded: Number(row.succeeded_count ?? 0),
+      failed: Number(row.failed_count ?? failedItems.length),
+      ...(String(row.current_uid ?? '') ? { currentUid: String(row.current_uid) } : {}),
+      ...(String(row.current_name ?? '') ? { currentName: String(row.current_name) } : {}),
+      failedItems,
+      startedAt: String(row.started_at ?? ''),
+      updatedAt: String(row.updated_at ?? ''),
+      ...(String(row.finished_at ?? '') ? { finishedAt: String(row.finished_at) } : {})
+    }
+  }
+
+  private recordMaintenanceStage(value: unknown): RecordMaintenanceStage {
+    return ['scanning', 'cleaning', 'lexical', 'vector', 'finalizing', 'idle'].includes(String(value))
+      ? String(value) as RecordMaintenanceStage
+      : 'idle'
+  }
+
+  private ensureRecordMaintenanceState(recordUid: string): void {
+    this.db.prepare(`
+      INSERT OR IGNORE INTO record_maintenance_states(record_uid, updated_at)
+      VALUES (?, ?)
+    `).run(recordUid, nowIso())
+  }
+
+  markRecordMaintenanceDataWritten(recordUid: string): void {
+    this.ensureRecordMaintenanceState(recordUid)
+    const timestamp = nowIso()
+    this.db.prepare(`
+      UPDATE record_maintenance_states
+      SET clean_status = 'ready', clean_version = ?, clean_updated_at = ?, clean_error = '',
+          lexical_status = 'ready', lexical_version = ?, lexical_updated_at = ?, lexical_error = '',
+          vector_status = 'pending', vector_version = '', vector_model_version = '',
+          vector_error = '', updated_at = ?
+      WHERE record_uid = ?
+    `).run(
+      RECORD_NORMALIZER_VERSION,
+      timestamp,
+      RECORD_LEXICAL_INDEX_VERSION,
+      timestamp,
+      timestamp,
+      recordUid
+    )
+  }
+
+  markRecordMaintenanceVectorReady(
+    recordUid: string,
+    modelVersion: string,
+    chunkCount: number,
+    taskId = '',
+    operation: RecordMaintenanceOperation | '' = ''
+  ): void {
+    this.ensureRecordMaintenanceState(recordUid)
+    const timestamp = nowIso()
+    this.db.prepare(`
+      UPDATE record_maintenance_states
+      SET vector_status = 'ready', vector_version = ?, vector_model_version = ?,
+          vector_chunk_count = ?, vector_updated_at = ?, vector_error = '',
+          last_task_id = CASE WHEN ? <> '' THEN ? ELSE last_task_id END,
+          last_operation = CASE WHEN ? <> '' THEN ? ELSE last_operation END,
+          updated_at = ?
+      WHERE record_uid = ?
+    `).run(
+      RECORD_VECTOR_INDEX_VERSION,
+      modelVersion,
+      Math.max(0, Math.trunc(chunkCount)),
+      timestamp,
+      taskId,
+      taskId,
+      operation,
+      operation,
+      timestamp,
+      recordUid
+    )
+  }
+
+  markRecordMaintenanceVectorFailed(
+    recordUid: string,
+    error: string,
+    taskId = '',
+    operation: RecordMaintenanceOperation | '' = ''
+  ): void {
+    this.ensureRecordMaintenanceState(recordUid)
+    const timestamp = nowIso()
+    this.db.prepare(`
+      UPDATE record_maintenance_states
+      SET vector_status = 'failed', vector_error = ?, vector_updated_at = ?,
+          last_task_id = CASE WHEN ? <> '' THEN ? ELSE last_task_id END,
+          last_operation = CASE WHEN ? <> '' THEN ? ELSE last_operation END,
+          updated_at = ?
+      WHERE record_uid = ?
+    `).run(
+      error.slice(0, 2000),
+      timestamp,
+      taskId,
+      taskId,
+      operation,
+      operation,
+      timestamp,
+      recordUid
+    )
+  }
+
+  markRecordMaintenanceStageFailed(
+    recordUid: string,
+    stage: RecordMaintenanceStage,
+    error: string,
+    taskId = '',
+    operation: RecordMaintenanceOperation | '' = ''
+  ): void {
+    if (stage === 'vector') {
+      this.markRecordMaintenanceVectorFailed(recordUid, error, taskId, operation)
+      return
+    }
+    const statusColumns = stage === 'cleaning'
+      ? { status: 'clean_status', updatedAt: 'clean_updated_at', error: 'clean_error' }
+      : stage === 'lexical'
+        ? { status: 'lexical_status', updatedAt: 'lexical_updated_at', error: 'lexical_error' }
+        : undefined
+    if (!statusColumns) return
+    this.ensureRecordMaintenanceState(recordUid)
+    const timestamp = nowIso()
+    this.db.prepare(`
+      UPDATE record_maintenance_states
+      SET ${statusColumns.status} = 'failed', ${statusColumns.updatedAt} = ?, ${statusColumns.error} = ?,
+          last_task_id = CASE WHEN ? <> '' THEN ? ELSE last_task_id END,
+          last_operation = CASE WHEN ? <> '' THEN ? ELSE last_operation END,
+          updated_at = ?
+      WHERE record_uid = ?
+    `).run(
+      timestamp,
+      error.slice(0, 2000),
+      taskId,
+      taskId,
+      operation,
+      operation,
+      timestamp,
+      recordUid
+    )
+  }
+
+  cleanRecordNormalizedText(
+    recordUid: string,
+    normalizedText: string,
+    taskId = '',
+    operation: RecordMaintenanceOperation | '' = 'clean'
+  ): boolean {
+    const row = this.db.prepare(`
+      SELECT name, last_modify_time, raw_json FROM records WHERE uid = ?
+    `).get(recordUid) as SqlRow | undefined
+    if (!row) return false
+    const semanticHash = requirementSemanticSourceHash({
+      name: String(row.name ?? ''),
+      lastModifyTime: String(row.last_modify_time ?? ''),
+      rawJson: String(row.raw_json ?? '{}'),
+      normalizedText
+    })
+    this.db.prepare(`
+      UPDATE records SET normalized_text = ?, semantic_hash = ? WHERE uid = ?
+    `).run(normalizedText, semanticHash, recordUid)
+    this.syncRequirementSearchIndex(recordUid)
+    this.ensureRecordMaintenanceState(recordUid)
+    const timestamp = nowIso()
+    this.db.prepare(`
+      UPDATE record_maintenance_states
+      SET clean_status = 'ready', clean_version = ?, clean_updated_at = ?, clean_error = '',
+          lexical_status = 'ready', lexical_version = ?, lexical_updated_at = ?, lexical_error = '',
+          last_task_id = CASE WHEN ? <> '' THEN ? ELSE last_task_id END,
+          last_operation = CASE WHEN ? <> '' THEN ? ELSE last_operation END,
+          updated_at = ?
+      WHERE record_uid = ?
+    `).run(
+      RECORD_NORMALIZER_VERSION,
+      timestamp,
+      RECORD_LEXICAL_INDEX_VERSION,
+      timestamp,
+      taskId,
+      taskId,
+      operation,
+      operation,
+      timestamp,
+      recordUid
+    )
+    return true
+  }
+
+  rebuildRequirementRecordLexicalIndex(
+    recordUid: string,
+    taskId = '',
+    operation: RecordMaintenanceOperation | '' = 'rebuild_indexes'
+  ): boolean {
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const row = this.db.prepare(`
+        SELECT uid, name, raw_json FROM records WHERE uid = ?
+      `).get(recordUid) as SqlRow | undefined
+      if (!row) {
+        this.db.exec('ROLLBACK')
+        return false
+      }
+      this.db.prepare('DELETE FROM requirement_records_fts WHERE record_uid = ?').run(recordUid)
+      const businessText = this.requirementBusinessTextFromRow(row)
+      if (businessText) {
+        this.db.prepare(`
+          INSERT INTO requirement_records_fts(record_uid, business_text) VALUES (?, ?)
+        `).run(recordUid, businessText)
+      }
+      this.ensureRecordMaintenanceState(recordUid)
+      const timestamp = nowIso()
+      this.db.prepare(`
+        UPDATE record_maintenance_states
+        SET lexical_status = 'ready', lexical_version = ?, lexical_updated_at = ?, lexical_error = '',
+            last_task_id = CASE WHEN ? <> '' THEN ? ELSE last_task_id END,
+            last_operation = CASE WHEN ? <> '' THEN ? ELSE last_operation END,
+            updated_at = ?
+        WHERE record_uid = ?
+      `).run(
+        RECORD_LEXICAL_INDEX_VERSION,
+        timestamp,
+        taskId,
+        taskId,
+        operation,
+        operation,
+        timestamp,
+        recordUid
+      )
+      this.db.exec('COMMIT')
+      return true
+    } catch (error) {
+      try { this.db.exec('ROLLBACK') } catch {}
+      throw error
+    }
+  }
+
+  optimizeRecordMaintenance(): void {
+    this.db.exec('PRAGMA optimize')
   }
 
   private parseChatMessages(value: unknown): ChatMessage[] {
@@ -1825,7 +2540,9 @@ export class AppDatabase {
   replaceKnowledgeRecordChunks(
     recordUid: string,
     chunks: KnowledgeChunkInput[],
-    vectors: KnowledgeVectorInput[]
+    vectors: KnowledgeVectorInput[],
+    taskId = '',
+    operation: RecordMaintenanceOperation | '' = ''
   ): void {
     this.db.exec('BEGIN IMMEDIATE')
     try {
@@ -1833,6 +2550,13 @@ export class AppDatabase {
       this.insertKnowledgeChunks(chunks)
       this.insertKnowledgeVectors(vectors)
       this.db.exec('COMMIT')
+      this.markRecordMaintenanceVectorReady(
+        recordUid,
+        vectors[0]?.modelVersion ?? '',
+        chunks.length,
+        taskId,
+        operation
+      )
     } catch (error) {
       this.db.exec('ROLLBACK')
       throw error
@@ -1904,6 +2628,23 @@ export class AppDatabase {
     return row ? String(row.model_version) : null
   }
 
+  getKnowledgeRecordIndexChunkCount(recordUid: string, modelVersion?: string): number {
+    const row = modelVersion
+      ? this.db.prepare(`
+          SELECT COUNT(*) AS count
+          FROM knowledge_chunks c
+          JOIN knowledge_vectors v ON v.chunk_id = c.id
+          WHERE c.source_type = 'record' AND c.record_uid = ? AND v.model_version = ?
+        `).get(recordUid, modelVersion) as SqlRow
+      : this.db.prepare(`
+          SELECT COUNT(*) AS count
+          FROM knowledge_chunks c
+          JOIN knowledge_vectors v ON v.chunk_id = c.id
+          WHERE c.source_type = 'record' AND c.record_uid = ?
+        `).get(recordUid) as SqlRow
+    return Number(row.count ?? 0)
+  }
+
   listKnowledgeRecordIndexRows(): KnowledgeRecordIndexRow[] {
     return (this.db.prepare(`
       SELECT uid, name, node_type, item_id, raw_json, semantic_hash
@@ -1918,6 +2659,25 @@ export class AppDatabase {
         .update(`${String(row.semantic_hash ?? '')}\n${this.requirementBusinessTextFromRow(row)}`)
         .digest('hex')
     }))
+  }
+
+  getKnowledgeRecordIndexRow(recordUid: string): KnowledgeRecordIndexRow | null {
+    const row = this.db.prepare(`
+      SELECT uid, name, node_type, item_id, raw_json, semantic_hash
+      FROM records WHERE uid = ? LIMIT 1
+    `).get(recordUid) as SqlRow | undefined
+    if (!row) return null
+    const content = this.requirementBusinessTextFromRow(row)
+    return {
+      uid: String(row.uid),
+      name: String(row.name),
+      nodeType: String(row.node_type),
+      itemId: String(row.item_id),
+      content,
+      contentHash: createHash('sha256')
+        .update(`${String(row.semantic_hash ?? '')}\n${content}`)
+        .digest('hex')
+    }
   }
 
   deleteKnowledgeRecordIndex(recordUid: string): void {
@@ -1968,7 +2728,9 @@ export class AppDatabase {
         ...this.mapRecord(row),
         normalizedText: String(row.normalized_text ?? ''),
         raw,
-        images: []
+        images: [],
+        matchingText: this.requirementBusinessTextFromRow(row),
+        maintenance: this.getRecordMaintenanceState(String(row.uid), modelVersion)
       }
     })
   }
@@ -5374,7 +6136,7 @@ export class AppDatabase {
            last_modify_time=excluded.last_modify_time,
            raw_json=excluded.raw_json,
            synced_at=excluded.synced_at`
-      )
+    )
       .run(
         input.uid,
         input.name,
@@ -5491,6 +6253,7 @@ export class AppDatabase {
         nowIso()
       )
     this.syncRequirementSearchIndex(input.uid)
+    this.markRecordMaintenanceDataWritten(input.uid)
   }
 
   updateRecordNormalizedText(uid: string, normalizedText: string): void {
@@ -5509,6 +6272,14 @@ export class AppDatabase {
       SET normalized_text = ?, semantic_hash = ?
       WHERE uid = ?
     `).run(normalizedText, semanticHash, uid)
+    this.ensureRecordMaintenanceState(uid)
+    const timestamp = nowIso()
+    this.db.prepare(`
+      UPDATE record_maintenance_states
+      SET clean_status = 'ready', clean_version = ?, clean_updated_at = ?, clean_error = '',
+          updated_at = ?
+      WHERE record_uid = ?
+    `).run(RECORD_NORMALIZER_VERSION, timestamp, timestamp, uid)
   }
 
   updateRecordRawAndNormalizedText(
@@ -5532,6 +6303,7 @@ export class AppDatabase {
       WHERE uid = ?
     `).run(rawJson, normalizedText, contentHash, semanticHash, uid)
     this.syncRequirementSearchIndex(uid)
+    this.markRecordMaintenanceDataWritten(uid)
   }
 
   findRecordByItemId(itemId: string): RecordRow | null {
@@ -5847,7 +6619,8 @@ export class AppDatabase {
   getRecord(
     uid: string,
     includeImages = true,
-    semanticContext?: RequirementSemanticizationContext
+    semanticContext?: RequirementSemanticizationContext,
+    maintenanceModelVersion = ''
   ): RecordDetail | null {
     const row = this.db
       .prepare(
@@ -5867,7 +6640,15 @@ export class AppDatabase {
       )
       .get(uid) as SqlRow | undefined
     if (!row) return null
-    const raw = JSON.parse(String(row.raw_json)) as Record<string, unknown>
+    let raw: Record<string, unknown> = {}
+    try {
+      const parsed = JSON.parse(String(row.raw_json)) as unknown
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        raw = parsed as Record<string, unknown>
+      }
+    } catch {
+      raw = {}
+    }
     const fieldLabels = this.getFieldDisplayNames(
       String(row.node_type ?? ''),
       Object.keys(raw)
@@ -5894,6 +6675,8 @@ export class AppDatabase {
       normalizedText: String(row.normalized_text),
       raw,
       images,
+      matchingText: this.requirementBusinessTextFromRow(row),
+      maintenance: this.getRecordMaintenanceState(uid, maintenanceModelVersion),
       ...(semanticAnalysisTrace ? { semanticAnalysisTrace } : {}),
       ...(Object.keys(fieldLabels).length ? { fieldLabels } : {})
     }

@@ -230,8 +230,103 @@ export interface FieldDefinition {
 export interface RecordDetail extends RecordRow {
   raw: Record<string, unknown>
   images: ImageAsset[]
+  matchingText: string
+  maintenance: RecordMaintenanceState
   fieldLabels?: Record<string, string>
   semanticAnalysisTrace?: RequirementSemanticizationAnalysisTrace
+}
+
+export type RecordMaintenanceScope = 'all' | 'selected'
+
+export type RecordMaintenanceOperation = 'clean' | 'rebuild_indexes' | 'optimize'
+
+export type RecordMaintenanceTaskStatus =
+  | 'queued'
+  | 'scanning'
+  | 'running'
+  | 'stopping'
+  | 'stopped'
+  | 'completed'
+  | 'completed_with_errors'
+  | 'failed'
+
+export type RecordMaintenanceStage =
+  | 'scanning'
+  | 'cleaning'
+  | 'lexical'
+  | 'vector'
+  | 'finalizing'
+  | 'idle'
+
+export type RecordMaintenanceIndexStatus =
+  | 'ready'
+  | 'pending'
+  | 'stale'
+  | 'running'
+  | 'failed'
+  | 'unavailable'
+
+export interface RecordMaintenanceIndexState {
+  status: RecordMaintenanceIndexStatus
+  version: string
+  modelVersion?: string
+  chunkCount?: number
+  updatedAt: string
+  error?: string
+}
+
+export interface RecordMaintenanceState {
+  overallStatus: RecordMaintenanceIndexStatus
+  clean: RecordMaintenanceIndexState
+  lexical: RecordMaintenanceIndexState
+  vector: RecordMaintenanceIndexState
+  lastTaskId?: string
+  lastOperation?: RecordMaintenanceOperation
+}
+
+export interface RecordMaintenanceStartInput {
+  scope: RecordMaintenanceScope
+  recordUids?: string[]
+  operation: RecordMaintenanceOperation
+}
+
+export interface RecordMaintenancePreview {
+  scope: RecordMaintenanceScope
+  totalCount: number
+  cleanPendingCount: number
+  lexicalPendingCount: number
+  vectorPendingCount: number
+  semanticInvalidationCount: number
+  modelVersion: string
+  normalizerVersion: string
+  lexicalVersion: string
+  scannedAt: string
+}
+
+export interface RecordMaintenanceFailedItem {
+  uid: string
+  name: string
+  stage: RecordMaintenanceStage
+  error: string
+}
+
+export interface RecordMaintenanceTaskSnapshot {
+  taskId: string
+  scope: RecordMaintenanceScope
+  operation: RecordMaintenanceOperation
+  status: RecordMaintenanceTaskStatus
+  stage: RecordMaintenanceStage
+  message: string
+  current: number
+  total: number
+  succeeded: number
+  failed: number
+  currentUid?: string
+  currentName?: string
+  failedItems: RecordMaintenanceFailedItem[]
+  startedAt: string
+  updatedAt: string
+  finishedAt?: string
 }
 
 export interface ImageAsset {
@@ -929,6 +1024,11 @@ export interface AppApi {
   listNodeTypes(): Promise<string[]>
   listRecords(query: RecordQuery): Promise<RecordPage>
   getRecord(uid: string): Promise<RecordDetail | null>
+  previewRecordMaintenance(input: Pick<RecordMaintenanceStartInput, 'scope' | 'recordUids'>): Promise<RecordMaintenancePreview>
+  startRecordMaintenance(input: RecordMaintenanceStartInput): Promise<RecordMaintenanceTaskSnapshot>
+  getRecordMaintenanceTask(): Promise<RecordMaintenanceTaskSnapshot | null>
+  stopRecordMaintenance(): Promise<RecordMaintenanceTaskSnapshot | null>
+  onRecordMaintenanceProgress(callback: (snapshot: RecordMaintenanceTaskSnapshot) => void): () => void
   startRequirementSemanticization(
     input: RequirementSemanticizationStartInput
   ): Promise<RequirementSemanticizationStartResult>

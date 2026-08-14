@@ -3,6 +3,7 @@ import {
   BorderOutlined,
   BulbOutlined,
   CheckCircleOutlined,
+  ClearOutlined,
   CloudDownloadOutlined,
   CloseOutlined,
   CloudUploadOutlined,
@@ -40,6 +41,7 @@ import {
   StopOutlined,
   SyncOutlined,
   SunOutlined,
+  ThunderboltOutlined,
   UserOutlined
 } from '@ant-design/icons'
 import {
@@ -122,6 +124,14 @@ import type {
   PushLogRow,
   PushResult,
   RecordDetail,
+  RecordMaintenanceIndexStatus,
+  RecordMaintenanceOperation,
+  RecordMaintenanceScope,
+  RecordMaintenanceStage,
+  RecordMaintenanceTaskSnapshot,
+  RecordMaintenanceTaskStatus,
+  RecordMaintenanceState,
+  RecordMaintenancePreview,
   RecordRow,
   RequirementSemanticizationControl as SemanticizationControlAction,
   RequirementSemanticizationStage as SemanticizationTaskStage,
@@ -407,6 +417,47 @@ const semanticAuditFieldLabels: Record<string, string> = {
   acceptance: '验收结果',
   businessScene: '业务场景'
 }
+
+const semanticResultFieldDefinitions: Array<{
+  aliases: readonly string[]
+}> = [
+  { aliases: ['action', '需求动作'] },
+  { aliases: ['functionalObject', '功能对象'] },
+  { aliases: ['behavior', '功能行为'] },
+  { aliases: ['targetState', '目标状态'] },
+  { aliases: ['constraints', '业务约束'] },
+  { aliases: ['acceptance', '验收结果'] }
+]
+
+const semanticActionLabels: Record<string, string> = {
+  rename_label: '修改名称/文案',
+  configure_permission: '配置权限',
+  compare: '对比分析',
+  enable_selection: '开启选择',
+  add_capability: '新增能力',
+  remove_capability: '移除能力',
+  relax_constraint: '放宽约束',
+  tighten_constraint: '收紧约束',
+  fix_defect: '修复缺陷',
+  change_flow: '调整流程',
+  optimize_ui: '优化界面',
+  unknown: '未识别'
+}
+
+const semanticResultPlaceholderValues = new Set(['—', '未确认', '未提供', '等待裁决', '等待裁决输出'])
+
+const semanticResultValueIsPresent = (value: string): boolean => Boolean(value)
+  && !semanticResultPlaceholderValues.has(value)
+
+const semanticResultFieldsOf = (fields: SemanticAuditFieldView[]): SemanticAuditFieldView[] => (
+  semanticResultFieldDefinitions.flatMap(({ aliases }) => {
+    const field = fields.find((candidate) => (
+      aliases.some((alias) => alias === candidate.key || alias === candidate.label)
+      && semanticResultValueIsPresent(candidate.value)
+    ))
+    return field ? [field] : []
+  })
+)
 
 const semanticAuditStatusLabels: Record<SemanticAuditStageStatus, string> = {
   pending: '待执行',
@@ -696,16 +747,20 @@ const buildSemanticAuditView = (
   comparisons: SemanticAuditComparisonView[]
   finalSummary: string
   evidence: string
+  finalFields: SemanticAuditFieldView[]
 } => {
   const payload = semanticAuditPayloadOf(task)
   const currentIndex = semanticAuditStageDefinitions.findIndex((stage) => stage.key === task.currentStage)
   const taskRecord = task as unknown as Record<string, unknown>
   const recentUid = task.currentRecord?.uid || task.recentItems[0]?.uid
   const sourceRecord = recentUid ? records.find((record) => record.uid === recentUid) : undefined
-  const finalAdjudicationFields = semanticAuditFieldsOf({
-    fields: auditRecordOf(auditRecordOf(payload.finalAdjudication)?.fields) ?? {}
-  })
-  const adjudicationEvidence = [...new Set(finalAdjudicationFields.map((field) => field.evidence).filter(Boolean))].join('；')
+  const finalAdjudication = auditRecordOf(payload.finalAdjudication)
+  const finalAdjudicationFields = finalAdjudication ? semanticAuditFieldsOf(finalAdjudication) : []
+  const adjudicationPayload = semanticAuditStagePayloadOf(payload, 'adjudication')
+  const adjudicationStageFields = semanticAuditFieldsOf(adjudicationPayload)
+  const adjudicatedFields = [...finalAdjudicationFields, ...adjudicationStageFields]
+  const finalFields = semanticResultFieldsOf(adjudicatedFields)
+  const adjudicationEvidence = [...new Set(adjudicatedFields.map((field) => field.evidence).filter(Boolean))].join('；')
   const evidence = firstAuditText(payload, ['sourceEvidence', 'originalEvidence', 'evidence', 'sourceText'])
     || adjudicationEvidence
     || plainAuditText(sourceRecord?.normalizedText || sourceRecord?.description || sourceRecord?.name)
@@ -728,7 +783,7 @@ const buildSemanticAuditView = (
   const independent = outputs.find((stage) => stage.key === 'independent') ?? outputs[1]
   const adjudication = outputs.find((stage) => stage.key === 'adjudication') ?? outputs[2]
   const finalSummary = firstAuditText(payload, ['finalSummary', 'adjudicationSummary', 'decisionSummary', 'analysisSummary', 'summary'])
-    || firstAuditText(auditRecordOf(payload.finalAdjudication), ['summary'])
+    || firstAuditText(finalAdjudication, ['summary'])
     || adjudication?.summary
     || ''
   const explicitEvents = semanticAuditEventsOf(payload)
@@ -772,7 +827,8 @@ const buildSemanticAuditView = (
     events: dedupedEvents,
     comparisons: initial && independent ? semanticAuditComparisonsOf(payload, initial, independent) : [],
     finalSummary,
-    evidence
+    evidence,
+    finalFields
   }
 }
 
@@ -809,6 +865,24 @@ function SemanticAuditPanel({
   history?: SemanticAuditEventView[]
 }): React.JSX.Element {
   const view = buildSemanticAuditView(task, records, history)
+  const adjudicationStage = view.timeline.find((stage) => stage.key === 'adjudication')
+  const hasSemanticResult = view.finalFields.length > 0 || Boolean(view.finalSummary)
+  const resultIsCompleted = hasSemanticResult
+    && adjudicationStage?.status !== 'failed'
+    && ((task.status === 'completed' && task.succeeded > 0 && task.failed === 0) || adjudicationStage?.status === 'completed')
+  const resultNeedsAttention = !resultIsCompleted && (
+    adjudicationStage?.status === 'failed' || task.status === 'stopped' || task.failed > 0
+  )
+  const resultStatusClass = resultIsCompleted
+    ? 'is-completed'
+    : resultNeedsAttention
+      ? 'is-failed'
+      : hasSemanticResult ? 'is-active' : 'is-pending'
+  const resultStatusLabel = resultIsCompleted
+    ? '已完成 · 结构化结果'
+    : resultNeedsAttention
+      ? '结果需关注'
+      : hasSemanticResult ? '已生成 · 待校验' : '尚未生成结构化结果'
   return (
     <section className="asset-semantic-audit" aria-label="AI 语义化可审计分析过程">
       <div className="asset-semantic-audit-heading">
@@ -821,6 +895,41 @@ function SemanticAuditPanel({
           <span className="asset-semantic-audit-disclaimer">过程记录 ≠ 内部思维链</span>
         </div>
       </div>
+      <section className={`asset-semantic-result-summary ${resultIsCompleted ? 'is-completed' : ''}`} aria-label="最终结构化语义结果">
+        <div className="asset-semantic-result-heading">
+          <div>
+            <div className="asset-semantic-result-title">
+              {resultIsCompleted ? <CheckCircleOutlined aria-hidden="true" /> : <InfoCircleOutlined aria-hidden="true" />}
+              <span>最终语义化结果</span>
+            </div>
+            <Text type="secondary">基于最终裁决字段汇总，优先展示已确认内容。</Text>
+          </div>
+          <span className={`asset-semantic-result-state ${resultStatusClass}`} role="status">
+            {resultStatusLabel}
+          </span>
+        </div>
+        {view.finalFields.length ? (
+          <div className="asset-semantic-result-grid" role="list" aria-label="最终语义化核心字段">
+            {view.finalFields.map((field) => {
+              const value = field.key === 'action' ? semanticActionLabels[field.value] ?? field.value : field.value
+              return (
+                <div className="asset-semantic-result-field" key={`final-${field.key}`} role="listitem">
+                  <div className="asset-semantic-result-field-heading">
+                    <span className="asset-semantic-result-label">{field.label}</span>
+                    {field.confidence !== undefined && <span className="asset-semantic-result-confidence">置信度 {Math.round(field.confidence * 100)}%</span>}
+                  </div>
+                  <div className="asset-semantic-result-value" title={value}>{value}</div>
+                </div>
+              )
+            })}
+          </div>
+        ) : hasSemanticResult ? (
+          <p className="asset-semantic-result-text">{view.finalSummary}</p>
+        ) : (
+          <div className="asset-semantic-result-empty">最终裁决完成后，已确认的核心字段会显示在这里。</div>
+        )}
+        {view.finalFields.length > 0 && view.finalSummary && <p className="asset-semantic-result-text">{view.finalSummary}</p>}
+      </section>
       <div className="asset-semantic-audit-grid">
         <section className="asset-semantic-audit-section" aria-label="阶段时间线">
           <div className="asset-semantic-audit-section-heading"><span>阶段时间线</span><Text type="secondary">实时更新</Text></div>
@@ -1037,6 +1146,74 @@ const formatDate = (value?: string): string => {
   const date = new Date(value)
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString('zh-CN')
 }
+
+const recordMaintenanceOperationLabels: Record<RecordMaintenanceOperation, string> = {
+  optimize: '一键优化匹配',
+  clean: '仅清理数据',
+  rebuild_indexes: '仅重建索引'
+}
+
+const recordMaintenanceTaskStatusLabels: Record<RecordMaintenanceTaskStatus, string> = {
+  queued: '排队中',
+  scanning: '扫描中',
+  running: '执行中',
+  stopping: '停止中',
+  stopped: '已安全停止',
+  completed: '已完成',
+  completed_with_errors: '完成但有失败',
+  failed: '执行失败'
+}
+
+const recordMaintenanceStageLabels: Record<RecordMaintenanceStage, string> = {
+  scanning: '扫描数据',
+  cleaning: '清理数据',
+  lexical: '重建全文索引',
+  vector: '重建向量索引',
+  finalizing: '保存结果',
+  idle: '空闲'
+}
+
+const recordMaintenanceIndexStatusMeta: Record<RecordMaintenanceIndexStatus, {
+  label: string
+  color: 'default' | 'processing' | 'success' | 'warning' | 'error'
+}> = {
+  ready: { label: '就绪', color: 'success' },
+  pending: { label: '待处理', color: 'warning' },
+  stale: { label: '需更新', color: 'warning' },
+  running: { label: '处理中', color: 'processing' },
+  failed: { label: '失败', color: 'error' },
+  unavailable: { label: '不可用', color: 'default' }
+}
+
+const recordMaintenanceActiveStatuses: RecordMaintenanceTaskStatus[] = [
+  'queued',
+  'scanning',
+  'running',
+  'stopping'
+]
+
+const recordMaintenanceTerminalStatuses: RecordMaintenanceTaskStatus[] = [
+  'stopped',
+  'completed',
+  'completed_with_errors',
+  'failed'
+]
+
+const fallbackMaintenanceState = (): RecordMaintenanceState => ({
+  overallStatus: 'unavailable',
+  clean: { status: 'unavailable', version: '—', updatedAt: '' },
+  lexical: { status: 'unavailable', version: '—', updatedAt: '' },
+  vector: { status: 'unavailable', version: '—', updatedAt: '' }
+})
+
+const recordMaintenanceIndexDefinitions: Array<{
+  key: 'clean' | 'lexical' | 'vector'
+  label: string
+}> = [
+  { key: 'clean', label: '数据清理' },
+  { key: 'lexical', label: '全文索引' },
+  { key: 'vector', label: '向量索引' }
+]
 
 const formatChatSessionTime = (value: string): string => {
   const date = new Date(value)
@@ -1710,6 +1887,21 @@ function DataPage({
   const [exporting, setExporting] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [review, setReview] = useState<{ batchId: string; items: DataReviewItem[] } | null>(null)
+  const [maintenanceOpen, setMaintenanceOpen] = useState(false)
+  const [maintenanceOpenFromDetail, setMaintenanceOpenFromDetail] = useState(false)
+  const [maintenanceScope, setMaintenanceScope] = useState<RecordMaintenanceScope>('all')
+  const [maintenanceTargetUids, setMaintenanceTargetUids] = useState<string[]>([])
+  const [maintenanceOperation, setMaintenanceOperation] = useState<RecordMaintenanceOperation>('optimize')
+  const [maintenancePreview, setMaintenancePreview] = useState<RecordMaintenancePreview | null>(null)
+  const [maintenancePreviewLoading, setMaintenancePreviewLoading] = useState(false)
+  const [maintenancePreviewError, setMaintenancePreviewError] = useState<string | null>(null)
+  const [maintenanceSubmitting, setMaintenanceSubmitting] = useState(false)
+  const [maintenanceStopPending, setMaintenanceStopPending] = useState(false)
+  const [maintenanceTask, setMaintenanceTask] = useState<RecordMaintenanceTaskSnapshot | null>(null)
+  const maintenanceTerminalRef = useRef('')
+  const maintenanceDetailUidRef = useRef<string | null>(null)
+  const maintenancePreviewRequestRef = useRef(0)
+  const [maintenancePreviewRefreshKey, setMaintenancePreviewRefreshKey] = useState(0)
 
   const load = useCallback(async (): Promise<void> => {
     setLoading(true)
@@ -1742,8 +1934,204 @@ function DataPage({
     void load()
   }, [load, refreshKey])
 
+  useEffect(() => {
+    maintenanceDetailUidRef.current = detail?.uid ?? null
+  }, [detail?.uid])
+
   const openDetail = async (uid: string): Promise<void> => {
     setDetail(await window.visslm.getRecord(uid))
+  }
+
+  const applyMaintenanceSnapshot = useCallback((snapshot: RecordMaintenanceTaskSnapshot): void => {
+    setMaintenanceTask(snapshot)
+    if (!recordMaintenanceTerminalStatuses.includes(snapshot.status)) return
+    const terminalKey = `${snapshot.taskId}:${snapshot.status}:${snapshot.finishedAt ?? snapshot.updatedAt}`
+    if (maintenanceTerminalRef.current === terminalKey) return
+    maintenanceTerminalRef.current = terminalKey
+    setMaintenancePreviewRefreshKey((current) => current + 1)
+    void load()
+    onDataChanged()
+    const detailUid = maintenanceDetailUidRef.current
+    if (!detailUid) return
+    void window.visslm.getRecord(detailUid).then((next) => {
+      setDetail((current) => current?.uid === detailUid ? next : current)
+    }).catch(() => {
+      // The list refresh remains useful when the detail request is temporarily unavailable.
+    })
+  }, [load, onDataChanged])
+
+  const hydrateMaintenanceTask = useCallback(async (): Promise<void> => {
+    try {
+      if (typeof window.visslm.getRecordMaintenanceTask !== 'function') return
+      const snapshot = await window.visslm.getRecordMaintenanceTask()
+      if (snapshot) applyMaintenanceSnapshot(snapshot)
+    } catch {
+      // Maintenance recovery is best effort; the data center remains usable without it.
+    }
+  }, [applyMaintenanceSnapshot])
+
+  useEffect(() => {
+    void hydrateMaintenanceTask()
+  }, [hydrateMaintenanceTask, refreshKey])
+
+  useEffect(() => {
+    if (typeof window.visslm.onRecordMaintenanceProgress !== 'function') return undefined
+    return window.visslm.onRecordMaintenanceProgress((snapshot) => {
+      applyMaintenanceSnapshot(snapshot)
+    })
+  }, [applyMaintenanceSnapshot])
+
+  const maintenanceTargetIds = useMemo(
+    () => [...new Set(maintenanceTargetUids.map((uid) => uid.trim()).filter(Boolean))],
+    [maintenanceTargetUids]
+  )
+  const maintenanceTaskIsActive = Boolean(
+    maintenanceTask && recordMaintenanceActiveStatuses.includes(maintenanceTask.status)
+  )
+
+  useEffect(() => {
+    if (!maintenanceOpen) return undefined
+    const requestId = ++maintenancePreviewRequestRef.current
+    if (maintenanceScope === 'selected' && !maintenanceTargetIds.length) {
+      setMaintenancePreview(null)
+      setMaintenancePreviewError('请先选择至少一条记录')
+      setMaintenancePreviewLoading(false)
+      return undefined
+    }
+    setMaintenancePreviewLoading(true)
+    setMaintenancePreviewError(null)
+    const input = maintenanceScope === 'selected'
+      ? { scope: maintenanceScope, recordUids: maintenanceTargetIds }
+      : { scope: maintenanceScope }
+    if (typeof window.visslm.previewRecordMaintenance !== 'function') {
+      setMaintenancePreviewLoading(false)
+      setMaintenancePreviewError('当前应用暂未提供数据维护预览能力')
+      return undefined
+    }
+    void window.visslm.previewRecordMaintenance(input).then((preview) => {
+      if (requestId !== maintenancePreviewRequestRef.current) return
+      setMaintenancePreview(preview)
+    }).catch((error) => {
+      if (requestId !== maintenancePreviewRequestRef.current) return
+      setMaintenancePreview(null)
+      setMaintenancePreviewError(error instanceof Error ? error.message : String(error))
+    }).finally(() => {
+      if (requestId === maintenancePreviewRequestRef.current) setMaintenancePreviewLoading(false)
+    })
+    return undefined
+  }, [maintenanceOpen, maintenanceScope, maintenanceTargetIds, maintenancePreviewRefreshKey])
+
+  const openMaintenancePanel = (
+    scope: RecordMaintenanceScope,
+    recordUids: string[],
+    fromDetail = false
+  ): void => {
+    const targetIds = [...new Set(recordUids.map((uid) => uid.trim()).filter(Boolean))]
+    if (scope === 'selected' && !targetIds.length) {
+      message.info('请先选择需要维护的记录')
+      return
+    }
+    setMaintenanceTargetUids(targetIds)
+    setMaintenanceScope(scope)
+    setMaintenanceOpenFromDetail(fromDetail)
+    setMaintenancePreview(null)
+    setMaintenancePreviewError(null)
+    setMaintenanceOpen(true)
+  }
+
+  const openMaintenanceFromToolbar = (): void => {
+    const targetIds = [...selectedRowKeys]
+    openMaintenancePanel(targetIds.length ? 'selected' : 'all', targetIds)
+  }
+
+  const startMaintenance = async (
+    operation: RecordMaintenanceOperation,
+    scope = maintenanceScope,
+    targetIds = maintenanceTargetIds
+  ): Promise<void> => {
+    const recordUids = [...new Set(targetIds.map((uid) => uid.trim()).filter(Boolean))]
+    if (scope === 'selected' && !recordUids.length) {
+      message.info('请先选择需要维护的记录')
+      return
+    }
+    if (maintenanceTaskIsActive) {
+      message.info('当前已有数据维护任务，请等待任务结束或先安全停止')
+      return
+    }
+    setMaintenanceSubmitting(true)
+    setMaintenanceOperation(operation)
+    maintenanceTerminalRef.current = ''
+    try {
+      if (typeof window.visslm.startRecordMaintenance !== 'function') {
+        throw new Error('当前应用暂未提供数据维护能力')
+      }
+      const snapshot = await window.visslm.startRecordMaintenance({
+        scope,
+        ...(scope === 'selected' ? { recordUids } : {}),
+        operation
+      })
+      applyMaintenanceSnapshot(snapshot)
+      message.success(`${recordMaintenanceOperationLabels[operation]}任务已启动`)
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : String(error))
+    } finally {
+      setMaintenanceSubmitting(false)
+    }
+  }
+
+  const confirmStartMaintenance = (operation: RecordMaintenanceOperation): void => {
+    const count = maintenancePreview?.totalCount
+    const scopeLabel = maintenanceScope === 'selected'
+      ? `已选 ${maintenanceTargetIds.length} 条记录`
+      : '全部数据中心记录'
+    modal.confirm({
+      title: `确认${recordMaintenanceOperationLabels[operation]}？`,
+      content: `将处理${scopeLabel}${count !== undefined ? `，预览共 ${count} 条` : ''}。任务会逐条执行，已完成结果会保留。`,
+      okText: '确认开始',
+      cancelText: '暂不执行',
+      onOk: () => startMaintenance(operation)
+    })
+  }
+
+  const confirmStopMaintenance = (): void => {
+    modal.confirm({
+      title: '安全停止当前维护任务？',
+      content: '停止请求会在当前记录处理完成后生效，已经完成的记录不会回滚。',
+      okText: '确认停止',
+      okType: 'danger',
+      cancelText: '继续执行',
+      onOk: async () => {
+        setMaintenanceStopPending(true)
+        try {
+          if (typeof window.visslm.stopRecordMaintenance !== 'function') {
+            throw new Error('当前应用暂未提供停止维护能力')
+          }
+          const snapshot = await window.visslm.stopRecordMaintenance()
+          if (snapshot) applyMaintenanceSnapshot(snapshot)
+          message.info('已请求安全停止，当前记录完成后生效')
+        } catch (error) {
+          message.error(error instanceof Error ? error.message : String(error))
+          throw error
+        } finally {
+          setMaintenanceStopPending(false)
+        }
+      }
+    })
+  }
+
+  const retryFailedMaintenanceItems = (): void => {
+    if (!maintenanceTask?.failedItems.length) return
+    const failedIds = [...new Set(maintenanceTask.failedItems.map((item) => item.uid).filter(Boolean))]
+    if (!failedIds.length) return
+    setMaintenanceTargetUids(failedIds)
+    setMaintenanceScope('selected')
+    modal.confirm({
+      title: `重试失败项（${failedIds.length} 条）？`,
+      content: '只会重新处理上次失败的记录，成功记录不会重复执行。',
+      okText: '重试失败项',
+      cancelText: '暂不重试',
+      onOk: () => startMaintenance(maintenanceTask.operation, 'selected', failedIds)
+    })
   }
 
   const importData = async (): Promise<void> => {
@@ -1840,6 +2228,25 @@ function DataPage({
     onVisualize(scope, parts.join(' · '))
   }
 
+  const maintenanceTaskPercent = maintenanceTask && maintenanceTask.total > 0
+    ? Math.min(100, Math.round((maintenanceTask.current / maintenanceTask.total) * 100))
+    : maintenanceTask && recordMaintenanceTerminalStatuses.includes(maintenanceTask.status)
+      ? 100
+      : 0
+  const maintenanceProgressStatus = maintenanceTask?.status === 'completed'
+    ? 'success'
+    : maintenanceTask && ['completed_with_errors', 'failed', 'stopped'].includes(maintenanceTask.status)
+      ? 'exception'
+      : 'active'
+  const maintenanceCanStart = Boolean(
+    maintenancePreview &&
+    maintenancePreview.totalCount > 0 &&
+    !maintenancePreviewLoading &&
+    !maintenancePreviewError &&
+    !maintenanceTaskIsActive
+  )
+  const detailMaintenance = detail?.maintenance ?? fallbackMaintenanceState()
+
   return (
     <div className="page-stack">
       <div className="page-toolbar">
@@ -1857,6 +2264,13 @@ function DataPage({
             onClick={() => void exportData()}
           >
             导出数据
+          </Button>
+          <Button
+            icon={<ThunderboltOutlined />}
+            onClick={openMaintenanceFromToolbar}
+          >
+            数据维护
+            {selectedRowKeys.length ? `（${selectedRowKeys.length}）` : ''}
           </Button>
           <Button
             type="primary"
@@ -2048,6 +2462,48 @@ function DataPage({
                 {formatDate(detail.lastModifyTime)}
               </Descriptions.Item>
             </Descriptions>
+            <section className="record-maintenance-readiness" aria-label="匹配准备度">
+              <div className="record-maintenance-readiness-heading">
+                <div>
+                  <Text strong>匹配准备度</Text>
+                  <Text type="secondary">查看清理、全文索引和向量索引的可用状态</Text>
+                </div>
+                <Button
+                  size="small"
+                  type="primary"
+                  icon={<ThunderboltOutlined />}
+                  onClick={() => openMaintenancePanel('selected', [detail.uid], true)}
+                >
+                  优化此记录
+                </Button>
+              </div>
+              <div className="record-maintenance-readiness-grid" role="list" aria-label="匹配准备度状态">
+                {recordMaintenanceIndexDefinitions.map(({ key, label }) => {
+                  const index = detailMaintenance[key]
+                  const meta = recordMaintenanceIndexStatusMeta[index.status]
+                  return (
+                    <div className="record-maintenance-readiness-item" key={key} role="listitem">
+                      <div className="record-maintenance-readiness-item-heading">
+                        <strong>{label}</strong>
+                        <Tag color={meta.color}>{meta.label}</Tag>
+                      </div>
+                      <dl>
+                        <div><dt>版本</dt><dd title={index.version}>{index.version || '—'}</dd></div>
+                        <div><dt>模型</dt><dd title={index.modelVersion || undefined}>{index.modelVersion || '—'}</dd></div>
+                        <div><dt>分块</dt><dd>{index.chunkCount ?? '—'}</dd></div>
+                        <div><dt>更新时间</dt><dd>{formatDate(index.updatedAt)}</dd></div>
+                      </dl>
+                      {index.error && (
+                        <p className="record-maintenance-index-error" title={index.error}>
+                          <ExclamationCircleOutlined />
+                          <span>{index.error}</span>
+                        </p>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+            </section>
             <Divider titlePlacement="start">描述</Divider>
             <RichDescription html={detail.description} images={detail.images} />
             {detail.images.length > 0 && (
@@ -2065,12 +2521,223 @@ function DataPage({
                 </Image.PreviewGroup>
               </>
             )}
-            <Divider titlePlacement="start">知识文本</Divider>
-            <pre className="text-preview">{detail.normalizedText || '暂无可索引文本'}</pre>
-            <Divider titlePlacement="start">原始 JSON</Divider>
-            <pre className="json-preview">{JSON.stringify(detail.raw, null, 2)}</pre>
+            <Divider titlePlacement="start">匹配文本</Divider>
+            <pre className="matching-text-preview">{detail.matchingText || detail.normalizedText || '暂无可用于匹配的文本'}</pre>
+            <Collapse
+              className="record-detail-raw-collapse"
+              items={[{
+                key: 'raw',
+                label: '原始 JSON（低频信息）',
+                children: <pre className="json-preview">{JSON.stringify(detail.raw, null, 2)}</pre>
+              }]}
+            />
           </div>
         )}
+      </Drawer>
+      <Drawer
+        rootClassName="record-maintenance-drawer-shell"
+        className="record-maintenance-drawer"
+        title={(
+          <div className="drawer-context-title">
+            <ThunderboltOutlined />
+            <span>数据维护</span>
+            <strong>{maintenanceTask ? recordMaintenanceTaskStatusLabels[maintenanceTask.status] : '执行前预览'}</strong>
+          </div>
+        )}
+        size={640}
+        open={maintenanceOpen}
+        mask={!maintenanceOpenFromDetail}
+        maskClosable={false}
+        onClose={() => {
+          setMaintenanceOpen(false)
+          setMaintenanceOpenFromDetail(false)
+        }}
+      >
+        <div className="record-maintenance-panel">
+          <section className="record-maintenance-section record-maintenance-preview" aria-label="数据维护执行前预览">
+            <div className="record-maintenance-section-heading">
+              <div>
+                <Text strong>执行前预览</Text>
+                <Text type="secondary">只读扫描当前范围，不会修改数据。</Text>
+              </div>
+              {maintenancePreviewLoading && <Spin size="small" aria-label="正在生成维护预览" />}
+            </div>
+            {maintenancePreviewError ? (
+              <Alert type="warning" showIcon message={maintenancePreviewError} />
+            ) : maintenancePreview ? (
+              <>
+                <div className="record-maintenance-preview-grid" role="list" aria-label="维护预览数量">
+                  <div role="listitem"><span>范围记录</span><strong>{maintenancePreview.totalCount}</strong></div>
+                  <div role="listitem"><span>待清理</span><strong>{maintenancePreview.cleanPendingCount}</strong></div>
+                  <div role="listitem"><span>待全文索引</span><strong>{maintenancePreview.lexicalPendingCount}</strong></div>
+                  <div role="listitem"><span>待向量索引</span><strong>{maintenancePreview.vectorPendingCount}</strong></div>
+                  <div role="listitem"><span>语义失效</span><strong>{maintenancePreview.semanticInvalidationCount}</strong></div>
+                </div>
+                <div className="record-maintenance-preview-versions" aria-label="维护版本">
+                  <span>规范化 {maintenancePreview.normalizerVersion || '—'}</span>
+                  <span>全文 {maintenancePreview.lexicalVersion || '—'}</span>
+                  <span>模型 {maintenancePreview.modelVersion || '—'}</span>
+                  <span>扫描于 {formatDate(maintenancePreview.scannedAt)}</span>
+                </div>
+              </>
+            ) : (
+              <div className="record-maintenance-empty">正在读取当前范围的可维护项。</div>
+            )}
+          </section>
+
+          <section className="record-maintenance-section record-maintenance-scope-section" aria-label="数据维护范围">
+            <div className="record-maintenance-section-heading">
+              <div>
+                <Text strong>处理范围</Text>
+                <Text type="secondary">默认优先使用当前已选记录。</Text>
+              </div>
+            </div>
+            <Segmented
+              aria-label="数据维护范围"
+              value={maintenanceScope}
+              options={[
+                { label: `已选记录（${maintenanceTargetIds.length}）`, value: 'selected', disabled: !maintenanceTargetIds.length },
+                { label: '全部记录', value: 'all' }
+              ]}
+              onChange={(value) => setMaintenanceScope(value as RecordMaintenanceScope)}
+            />
+          </section>
+
+          <section className="record-maintenance-section record-maintenance-actions-section" aria-label="数据维护操作">
+            <div className="record-maintenance-section-heading">
+              <div>
+                <Text strong>执行操作</Text>
+                <Text type="secondary">维护任务会逐条处理，完成后自动刷新列表和详情。</Text>
+              </div>
+            </div>
+            <div className="record-maintenance-action-grid">
+              <Button
+                type="primary"
+                icon={<ThunderboltOutlined />}
+                loading={maintenanceSubmitting && maintenanceOperation === 'optimize'}
+                disabled={!maintenanceCanStart || maintenanceSubmitting}
+                onClick={() => confirmStartMaintenance('optimize')}
+              >
+                一键优化匹配
+              </Button>
+              <Button
+                icon={<ClearOutlined />}
+                loading={maintenanceSubmitting && maintenanceOperation === 'clean'}
+                disabled={!maintenanceCanStart || maintenanceSubmitting}
+                onClick={() => confirmStartMaintenance('clean')}
+              >
+                仅清理数据
+              </Button>
+              <Button
+                icon={<DatabaseOutlined />}
+                loading={maintenanceSubmitting && maintenanceOperation === 'rebuild_indexes'}
+                disabled={!maintenanceCanStart || maintenanceSubmitting}
+                onClick={() => confirmStartMaintenance('rebuild_indexes')}
+              >
+                仅重建索引
+              </Button>
+            </div>
+          </section>
+
+          {maintenanceTask && (
+            <section
+              className={`record-maintenance-section record-maintenance-task-panel is-${maintenanceTask.status}`}
+              aria-label="数据维护任务状态"
+            >
+              <div className="record-maintenance-task-heading">
+                <div>
+                  <div className="record-maintenance-task-title">
+                    <Text strong>当前维护任务</Text>
+                    <Tag color={maintenanceTask.status === 'completed'
+                      ? 'success'
+                      : maintenanceTask.status === 'completed_with_errors' || maintenanceTask.status === 'failed'
+                        ? 'warning'
+                        : maintenanceTask.status === 'stopped'
+                          ? 'default'
+                          : 'processing'}>
+                      {recordMaintenanceTaskStatusLabels[maintenanceTask.status]}
+                    </Tag>
+                  </div>
+                  <Text type="secondary" aria-live="polite">
+                    {maintenanceTask.message || recordMaintenanceOperationLabels[maintenanceTask.operation]}
+                  </Text>
+                </div>
+                <Button
+                  danger
+                  size="small"
+                  icon={<StopOutlined />}
+                  loading={maintenanceStopPending}
+                  disabled={!maintenanceTaskIsActive || maintenanceStopPending || maintenanceTask.status === 'stopping'}
+                  onClick={confirmStopMaintenance}
+                >
+                  安全停止
+                </Button>
+              </div>
+              <div className="record-maintenance-task-current">
+                <div>
+                  <span>当前阶段</span>
+                  <strong>{recordMaintenanceStageLabels[maintenanceTask.stage]}</strong>
+                </div>
+                <div>
+                  <span>当前记录</span>
+                  <strong title={maintenanceTask.currentName || maintenanceTask.currentUid || undefined}>
+                    {maintenanceTask.currentName || maintenanceTask.currentUid || '等待开始'}
+                  </strong>
+                </div>
+              </div>
+              <Tooltip title={`已处理 ${maintenanceTask.current} / ${maintenanceTask.total} 条`}>
+                <Progress
+                  percent={maintenanceTaskPercent}
+                  status={maintenanceProgressStatus}
+                  showInfo={false}
+                  aria-label={`数据维护进度 ${maintenanceTaskPercent}%`}
+                />
+              </Tooltip>
+              <div className="record-maintenance-task-metrics" aria-label="数据维护任务统计">
+                <span><strong>{maintenanceTask.current}</strong><small>已处理</small></span>
+                <span className="is-success"><strong>{maintenanceTask.succeeded}</strong><small>成功</small></span>
+                <span className="is-error"><strong>{maintenanceTask.failed}</strong><small>失败</small></span>
+                <span><strong>{Math.max(0, maintenanceTask.total - maintenanceTask.current)}</strong><small>剩余</small></span>
+              </div>
+              {maintenanceTask.status === 'completed_with_errors' && (
+                <Alert type="warning" showIcon message="维护已完成，但仍有失败记录，可在下方重试。" />
+              )}
+              {maintenanceTask.status === 'stopped' && (
+                <Alert type="info" showIcon message="任务已安全停止，已完成的记录结果已保留。" />
+              )}
+              {maintenanceTask.status === 'failed' && (
+                <Alert type="error" showIcon message={maintenanceTask.message || '维护任务失败，请检查失败记录。'} />
+              )}
+              {maintenanceTask.failedItems.length > 0 && (
+                <div className="record-maintenance-failed-items">
+                  <div className="record-maintenance-failed-heading">
+                    <Text strong>失败记录（{maintenanceTask.failedItems.length}）</Text>
+                    <Button
+                      size="small"
+                      icon={<ReloadOutlined />}
+                      disabled={maintenanceTaskIsActive || maintenanceSubmitting}
+                      onClick={retryFailedMaintenanceItems}
+                    >
+                      重试失败项
+                    </Button>
+                  </div>
+                  <ul>
+                    {maintenanceTask.failedItems.slice(0, 12).map((item) => (
+                      <li key={`${item.uid}-${item.stage}`}>
+                        <span title={item.name || item.uid}>{item.name || item.uid}</span>
+                        <small>{recordMaintenanceStageLabels[item.stage]}</small>
+                        <Text type="secondary" title={item.error}>{item.error}</Text>
+                      </li>
+                    ))}
+                  </ul>
+                  {maintenanceTask.failedItems.length > 12 && (
+                    <Text type="secondary">其余失败记录可通过重试失败项再次处理。</Text>
+                  )}
+                </div>
+              )}
+            </section>
+          )}
+        </div>
       </Drawer>
       {review && (
         <DataReviewModal
@@ -5474,6 +6141,144 @@ const updateStatusColor = (status: UpdateStatus | null): string => {
   return 'default'
 }
 
+type UpdateReleaseNoteBlock =
+  | { type: 'heading'; level: number; text: string }
+  | { type: 'paragraph'; text: string }
+  | { type: 'list'; ordered: boolean; items: string[] }
+
+const compactUpdateNoteText = (value: string): string => value.replace(/\s+/g, ' ').trim()
+
+const parsePlainUpdateNotes = (value: string): UpdateReleaseNoteBlock[] => {
+  const blocks: UpdateReleaseNoteBlock[] = []
+  let paragraphLines: string[] = []
+  let list: Extract<UpdateReleaseNoteBlock, { type: 'list' }> | null = null
+
+  const flushParagraph = (): void => {
+    const text = compactUpdateNoteText(paragraphLines.join(' '))
+    if (text) blocks.push({ type: 'paragraph', text })
+    paragraphLines = []
+  }
+
+  const flushList = (): void => {
+    if (list?.items.length) blocks.push(list)
+    list = null
+  }
+
+  value.replace(/\r\n?/g, '\n').split('\n').forEach((rawLine) => {
+    const line = rawLine.trim()
+    if (!line) {
+      flushParagraph()
+      flushList()
+      return
+    }
+
+    const unorderedItem = line.match(/^[-*•]\s+(.+)$/)
+    const orderedItem = line.match(/^\d+[.)]\s+(.+)$/)
+    if (unorderedItem || orderedItem) {
+      flushParagraph()
+      const ordered = Boolean(orderedItem)
+      if (!list || list.ordered !== ordered) {
+        flushList()
+        list = { type: 'list', ordered, items: [] }
+      }
+      list.items.push(compactUpdateNoteText((unorderedItem ?? orderedItem)?.[1] ?? ''))
+      return
+    }
+
+    flushList()
+    const heading = line.match(/^(#{1,6})\s+(.+)$/)
+    if (heading) {
+      flushParagraph()
+      blocks.push({
+        type: 'heading',
+        level: heading[1].length,
+        text: compactUpdateNoteText(heading[2])
+      })
+      return
+    }
+    paragraphLines.push(line)
+  })
+
+  flushParagraph()
+  flushList()
+  return blocks
+}
+
+const hasStructuredUpdateNoteMarkup = (value: string): boolean =>
+  /<\s*\/?\s*(?:h[1-6]|ul|ol|li|p|div|br|blockquote|section|article|strong|em)\b/i.test(value) ||
+  /&lt;\s*\/?\s*(?:h[1-6]|ul|ol|li|p|div|br|blockquote|section|article|strong|em)\b/i.test(value)
+
+const parseHtmlUpdateNotes = (value: string): UpdateReleaseNoteBlock[] => {
+  if (typeof DOMParser === 'undefined' || typeof document === 'undefined') {
+    return parsePlainUpdateNotes(value.replace(/<[^>]*>/g, ''))
+  }
+
+  const decoder = document.createElement('textarea')
+  decoder.innerHTML = value
+  const decoded = decoder.value
+  const documentFragment = new DOMParser().parseFromString(decoded, 'text/html')
+  const blocks: UpdateReleaseNoteBlock[] = []
+
+  Array.from(documentFragment.body.children).forEach((element) => {
+    const tagName = element.tagName.toLowerCase()
+    if (tagName === 'script' || tagName === 'style') return
+
+    if (/^h[1-6]$/.test(tagName)) {
+      const text = compactUpdateNoteText(element.textContent ?? '')
+      if (text) blocks.push({ type: 'heading', level: Number(tagName.slice(1)), text })
+      return
+    }
+
+    if (tagName === 'ul' || tagName === 'ol') {
+      const items = Array.from(element.children)
+        .filter((child) => child.tagName.toLowerCase() === 'li')
+        .map((item) => compactUpdateNoteText(item.textContent ?? ''))
+        .filter(Boolean)
+      if (items.length) blocks.push({ type: 'list', ordered: tagName === 'ol', items })
+      return
+    }
+
+    const text = compactUpdateNoteText(element.textContent ?? '')
+    if (text) blocks.push({ type: 'paragraph', text })
+  })
+
+  if (blocks.length) return blocks
+  return parsePlainUpdateNotes(documentFragment.body.textContent ?? decoded)
+}
+
+const parseUpdateReleaseNotes = (value: string): UpdateReleaseNoteBlock[] =>
+  hasStructuredUpdateNoteMarkup(value) ? parseHtmlUpdateNotes(value) : parsePlainUpdateNotes(value)
+
+function UpdateReleaseNotes({ notes }: { notes: string }): React.JSX.Element {
+  const blocks = parseUpdateReleaseNotes(notes)
+
+  return (
+    <div className="settings-update-notes-content">
+      {blocks.length === 0 ? (
+        <p>暂无可显示的发行说明</p>
+      ) : blocks.map((block, index) => {
+        if (block.type === 'heading') {
+          return React.createElement(
+            `h${Math.min(6, Math.max(1, block.level))}`,
+            { key: `heading-${index}`, className: 'settings-update-note-heading' },
+            block.text
+          )
+        }
+
+        if (block.type === 'list') {
+          return React.createElement(
+            block.ordered ? 'ol' : 'ul',
+            { key: `list-${index}`, className: 'settings-update-note-list' },
+            block.items.map((item, itemIndex) => <li key={`${index}-${itemIndex}`}>{item}</li>)
+          )
+        }
+
+        return <p key={`paragraph-${index}`}>{block.text}</p>
+      })}
+    </div>
+  )
+}
+
 function SettingsPage({
   settings,
   onChanged,
@@ -6060,9 +6865,9 @@ function SettingsPage({
                           />
                         )}
                         {updateStatus?.releaseNotes && (
-                          <div className="settings-update-notes">
+                          <div className="settings-update-notes" role="region" aria-label="发行说明">
                             <Text type="secondary">发行说明</Text>
-                            <div>{updateStatus.releaseNotes}</div>
+                            <UpdateReleaseNotes notes={updateStatus.releaseNotes} />
                           </div>
                         )}
                       </div>

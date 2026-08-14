@@ -20,6 +20,9 @@ import type {
   SystemSettingsInput,
   PushConfig,
   RecordQuery,
+  RecordMaintenancePreview,
+  RecordMaintenanceStartInput,
+  RecordMaintenanceTaskSnapshot,
   RequirementSemanticizationControl,
   RequirementSemanticizationProgress,
   RequirementSemanticizationStartInput,
@@ -101,6 +104,24 @@ const api: AppApi = {
   listNodeTypes: () => ipcRenderer.invoke('data:node-types'),
   listRecords: (query: RecordQuery) => ipcRenderer.invoke('data:records', query),
   getRecord: (uid: string) => ipcRenderer.invoke('data:record', uid),
+  previewRecordMaintenance: (
+    input: Pick<RecordMaintenanceStartInput, 'scope' | 'recordUids'>
+  ): Promise<RecordMaintenancePreview> => ipcRenderer.invoke('data:maintenance-preview', input),
+  startRecordMaintenance: (
+    input: RecordMaintenanceStartInput
+  ): Promise<RecordMaintenanceTaskSnapshot> => ipcRenderer.invoke('data:maintenance-start', input),
+  getRecordMaintenanceTask: (): Promise<RecordMaintenanceTaskSnapshot | null> =>
+    ipcRenderer.invoke('data:maintenance-task'),
+  stopRecordMaintenance: (): Promise<RecordMaintenanceTaskSnapshot | null> =>
+    ipcRenderer.invoke('data:maintenance-stop'),
+  onRecordMaintenanceProgress: (
+    callback: (snapshot: RecordMaintenanceTaskSnapshot) => void
+  ) => {
+    const listener = (_event: Electron.IpcRendererEvent, snapshot: RecordMaintenanceTaskSnapshot): void =>
+      callback(snapshot)
+    ipcRenderer.on('data:maintenance-progress', listener)
+    return () => ipcRenderer.removeListener('data:maintenance-progress', listener)
+  },
   startRequirementSemanticization: (input: RequirementSemanticizationStartInput) =>
     ipcRenderer.invoke('requirements:semanticize', input),
   getRequirementSemanticizationTask: (): Promise<RequirementSemanticizationTaskSnapshot | null> =>

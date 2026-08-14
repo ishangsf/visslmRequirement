@@ -15,7 +15,13 @@ import type {
   KnowledgeUploadResult,
   RecordDetail
 } from '../shared/types'
-import { AppDatabase, type KnowledgeChunkInput, type KnowledgeVectorInput } from './database'
+import {
+  AppDatabase,
+  type KnowledgeChunkInput,
+  type KnowledgeVectorInput
+} from './database'
+import type { RecordMaintenanceOperation } from '../shared/types'
+import { AsyncMutex } from './record-index-lock'
 
 export const MAX_KNOWLEDGE_FILE_BYTES = 100 * 1024 * 1024
 export const EMBEDDING_MODEL_ID = 'Xenova/bge-small-zh-v1.5'
@@ -486,7 +492,8 @@ export class KnowledgeService {
 
   constructor(
     private readonly db: AppDatabase,
-    private readonly progress?: (progress: KnowledgeIndexProgress) => void
+    private readonly progress?: (progress: KnowledgeIndexProgress) => void,
+    private readonly recordIndexLock: AsyncMutex = new AsyncMutex()
   ) {}
 
   get modelVersion(): string {
@@ -661,6 +668,14 @@ export class KnowledgeService {
   }
 
   async rebuildIndex(): Promise<KnowledgeRebuildResult> {
+    return this.recordIndexLock.runExclusive(() => this.rebuildIndexInternal())
+  }
+
+  async rebuildIndexInLock(): Promise<KnowledgeRebuildResult> {
+    return this.rebuildIndexInternal()
+  }
+
+  private async rebuildIndexInternal(): Promise<KnowledgeRebuildResult> {
     await this.embeddings.prepare()
     if (!this.embeddings.available) throw new Error(this.embeddings.unavailableReason)
     const taskId = randomUUID()
@@ -708,10 +723,49 @@ export class KnowledgeService {
 
   async syncRecordIndex(): Promise<void> {
     if (this.indexingPromise) return this.indexingPromise
-    this.indexingPromise = this.syncRecordIndexInternal().finally(() => {
+    this.indexingPromise = this.recordIndexLock.runExclusive(() => this.syncRecordIndexInternal()).finally(() => {
       this.indexingPromise = null
     })
     return this.indexingPromise
+  }
+
+  async syncRecordIndexInLock(): Promise<void> {
+    return this.syncRecordIndexInternal()
+  }
+
+  async rebuildRecordIndexInLock(
+    recordUid: string,
+    taskId = '',
+    operation: RecordMaintenanceOperation | '' = ''
+  ): Promise<number> {
+    await this.embeddings.prepare()
+    if (!this.embeddings.available) throw new Error(this.embeddings.unavailableReason)
+    const row = this.db.getKnowledgeRecordIndexRow(recordUid)
+    if (!row) throw new Error('记录不存在或已被删除')
+    const pages: ParsedPage[] = [{ text: row.content, location: '采集记录' }]
+    const chunks = chunkKnowledgePages(pages)
+    const embeddings = await this.embeddings.embedMany(chunks.map((chunk) => chunk.text))
+    if (embeddings.length !== chunks.length) throw new Error(this.embeddings.unavailableReason)
+    const inputs: KnowledgeChunkInput[] = []
+    const vectors: KnowledgeVectorInput[] = []
+    chunks.forEach((chunk, chunkIndex) => {
+      const chunkId = randomUUID()
+      inputs.push({
+        id: chunkId,
+        recordUid: row.uid,
+        sourceType: 'record',
+        sourceName: row.name,
+        sourceHash: row.contentHash,
+        content: chunk.text,
+        chunkIndex,
+        location: chunk.location,
+        charStart: chunk.charStart,
+        charEnd: chunk.charEnd
+      })
+      vectors.push({ chunkId, vector: embeddings[chunkIndex], modelVersion: this.modelVersion })
+    })
+    this.db.replaceKnowledgeRecordChunks(row.uid, inputs, vectors, taskId, operation)
+    return inputs.length
   }
 
   async search(question: string, limit = 8): Promise<KnowledgeSearchHit[]> {
@@ -1013,7 +1067,14 @@ export class KnowledgeService {
       if (
         this.db.getKnowledgeRecordIndexHash(row.uid) === row.contentHash &&
         this.db.getKnowledgeRecordIndexModelVersion(row.uid) === this.modelVersion
-      ) continue
+      ) {
+        this.db.markRecordMaintenanceVectorReady(
+          row.uid,
+          this.modelVersion,
+          this.db.getKnowledgeRecordIndexChunkCount(row.uid, this.modelVersion)
+        )
+        continue
+      }
       const pages: ParsedPage[] = [{
         // row.content is already restricted to business evidence. Keep
         // identity and audit metadata out of embedding input.
