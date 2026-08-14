@@ -198,6 +198,15 @@ const parseJsonPayload = (input: unknown): unknown => {
   return current
 }
 
+const describeInvalidJsonResponse = (response: Response, body: string): string => {
+  const contentType = response.headers.get('content-type')?.split(';', 1)[0]?.trim()
+  const normalizedBody = body.trimStart()
+  const isHtml = /^<(?:!doctype\s+html|html|head|body|script)\b/i.test(normalizedBody)
+  const responseKind = isHtml ? 'HTML 页面' : '无效 JSON'
+  const contentHint = contentType ? `，Content-Type 为 ${contentType}` : ''
+  return `VISSLM 返回${responseKind}而不是 JSON（HTTP ${response.status}${contentHint}）。请检查接口地址、登录状态或接口权限`
+}
+
 const validFieldKey = (field: string): boolean =>
   field.length > 0 && field.length <= 240 && field !== '_valm_NodeType' &&
   !FIELD_COLLECTION_KEYS.has(field.toLocaleLowerCase())
@@ -487,8 +496,14 @@ export class VisslmClient {
     const response = await fetch(this.authenticatedUrl(path, query), {
       signal: AbortSignal.timeout(30_000)
     })
+    const responseText = await response.text()
     if (!response.ok) throw new Error(`VISSLM HTTP ${response.status}`)
-    const data = (await response.json()) as AlmResponse | unknown
+    let data: AlmResponse | unknown = null
+    try {
+      data = responseText.trim() ? JSON.parse(responseText) as AlmResponse | unknown : null
+    } catch {
+      throw new Error(describeInvalidJsonResponse(response, responseText))
+    }
     if (data && typeof data === 'object' && 'ErrorCode' in data) {
       const result = data as AlmResponse
       if (Number(result.ErrorCode) !== 0) {

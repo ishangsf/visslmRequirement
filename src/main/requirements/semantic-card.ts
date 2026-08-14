@@ -47,7 +47,7 @@ export interface RequirementSemanticFieldAssessment {
   evidence: string
 }
 
-export interface RequirementSemanticCard {
+export interface RequirementMatchCard {
   requirementType: string
   productDomain: string
   module: string
@@ -62,12 +62,18 @@ export interface RequirementSemanticCard {
   constraints: string
   acceptance: string
   businessScene: string
+  /** Clean source fields used by the deterministic exact/near-text path. */
+  sourceTitle?: string
+  sourceDescription?: string
   evidence: string
   matchingText: string
   lexicalTerms: string[]
-  fieldAssessments: Record<RequirementSemanticFieldName, RequirementSemanticFieldAssessment>
   analysisStatus: 'source_only' | 'ai_adjudicated'
   analysisSummary: string
+}
+
+export interface RequirementSemanticCard extends RequirementMatchCard {
+  fieldAssessments: Record<RequirementSemanticFieldName, RequirementSemanticFieldAssessment>
 }
 
 export const isAiRequirementSemanticCard = (value: unknown): value is RequirementSemanticCard => {
@@ -164,11 +170,74 @@ export const removeRequirementNoise = (value: string): string => value
   .replace(/\n{3,}/g, '\n\n')
   .trim()
 
-const lexicalTermsOf = (values: string[]): string[] => {
+export interface RequirementBusinessSource {
+  name?: unknown
+  description?: unknown
+  raw?: Record<string, unknown>
+}
+
+const REQUIREMENT_DESCRIPTION_ALIASES = [
+  '_valm_Description', 'description', 'Description', 'content', 'Content', '需求描述', '描述'
+] as const
+
+const requirementDescriptionOf = (source: RequirementBusinessSource): string => (
+  removeRequirementNoise(
+    toRequirementPlainText(source.description) ||
+    requirementRawField(source.raw ?? {}, REQUIREMENT_DESCRIPTION_ALIASES)
+  )
+)
+
+/**
+ * Return only business text that is safe for requirement recall and embedding.
+ * Record identity, audit fields, and generic normalized_text are deliberately
+ * excluded because they are metadata rather than requirement evidence.
+ */
+export const buildRequirementBusinessText = (source: RequirementBusinessSource): string => {
+  const title = toRequirementPlainText(source.name)
+  const raw = source.raw ?? {}
+  const requirementType = requirementRawField(raw, [
+    'IssueType', 'issueType', '_valm_IssueType', 'requirementType', '需求类型', '问题类型'
+  ])
+  const productDomain = requirementRawField(raw, [
+    '_valm_ProductDomain', '_valm_Product', 'productDomain', 'product', 'domain',
+    '产品域', '产品领域', '产品'
+  ])
+  const module = requirementRawField(raw, [
+    '_valm_Module', '_valm_ModuleName', 'module', 'moduleName', 'Module', 'ModuleName',
+    'featureModule', 'featureModuleName', 'requirementModule', '业务模块', '功能模块', '模块'
+  ])
+  const description = requirementDescriptionOf(source)
+  return [
+    title ? `名称：${title}` : '',
+    requirementType ? `明确需求类型：${requirementType}` : '',
+    productDomain ? `明确产品域：${productDomain}` : '',
+    module ? `明确模块：${module}` : '',
+    description ? `描述：${description}` : ''
+  ].filter(Boolean).join('\n')
+}
+
+export const requirementLexicalTermsOf = (values: string[]): string[] => {
   const terms = values.flatMap((value) => value
     .split(/[\s，。；;：:、/|·（）()\[\]【】]+/)
-    .map((item) => item.trim())
-    .filter((item) => item.length >= 2 && item.length <= 32))
+    .flatMap((rawItem) => {
+      const item = rawItem.trim()
+      if (!item) return []
+      const technicalTerms = item.match(/[A-Za-z][A-Za-z0-9_.+-]{1,31}/g) ?? []
+      const hanRuns = item.match(/[\p{Script=Han}]{3,}/gu) ?? []
+      const hanTerms = hanRuns.flatMap((run) => {
+        const clipped = run.slice(0, 48)
+        const windows: string[] = []
+        for (let index = 0; index <= clipped.length - 3; index += 1) {
+          windows.push(clipped.slice(index, index + 3))
+        }
+        return [clipped, ...windows]
+      })
+      return [
+        ...(item.length >= 2 && item.length <= 32 ? [item] : []),
+        ...technicalTerms,
+        ...hanTerms
+      ]
+    }))
   return [...new Set(terms)].slice(0, 80)
 }
 
@@ -179,7 +248,7 @@ const assessment = (value = '', evidence = '', confidence = 0): RequirementSeman
 })
 
 export const buildRequirementMatchingText = (
-  card: Pick<RequirementSemanticCard,
+  card: Pick<RequirementMatchCard,
     'requirementType' | 'productDomain' | 'module' | 'functionalObject' | 'action' |
     'currentState' | 'targetState' | 'trigger' | 'input' | 'output' | 'behavior' |
     'constraints' | 'acceptance' | 'businessScene' | 'evidence'>
@@ -213,27 +282,17 @@ export const buildRequirementSemanticCard = (record: RecordDetail): RequirementS
     '_valm_ProductDomain', '_valm_Product', 'productDomain', 'product', 'domain',
     '产品域', '产品领域', '产品'
   ])
-  const description = removeRequirementNoise(toRequirementPlainText(record.description) || requirementRawField(record.raw, [
-    '_valm_Description', 'description', 'Description', 'content', 'Content', '需求描述', '描述'
-  ]))
+  const description = requirementDescriptionOf(record)
   const title = toRequirementPlainText(record.name)
-  const normalizedFallback = removeRequirementNoise(toRequirementPlainText(record.normalizedText ?? ''))
-  const evidence = [
-    title ? `名称：${title}` : '',
-    requirementType ? `明确需求类型：${requirementType}` : '',
-    productDomain ? `明确产品域：${productDomain}` : '',
-    module ? `明确模块：${module}` : '',
-    description ? `描述：${description}` : '',
-    normalizedFallback ? `规范化全文：${normalizedFallback}` : ''
-  ].filter(Boolean).join('\n')
-  const behavior = description || title || normalizedFallback
+  const evidence = buildRequirementBusinessText(record)
+  const behavior = description || title
   const fieldAssessments = Object.fromEntries(
     REQUIREMENT_SEMANTIC_FIELDS.map((field) => [field, assessment()])
   ) as Record<RequirementSemanticFieldName, RequirementSemanticFieldAssessment>
   fieldAssessments.requirementType = assessment(requirementType, requirementType, requirementType ? 1 : 0)
   fieldAssessments.productDomain = assessment(productDomain, productDomain, productDomain ? 1 : 0)
   fieldAssessments.module = assessment(module, module, module ? 1 : 0)
-  fieldAssessments.behavior = assessment(behavior, description || title || normalizedFallback, behavior ? 1 : 0)
+  fieldAssessments.behavior = assessment(behavior, description || title, behavior ? 1 : 0)
   const card: RequirementSemanticCard = {
     requirementType,
     productDomain,
@@ -249,15 +308,61 @@ export const buildRequirementSemanticCard = (record: RecordDetail): RequirementS
     constraints: '',
     acceptance: '',
     businessScene: '',
+    sourceTitle: title,
+    sourceDescription: description,
     evidence,
     matchingText: '',
-    lexicalTerms: lexicalTermsOf([title, description, requirementType, productDomain, module]),
+    lexicalTerms: requirementLexicalTermsOf([title, description, requirementType, productDomain, module]),
     fieldAssessments,
     analysisStatus: 'source_only',
     analysisSummary: '仅完成原文清洗和明确字段读取，未推断业务语义。'
   }
   card.matchingText = evidence
   return card
+}
+
+/**
+ * Build the read-only source view used by matching when no valid AI asset exists.
+ * It intentionally carries no inferred action, object, state, or business rule.
+ */
+export const buildRequirementSourceView = (record: RecordDetail): RequirementMatchCard => {
+  const requirementType = requirementRawField(record.raw, [
+    'IssueType', 'issueType', '_valm_IssueType', 'requirementType', '需求类型', '问题类型'
+  ])
+  const module = requirementRawField(record.raw, [
+    '_valm_Module', '_valm_ModuleName', 'module', 'moduleName', 'Module', 'ModuleName',
+    'featureModule', 'featureModuleName', 'requirementModule', '业务模块', '功能模块', '模块'
+  ])
+  const productDomain = requirementRawField(record.raw, [
+    '_valm_ProductDomain', '_valm_Product', 'productDomain', 'product', 'domain',
+    '产品域', '产品领域', '产品'
+  ])
+  const title = toRequirementPlainText(record.name)
+  const description = requirementDescriptionOf(record)
+  const evidence = buildRequirementBusinessText(record)
+  return {
+    requirementType,
+    productDomain,
+    module,
+    functionalObject: '',
+    action: 'unknown',
+    currentState: '',
+    targetState: '',
+    trigger: '',
+    input: '',
+    output: '',
+    behavior: description || title,
+    constraints: '',
+    acceptance: '',
+    businessScene: '',
+    sourceTitle: title,
+    sourceDescription: description,
+    evidence,
+    matchingText: evidence,
+    lexicalTerms: requirementLexicalTermsOf([title, description, requirementType, productDomain, module]),
+    analysisStatus: 'source_only',
+    analysisSummary: '仅使用数据中心原文，不包含 AI 推断语义。'
+  }
 }
 
 const normalized = (value: string): string => value.toLocaleLowerCase().replace(/[\s\p{P}\p{S}]+/gu, '')
@@ -278,8 +383,8 @@ export const semanticTextSimilarity = (left: string, right: string): number => {
 }
 
 export const structuralRequirementScore = (
-  base: RequirementSemanticCard,
-  candidate: RequirementSemanticCard
+  base: RequirementMatchCard,
+  candidate: RequirementMatchCard
 ): number => {
   const weighted: Array<[number, number]> = []
   const add = (weight: number, left: string, right: string): void => {
@@ -298,4 +403,4 @@ export const structuralRequirementScore = (
   return weighted.reduce((sum, [weight, score]) => sum + weight * score, 0) / totalWeight * 100
 }
 
-export const requirementLexicalTerms = (values: string[]): string[] => lexicalTermsOf(values)
+export const requirementLexicalTerms = (values: string[]): string[] => requirementLexicalTermsOf(values)

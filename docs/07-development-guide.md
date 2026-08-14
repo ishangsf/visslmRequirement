@@ -158,7 +158,7 @@ npx tsx .\scripts\smoke-dashboard-drafts.ts
 npm run smoke:dashboard-editor
 ```
 
-`smoke:project-export` 会实际写出并重新读取 Excel 工作簿，检查 9 个工作表和关键字段。需求分析固定回归以 `VISSLM-TSIS-779` 为 hard-negative 合同案例。可视化的 golden、性能、视觉矩阵、像素差异和回归脚本也位于 `scripts/`，涉及 renderer 或布局时应按变更范围选择执行。
+`smoke:project-export` 会实际写出并重新读取 Excel 工作簿，检查 9 个工作表和关键字段。需求分析固定回归使用通用 hard-negative 合同夹具，夹具编号只用于测试数据，不参与运行时分支。可视化的 golden、性能、视觉矩阵、像素差异和回归脚本也位于 `scripts/`，涉及 renderer 或布局时应按变更范围选择执行。
 
 ### 7.3 外部连接和端到端
 

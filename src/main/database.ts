@@ -42,7 +42,11 @@ import type {
   RequirementSemanticizationAnalysisTrace,
   SyncRun
 } from '../shared/types'
-import { isAiRequirementSemanticCard, type RequirementSemanticCard } from './requirements/semantic-card'
+import {
+  buildRequirementBusinessText,
+  isAiRequirementSemanticCard,
+  type RequirementSemanticCard
+} from './requirements/semantic-card'
 import type {
   ManagedProject,
   ManagedProjectInput,
@@ -257,16 +261,141 @@ export interface RequirementSemanticizationContext {
   modelSignature: string
 }
 
+export interface RequirementMatchCache {
+  cacheKey: string
+  baseRecordUid: string
+  candidateRecordUid: string
+  queryHash: string
+  baseContentHash: string
+  candidateContentHash: string
+  baseCardHash: string
+  candidateCardHash: string
+  analyzerVersion: string
+  semanticModelSignature: string
+  embeddingModelVersion: string
+  rerankerVersion: string
+  strategyVersion: string
+  explanationModelSignature: string
+  resultJson: string
+  resultStatus: 'live_verified' | 'cache_verified'
+  createdAt: string
+  updatedAt: string
+}
+
+export interface RequirementMatchCacheInput {
+  cacheKey: string
+  baseRecordUid: string
+  candidateRecordUid: string
+  queryHash: string
+  baseContentHash: string
+  candidateContentHash: string
+  baseCardHash: string
+  candidateCardHash: string
+  analyzerVersion: string
+  semanticModelSignature: string
+  embeddingModelVersion: string
+  rerankerVersion: string
+  strategyVersion: string
+  explanationModelSignature: string
+  result: unknown
+  resultStatus: 'live_verified' | 'cache_verified'
+}
+
+const requirementMatchCacheStatuses = new Set<RequirementMatchCache['resultStatus']>([
+  'live_verified',
+  'cache_verified'
+])
+
+const requirementMatchCacheMax = {
+  cacheKey: 512,
+  recordUid: 256,
+  hash: 256,
+  version: 256,
+  resultJson: 512 * 1024
+} as const
+
+const normalizeRequirementMatchCacheString = (
+  value: unknown,
+  field: string,
+  maxLength: number
+): string => {
+  if (typeof value !== 'string') throw new Error(`${field} 必须是文本`)
+  const normalized = value.trim()
+  if (!normalized) throw new Error(`${field} 不能为空`)
+  if (normalized.length > maxLength) throw new Error(`${field} 超过 ${maxLength} 字符限制`)
+  return normalized
+}
+
+const normalizeRequirementMatchCacheJson = (value: unknown): string => {
+  let parsed: unknown
+  try {
+    parsed = typeof value === 'string' ? JSON.parse(value.trim()) : value
+  } catch {
+    throw new Error('result 必须是有效 JSON')
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('result 必须是结构化 JSON 对象')
+  }
+  const serialized = JSON.stringify(parsed)
+  if (!serialized || serialized.length > requirementMatchCacheMax.resultJson) {
+    throw new Error(`result 超过 ${requirementMatchCacheMax.resultJson} 字符限制`)
+  }
+  return serialized
+}
+
+const mapRequirementMatchCacheRow = (row: SqlRow): RequirementMatchCache | null => {
+  const resultStatus = String(row.result_status ?? '').trim() as RequirementMatchCache['resultStatus']
+  if (!requirementMatchCacheStatuses.has(resultStatus)) return null
+  try {
+    return {
+      cacheKey: normalizeRequirementMatchCacheString(row.cache_key, 'cacheKey', requirementMatchCacheMax.cacheKey),
+      baseRecordUid: normalizeRequirementMatchCacheString(row.base_record_uid, 'baseRecordUid', requirementMatchCacheMax.recordUid),
+      candidateRecordUid: normalizeRequirementMatchCacheString(row.candidate_record_uid, 'candidateRecordUid', requirementMatchCacheMax.recordUid),
+      queryHash: normalizeRequirementMatchCacheString(row.query_hash, 'queryHash', requirementMatchCacheMax.hash),
+      baseContentHash: normalizeRequirementMatchCacheString(row.base_content_hash, 'baseContentHash', requirementMatchCacheMax.hash),
+      candidateContentHash: normalizeRequirementMatchCacheString(row.candidate_content_hash, 'candidateContentHash', requirementMatchCacheMax.hash),
+      baseCardHash: normalizeRequirementMatchCacheString(row.base_card_hash, 'baseCardHash', requirementMatchCacheMax.hash),
+      candidateCardHash: normalizeRequirementMatchCacheString(row.candidate_card_hash, 'candidateCardHash', requirementMatchCacheMax.hash),
+      analyzerVersion: normalizeRequirementMatchCacheString(row.analyzer_version, 'analyzerVersion', requirementMatchCacheMax.version),
+      semanticModelSignature: normalizeRequirementMatchCacheString(row.semantic_model_signature, 'semanticModelSignature', requirementMatchCacheMax.version),
+      embeddingModelVersion: normalizeRequirementMatchCacheString(row.embedding_model_version, 'embeddingModelVersion', requirementMatchCacheMax.version),
+      rerankerVersion: normalizeRequirementMatchCacheString(row.reranker_version, 'rerankerVersion', requirementMatchCacheMax.version),
+      strategyVersion: normalizeRequirementMatchCacheString(row.strategy_version, 'strategyVersion', requirementMatchCacheMax.version),
+      explanationModelSignature: normalizeRequirementMatchCacheString(row.explanation_model_signature, 'explanationModelSignature', requirementMatchCacheMax.version),
+      resultJson: normalizeRequirementMatchCacheJson(String(row.result_json ?? '')),
+      resultStatus,
+      createdAt: normalizeRequirementMatchCacheString(row.created_at, 'createdAt', 64),
+      updatedAt: normalizeRequirementMatchCacheString(row.updated_at, 'updatedAt', 64)
+    }
+  } catch {
+    return null
+  }
+}
+
 const requirementSemanticContentSql = (alias: string): string => `${alias}.semantic_hash`
+
+const REQUIREMENT_BUSINESS_INDEX_MIGRATION_KEY = 'migration:requirement-business-index'
+const REQUIREMENT_BUSINESS_INDEX_VERSION = 'requirement-business-index-v2'
 
 const requirementSemanticSourceHash = (input: {
   name: string
   lastModifyTime: string
   rawJson: string
   normalizedText: string
-}): string => createHash('sha256')
-  .update([input.name, input.lastModifyTime, input.rawJson, input.normalizedText].join('\n'))
-  .digest('hex')
+}): string => {
+  let raw: Record<string, unknown> = {}
+  try {
+    const parsed = JSON.parse(input.rawJson) as unknown
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      raw = parsed as Record<string, unknown>
+    }
+  } catch {
+    raw = {}
+  }
+  return createHash('sha256')
+    .update(`requirement-business-source-v2\n${buildRequirementBusinessText({ name: input.name, raw })}`)
+    .digest('hex')
+}
 
 export interface KnowledgeVectorRow {
   chunk: KnowledgeChunk
@@ -914,6 +1043,32 @@ export class AppDatabase {
       CREATE INDEX IF NOT EXISTS idx_requirement_semantic_cards_status
         ON requirement_semantic_cards(status, updated_at DESC);
 
+      CREATE TABLE IF NOT EXISTS requirement_match_cache (
+        cache_key TEXT PRIMARY KEY,
+        base_record_uid TEXT NOT NULL,
+        candidate_record_uid TEXT NOT NULL,
+        query_hash TEXT NOT NULL,
+        base_content_hash TEXT NOT NULL,
+        candidate_content_hash TEXT NOT NULL,
+        base_card_hash TEXT NOT NULL,
+        candidate_card_hash TEXT NOT NULL,
+        analyzer_version TEXT NOT NULL,
+        semantic_model_signature TEXT NOT NULL,
+        embedding_model_version TEXT NOT NULL,
+        reranker_version TEXT NOT NULL,
+        strategy_version TEXT NOT NULL,
+        explanation_model_signature TEXT NOT NULL,
+        result_json TEXT NOT NULL CHECK (json_valid(result_json)),
+        result_status TEXT NOT NULL CHECK (result_status IN ('live_verified', 'cache_verified')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_requirement_match_cache_updated
+        ON requirement_match_cache(updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_requirement_match_cache_lookup
+        ON requirement_match_cache(base_record_uid, candidate_record_uid, query_hash, updated_at DESC);
+
       CREATE TABLE IF NOT EXISTS org_people (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -1244,19 +1399,6 @@ export class AppDatabase {
       }
     }
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_records_push_status ON records(push_status)')
-    const missingSemanticHashes = this.db.prepare(`
-      SELECT uid, name, last_modify_time, raw_json, normalized_text
-      FROM records WHERE semantic_hash = ''
-    `).all() as SqlRow[]
-    const updateSemanticHash = this.db.prepare('UPDATE records SET semantic_hash = ? WHERE uid = ?')
-    for (const row of missingSemanticHashes) {
-      updateSemanticHash.run(requirementSemanticSourceHash({
-        name: String(row.name ?? ''),
-        lastModifyTime: String(row.last_modify_time ?? ''),
-        rawJson: String(row.raw_json ?? '{}'),
-        normalizedText: String(row.normalized_text ?? '')
-      }), String(row.uid))
-    }
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_pm_cost_entries_responsible ON pm_cost_entries(responsible_participant_id)')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_pm_requirements_set ON pm_requirements(set_id, requirement_no)')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_pm_requirements_review ON pm_requirements(project_id, review_status)')
@@ -1287,6 +1429,7 @@ export class AppDatabase {
       `)
     }
 
+    this.db.exec('DROP TRIGGER IF EXISTS records_au;')
     this.db.exec(`
       CREATE TRIGGER IF NOT EXISTS records_ai AFTER INSERT ON records BEGIN
         INSERT INTO records_fts(rowid, name, item_id, node_type, normalized_text)
@@ -1296,7 +1439,7 @@ export class AppDatabase {
         INSERT INTO records_fts(records_fts, rowid, name, item_id, node_type, normalized_text)
         VALUES ('delete', old.rowid, old.name, old.item_id, old.node_type, old.normalized_text);
       END;
-      CREATE TRIGGER IF NOT EXISTS records_au AFTER UPDATE ON records BEGIN
+      CREATE TRIGGER records_au AFTER UPDATE OF name, item_id, node_type, normalized_text ON records BEGIN
         INSERT INTO records_fts(records_fts, rowid, name, item_id, node_type, normalized_text)
         VALUES ('delete', old.rowid, old.name, old.item_id, old.node_type, old.normalized_text);
         INSERT INTO records_fts(rowid, name, item_id, node_type, normalized_text)
@@ -1307,6 +1450,79 @@ export class AppDatabase {
     const indexedCount = Number((this.db.prepare('SELECT COUNT(*) AS count FROM records_fts').get() as SqlRow).count ?? 0)
     if (recordCount !== indexedCount) {
       this.db.exec("INSERT INTO records_fts(records_fts) VALUES ('rebuild')")
+    }
+    try {
+      this.db.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS requirement_records_fts USING fts5(
+          record_uid UNINDEXED,
+          business_text,
+          tokenize='trigram'
+        );
+      `)
+    } catch {
+      this.db.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS requirement_records_fts USING fts5(
+          record_uid UNINDEXED,
+          business_text
+        );
+      `)
+    }
+    this.db.exec(`
+      CREATE TRIGGER IF NOT EXISTS requirement_records_ad AFTER DELETE ON records BEGIN
+        DELETE FROM requirement_records_fts WHERE record_uid = old.uid;
+      END;
+    `)
+
+    const businessIndexStats = this.db.prepare(`
+      SELECT COUNT(*) AS count, COUNT(DISTINCT record_uid) AS distinct_count
+      FROM requirement_records_fts
+    `).get() as SqlRow
+    const businessIndexCount = Number(businessIndexStats.count ?? 0)
+    const businessIndexDistinctCount = Number(businessIndexStats.distinct_count ?? 0)
+    const missingSemanticHashCount = Number((this.db.prepare(`
+      SELECT COUNT(*) AS count FROM records WHERE semantic_hash = ''
+    `).get() as SqlRow).count ?? 0)
+    const migrationVersion = this.getSetting(REQUIREMENT_BUSINESS_INDEX_MIGRATION_KEY)
+    const completeBusinessIndex = missingSemanticHashCount === 0 &&
+      businessIndexCount === recordCount && businessIndexDistinctCount === recordCount
+
+    const runBusinessIndexMigration = (recomputeHashes: boolean): void => {
+      this.db.exec('BEGIN IMMEDIATE')
+      try {
+        if (recomputeHashes) {
+          const semanticHashRows = this.db.prepare(`
+            SELECT uid, name, last_modify_time, raw_json, normalized_text
+            FROM records
+          `).all() as SqlRow[]
+          const updateSemanticHash = this.db.prepare('UPDATE records SET semantic_hash = ? WHERE uid = ?')
+          for (const row of semanticHashRows) {
+            updateSemanticHash.run(requirementSemanticSourceHash({
+              name: String(row.name ?? ''),
+              lastModifyTime: String(row.last_modify_time ?? ''),
+              rawJson: String(row.raw_json ?? '{}'),
+              normalizedText: String(row.normalized_text ?? '')
+            }), String(row.uid))
+          }
+        }
+        this.rebuildRequirementSearchIndex()
+        this.setSetting(REQUIREMENT_BUSINESS_INDEX_MIGRATION_KEY, REQUIREMENT_BUSINESS_INDEX_VERSION)
+        this.db.exec('COMMIT')
+      } catch (error) {
+        try { this.db.exec('ROLLBACK') } catch {}
+        throw error
+      }
+    }
+
+    if (migrationVersion !== REQUIREMENT_BUSINESS_INDEX_VERSION) {
+      if (completeBusinessIndex) {
+        // A previous launch may have completed the data work before the
+        // version marker was introduced or persisted.
+        this.setSetting(REQUIREMENT_BUSINESS_INDEX_MIGRATION_KEY, REQUIREMENT_BUSINESS_INDEX_VERSION)
+      } else {
+        runBusinessIndexMigration(true)
+      }
+    } else if (!completeBusinessIndex) {
+      runBusinessIndexMigration(false)
     }
   }
 
@@ -1690,16 +1906,16 @@ export class AppDatabase {
 
   listKnowledgeRecordIndexRows(): KnowledgeRecordIndexRow[] {
     return (this.db.prepare(`
-      SELECT uid, name, node_type, item_id, normalized_text, content_hash
+      SELECT uid, name, node_type, item_id, raw_json, semantic_hash
       FROM records ORDER BY uid
     `).all() as SqlRow[]).map((row) => ({
       uid: String(row.uid),
       name: String(row.name),
       nodeType: String(row.node_type),
       itemId: String(row.item_id),
-      content: String(row.normalized_text ?? ''),
+      content: this.requirementBusinessTextFromRow(row),
       contentHash: createHash('sha256')
-        .update(`${String(row.content_hash ?? '')}\n${String(row.normalized_text ?? '')}`)
+        .update(`${String(row.semantic_hash ?? '')}\n${this.requirementBusinessTextFromRow(row)}`)
         .digest('hex')
     }))
   }
@@ -1853,7 +2069,6 @@ export class AppDatabase {
   listRequirementSemanticizationCandidates(input: {
     analyzerVersion: string
     modelSignature: string
-    limit?: number | null
   }): { available: number; candidates: RequirementSemanticizationCandidate[] } {
     const rows = this.db.prepare(`
       SELECT r.uid, r.item_id, r.name,
@@ -1884,12 +2099,9 @@ export class AppDatabase {
         contentHash
       }]
     })
-    const limit = input.limit === null || input.limit === undefined
-      ? null
-      : Math.max(1, Math.trunc(input.limit))
     return {
       available: candidates.length,
-      candidates: limit === null ? candidates : candidates.slice(0, limit)
+      candidates
     }
   }
 
@@ -1975,6 +2187,110 @@ export class AppDatabase {
     `).run(JSON.stringify(analysisTrace ?? {}), timestamp, recordUid)
   }
 
+  getRequirementMatchCache(cacheKey: string): RequirementMatchCache | null {
+    const normalizedKey = normalizeRequirementMatchCacheString(
+      cacheKey,
+      'cacheKey',
+      requirementMatchCacheMax.cacheKey
+    )
+    const row = this.db.prepare(`
+      SELECT * FROM requirement_match_cache WHERE cache_key = ? LIMIT 1
+    `).get(normalizedKey) as SqlRow | undefined
+    if (!row) return null
+    const mapped = mapRequirementMatchCacheRow(row)
+    if (mapped) return mapped
+    this.db.prepare('DELETE FROM requirement_match_cache WHERE cache_key = ?').run(normalizedKey)
+    return null
+  }
+
+  saveRequirementMatchCache(input: RequirementMatchCacheInput): void {
+    const normalized = {
+      cacheKey: normalizeRequirementMatchCacheString(input.cacheKey, 'cacheKey', requirementMatchCacheMax.cacheKey),
+      baseRecordUid: normalizeRequirementMatchCacheString(input.baseRecordUid, 'baseRecordUid', requirementMatchCacheMax.recordUid),
+      candidateRecordUid: normalizeRequirementMatchCacheString(input.candidateRecordUid, 'candidateRecordUid', requirementMatchCacheMax.recordUid),
+      queryHash: normalizeRequirementMatchCacheString(input.queryHash, 'queryHash', requirementMatchCacheMax.hash),
+      baseContentHash: normalizeRequirementMatchCacheString(input.baseContentHash, 'baseContentHash', requirementMatchCacheMax.hash),
+      candidateContentHash: normalizeRequirementMatchCacheString(input.candidateContentHash, 'candidateContentHash', requirementMatchCacheMax.hash),
+      baseCardHash: normalizeRequirementMatchCacheString(input.baseCardHash, 'baseCardHash', requirementMatchCacheMax.hash),
+      candidateCardHash: normalizeRequirementMatchCacheString(input.candidateCardHash, 'candidateCardHash', requirementMatchCacheMax.hash),
+      analyzerVersion: normalizeRequirementMatchCacheString(input.analyzerVersion, 'analyzerVersion', requirementMatchCacheMax.version),
+      semanticModelSignature: normalizeRequirementMatchCacheString(input.semanticModelSignature, 'semanticModelSignature', requirementMatchCacheMax.version),
+      embeddingModelVersion: normalizeRequirementMatchCacheString(input.embeddingModelVersion, 'embeddingModelVersion', requirementMatchCacheMax.version),
+      rerankerVersion: normalizeRequirementMatchCacheString(input.rerankerVersion, 'rerankerVersion', requirementMatchCacheMax.version),
+      strategyVersion: normalizeRequirementMatchCacheString(input.strategyVersion, 'strategyVersion', requirementMatchCacheMax.version),
+      explanationModelSignature: normalizeRequirementMatchCacheString(input.explanationModelSignature, 'explanationModelSignature', requirementMatchCacheMax.version),
+      resultJson: normalizeRequirementMatchCacheJson(input.result),
+      resultStatus: input.resultStatus
+    }
+    if (!requirementMatchCacheStatuses.has(normalized.resultStatus)) {
+      throw new Error('resultStatus 必须是 live_verified 或 cache_verified')
+    }
+    const timestamp = nowIso()
+    this.db.prepare(`
+      INSERT INTO requirement_match_cache(
+        cache_key, base_record_uid, candidate_record_uid, query_hash,
+        base_content_hash, candidate_content_hash, base_card_hash, candidate_card_hash,
+        analyzer_version, semantic_model_signature, embedding_model_version,
+        reranker_version, strategy_version, explanation_model_signature,
+        result_json, result_status, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(cache_key) DO UPDATE SET
+        base_record_uid = excluded.base_record_uid,
+        candidate_record_uid = excluded.candidate_record_uid,
+        query_hash = excluded.query_hash,
+        base_content_hash = excluded.base_content_hash,
+        candidate_content_hash = excluded.candidate_content_hash,
+        base_card_hash = excluded.base_card_hash,
+        candidate_card_hash = excluded.candidate_card_hash,
+        analyzer_version = excluded.analyzer_version,
+        semantic_model_signature = excluded.semantic_model_signature,
+        embedding_model_version = excluded.embedding_model_version,
+        reranker_version = excluded.reranker_version,
+        strategy_version = excluded.strategy_version,
+        explanation_model_signature = excluded.explanation_model_signature,
+        result_json = excluded.result_json,
+        result_status = excluded.result_status,
+        updated_at = excluded.updated_at
+    `).run(
+      normalized.cacheKey,
+      normalized.baseRecordUid,
+      normalized.candidateRecordUid,
+      normalized.queryHash,
+      normalized.baseContentHash,
+      normalized.candidateContentHash,
+      normalized.baseCardHash,
+      normalized.candidateCardHash,
+      normalized.analyzerVersion,
+      normalized.semanticModelSignature,
+      normalized.embeddingModelVersion,
+      normalized.rerankerVersion,
+      normalized.strategyVersion,
+      normalized.explanationModelSignature,
+      normalized.resultJson,
+      normalized.resultStatus,
+      timestamp,
+      timestamp
+    )
+  }
+
+  deleteRequirementMatchCache(cacheKey: string): void {
+    const normalizedKey = normalizeRequirementMatchCacheString(
+      cacheKey,
+      'cacheKey',
+      requirementMatchCacheMax.cacheKey
+    )
+    this.db.prepare('DELETE FROM requirement_match_cache WHERE cache_key = ?').run(normalizedKey)
+  }
+
+  pruneRequirementMatchCache(olderThanIso?: string): number {
+    const cutoff = olderThanIso === undefined
+      ? new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString()
+      : normalizeRequirementMatchCacheString(olderThanIso, 'olderThanIso', 64)
+    if (!Number.isFinite(Date.parse(cutoff))) throw new Error('olderThanIso 必须是有效时间')
+    const result = this.db.prepare('DELETE FROM requirement_match_cache WHERE updated_at < ?').run(cutoff)
+    return Number(result.changes)
+  }
+
   deleteKnowledgeVectors(): void {
     this.db.prepare('DELETE FROM knowledge_vectors').run()
   }
@@ -2049,12 +2365,12 @@ export class AppDatabase {
     const matchQuery = normalizedTerms.map((term) => `"${term}"`).join(' OR ')
     try {
       const rows = this.db.prepare(`
-        SELECT r.uid, r.name, r.node_type, r.item_id, r.normalized_text,
-               bm25(records_fts) AS rank
-        FROM records_fts
-        JOIN records r ON r.rowid = records_fts.rowid
+        SELECT r.uid, r.name, r.node_type, r.item_id, f.business_text,
+               bm25(requirement_records_fts) AS rank
+        FROM requirement_records_fts f
+        JOIN records r ON r.uid = f.record_uid
         ${semanticContext ? 'JOIN requirement_semantic_cards s ON s.record_uid = r.uid' : ''}
-        WHERE records_fts MATCH ?
+        WHERE requirement_records_fts MATCH ?
           ${semanticContext ? `AND s.status = 'ready'
           AND s.content_hash = ${requirementSemanticContentSql('r')}
           AND s.analyzer_version = ?
@@ -2081,7 +2397,7 @@ export class AppDatabase {
         nodeType: String(row.node_type ?? ''),
         itemId: String(row.item_id ?? ''),
         score: Number.isFinite(Number(row.rank)) ? Math.max(0, -Number(row.rank)) : 0,
-        snippet: String(row.normalized_text ?? '').slice(0, 600)
+        snippet: String(row.business_text ?? '').slice(0, 600)
       }))
     } catch (error) {
       throw new Error(
@@ -5069,6 +5385,45 @@ export class AppDatabase {
       )
   }
 
+  private requirementBusinessTextFromRow(row: SqlRow): string {
+    let raw: Record<string, unknown> = {}
+    try {
+      const parsed = JSON.parse(String(row.raw_json ?? '{}')) as unknown
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        raw = parsed as Record<string, unknown>
+      }
+    } catch {
+      raw = {}
+    }
+    return buildRequirementBusinessText({ name: row.name, raw })
+  }
+
+  private syncRequirementSearchIndex(recordUid: string): void {
+    this.db.prepare('DELETE FROM requirement_records_fts WHERE record_uid = ?').run(recordUid)
+    const row = this.db.prepare(`
+      SELECT uid, name, raw_json FROM records WHERE uid = ?
+    `).get(recordUid) as SqlRow | undefined
+    if (!row) return
+    const businessText = this.requirementBusinessTextFromRow(row)
+    if (businessText) {
+      this.db.prepare(`
+        INSERT INTO requirement_records_fts(record_uid, business_text) VALUES (?, ?)
+      `).run(recordUid, businessText)
+    }
+  }
+
+  private rebuildRequirementSearchIndex(): void {
+    this.db.prepare('DELETE FROM requirement_records_fts').run()
+    const rows = this.db.prepare('SELECT uid, name, raw_json FROM records ORDER BY uid').all() as SqlRow[]
+    const insert = this.db.prepare(`
+      INSERT INTO requirement_records_fts(record_uid, business_text) VALUES (?, ?)
+    `)
+    for (const row of rows) {
+      const businessText = this.requirementBusinessTextFromRow(row)
+      if (businessText) insert.run(String(row.uid), businessText)
+    }
+  }
+
   upsertRecord(input: RecordInput): void {
     const itemId = input.itemId.trim()
     if (!itemId) throw new Error('记录缺少 _valm_ItemID，不能写入本地数据')
@@ -5135,6 +5490,7 @@ export class AppDatabase {
         semanticHash,
         nowIso()
       )
+    this.syncRequirementSearchIndex(input.uid)
   }
 
   updateRecordNormalizedText(uid: string, normalizedText: string): void {
@@ -5175,6 +5531,7 @@ export class AppDatabase {
       SET raw_json = ?, normalized_text = ?, content_hash = ?, semantic_hash = ?
       WHERE uid = ?
     `).run(rawJson, normalizedText, contentHash, semanticHash, uid)
+    this.syncRequirementSearchIndex(uid)
   }
 
   findRecordByItemId(itemId: string): RecordRow | null {

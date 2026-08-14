@@ -278,13 +278,27 @@ const createWindow = (): void => {
     }
   })
 
+  let showFallback: ReturnType<typeof setTimeout> | undefined
+  const showMainWindow = (): void => {
+    if (!mainWindow || mainWindow.isDestroyed()) return
+    if (showFallback) {
+      clearTimeout(showFallback)
+      showFallback = undefined
+    }
+    if (!mainWindow.isVisible()) mainWindow.show()
+  }
+
   mainWindow.on('closed', () => {
+    if (showFallback) clearTimeout(showFallback)
     updateManager?.attachWindow(null)
     mainWindow = null
   })
   updateManager?.attachWindow(mainWindow)
 
-  mainWindow.once('ready-to-show', () => mainWindow?.show())
+  mainWindow.once('ready-to-show', showMainWindow)
+  mainWindow.webContents.once('did-finish-load', showMainWindow)
+  showFallback = setTimeout(showMainWindow, 5_000)
+  showFallback.unref()
   mainWindow.on('maximize', () =>
     mainWindow?.webContents.send('window:maximized-changed', true)
   )

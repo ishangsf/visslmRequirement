@@ -201,7 +201,7 @@ npm run knowledge:smoke
 npm run smoke:agent-requirement-analysis
 ```
 
-该命令是需求编号分析的窄范围 smoke 入口，覆盖多编号分组、HTML/IssueType 清洗、双次独立复核、关系过滤、UID/证据严格校验、模型失败关闭和 `VISSLM-TSIS-779` hard-negative 回归。运行真实匹配前应执行 `npm run prepare:model`，使本地 embedding 和 Cross-Encoder 资源可用；模型、当前版本向量索引、FTS5/BM25 或 AI 复核不可用时不会回退到向量分，而是返回失败关闭。Dense、FTS5 和结构化召回都只在当前 embedding `modelVersion` 已建立向量索引的记录 UID 集合内运行。
+该命令是需求编号分析的窄范围 smoke 入口，覆盖多编号分组、原文清洗、全量 Dense/BM25/结构化混合召回、Cross-Encoder Top20 重排、确定性评分、Top10 一次批量 AI 解释、UID/证据严格校验、持久化缓存和失败关闭。运行真实匹配前应执行 `npm run prepare:model`，使本地 embedding 和 Cross-Encoder 资源可用；未就绪的语义卡片不会触发查询时 AI 生成，系统继续使用完整清洗原文参与召回和匹配。Dense、FTS5 和结构化召回都只在当前 embedding `modelVersion` 已建立向量索引的记录 UID 集合内运行。
 
 自动化回归和性能基准命令：
 
@@ -210,7 +210,7 @@ npm run benchmark:requirement-matching -- --records 5000 --report-only
 npm run compare:requirement-rerankers -- --manifest test-data/requirement-matching/reranker-model-manifest.json --report-only
 ```
 
-`test-data/requirement-matching` 仅保留 `VISSLM-TSIS-779` 固定回归和模型资源清单。项目不再建设人工金标、双人标注/裁决、Excel 标注样本包或依赖人工标签的质量门禁。匹配百分比继续称为“综合匹配度”，表示经过双重 AI 复核和规则校验后的业务判断分，不解释为统计概率。
+`test-data/requirement-matching` 仅保留固定行为回归和模型资源清单。项目不再建设人工金标、双人标注/裁决、Excel 标注样本包或依赖人工标签的质量门禁。匹配百分比继续称为“综合匹配度”，表示经过确定性评分、硬规则校验和可选 AI 解释后的业务判断分，不解释为统计概率。
 
 ### 可视化离线回归
 

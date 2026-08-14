@@ -32,9 +32,9 @@ export const expertRegistry: readonly ExpertDefinition[] = [
     mention: '@需求分析专家',
     description: '按需求编号定位数据中心记录并匹配相似数据',
     icon: 'file-search',
-    capabilities: ['requirement-lookup', 'record-similarity', 'match-explanation'],
-    allowedTools: ['locate_requirement', 'rank_record_matches', 'review_requirement_matches'],
-    systemPromptVersion: 'requirement-analysis-v1'
+    capabilities: ['requirement-lookup', 'hybrid-retrieval', 'cross-encoder-rerank', 'deterministic-scoring', 'batch-explanation', 'match-cache'],
+    allowedTools: ['locate_requirement', 'hybrid_requirement_retrieval', 'cross_encoder_rerank', 'score_requirement_matches', 'explain_requirement_matches'],
+    systemPromptVersion: 'requirement-analysis-v2'
   }
 ] as const
 

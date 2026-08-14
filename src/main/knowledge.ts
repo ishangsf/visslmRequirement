@@ -1015,7 +1015,9 @@ export class KnowledgeService {
         this.db.getKnowledgeRecordIndexModelVersion(row.uid) === this.modelVersion
       ) continue
       const pages: ParsedPage[] = [{
-        text: `名称: ${row.name}\n类型: ${row.nodeType}\n业务编号: ${row.itemId}\n${row.content}`,
+        // row.content is already restricted to business evidence. Keep
+        // identity and audit metadata out of embedding input.
+        text: row.content,
         location: '采集记录'
       }]
       const chunks = chunkKnowledgePages(pages)

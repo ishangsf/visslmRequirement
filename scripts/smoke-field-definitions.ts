@@ -15,11 +15,19 @@ const root = mkdtempSync(join(tmpdir(), 'visslm-field-definitions-'))
 const db = new AppDatabase(join(root, 'fields.db'), join(root, 'assets'))
 const originalFetch = globalThis.fetch
 const fieldRequests: URL[] = []
+const progressMessages: string[] = []
 let sourceDisplayName = '来源'
+let returnHtmlFieldDefinitions = false
+const htmlFieldDefinitionMarker = 'unexpected-field-definitions-html '.repeat(200)
 
 const response = (body: unknown): Response => new Response(JSON.stringify(body), {
   status: 200,
   headers: { 'Content-Type': 'application/json' }
+})
+
+const htmlResponse = (body: string): Response => new Response(body, {
+  status: 200,
+  headers: { 'Content-Type': 'text/html' }
 })
 
 const fieldDefinitionResponse = (): Record<string, unknown> => ({
@@ -92,7 +100,9 @@ try {
     const url = new URL(String(input))
     if (url.pathname.endsWith('/Admin/Virtualization_ReadMember')) {
       fieldRequests.push(url)
-      return response(fieldDefinitionResponse())
+      return returnHtmlFieldDefinitions
+        ? htmlResponse(`<html><body>${htmlFieldDefinitionMarker}</body></html>`)
+        : response(fieldDefinitionResponse())
     }
     if (url.pathname.endsWith('/rest/application/Version')) {
       return response({ ErrorCode: 0, Data: '1.0' })
@@ -114,7 +124,9 @@ try {
     username: 'collector',
     token: 'token'
   })
-  const service = new SyncService(db, () => client, () => undefined)
+  const service = new SyncService(db, () => client, (progress) => {
+    progressMessages.push(progress.message)
+  })
 
   const first = await service.run(config)
   assert.equal(first.ok, true)
@@ -143,14 +155,47 @@ try {
   const refreshed = db.getRecord('task-1', false)
   assert(refreshed?.normalizedText?.includes('客户来源: Customer'))
   assert(!refreshed?.normalizedText?.split('\n').some((line) => line.startsWith('来源:')))
-  assert.notEqual(db.listKnowledgeRecordIndexRows()[0]?.contentHash, firstIndexHash)
+  // Display-label refreshes must not invalidate the requirement business-text
+  // embedding when the underlying requirement facts are unchanged.
+  const refreshedIndexHash = db.listKnowledgeRecordIndexRows()[0]?.contentHash
+  assert.equal(refreshedIndexHash, firstIndexHash)
+
+  returnHtmlFieldDefinitions = true
+  remoteRows = [{
+    _valm_Uid: 'task-2',
+    _valm_NodeType: 'Task',
+    _valm_ItemID: 'TASK-2',
+    _valm_Name: 'Collected after HTML field definitions',
+    Source: 'Customer',
+    State: 'Open',
+    Owner: 'Alice'
+  }]
+  const htmlFieldDefinitionsRun = await service.run(config)
+  assert.equal(htmlFieldDefinitionsRun.ok, true)
+  assert.equal(htmlFieldDefinitionsRun.recordCount, 1)
+  assert.equal(db.getRecord('task-2', false)?.name, 'Collected after HTML field definitions')
+
+  const htmlFieldDefinitionsProgress = progressMessages.find((message) =>
+    message.includes('field definitions unavailable for Task')
+  )
+  assert(htmlFieldDefinitionsProgress)
+  assert.match(htmlFieldDefinitionsProgress, /continue collection/)
+  assert(htmlFieldDefinitionsProgress.length < 300)
+  assert(!htmlFieldDefinitionsProgress.includes(htmlFieldDefinitionMarker))
+  assert(!htmlFieldDefinitionsProgress.includes('<html>'))
 
   console.log(JSON.stringify({
     parsedDefinitionCount: parsed.length,
     storedLabels: refreshed?.fieldLabels,
     queryLabels: query.fieldLabels,
     duplicateRefresh: refreshed?.normalizedText?.includes('客户来源: Customer') === true,
-    fieldRequest: fieldRequests[0]?.pathname
+    businessIndexStable: refreshedIndexHash === firstIndexHash,
+    fieldRequest: fieldRequests[0]?.pathname,
+    htmlFieldDefinitions: {
+      ok: htmlFieldDefinitionsRun.ok,
+      recordCount: htmlFieldDefinitionsRun.recordCount,
+      progressMessage: htmlFieldDefinitionsProgress
+    }
   }, null, 2))
 } finally {
   globalThis.fetch = originalFetch

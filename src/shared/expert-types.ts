@@ -14,8 +14,31 @@ export interface ExpertDefinition {
   systemPromptVersion: string
 }
 
+export interface AgentMatchProgress {
+  hasMatch: boolean
+  recallTotal?: number
+  rerankCurrent?: number
+  rerankTotal?: number
+  scoredCurrent?: number
+  scoredTotal?: number
+  explanationDone?: number
+  explanationTotal?: number
+  cacheHits?: number
+  isolated?: number
+}
+
+export interface AgentProgress {
+  percent: number
+  currentItem: number
+  totalItems: number
+  completedItems: number
+  stageCurrent?: number
+  stageTotal?: number
+  match?: AgentMatchProgress
+}
+
 export type AgentEvent =
-  | { type: 'status'; stage: string; message: string }
+  | { type: 'status'; stage: string; message: string; progress?: AgentProgress }
   | { type: 'text'; content: string }
   | { type: 'artifact'; artifactId: string; version: number; dashboard: DashboardSpec }
   | {

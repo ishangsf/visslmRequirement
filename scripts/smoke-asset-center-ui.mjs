@@ -2,10 +2,6 @@ import WebSocket from 'ws'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-if (process.env.VISSLM_SMOKE_EMPTY_SEMANTIC_TASK === '1' && process.env.VISSLM_SMOKE_ALLOW_MUTATION !== '1') {
-  throw new Error('Refusing to start a semanticization task without VISSLM_SMOKE_ALLOW_MUTATION=1 and an isolated user-data directory')
-}
-
 const cdpPort = process.env.VISSLM_CDP_PORT ?? '9223'
 const targets = await (await fetch(`http://127.0.0.1:${cdpPort}/json/list`)).json()
 const target = targets.find((item) => item.type === 'page' && item.title === 'VISSLM Agent')
@@ -47,63 +43,122 @@ const evaluate = async (expression) => {
 
 await call('Page.reload')
 const checks = await evaluate(`(async () => {
-  const menuStarted = Date.now()
-  while (!document.querySelector('.ant-menu-item') && Date.now() - menuStarted < 10000) {
-    await new Promise((resolve) => setTimeout(resolve, 100))
+  const waitFor = async (selector, timeout = 10000) => {
+    const started = Date.now()
+    while (!document.querySelector(selector) && Date.now() - started < timeout) {
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+    return document.querySelector(selector)
   }
-  const clickMenu = () => [...document.querySelectorAll('.ant-menu-item')]
-    .find((item) => item.textContent?.includes('资产中心'))
-    ?.click()
-  clickMenu()
-  const started = Date.now()
-  while (!document.querySelector('.asset-center-page') && Date.now() - started < 10000) {
-    await new Promise((resolve) => setTimeout(resolve, 100))
+  const clickMenu = (label) => {
+    const item = [...document.querySelectorAll('.ant-menu-item')]
+      .find((candidate) => candidate.textContent?.includes(label))
+    item?.click()
+    return Boolean(item)
   }
+
+  await waitFor('.ant-menu-item')
+  const assetMenu = clickMenu('资产中心')
+  const assetCenter = await waitFor('.asset-center-page')
   const tabs = [...document.querySelectorAll('.asset-center-tabs .ant-tabs-tab')]
     .map((item) => item.textContent?.trim())
   const dataPage = Boolean(document.querySelector('.asset-center-page .filter-bar'))
-  const dataPageText = document.querySelector('.asset-center-page')?.textContent ?? ''
+  const dataPageText = assetCenter?.textContent ?? ''
   const semanticFilter = [...document.querySelectorAll('.asset-center-page .filter-bar .ant-select')]
     .some((item) => item.textContent?.includes('全部') || item.textContent?.includes('语义'))
-  const semanticAction = dataPageText.includes('语义化全部未处理数据') && dataPageText.includes('语义化所选')
   const semanticColumn = dataPageText.includes('AI 语义化')
-  const taskSizeInput = document.querySelector('.asset-semantic-task-config .ant-input-number-input')
-  const taskSizeControl = Boolean(taskSizeInput)
-  const taskSizeMaximum = taskSizeInput?.getAttribute('aria-valuemax') ?? taskSizeInput?.getAttribute('max')
-  const noUnlimitedOption = ![...document.querySelectorAll('.asset-semantic-task-config button')]
-    .some((item) => item.textContent?.includes('不限'))
+  const assetCenterHasNoTaskOperations = !document.querySelector('.asset-center-page .asset-semantic-task-config') &&
+    !document.querySelector('.asset-center-page .asset-semantic-task-panel') &&
+    !document.querySelector('.asset-center-page .asset-semantic-audit') &&
+    !dataPageText.includes('处理全部未语义化数据') &&
+    !dataPageText.includes('生成语义卡片') &&
+    !dataPageText.includes('重新生成')
   const taskApi = ['startRequirementSemanticization', 'getRequirementSemanticizationTask', 'controlRequirementSemanticization']
     .every((name) => typeof window.visslm?.[name] === 'function')
   const selectableRows = Boolean(document.querySelector('.asset-center-page .ant-table-selection-column'))
+
   const knowledgeTab = [...document.querySelectorAll('.asset-center-tabs .ant-tabs-tab')]
     .find((item) => item.textContent?.includes('知识库'))
   knowledgeTab?.click()
-  const knowledgeStarted = Date.now()
-  while (!document.querySelector('.knowledge-page') && Date.now() - knowledgeStarted < 10000) {
-    await new Promise((resolve) => setTimeout(resolve, 100))
-  }
-  const knowledgePage = Boolean(document.querySelector('.knowledge-page'))
+  const knowledgePage = Boolean(await waitFor('.knowledge-page'))
   const uploadButton = Boolean(document.querySelector('.knowledge-toolbar button'))
   const metrics = document.querySelectorAll('.knowledge-metric-grid .ant-card').length
   const filters = Boolean(document.querySelector('.knowledge-filter-bar'))
   const table = Boolean(document.querySelector('.knowledge-list-card .ant-table'))
+
   const dataTab = [...document.querySelectorAll('.asset-center-tabs .ant-tabs-tab')]
     .find((item) => item.textContent?.includes('数据中心'))
   dataTab?.click()
-  const dataReturnStarted = Date.now()
-  while (!document.querySelector('.data-workbench-card') && Date.now() - dataReturnStarted < 10000) {
-    await new Promise((resolve) => setTimeout(resolve, 100))
-  }
+  const dataPageRestored = Boolean(await waitFor('.asset-center-page .data-workbench-card'))
+
+  const semanticizationMenu = clickMenu('AI 语义化')
+  const semanticizationPage = await waitFor('.semanticization-page')
+  const semanticizationText = semanticizationPage?.textContent ?? ''
+  const noTaskSizeControl = !semanticizationPage?.querySelector('.asset-semantic-task-config') &&
+    !semanticizationText.includes('单任务条数') &&
+    !semanticizationText.includes('1–5')
+  const fullBatchCopy = semanticizationText.includes('全部未就绪记录')
+  const semanticizationActions = ['处理所选', '当前页待处理', '处理全部未语义化数据']
+    .every((label) => semanticizationText.includes(label))
+  const semanticizationTable = Boolean(semanticizationPage?.querySelector('.semanticization-records-card .ant-table'))
+  const semanticizationSelection = Boolean(semanticizationPage?.querySelector('.ant-table-selection-column'))
+  const modelSettingsAction = semanticizationText.includes('模型设置')
+  const thinkingSwitch = semanticizationPage?.querySelector('[aria-label="语义化深度思考模式"]')
+  const deepThinkingControl = Boolean(thinkingSwitch)
+  const deepThinkingDefault = thinkingSwitch?.getAttribute('aria-checked') === 'true'
+
+  const fixture = document.createElement('section')
+  fixture.className = 'asset-semantic-audit'
+  fixture.style.position = 'fixed'
+  fixture.style.left = '-2400px'
+  fixture.style.top = '0'
+  fixture.style.width = '1000px'
+  fixture.style.maxHeight = 'none'
+  const stages = Array.from({ length: 8 }, (_, index) =>
+    '<li><span class="asset-semantic-audit-timeline-marker"></span><div><div class="asset-semantic-audit-line"><strong>阶段 ' +
+    (index + 1) + '</strong></div><span>用于验证较长阶段内容不会覆盖下一区域。</span></div></li>'
+  ).join('')
+  const events = Array.from({ length: 8 }, (_, index) =>
+    '<div class="asset-semantic-audit-event"><span class="asset-semantic-audit-event-dot"></span><div><strong>事件 ' +
+    (index + 1) + '</strong><p>结构化校验事件详情</p></div></div>'
+  ).join('')
+  fixture.innerHTML =
+    '<div class="asset-semantic-audit-heading"><div><strong>可审计分析过程</strong></div></div>' +
+    '<div class="asset-semantic-audit-grid">' +
+    '<section class="asset-semantic-audit-section"><div class="asset-semantic-audit-section-heading"><span>阶段时间线</span></div><ol class="asset-semantic-audit-timeline-list">' + stages + '</ol></section>' +
+    '<section class="asset-semantic-audit-section"><div class="asset-semantic-audit-section-heading"><span>校验与重试事件</span></div><div class="asset-semantic-audit-event-list">' + events + '</div></section>' +
+    '</div><div class="asset-semantic-audit-output-grid"><details class="asset-semantic-audit-output" open><summary><span>初步分析</span></summary><div class="asset-semantic-audit-output-body"><p>阶段输出</p></div></details></div>'
+  document.body.appendChild(fixture)
+  const auditGrid = fixture.querySelector('.asset-semantic-audit-grid')
+  const auditOutput = fixture.querySelector('.asset-semantic-audit-output-grid')
+  const gridRect = auditGrid?.getBoundingClientRect()
+  const outputRect = auditOutput?.getBoundingClientRect()
+  const auditNoOverlap = Boolean(gridRect && outputRect && outputRect.top + 0.5 >= gridRect.bottom)
+  const auditGridAutoRows = getComputedStyle(fixture).gridAutoRows
+  fixture.remove()
+
+  const actualAudit = semanticizationPage?.querySelector('.asset-semantic-audit')
+  const actualGrid = actualAudit?.querySelector('.asset-semantic-audit-grid')?.getBoundingClientRect()
+  const actualOutput = actualAudit?.querySelector('.asset-semantic-audit-output-grid')?.getBoundingClientRect()
+  const actualAuditNoOverlap = !actualAudit || Boolean(actualGrid && actualOutput && actualOutput.top + 0.5 >= actualGrid.bottom)
+
+  const modelSettingsButton = [...(semanticizationPage?.querySelectorAll('button') ?? [])]
+    .find((button) => button.textContent?.includes('模型设置'))
+  modelSettingsButton?.click()
+  await waitFor('.settings-tabs')
+  const activeSettingsTab = document.querySelector('.settings-tabs .ant-tabs-tab-active')?.textContent?.trim() ?? ''
+  const modelSettingsDirect = activeSettingsTab.includes('大模型配置')
+  clickMenu('AI 语义化')
+  await waitFor('.semanticization-page')
+
   return {
-    assetCenter: Boolean(document.querySelector('.asset-center-page')),
+    assetMenu,
+    assetCenter: Boolean(assetCenter),
     tabs,
     dataPage,
     semanticFilter,
-    semanticAction,
     semanticColumn,
-    taskSizeControl,
-    taskSizeMaximum,
-    noUnlimitedOption,
+    assetCenterHasNoTaskOperations,
     taskApi,
     selectableRows,
     knowledgePage,
@@ -111,66 +166,49 @@ const checks = await evaluate(`(async () => {
     metrics,
     filters,
     table,
-    dataPageRestored: Boolean(document.querySelector('.data-workbench-card'))
+    dataPageRestored,
+    semanticizationMenu,
+    semanticizationPage: Boolean(semanticizationPage),
+    semanticizationActions,
+    semanticizationTable,
+    semanticizationSelection,
+    modelSettingsAction,
+    deepThinkingControl,
+    deepThinkingDefault,
+    modelSettingsDirect,
+    noTaskSizeControl,
+    fullBatchCopy,
+    auditNoOverlap,
+    auditGridAutoRows,
+    actualAuditNoOverlap
   }
 })()`)
 
-const taskPanelChecks = process.env.VISSLM_SMOKE_EMPTY_SEMANTIC_TASK === '1'
-  ? await evaluate(`(async () => {
-      const recordPage = await window.visslm.listRecords({ page: 1, pageSize: 1 })
-      if (recordPage.total > 0) {
-        return { refused: true, reason: 'semantic task smoke requires an empty isolated database' }
-      }
-      const button = [...document.querySelectorAll('.asset-center-page .page-toolbar button')]
-        .find((item) => item.textContent?.includes('语义化全部未处理数据'))
-      button?.click()
-      const started = Date.now()
-      while (!document.querySelector('.asset-semantic-task-panel') && Date.now() - started < 5000) {
-        await new Promise((resolve) => setTimeout(resolve, 50))
-      }
-      const panel = document.querySelector('.asset-semantic-task-panel')
-      const text = panel?.textContent ?? ''
-      const audit = panel?.querySelector('.asset-semantic-audit')
-      const auditText = audit?.textContent ?? ''
-      return {
-        rendered: Boolean(panel),
-        completed: text.includes('已完成'),
-        metrics: ['已处理', '成功', '失败', '剩余', '可用'].every((label) => text.includes(label)),
-        controls: ['暂停', '恢复', '停止'].every((label) => text.includes(label)),
-        auditRendered: Boolean(audit),
-        auditSections: ['阶段时间线', '校验与重试事件', '初步分析', '独立复核', '结果裁决', '最终裁决摘要']
-          .every((label) => auditText.includes(label)),
-        auditBoundary: auditText.includes('过程记录 ≠ 内部思维链') && auditText.includes('不展示模型内部思维链'),
-        background: panel ? getComputedStyle(panel).backgroundColor : '',
-        auditBackground: audit ? getComputedStyle(audit).backgroundColor : '',
-        auditOverflow: audit ? getComputedStyle(audit).overflowY : ''
-      }
-    })()`)
-  : { skipped: true }
-
 const appSource = readFileSync(join(process.cwd(), 'src/renderer/src/App.tsx'), 'utf8')
-const taskControls = ['暂停', '恢复', '停止'].every((label) => appSource.includes(`>${label}<`) || appSource.includes(`${label}\n`)) &&
-  appSource.includes("controlSemanticization('pause')") &&
-  appSource.includes("controlSemanticization('resume')") &&
-  appSource.includes("controlSemanticization('stop')")
-const auditHistorySupport = appSource.includes('semanticAnalysisTrace') &&
-  appSource.includes('persistedSemanticAuditTask(detail)') &&
-  appSource.includes('<SemanticAuditPanel task={semanticTask}')
+const dataPageSource = appSource.slice(appSource.indexOf('function DataPage('), appSource.indexOf('function SemanticizationPage('))
+const semanticizationPageSource = appSource.slice(appSource.indexOf('function SemanticizationPage('), appSource.indexOf('const knowledgeStatusMeta'))
+const taskControls = ['暂停', '恢复', '停止'].every((label) => semanticizationPageSource.includes(`>${label}<`)) &&
+  semanticizationPageSource.includes("controlSemanticization('pause')") &&
+  semanticizationPageSource.includes("controlSemanticization('resume')") &&
+  semanticizationPageSource.includes("controlSemanticization('stop')")
+const assetCenterSourceSeparated = !dataPageSource.includes('startRequirementSemanticization') &&
+  !dataPageSource.includes('SemanticAuditPanel') &&
+  !dataPageSource.includes('asset-semantic-task-config')
+const auditHistorySupport = semanticizationPageSource.includes('semanticAnalysisTrace') &&
+  semanticizationPageSource.includes('persistedSemanticAuditTask(detail)') &&
+  semanticizationPageSource.includes('<SemanticAuditPanel task={semanticTask')
 
-if (!checks.assetCenter || !checks.dataPage || !checks.semanticFilter || !checks.semanticAction ||
-    !checks.semanticColumn || !checks.taskSizeControl || checks.taskSizeMaximum !== '5' ||
-    !checks.noUnlimitedOption || !checks.taskApi || !taskControls || !auditHistorySupport ||
-    !checks.selectableRows || !checks.knowledgePage || !checks.uploadButton ||
-    !checks.filters || !checks.table || !checks.dataPageRestored) {
-  throw new Error(`Asset center UI smoke failed: ${JSON.stringify(checks)}`)
-}
-if (!('skipped' in taskPanelChecks) && (
-  'refused' in taskPanelChecks ||
-  !taskPanelChecks.rendered || !taskPanelChecks.completed || !taskPanelChecks.metrics || !taskPanelChecks.controls ||
-  !taskPanelChecks.auditRendered || !taskPanelChecks.auditSections || !taskPanelChecks.auditBoundary ||
-  !['auto', 'scroll'].includes(taskPanelChecks.auditOverflow)
-)) {
-  throw new Error(`Asset center semantic task panel smoke failed: ${JSON.stringify(taskPanelChecks)}`)
+if (!checks.assetMenu || !checks.assetCenter || !checks.dataPage || !checks.semanticFilter ||
+    !checks.semanticColumn || !checks.assetCenterHasNoTaskOperations || !assetCenterSourceSeparated ||
+    !checks.semanticizationMenu || !checks.semanticizationPage || !checks.semanticizationActions ||
+    !checks.semanticizationTable || !checks.semanticizationSelection || !checks.modelSettingsAction ||
+    !checks.modelSettingsDirect || !checks.deepThinkingControl || !checks.deepThinkingDefault ||
+    !checks.noTaskSizeControl || !checks.fullBatchCopy ||
+    !checks.taskApi || !taskControls || !auditHistorySupport || !checks.auditNoOverlap ||
+    checks.auditGridAutoRows !== 'max-content' || !checks.actualAuditNoOverlap || !checks.selectableRows ||
+    !checks.knowledgePage || !checks.uploadButton || !checks.filters || !checks.table ||
+    !checks.dataPageRestored) {
+  throw new Error(`Asset center and semanticization UI smoke failed: ${JSON.stringify(checks)}`)
 }
 
 await call('Page.enable')
@@ -179,40 +217,39 @@ const lightChecks = await evaluate(`(async () => {
   if (!toggle) return { toggled: false }
   if (document.documentElement.dataset.theme !== 'light') toggle.click()
   await new Promise((resolve) => setTimeout(resolve, 250))
-  const config = document.querySelector('.asset-semantic-task-config')
-  const card = document.querySelector('.data-workbench-card')
+  const card = document.querySelector('.semanticization-launch-card')
   return {
     toggled: document.documentElement.dataset.theme === 'light',
-    configBackground: config ? getComputedStyle(config).backgroundColor : '',
     cardBackground: card ? getComputedStyle(card).backgroundColor : ''
   }
 })()`)
 const screenshot = await call('Page.captureScreenshot', { format: 'png', fromSurface: true })
-const screenshotPath = join(process.env.TEMP ?? '.', 'visslm-asset-center.png')
+const screenshotPath = join(process.env.TEMP ?? '.', 'visslm-semanticization.png')
 writeFileSync(screenshotPath, Buffer.from(screenshot.result.data, 'base64'))
+
 const darkChecks = await evaluate(`(async () => {
   const toggle = document.querySelector('.window-theme-toggle')
   if (!toggle) return { toggled: false }
   if (document.documentElement.dataset.theme !== 'dark') toggle.click()
   await new Promise((resolve) => setTimeout(resolve, 250))
-  const status = document.querySelector('.asset-semantic-status')
-  const card = document.querySelector('.data-workbench-card')
+  const card = document.querySelector('.semanticization-launch-card')
   return {
     toggled: document.documentElement.dataset.theme === 'dark',
-    statusBackground: status ? getComputedStyle(status).backgroundColor : '',
     cardBackground: card ? getComputedStyle(card).backgroundColor : ''
   }
 })()`)
 const darkScreenshot = await call('Page.captureScreenshot', { format: 'png', fromSurface: true })
-const darkScreenshotPath = join(process.env.TEMP ?? '.', 'visslm-asset-center-dark.png')
+const darkScreenshotPath = join(process.env.TEMP ?? '.', 'visslm-semanticization-dark.png')
 writeFileSync(darkScreenshotPath, Buffer.from(darkScreenshot.result.data, 'base64'))
-if (!lightChecks.toggled) throw new Error(`Asset center light-theme smoke failed: ${JSON.stringify(lightChecks)}`)
-if (!darkChecks.toggled) throw new Error(`Asset center dark-theme smoke failed: ${JSON.stringify(darkChecks)}`)
+
+if (!lightChecks.toggled) throw new Error(`Semanticization light-theme smoke failed: ${JSON.stringify(lightChecks)}`)
+if (!darkChecks.toggled) throw new Error(`Semanticization dark-theme smoke failed: ${JSON.stringify(darkChecks)}`)
+
 console.log(JSON.stringify({
   ...checks,
   taskControls,
+  assetCenterSourceSeparated,
   auditHistorySupport,
-  taskPanel: taskPanelChecks,
   screenshot: screenshotPath,
   lightTheme: lightChecks,
   darkTheme: darkChecks,

@@ -102,6 +102,7 @@ export type FeatureModuleKey =
   | 'visualization'
   | 'projects'
   | 'data'
+  | 'semanticization'
   | 'chat'
   | 'sync'
   | 'push'
@@ -132,6 +133,7 @@ export const DEFAULT_FEATURE_MODULE_SETTINGS: FeatureModuleSettings = {
   visualization: true,
   projects: true,
   data: true,
+  semanticization: true,
   chat: true,
   sync: true,
   push: false
@@ -142,6 +144,7 @@ export const DEFAULT_FEATURE_NAVIGATION_ORDER: FeatureNavigationOrder = [
   'visualization',
   'projects',
   'data',
+  'semanticization',
   'chat',
   'sync',
   'push'
@@ -292,12 +295,23 @@ export type RequirementSemanticizationTraceEventKind =
   | 'retry'
   | 'validation_passed'
   | 'validation_failed'
+  | 'model_error'
   | 'divergence'
 
 export interface RequirementSemanticizationTraceField {
   value: string
   confidence: number
   evidence: string
+}
+
+/** Safe numeric model telemetry; hidden reasoning/content is intentionally excluded. */
+export interface RequirementSemanticizationModelUsage {
+  promptTokens?: number
+  completionTokens?: number
+  promptDurationMs?: number
+  completionDurationMs?: number
+  totalDurationMs?: number
+  loadDurationMs?: number
 }
 
 export interface RequirementSemanticizationDivergenceField {
@@ -332,6 +346,7 @@ export interface RequirementSemanticizationTraceStage {
   attempts: number
   summary?: string
   fields?: Record<string, RequirementSemanticizationTraceField>
+  modelUsage?: RequirementSemanticizationModelUsage
 }
 
 export interface RequirementSemanticizationAnalysisTrace {
@@ -339,6 +354,8 @@ export interface RequirementSemanticizationAnalysisTrace {
   recordUid: string
   analyzerVersion: string
   modelSignature: string
+  /** Whether this task requested the model's deep-thinking mode. */
+  deepThinking?: boolean
   outcome?: 'completed' | 'failed' | 'stopped'
   events: RequirementSemanticizationTraceEvent[]
   stages: Partial<Record<RequirementSemanticizationAnalysisStage, RequirementSemanticizationTraceStage>>
@@ -354,8 +371,8 @@ export interface RequirementSemanticizationAnalysisTrace {
 export interface RequirementSemanticizationStartInput {
   recordUids?: string[]
   scope?: RequirementSemanticizationScope
-  maxRecords?: number
   force?: boolean
+  deepThinking?: boolean
 }
 
 export interface RequirementSemanticizationStartResult {
@@ -396,6 +413,8 @@ export interface RequirementSemanticizationTaskSnapshot {
   updatedAt: string
   message: string
   recentItems: RequirementSemanticizationRecentItem[]
+  /** Defaults to true for snapshots created before this field existed. */
+  deepThinking?: boolean
   /** Structured audit result only; model hidden reasoning is never included. */
   analysisTrace?: RequirementSemanticizationAnalysisTrace
 }

@@ -10,36 +10,11 @@ import type {
 import { AppDatabase } from './database'
 import { ModelClient } from './model-client'
 import type { ModelMessage, ModelResponse } from './model-client'
-import type { KnowledgeRecordMatch, KnowledgeSearchHit } from './knowledge'
+import type { KnowledgeSearchHit } from './knowledge'
 import { KnowledgeService } from './knowledge'
 import type { AgentEvent } from '../shared/expert-types'
 
 type AgentStatusEvent = Extract<AgentEvent, { type: 'status' }>
-
-interface RecordSimilarityRequest {
-  itemId?: string
-  limit: number
-}
-
-interface RecordSimilarityCandidate {
-  match: KnowledgeRecordMatch
-  record: NonNullable<ReturnType<AppDatabase['getRecord']>>
-}
-
-type RecordSimilarityVerdict = 'high' | 'medium' | 'low' | 'none'
-
-interface RecordSimilarityReviewItem {
-  recordUid: string
-  score: number
-  verdict: RecordSimilarityVerdict
-  sharedEvidence: string
-  difference: string
-}
-
-interface RecordSimilarityReview {
-  summary: string
-  items: RecordSimilarityReviewItem[]
-}
 
 type RelatedDataRelation = 'direct' | 'indirect' | 'none'
 
@@ -64,10 +39,6 @@ interface ValidatedRelatedDataItem extends RelatedDataReviewItem {
   hit: KnowledgeSearchHit
 }
 
-const RECORD_SIMILARITY_MIN_SCORE = 40
-const RECORD_SIMILARITY_AI_MIN_SCORE = 50
-const RECORD_SIMILARITY_DEFAULT_LIMIT = 10
-const RECORD_SIMILARITY_MAX_LIMIT = 20
 const RELATED_DATA_DEFAULT_LIMIT = 20
 const RELATED_DATA_MAX_LIMIT = 20
 const RELATED_DATA_SEARCH_LIMIT = 12
@@ -91,30 +62,6 @@ const relatedDataReviewFormat = {
           relation: { type: 'string', enum: ['direct', 'indirect', 'none'] },
           claim: { type: 'string' },
           evidence: { type: 'string' }
-        }
-      }
-    }
-  }
-}
-
-const recordSimilarityReviewFormat = {
-  type: 'object',
-  additionalProperties: false,
-  required: ['summary', 'items'],
-  properties: {
-    summary: { type: 'string' },
-    items: {
-      type: 'array',
-      maxItems: RECORD_SIMILARITY_MAX_LIMIT,
-      items: {
-        type: 'object',
-        additionalProperties: false,
-        required: ['recordUid', 'score', 'sharedEvidence', 'difference'],
-        properties: {
-          recordUid: { type: 'string' },
-          score: { type: 'number', minimum: 0, maximum: 100 },
-          sharedEvidence: { type: 'string' },
-          difference: { type: 'string' }
         }
       }
     }
@@ -418,10 +365,6 @@ export class OllamaAgent {
 
   async ask(request: ChatRequest): Promise<ChatResponse> {
     this.progress('route', '正在判断问题类型')
-    const similarityRequest = this.parseRecordSimilarityRequest(request.question)
-    if (similarityRequest) {
-      return this.answerRecordSimilarity(request, similarityRequest)
-    }
     const relatedDataRequest = this.parseRelatedDataRequest(request.question)
     if (relatedDataRequest) {
       return this.answerRelatedData(request, relatedDataRequest)
@@ -475,8 +418,7 @@ export class OllamaAgent {
   }
 
   private isStructuredDataQuestion(question: string): boolean {
-    return Boolean(this.parseRecordSimilarityRequest(question)) ||
-      Boolean(this.parseRelatedDataRequest(question)) ||
+    return Boolean(this.parseRelatedDataRequest(question)) ||
       /总数|数量|多少|统计|排名|分布|前\s*\d+|大于|小于|不小于|不大于|等于|筛选|排序|字段|可视化/.test(question)
   }
 
@@ -514,31 +456,6 @@ export class OllamaAgent {
       limit: Math.min(
         RELATED_DATA_MAX_LIMIT,
         Math.max(1, Number.isFinite(requestedLimit) ? Math.trunc(requestedLimit) : RELATED_DATA_DEFAULT_LIMIT)
-      )
-    }
-  }
-
-  private parseRecordSimilarityRequest(question: string): RecordSimilarityRequest | null {
-    const normalized = question.trim()
-    const hasSimilarityCue = /相似|类似|差不多|近似|同类|雷同/.test(normalized)
-    const hasRecordCue = /需求|条目|记录|数据|编号|工单|问题单|\bID\b/i.test(normalized)
-    if (!hasSimilarityCue || !hasRecordCue) return null
-
-    const labeledItemId = normalized.match(
-      /(?:编号|\bID\b)\s*(?:为|是|[:：#])?\s*([A-Za-z][A-Za-z0-9_]*(?:-[A-Za-z0-9_]+)+)/i
-    )?.[1]
-    const itemId = labeledItemId ?? normalized.match(
-      /([A-Za-z][A-Za-z0-9_]*(?:-[A-Za-z0-9_]+)+)/
-    )?.[1]
-    const requestedLimit = Number(
-      normalized.match(/(?:前|最多|返回|列出)?\s*(\d+)\s*(?:条|个)/)?.[1] ??
-      RECORD_SIMILARITY_DEFAULT_LIMIT
-    )
-    return {
-      ...(itemId ? { itemId } : {}),
-      limit: Math.min(
-        RECORD_SIMILARITY_MAX_LIMIT,
-        Math.max(1, Number.isFinite(requestedLimit) ? Math.trunc(requestedLimit) : RECORD_SIMILARITY_DEFAULT_LIMIT)
       )
     }
   }
@@ -844,299 +761,6 @@ export class OllamaAgent {
       .toLocaleLowerCase()
       .replace(/\s+/g, '')
       .replace(/[，。！？；：、“”‘’"'、（）()【】[\]{}<>《》·,.;:!?]/g, '')
-  }
-
-  private async answerRecordSimilarity(
-    request: ChatRequest,
-    similarityRequest: RecordSimilarityRequest
-  ): Promise<ChatResponse> {
-    const requestedItemId = similarityRequest.itemId?.trim()
-    if (!requestedItemId) {
-      return {
-        answer: '请提供一条作为比较基准的业务编号，例如：`和编号 VISSLM-TSIS-3959 相似的需求有哪些？`。缺少基准记录时，我不会猜测相似对象。',
-        sources: [],
-        dataViews: []
-      }
-    }
-
-    this.progress('locate', `正在定位基准记录 ${requestedItemId}`)
-    const baseRecord = this.db.findRecordByItemId(requestedItemId) ??
-      this.db.findRecordByItemId(requestedItemId.toLocaleUpperCase())
-    if (!baseRecord) {
-      return {
-        answer: `数据中心中不存在编号为 **${requestedItemId}** 的记录。请核对编号或先完成数据采集；本次未执行宽泛检索。`,
-        sources: [],
-        dataViews: []
-      }
-    }
-    if (!this.knowledge) {
-      return {
-        answer: `已定位到 **${baseRecord.itemId}**，但当前记录向量索引服务不可用，暂时无法计算相似记录。`,
-        sources: [],
-        dataViews: []
-      }
-    }
-
-    const baseDetail = this.db.getRecord(baseRecord.uid, false)
-    const baseText = baseDetail?.normalizedText?.trim() ?? ''
-    if (!baseDetail || !baseText) {
-      return {
-        answer: `已定位到 **${baseRecord.itemId}**，但该记录没有可用于语义匹配的正文，无法计算相似记录。`,
-        sources: [],
-        dataViews: []
-      }
-    }
-
-    this.progress('match', `正在计算与 ${baseRecord.itemId} 的记录相似度`)
-    const vectorMatches = await this.knowledge.rankRecordMatches(baseText)
-    const candidates = vectorMatches
-      .map((match) => ({ match, record: this.db.getRecord(match.recordUid, false) }))
-      .filter((candidate): candidate is RecordSimilarityCandidate => Boolean(candidate.record))
-      .filter(({ match, record }) =>
-        record.uid !== baseRecord.uid &&
-        record.nodeType === baseRecord.nodeType &&
-        (!request.projectId || record.projectId === request.projectId) &&
-        Number.isFinite(match.score) &&
-        match.score >= RECORD_SIMILARITY_MIN_SCORE
-      )
-      .sort((left, right) =>
-        right.match.score - left.match.score || left.record.uid.localeCompare(right.record.uid)
-      )
-      .slice(0, similarityRequest.limit)
-
-    this.progress('verify', '正在核对候选记录和真实业务字段')
-    if (!candidates.length) {
-      return {
-        answer: [
-          `已定位基准记录 **${baseRecord.itemId} · ${baseRecord.name}**。`,
-          `未找到相似度达到 **${RECORD_SIMILARITY_MIN_SCORE}%** 的同类型记录。已排除基准记录自身和其他记录类型，没有使用宽泛检索结果凑数。`
-        ].join('\n\n'),
-        sources: [],
-        dataViews: []
-      }
-    }
-
-    let review: RecordSimilarityReview
-    try {
-      this.progress('reason', `大模型正在深度分析 ${candidates.length} 条候选记录`)
-      const draft = await this.reviewRecordSimilarity(request.question, baseDetail, candidates)
-      this.progress('critique', '独立复核模型正在检查结论和证据一致性')
-      review = await this.reviewRecordSimilarity(request.question, baseDetail, candidates, draft)
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      this.progress('answer', '深度复核未通过，停止输出候选结论')
-      return {
-        answer: [
-          `已定位基准记录 **${baseRecord.itemId} · ${baseRecord.name}**，也已完成候选召回。`,
-          '但大模型深度分析或独立复核没有返回可验证的结构化结果。出于准确性要求，本次不输出相似候选，请重试。',
-          `校验信息：${message}`
-        ].join('\n\n'),
-        sources: [],
-        dataViews: []
-      }
-    }
-
-    const reviewByUid = new Map(review.items.map((item) => [item.recordUid, item]))
-    const accepted = candidates
-      .map((candidate) => ({ ...candidate, review: reviewByUid.get(candidate.record.uid)! }))
-      .filter(({ review: item }) =>
-        ['high', 'medium'].includes(item.verdict) && item.score >= RECORD_SIMILARITY_AI_MIN_SCORE
-      )
-      .sort((left, right) =>
-        right.review.score - left.review.score ||
-        right.match.score - left.match.score ||
-        left.record.uid.localeCompare(right.record.uid)
-      )
-
-    if (!accepted.length) {
-      this.progress('answer', '正在生成深度复核结论')
-      return {
-        answer: [
-          `已按编号精确定位基准记录 **${baseRecord.itemId} · ${baseRecord.name}**。`,
-          review.summary,
-          `大模型逐条分析并经第二次独立复核后，没有候选达到 ${RECORD_SIMILARITY_AI_MIN_SCORE}% 的有效相似标准，因此本次不列出相似记录。`
-        ].join('\n\n'),
-        sources: [],
-        dataViews: []
-      }
-    }
-
-    const sources: ChatSource[] = accepted.map(({ match, record, review: item }) => ({
-      uid: record.uid,
-      name: record.name,
-      nodeType: record.nodeType,
-      itemId: record.itemId,
-      sourceType: 'record',
-      chunkId: match.chunkId,
-      snippet: match.snippet,
-      score: Math.round(item.score * 10) / 10
-    }))
-    const rows: ChatDataRow[] = accepted.map(({ match, record, review: item }) => ({
-      uid: record.uid,
-      name: record.name,
-      nodeType: record.nodeType,
-      itemId: record.itemId,
-      values: {
-        aiSimilarity: `${item.score.toFixed(1)}%`,
-        semanticRecall: `${match.score.toFixed(1)}%`,
-        reviewReason: `相同点：${item.sharedEvidence}；差异：${item.difference}`
-      }
-    }))
-    const list = accepted.flatMap(({ record, review: item }, index) => [
-      `${index + 1}. **${record.itemId} · ${record.name}** · AI 复核匹配度 **${item.score.toFixed(1)}%** [UID:${record.uid}]`,
-      `   - 相同点：${item.sharedEvidence}`,
-      `   - 主要差异：${item.difference}`
-    ])
-    const answer = [
-      `已按编号精确定位基准记录 **${baseRecord.itemId} · ${baseRecord.name}**。`,
-      review.summary,
-      `经语义召回、AI 深度分析和第二次独立复核，确认 ${sources.length} 条有效相似记录：`,
-      '',
-      ...list,
-      '',
-      '匹配口径：先以完整标准化正文召回同类型候选，再由大模型逐条比较目标、范围、行为和约束，最后对结论进行独立复核；基准记录自身、其他类型、低分和证据不足的候选均不展示。'
-    ].join('\n')
-    const dataView: ChatDataView = {
-      id: `record-similarity:${baseRecord.uid}`,
-      title: `与 ${baseRecord.itemId} 相似的记录`,
-      description: `基准：${baseRecord.itemId} · ${baseRecord.name} · 已完成语义召回、AI 深度分析和独立复核`,
-      total: rows.length,
-      fields: ['aiSimilarity', 'semanticRecall', 'reviewReason'],
-      fieldLabels: {
-        aiSimilarity: 'AI 复核匹配度',
-        semanticRecall: '语义召回分',
-        reviewReason: '复核依据'
-      },
-      groups: [{
-        name: '相似记录',
-        count: rows.length,
-        rows
-      }]
-    }
-    this.progress('answer', '正在生成可核验的相似记录清单')
-    return { answer, sources, dataViews: [dataView] }
-  }
-
-  private async reviewRecordSimilarity(
-    question: string,
-    baseRecord: NonNullable<ReturnType<AppDatabase['getRecord']>>,
-    candidates: RecordSimilarityCandidate[],
-    draft?: RecordSimilarityReview
-  ): Promise<RecordSimilarityReview> {
-    const evidence = {
-      question,
-      baseRecord: {
-        uid: baseRecord.uid,
-        itemId: baseRecord.itemId,
-        name: baseRecord.name,
-        nodeType: baseRecord.nodeType,
-        content: baseRecord.normalizedText?.slice(0, 6000) ?? ''
-      },
-      candidates: candidates.map(({ match, record }) => ({
-        uid: record.uid,
-        itemId: record.itemId,
-        name: record.name,
-        nodeType: record.nodeType,
-        semanticRecallScore: Number(match.score.toFixed(2)),
-        content: record.normalizedText?.slice(0, 2400) ?? ''
-      }))
-    }
-    let lastError: unknown
-    for (let attempt = 1; attempt <= 2; attempt += 1) {
-      try {
-        const response = await this.callModel({
-          messages: [
-            {
-              role: 'system',
-              content: draft
-                ? [
-                    '你是 VISSLM 相似记录结论的独立复核器。请重新阅读全部原始证据，检查初审是否误解用户意图、遗漏关键差异或给出无依据结论。',
-                    '必须独立判断并修正初审，不能因为初审给出高分就直接接受。只允许引用输入中的事实，不得补充常识推测或不存在的字段。',
-                    '逐条比较业务目标、作用对象、触发条件、输入输出、功能行为和约束。字面词相同但目标不同不能判为相似；字面不同但能力和约束一致可以判为相似。',
-                    'semanticRecallScore 只用于候选召回，不是最终结论。必须为每个候选 UID 输出且只输出一条复核。',
-                    '在内部完成充分推理，但不要输出思维过程，只输出符合 schema 的结论、相同点和主要差异。'
-                  ].join('\n')
-                : [
-                    '你是 VISSLM 需求与记录相似性深度分析器。请先准确理解用户问题和基准记录，再逐条分析候选。',
-                    '逐条比较业务目标、作用对象、触发条件、输入输出、功能行为和约束。不要只按关键词重合判断，也不要把同属一个模块误判为需求相似。',
-                    'semanticRecallScore 只用于候选召回，不是最终结论。只允许使用输入中的真实证据，不得虚构字段、背景或因果关系。',
-                    '为每个候选给出 0-100 分，必须为每个候选 UID 输出且只输出一条分析。相似等级由系统根据分数统一计算，不要输出 verdict 字段。',
-                    '在内部完成充分推理，但不要输出思维过程，只输出符合 schema 的总结、相同点和主要差异。'
-                  ].join('\n')
-            },
-            {
-              role: 'user',
-              content: JSON.stringify({
-                ...(draft ? { evidence, draftToVerify: draft } : evidence),
-                validationAttempt: attempt
-              })
-            }
-          ],
-          format: recordSimilarityReviewFormat,
-          think: true,
-          temperature: 0,
-          numPredict: 2800
-        })
-        return this.parseRecordSimilarityReview(response.message?.content ?? '', candidates)
-      } catch (error) {
-        lastError = error
-      }
-    }
-    const message = lastError instanceof Error ? lastError.message : String(lastError ?? '')
-    throw new Error(`${draft ? '独立复核' : '深度分析'}连续两次未通过结构化校验${message ? `：${message}` : ''}`)
-  }
-
-  private parseRecordSimilarityReview(
-    content: string,
-    candidates: RecordSimilarityCandidate[]
-  ): RecordSimilarityReview {
-    const normalized = content.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '')
-    if (!normalized) throw new Error('复核模型未返回内容')
-    const start = normalized.indexOf('{')
-    const end = normalized.lastIndexOf('}')
-    if (start < 0 || end <= start) throw new Error('复核结果不是有效 JSON')
-    const raw = JSON.parse(normalized.slice(start, end + 1)) as Record<string, unknown>
-    const summary = typeof raw.summary === 'string' ? raw.summary.trim() : ''
-    if (!summary) throw new Error('复核结果缺少总结')
-    if (!Array.isArray(raw.items)) throw new Error('复核结果缺少候选明细')
-
-    const expectedUids = new Set(candidates.map(({ record }) => record.uid))
-    const seenUids = new Set<string>()
-    const items = raw.items.map((value): RecordSimilarityReviewItem => {
-      if (!value || typeof value !== 'object' || Array.isArray(value)) {
-        throw new Error('复核候选格式无效')
-      }
-      const item = value as Record<string, unknown>
-      const recordUid = typeof item.recordUid === 'string' ? item.recordUid.trim() : ''
-      const score = Number(item.score)
-      const sharedEvidence = typeof item.sharedEvidence === 'string' ? item.sharedEvidence.trim() : ''
-      const difference = typeof item.difference === 'string' ? item.difference.trim() : ''
-      if (!expectedUids.has(recordUid)) throw new Error(`复核结果包含未知 UID：${recordUid || '空'}`)
-      if (seenUids.has(recordUid)) throw new Error(`复核结果重复 UID：${recordUid}`)
-      if (!Number.isFinite(score) || score < 0 || score > 100) {
-        throw new Error(`UID ${recordUid} 的相似分数无效`)
-      }
-      if (!sharedEvidence || !difference) throw new Error(`UID ${recordUid} 缺少相同点或差异说明`)
-      seenUids.add(recordUid)
-      const normalizedScore = Math.round(score * 10) / 10
-      return {
-        recordUid,
-        score: normalizedScore,
-        verdict: normalizedScore >= 75
-          ? 'high'
-          : normalizedScore >= 50
-            ? 'medium'
-            : normalizedScore >= 25
-              ? 'low'
-              : 'none',
-        sharedEvidence,
-        difference
-      }
-    })
-    if (items.length !== candidates.length || seenUids.size !== expectedUids.size) {
-      throw new Error('复核结果未覆盖全部候选记录')
-    }
-    return { summary, items }
   }
 
   private async askWithKnowledge(request: ChatRequest): Promise<ChatResponse | null> {

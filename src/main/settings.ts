@@ -21,7 +21,7 @@ import { AppDatabase } from './database'
 const DEFAULT_PLATFORM_URL = 'http://visionmc.vicp.net:889/alm'
 const DEFAULT_MODEL_URL = 'http://127.0.0.1:11434'
 const FEATURE_MODULE_KEYS = Object.keys(DEFAULT_FEATURE_MODULE_SETTINGS) as FeatureModuleKey[]
-const NAVIGATION_ORDER_VERSION = 1
+const NAVIGATION_ORDER_VERSION = 2
 const USER_PROPERTY_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_.]*$/
 const USER_PROPERTY_KEYS_SETTING = 'system.userPropertyKeys'
 const LEGACY_USER_PROPERTY_KEYS_SETTING = 'platform.userPropertyKeys'

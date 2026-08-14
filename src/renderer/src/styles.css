@@ -6616,7 +6616,7 @@ body,
 
 .chat-workspace-v2 .agent-run-current {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 9px;
   color: var(--text-main);
   font-size: 12px;
@@ -6624,13 +6624,15 @@ body,
 
 .chat-workspace-v2 .agent-run-current > span:nth-child(2) {
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  flex: 1 1 auto;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .chat-workspace-v2 .agent-run-current .ant-tag {
   margin-left: auto;
+  flex: 0 0 auto;
+  white-space: nowrap;
   border-color: color-mix(in srgb, var(--accent) 36%, var(--stroke));
   color: var(--accent);
   background: var(--accent-soft);
@@ -6661,6 +6663,135 @@ body,
 
 .chat-workspace-v2 .agent-run-steps > span.active > .anticon {
   color: var(--accent);
+}
+
+.chat-workspace-v2 .agent-review-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--stroke));
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.chat-workspace-v2 .agent-review-progress-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  color: var(--text-main);
+  font-size: 11px;
+}
+
+.chat-workspace-v2 .agent-review-progress-heading strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.chat-workspace-v2 .agent-review-progress-heading .ant-tag {
+  flex: 0 0 auto;
+  margin: 0;
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 36%, var(--stroke));
+  background: var(--accent-soft);
+  white-space: nowrap;
+}
+
+.chat-workspace-v2 .agent-overall-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--stroke);
+}
+
+.chat-workspace-v2 .agent-overall-progress-heading,
+.chat-workspace-v2 .agent-overall-progress-details {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  min-width: 0;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.chat-workspace-v2 .agent-overall-progress-heading {
+  justify-content: space-between;
+}
+
+.chat-workspace-v2 .agent-overall-progress-heading strong {
+  color: var(--accent);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.chat-workspace-v2 .agent-overall-progress .ant-progress {
+  line-height: 1;
+}
+
+.chat-workspace-v2 .agent-overall-progress .ant-progress-outer {
+  width: 100%;
+}
+
+.chat-workspace-v2 .agent-overall-progress .ant-progress-bg {
+  min-height: 8px;
+  background: var(--accent);
+}
+
+.chat-workspace-v2 .agent-overall-progress .ant-progress-inner {
+  background: var(--surface-raised);
+}
+
+.chat-workspace-v2 .agent-overall-progress-details > span {
+  white-space: nowrap;
+}
+
+.chat-workspace-v2 .agent-overall-progress-details strong {
+  color: var(--text-main);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.chat-workspace-v2 .agent-review-progress-metrics {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.chat-workspace-v2 .agent-review-progress-metric {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 7px 8px;
+  border: 1px solid var(--stroke);
+  border-radius: 6px;
+  background: var(--surface-raised);
+}
+
+.chat-workspace-v2 .agent-review-progress-metric span {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-workspace-v2 .agent-review-progress-metric strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--text-main);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.chat-workspace-v2 .agent-review-progress-metric.agent-review-progress-mode strong {
+  color: var(--accent);
+  font-size: 11px;
 }
 
 .chat-workspace-v2 .agent-run-note {
@@ -6842,6 +6973,10 @@ body,
   .chat-workspace-v2 .chat-toolbar-v2 {
     padding-inline: 14px;
   }
+
+  .chat-workspace-v2 .agent-review-progress-metrics {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
 }
 
 @media (max-width: 680px) {
@@ -6890,6 +7025,14 @@ body,
   .chat-workspace-v2 .chat-artifact-context {
     width: 100%;
     max-width: none;
+  }
+
+  .chat-workspace-v2 .agent-review-progress-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .chat-workspace-v2 .agent-review-progress-metric.agent-review-progress-mode {
+    grid-column: 1 / -1;
   }
 }
 
@@ -10824,6 +10967,7 @@ body,
 
 .project-gantt-plugin {
   --project-gantt-raster-stroke: color-mix(in srgb, var(--stroke) 68%, transparent);
+  --wx-font-family: "Inter", "PingFang SC", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
   --wx-color-primary: var(--accent);
   --wx-color-primary-selected: var(--accent-soft);
   --wx-color-primary-font: var(--text-main);
@@ -10880,6 +11024,7 @@ body,
   border-radius: 8px;
   color: var(--text-main);
   background: var(--surface-base);
+  font-family: var(--wx-font-family);
   color-scheme: dark;
 }
 
@@ -14552,36 +14697,66 @@ html[data-theme='light'] .dashboard-style-color-control .ant-color-picker-trigge
   color: var(--state-error);
 }
 
-.asset-semantic-task-config {
+.semanticization-page {
+  min-height: 0;
+}
+
+.semanticization-launch-card,
+.semanticization-records-card,
+.semanticization-empty-task-card {
+  min-height: 0;
+}
+
+.semanticization-card-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-width: 0;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.semanticization-card-heading > div {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.semanticization-toolbar {
+  justify-content: flex-start;
+  min-height: 36px;
+}
+
+.semanticization-thinking-config {
   display: inline-flex;
   align-items: center;
   min-height: 36px;
-  gap: 4px;
-  padding: 0 4px 0 12px;
+  gap: 12px;
+  padding: 4px 8px 4px 12px;
   border: 1px solid var(--stroke);
   border-radius: 8px;
-  color: var(--text-muted);
   background: var(--surface-soft);
+}
+
+.semanticization-thinking-config > div {
+  display: grid;
+  gap: 1px;
+}
+
+.semanticization-thinking-config span {
+  color: var(--text-main);
   font-size: 12px;
+  font-weight: 600;
+}
+
+.semanticization-thinking-config small {
+  color: var(--text-muted);
+  font-size: 10px;
   white-space: nowrap;
 }
 
-.asset-semantic-task-config .ant-input-number {
-  width: 84px;
-  border-color: var(--stroke-strong);
-  background: var(--surface-raised);
-}
-
-.asset-semantic-task-help {
-  margin-inline: 4px;
-  color: var(--text-muted);
-  cursor: help;
-}
-
-.asset-semantic-task-help:focus-visible {
-  border-radius: 4px;
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
+.semanticization-empty-task-card .ant-empty {
+  margin-block: 12px;
 }
 
 .asset-semantic-task-panel {
@@ -14808,6 +14983,7 @@ html[data-theme='light'] .dashboard-style-color-control .ant-color-picker-trigge
 
 .asset-semantic-audit {
   display: grid;
+  grid-auto-rows: max-content;
   overflow: auto;
   max-height: clamp(360px, calc(100vh - 320px), 680px);
   min-height: 0;
@@ -14835,6 +15011,13 @@ html[data-theme='light'] .dashboard-style-color-control .ant-color-picker-trigge
   display: grid;
   min-width: 0;
   gap: 2px;
+}
+
+.asset-semantic-audit-badges {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .asset-semantic-audit-disclaimer,
@@ -15133,8 +15316,9 @@ html[data-theme='light'] .dashboard-style-color-control .ant-color-picker-trigge
 }
 
 @media (max-width: 680px) {
-  .asset-semantic-task-config {
+  .semanticization-thinking-config {
     width: 100%;
+    justify-content: space-between;
   }
 
   .asset-semantic-task-panel {

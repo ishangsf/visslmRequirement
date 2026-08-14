@@ -1,6 +1,33 @@
 import { defineConfig, externalizeDepsPlugin } from 'electron-vite'
 import react from '@vitejs/plugin-react'
 import { resolve } from 'node:path'
+import type { Plugin } from 'vite'
+
+const SVAR_REMOTE_FONT_URL = 'https://cdn.svar.dev/fonts/'
+const SVAR_REMOTE_FONT_FACE = /@font-face\s*\{[^{}]*https:\/\/cdn\.svar\.dev\/fonts\/[^{}]*\}/g
+
+function stripSvarRemoteFontFaces(): Plugin {
+  return {
+    name: 'strip-svar-remote-font-faces',
+    enforce: 'pre',
+    transform(source, id) {
+      const cleanId = id.split('?', 1)[0]
+      if (!cleanId.endsWith('.css') || !id.includes('@svar-ui') || !source.includes(SVAR_REMOTE_FONT_URL)) {
+        return null
+      }
+
+      const sanitized = source.replace(SVAR_REMOTE_FONT_FACE, '')
+      if (sanitized.includes(SVAR_REMOTE_FONT_URL)) {
+        throw new Error(`Unable to remove every SVAR remote font reference from ${id}`)
+      }
+
+      return {
+        code: sanitized,
+        map: null
+      }
+    }
+  }
+}
 
 export default defineConfig({
   main: {
@@ -25,7 +52,7 @@ export default defineConfig({
   },
   renderer: {
     root: resolve(__dirname, 'src/renderer'),
-    plugins: [react()],
+    plugins: [stripSvarRemoteFontFaces(), react()],
     server: {
       host: '127.0.0.1'
     },

@@ -1,271 +1,356 @@
+import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { AppDatabase } from '../src/main/database'
-import type { KnowledgeRecordMatch } from '../src/main/knowledge'
-import { KnowledgeService } from '../src/main/knowledge'
-import { OllamaAgent } from '../src/main/ollama'
 
-const assert = (condition: unknown, message: string): asserts condition => {
-  if (!condition) throw new Error(message)
+import { AppDatabase } from '../src/main/database'
+import { RequirementAnalysisAgent } from '../src/main/experts/requirement-analysis-agent'
+import type { KnowledgeService } from '../src/main/knowledge'
+import type { ModelChatInput, ModelResponse } from '../src/main/model-client'
+import type { RequirementReranker } from '../src/main/requirements/cross-encoder-reranker'
+import type { HybridRequirementCandidate } from '../src/main/requirements/hybrid-retrieval'
+import {
+  buildRequirementSemanticCard,
+  type RequirementSemanticCard
+} from '../src/main/requirements/semantic-card'
+import {
+  REQUIREMENT_SEMANTIC_ANALYZER_VERSION,
+  requirementSemanticModelSignature
+} from '../src/main/requirements/semanticization-service'
+import type { ModelSettings, RecordDetail } from '../src/shared/types'
+
+const settings: ModelSettings = {
+  source: 'local',
+  provider: 'ollama',
+  baseUrl: 'http://127.0.0.1:11434',
+  model: 'requirement-analysis-smoke-model',
+  thinking: false
 }
 
-const main = async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'visslm-agent-similarity-'))
+const semanticContext = {
+  analyzerVersion: REQUIREMENT_SEMANTIC_ANALYZER_VERSION,
+  modelSignature: requirementSemanticModelSignature(settings)
+}
+
+type ExplanationMode = 'valid' | 'different' | 'forbidden' | 'unknown-uid' | 'invalid-evidence'
+
+type ExplanationPayload = {
+  requirement?: { evidenceSegments?: Array<{ id: string }> }
+  candidates?: Array<{ recordUid: string; evidenceSegments?: Array<{ id: string }> }>
+}
+
+type ExplanationModel = {
+  client: { chat(input: ModelChatInput): Promise<ModelResponse> }
+  inputs: ModelChatInput[]
+  calls: number
+}
+
+const upsert = (db: AppDatabase, input: {
+  uid: string
+  itemId: string
+  name: string
+  description: string
+}): RecordDetail => {
+  db.upsertRecord({
+    uid: input.uid,
+    projectId: 'requirement-analysis-similarity-smoke',
+    nodeType: 'Requirement',
+    itemId: input.itemId,
+    parentId: '',
+    name: input.name,
+    lastModifyTime: new Date().toISOString(),
+    raw: {
+      _valm_Description: input.description,
+      IssueType: 'Enhancement',
+      _valm_Module: '报表管理'
+    },
+    normalizedText: `${input.name}\n${input.description}\n报表管理`
+  })
+  const record = db.getRecord(input.uid, false)
+  assert.ok(record, `record was not persisted: ${input.uid}`)
+  return record
+}
+
+const aiCard = (record: RecordDetail): RequirementSemanticCard => {
+  const source = buildRequirementSemanticCard(record)
+  const functionalObject = '报表导出'
+  const action = 'add_capability' as const
+  return {
+    ...source,
+    functionalObject,
+    action,
+    matchingText: `${source.evidence}\n功能对象：${functionalObject}`,
+    fieldAssessments: {
+      ...source.fieldAssessments,
+      functionalObject: { value: functionalObject, confidence: 0.95, evidence: source.evidence },
+      action: { value: action, confidence: 0.95, evidence: source.evidence }
+    },
+    analysisStatus: 'ai_adjudicated',
+    analysisSummary: 'similarity smoke 的 AI 语义卡片'
+  }
+}
+
+const persistReadyCard = (db: AppDatabase, record: RecordDetail): RequirementSemanticCard => {
+  const contentHash = db.getRecordContentHash(record.uid)
+  assert.ok(contentHash, `record has no content hash: ${record.uid}`)
+  assert.equal(
+    db.claimRequirementSemanticCard({ recordUid: record.uid, contentHash, ...semanticContext }),
+    true,
+    `semantic-card claim failed: ${record.uid}`
+  )
+  const card = aiCard(record)
+  db.completeRequirementSemanticCard(record.uid, card)
+  assert.ok(
+    db.getReadyRequirementSemanticCard({ recordUid: record.uid, contentHash, ...semanticContext }),
+    `semantic card was not ready: ${record.uid}`
+  )
+  return card
+}
+
+const candidateFor = (db: AppDatabase, uid: string): HybridRequirementCandidate => {
+  const record = db.getRecord(uid, false)
+  assert.ok(record, `candidate was not persisted: ${uid}`)
+  const contentHash = db.getRecordContentHash(uid)
+  assert.ok(contentHash, `candidate has no content hash: ${uid}`)
+  const card = db.getReadyRequirementSemanticCard({ recordUid: uid, contentHash, ...semanticContext })
+  assert.ok(card, `candidate semantic card was not ready: ${uid}`)
+  return {
+    record,
+    card,
+    denseScore: 96,
+    lexicalScore: 94,
+    structuralScore: 92,
+    retrievalScore: 1,
+    snippet: record.description
+  }
+}
+
+const createReranker = (onInput?: (count: number) => void): RequirementReranker => ({
+  modelId: 'similarity-smoke-cross-encoder',
+  async rerank(_base, candidates) {
+    onInput?.(candidates.length)
+    return candidates.map((candidate, index) => ({
+      recordUid: candidate.record.uid,
+      score: 100 - index
+    }))
+  }
+})
+
+const explanationPayload = (input: ModelChatInput): ExplanationPayload => (
+  JSON.parse(input.messages.at(-1)?.content ?? '{}') as ExplanationPayload
+)
+
+const explanationResponse = (
+  input: ModelChatInput,
+  mode: ExplanationMode
+): ModelResponse => {
+  const payload = explanationPayload(input)
+  const baseEvidence = payload.requirement?.evidenceSegments?.[0]?.id ?? 'B001'
+  const candidates = payload.candidates ?? []
+  const items = candidates.map((candidate, index) => ({
+    recordUid: mode === 'unknown-uid' && index === 0 ? 'unknown-record-uid' : candidate.recordUid,
+    relation: 'partial_overlap',
+    similarities: [mode === 'different'
+      ? '解释文本发生变化，但它不参与匹配决策。'
+      : '两条需求都描述报表导出能力。'],
+    differences: [mode === 'different'
+      ? '解释文本变化不能改变确定性关系或分数。'
+      : '候选记录的业务范围需要结合原文核对。'],
+    baseEvidence: mode === 'invalid-evidence' ? 'B999' : baseEvidence,
+    candidateEvidence: mode === 'invalid-evidence'
+      ? 'C999'
+      : candidate.evidenceSegments?.[0]?.id ?? 'C001',
+    ...(mode === 'forbidden' ? { relation: 'duplicate', score: 99 } : {})
+  }))
+  return {
+    message: {
+      role: 'assistant',
+      content: JSON.stringify({
+        summary: mode === 'different'
+          ? '另一种解释文本，仅用于验证解释与决策解耦。'
+          : '单次批量解释完成。',
+        items
+      })
+    }
+  }
+}
+
+const createExplanationModel = (mode: ExplanationMode = 'valid'): ExplanationModel => {
+  const model: ExplanationModel = {
+    inputs: [],
+    calls: 0,
+    client: {
+      async chat(input: ModelChatInput): Promise<ModelResponse> {
+        model.calls += 1
+        model.inputs.push(input)
+        return explanationResponse(input, mode)
+      }
+    }
+  }
+  return model
+}
+
+const createAgent = (
+  db: AppDatabase,
+  candidates: HybridRequirementCandidate[],
+  model: ExplanationModel,
+  matchModelSignature: string,
+  onRerankInput?: (count: number) => void
+): RequirementAnalysisAgent => new RequirementAnalysisAgent(
+  db,
+  {} as KnowledgeService,
+  settings,
+  undefined,
+  {
+    retriever: {
+      async retrieve(_base, excludedUids): Promise<HybridRequirementCandidate[]> {
+        return candidates.filter((candidate) => !excludedUids.has(candidate.record.uid))
+      }
+    },
+    reranker: createReranker(onRerankInput),
+    modelClient: model.client,
+    semanticContext,
+    matchModelSignature,
+    embeddingModelVersion: 'similarity-smoke-embedding-v1'
+  }
+)
+
+const rowsOf = (response: Awaited<ReturnType<RequirementAnalysisAgent['ask']>>) => (
+  response.dataViews.flatMap((view) => view.groups.flatMap((group) => group.rows))
+)
+
+const rowFor = (
+  response: Awaited<ReturnType<RequirementAnalysisAgent['ask']>>,
+  uid: string
+) => rowsOf(response).find((row) => row.uid === uid)
+
+const main = async (): Promise<void> => {
+  const directory = await mkdtemp(join(tmpdir(), 'visslm-agent-similarity-v2-'))
   let db: AppDatabase | null = null
   try {
     db = new AppDatabase(join(directory, 'agent.db'), join(directory, 'assets'))
-    const records = [
-      {
-        uid: 'record-base',
-        projectId: 'project-1',
-        nodeType: 'TSIssue',
-        itemId: 'VISSLM-TSIS-3959',
-        name: '需求条目导出格式优化',
-        normalizedText: '需求条目导出 Excel 时需要保留编号、标题和层级格式。'
-      },
-      {
-        uid: 'record-similar-high',
-        projectId: 'project-1',
-        nodeType: 'TSIssue',
-        itemId: 'VISSLM-TSIS-4100',
-        name: '需求导出字段与层级保持',
-        normalizedText: '导出需求到 Excel 时保留字段和树形层级。'
-      },
-      {
-        uid: 'record-similar-medium',
-        projectId: 'project-1',
-        nodeType: 'TSIssue',
-        itemId: 'VISSLM-TSIS-4200',
-        name: '需求编号导出',
-        normalizedText: '导出需求列表时显示业务编号。'
-      },
-      {
-        uid: 'record-low-score',
-        projectId: 'project-1',
-        nodeType: 'TSIssue',
-        itemId: 'VISSLM-TSIS-4300',
-        name: '低相关记录',
-        normalizedText: '用户头像上传。'
-      },
-      {
-        uid: 'record-wrong-type',
-        projectId: 'project-1',
-        nodeType: 'TestCase',
-        itemId: 'VISSLM-TC-100',
-        name: '导出测试用例',
-        normalizedText: '验证需求导出 Excel 的字段。'
-      }
-    ]
-    for (const record of records) {
-      db.upsertRecord({
-        ...record,
-        parentId: '',
-        lastModifyTime: new Date().toISOString(),
-        raw: { Summary: record.name }
+    const base = upsert(db, {
+      uid: 'similarity-base-uid',
+      itemId: 'BASE-ALPHA',
+      name: '报表导出配置',
+      description: '报表页面支持导出订单明细，并保留字段与层级。'
+    })
+    const genericBaseOne = upsert(db, {
+      uid: 'generic-base-one-uid',
+      itemId: 'GENERIC-BASE-ONE',
+      name: '通用报表基准一',
+      description: '报表页面支持导出订单明细，并保留字段与层级。'
+    })
+    const genericBaseTwo = upsert(db, {
+      uid: 'generic-base-two-uid',
+      itemId: 'GENERIC-BASE-TWO',
+      name: '通用报表基准二',
+      description: '报表页面支持导出订单明细，并保留字段与层级。'
+    })
+    persistReadyCard(db, base)
+    persistReadyCard(db, genericBaseOne)
+    persistReadyCard(db, genericBaseTwo)
+
+    const candidateUids: string[] = []
+    for (let index = 0; index < 12; index += 1) {
+      const candidate = upsert(db, {
+        uid: `similarity-candidate-${index + 1}-uid`,
+        itemId: `CANDIDATE-${String(index + 1).padStart(2, '0')}`,
+        name: `报表导出候选 ${index + 1}`,
+        description: '报表页面支持导出订单明细，并保留字段与层级。'
       })
+      persistReadyCard(db, candidate)
+      candidateUids.push(candidate.uid)
+    }
+    const candidates = candidateUids.map((uid) => candidateFor(db!, uid))
+
+    let rerankerInputCount = 0
+    const model = createExplanationModel('valid')
+    const agent = createAgent(db, candidates, model, 'similarity-smoke-explanation-v1', (count) => {
+      rerankerInputCount = count
+    })
+    const response = await agent.ask({ question: '分析需求编号 BASE-ALPHA' })
+    assert.equal(rerankerInputCount, 12, 'Cross-Encoder must receive the full retrieved candidate set')
+    assert.equal(model.calls, 1, 'one base must use one batch explanation call')
+    assert.equal(model.inputs[0]?.format && JSON.stringify(model.inputs[0].format).includes('relation'), true)
+    assert.equal(model.inputs[0]?.format && JSON.stringify(model.inputs[0].format).includes('score'), false)
+    assert.equal(explanationPayload(model.inputs[0]!).candidates?.length, 10, 'only Top10 may enter explanation')
+    assert.ok(response.sources.length > 0, 'deterministic scoring must keep visible matches')
+    assert.equal(rowsOf(response).length, 10, 'visible results must be limited to deterministic Top20/AI Top10')
+    assert.match(response.answer, /一次批量 AI 语义复核/)
+    const baselineRow = rowFor(response, candidates[0]!.record.uid)
+    assert.ok(baselineRow, 'the highest-ranked candidate must remain visible')
+    const baselineDecision = {
+      relation: baselineRow.values.relation,
+      matchScore: baselineRow.values.matchScore
     }
 
-    const matches: KnowledgeRecordMatch[] = [
-      {
-        recordUid: 'record-similar-medium',
-        recordName: '占位名称不应展示',
-        nodeType: 'record',
-        itemId: 'record-similar-medium',
-        score: 68.24,
-        chunkId: 'chunk-medium',
-        snippet: '中等相似候选'
-      },
-      {
-        recordUid: 'record-base',
-        recordName: '基准记录',
-        nodeType: 'record',
-        itemId: 'record-base',
-        score: 100,
-        chunkId: 'chunk-base',
-        snippet: '基准记录自身'
-      },
-      {
-        recordUid: 'record-wrong-type',
-        recordName: '其他类型',
-        nodeType: 'record',
-        itemId: 'record-wrong-type',
-        score: 96,
-        chunkId: 'chunk-wrong-type',
-        snippet: '其他类型候选'
-      },
-      {
-        recordUid: 'record-low-score',
-        recordName: '低分候选',
-        nodeType: 'record',
-        itemId: 'record-low-score',
-        score: 39.9,
-        chunkId: 'chunk-low',
-        snippet: '低分候选'
-      },
-      {
-        recordUid: 'record-similar-high',
-        recordName: '另一个占位名称',
-        nodeType: 'record',
-        itemId: 'record-similar-high',
-        score: 82.56,
-        chunkId: 'chunk-high',
-        snippet: '高相似候选'
-      }
-    ]
-    let rankCallCount = 0
-    let ragSearchCallCount = 0
-    const knowledge = {
-      modelVersion: 'test-model',
-      rankRecordMatches: async (query: string) => {
-        rankCallCount += 1
-        assert(query === records[0].normalizedText, 'similarity query should use the base record normalized text')
-        return matches
-      },
-      search: async () => {
-        ragSearchCallCount += 1
-        throw new Error('generic RAG must not run for record similarity queries')
-      }
-    } as unknown as KnowledgeService
-    const progressStages: string[] = []
-    const agent = new OllamaAgent(db, {
-      baseUrl: 'http://127.0.0.1:1',
-      model: 'test-model',
-      thinking: false
-    }, knowledge, (event) => progressStages.push(event.stage))
-    const draftReview = {
-      summary: '两条候选都涉及需求导出，但覆盖范围和约束不同。',
-      items: [
-        {
-          recordUid: 'record-similar-high',
-          score: 83,
-          verdict: 'none',
-          sharedEvidence: '都要求需求导出 Excel 时保留字段和层级信息',
-          difference: '候选没有明确提及标题字段'
-        },
-        {
-          recordUid: 'record-similar-medium',
-          score: 62,
-          verdict: 'high',
-          sharedEvidence: '都涉及导出需求业务编号',
-          difference: '候选只覆盖编号，没有覆盖标题和层级格式'
-        }
-      ]
-    }
-    const verifiedReview = {
-      summary: '深度复核确认两条记录与基准需求存在实质相似，但第一条覆盖范围更完整。',
-      items: [
-        {
-          recordUid: 'record-similar-high',
-          score: 86,
-          verdict: 'none',
-          sharedEvidence: '都要求需求导出 Excel 时保留字段和树形层级',
-          difference: '候选没有明确要求导出标题字段'
-        },
-        {
-          recordUid: 'record-similar-medium',
-          score: 58,
-          verdict: 'high',
-          sharedEvidence: '都要求导出需求业务编号',
-          difference: '候选未覆盖 Excel、标题和层级格式要求'
-        }
-      ]
-    }
-    let modelCallCount = 0
-    Object.defineProperty(agent, 'callModel', {
-      configurable: true,
-      value: async (input: { think?: boolean; format?: unknown; messages?: unknown[] }) => {
-        modelCallCount += 1
-        assert(input.think === true, 'similarity analysis should explicitly enable deep thinking')
-        assert(!JSON.stringify(input.format).includes('verdict'), 'similarity schema should use score as the single source of truth')
-        const serializedInput = JSON.stringify(input)
-        assert(!serializedInput.includes('record-wrong-type'), 'wrong-type candidates must not reach the model')
-        assert(!serializedInput.includes('record-low-score'), 'low-score candidates must not reach the model')
-        const review = modelCallCount === 1 ? draftReview : verifiedReview
-        if (modelCallCount > 2) throw new Error('similarity analysis should use exactly two model passes')
-        return { message: { role: 'assistant' as const, content: JSON.stringify(review) } }
-      }
-    })
+    const changedExplanationModel = createExplanationModel('different')
+    const changedExplanation = await createAgent(
+      db,
+      candidates,
+      changedExplanationModel,
+      'similarity-smoke-explanation-v2'
+    ).ask({ question: '分析需求编号 BASE-ALPHA' })
+    const changedRow = rowFor(changedExplanation, candidates[0]!.record.uid)
+    assert.ok(changedRow)
+    assert.deepEqual(
+      { relation: changedRow.values.relation, matchScore: changedRow.values.matchScore },
+      baselineDecision,
+      'explanation text must not alter deterministic relation or score'
+    )
+    assert.equal(changedExplanationModel.calls, 1, 'changed explanation signature still uses one batch call')
 
-    const response = await agent.ask({
-      question: '@通用数据助手 和编号 VISSLM-TSIS-3959 差不多的需求条目有哪些？'
-    })
-    assert(rankCallCount === 1, 'similarity ranking should run exactly once')
-    assert(ragSearchCallCount === 0, 'similarity query should bypass generic RAG')
-    assert(modelCallCount === 2, 'similarity query should run deep analysis and independent verification')
-    assert(response.sources.length === 2, 'only same-type candidates above the threshold should remain')
-    assert(response.sources[0]?.uid === 'record-similar-high', 'results should sort by score descending')
-    assert(response.sources[0]?.itemId === 'VISSLM-TSIS-4100', 'sources should use the real business item ID')
-    assert(response.sources[0]?.nodeType === 'TSIssue', 'sources should use the real record type')
-    assert(response.sources[0]?.name === '需求导出字段与层级保持', 'sources should use the database record name')
-    assert(!response.sources.some((source) => source.uid === 'record-base'), 'base record should be excluded')
-    assert(!response.sources.some((source) => source.uid === 'record-wrong-type'), 'other record types should be excluded')
-    assert(!response.sources.some((source) => source.uid === 'record-low-score'), 'low-score candidates should be excluded')
-    assert(response.answer.includes('86.0%'), 'answer should show the independently verified score')
-    assert(!response.answer.includes('分数与相似等级不一致'), 'model-provided verdict must not override the numeric score')
-    assert(response.answer.includes('第一条覆盖范围更完整'), 'answer should include the verified model summary')
-    assert(response.dataViews.length === 1, 'similarity results should expose a data view')
-    assert(response.dataViews[0]?.groups[0]?.rows[0]?.uid === 'record-similar-high', 'data view should preserve result order')
-    assert(response.dataViews[0]?.groups[0]?.rows[0]?.values.aiSimilarity === '86.0%', 'data view should expose verified similarity')
-    assert(response.dataViews[0]?.groups[0]?.rows[0]?.values.semanticRecall === '82.6%', 'data view should preserve the recall score')
-    for (const stage of ['route', 'locate', 'match', 'verify', 'reason', 'critique', 'answer']) {
-      assert(progressStages.includes(stage), `agent progress should include ${stage}`)
+    for (const mode of ['forbidden', 'unknown-uid', 'invalid-evidence'] as const) {
+      const invalidModel = createExplanationModel(mode)
+      const invalidResponse = await createAgent(
+        db,
+        candidates,
+        invalidModel,
+        `similarity-smoke-invalid-${mode}`
+      ).ask({ question: '分析需求编号 BASE-ALPHA' })
+      const invalidRow = rowFor(invalidResponse, candidates[0]!.record.uid)
+      assert.ok(invalidRow, `${mode} explanation failure must retain deterministic output`)
+      assert.deepEqual(
+        { relation: invalidRow.values.relation, matchScore: invalidRow.values.matchScore },
+        baselineDecision,
+        `${mode} explanation failure must not alter deterministic relation or score`
+      )
+      assert.equal(invalidModel.calls, 1, `${mode} must fail closed without a repair pass`)
+      assert.equal(invalidRow.values.explanationStatus, 'AI 语义复核暂不可用，正式关系已降级并保留召回审计')
     }
 
-    const missingReference = await agent.ask({ question: '帮我找一些相似的需求记录' })
-    assert(missingReference.answer.includes('请提供一条作为比较基准的业务编号'), 'missing base ID should return a recoverable prompt')
-    assert(rankCallCount === 1, 'missing base ID must not run similarity ranking')
+    const cachedAgain = await agent.ask({ question: '分析需求编号 BASE-ALPHA' })
+    assert.equal(model.calls, 1, 'repeated verified input must hit persistent cache with zero model calls')
+    assert.equal(rowFor(cachedAgain, candidates[0]!.record.uid)?.values.explanationStatus, '已复核缓存命中')
+    await agent.ask({ question: '请分析需求编号 BASE-ALPHA' })
+    assert.equal(model.calls, 2, 'query changes must invalidate the explanation cache')
 
-    const unknownReference = await agent.ask({ question: '和编号 VISSLM-TSIS-9999 类似的需求有哪些？' })
-    assert(unknownReference.answer.includes('不存在编号'), 'unknown base ID should be reported explicitly')
-    assert(unknownReference.answer.includes('未执行宽泛检索'), 'unknown base ID should not fall back to broad retrieval')
-    assert(rankCallCount === 1, 'unknown base ID must not run similarity ranking')
-    assert(ragSearchCallCount === 0, 'all similarity branches should bypass generic RAG')
-    assert(modelCallCount === 2, 'missing and unknown base IDs must not call the model')
-
-    const invalidAgent = new OllamaAgent(db, {
-      baseUrl: 'http://127.0.0.1:1',
-      model: 'test-model',
-      thinking: false
-    }, knowledge)
-    let invalidModelCallCount = 0
-    Object.defineProperty(invalidAgent, 'callModel', {
-      configurable: true,
-      value: async () => {
-        invalidModelCallCount += 1
-        return {
-          message: {
-            role: 'assistant' as const,
-            content: JSON.stringify({
-              summary: '包含模型自行添加的候选。',
-              items: [{
-                recordUid: 'invented-record',
-                score: 95,
-                verdict: 'high',
-                sharedEvidence: '无真实依据',
-                difference: '无'
-              }]
-            })
-          }
-        }
-      }
-    })
-    const rejectedReview = await invalidAgent.ask({
-      question: '和编号 VISSLM-TSIS-3959 相似的需求条目有哪些？'
-    })
-    assert(invalidModelCallCount === 2, 'invalid first-pass review should retry once before failing closed')
-    assert(rejectedReview.sources.length === 0, 'invalid model output must not expose any candidate')
-    assert(rejectedReview.dataViews.length === 0, 'invalid model output must not expose a data view')
-    assert(rejectedReview.answer.includes('本次不输出相似候选'), 'invalid model output should fail closed')
+    const genericCandidate = candidates[0]!
+    const genericModel = createExplanationModel('valid')
+    const genericResponse = await createAgent(
+      db,
+      [genericCandidate],
+      genericModel,
+      'similarity-smoke-generic-v1'
+    ).ask({ question: '分析需求编号 GENERIC-BASE-ONE、GENERIC-BASE-TWO' })
+    assert.equal(genericModel.calls, 2, 'generic IDs must use the same one-batch branch independently')
+    assert.deepEqual(
+      genericModel.inputs.map((input) => explanationPayload(input).candidates?.length),
+      [1, 1]
+    )
+    assert.equal(genericResponse.sources.length, 2)
 
     console.log(JSON.stringify({
       ok: true,
-      matchedItemIds: response.sources.map((source) => source.itemId),
-      progressStages
+      matchedCandidates: response.sources.map((source) => source.itemId),
+      explanationCalls: model.calls,
+      cachedExplanationCalls: 1,
+      genericExplanationCalls: genericModel.calls
     }))
   } finally {
     db?.close()
-    await rm(directory, { recursive: true, force: true })
+    await rm(directory, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 })
   }
 }
 

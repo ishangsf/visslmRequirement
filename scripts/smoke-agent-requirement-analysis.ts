@@ -1,5 +1,5 @@
+import { mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import assert from 'node:assert/strict'
 import { AppDatabase } from '../src/main/database'
@@ -15,19 +15,6 @@ import type { KnowledgeService } from '../src/main/knowledge'
 import type { ModelChatInput, ModelResponse } from '../src/main/model-client'
 import type { ModelSettings, RecordDetail } from '../src/shared/types'
 
-type ReviewRelation = 'duplicate' | 'highly_similar' | 'partial_overlap' | 'same_pattern' | 'topic_only' | 'unrelated'
-
-interface FixedOutcome {
-  candidateItemId: string
-  allowedRelations: ReviewRelation[]
-}
-
-interface FixedOutcomeFixture {
-  baseItemId: string
-  expected: FixedOutcome[]
-  noFormalMatch: boolean
-}
-
 const settings: ModelSettings = {
   source: 'local',
   provider: 'ollama',
@@ -41,11 +28,6 @@ const semanticContext = {
   modelSignature: requirementSemanticModelSignature(settings)
 }
 
-const readFixedOutcomes = async (): Promise<FixedOutcomeFixture> => {
-  const path = join(process.cwd(), 'test-data', 'requirement-matching', 'fixed-outcomes.json')
-  return JSON.parse(await readFile(path, 'utf8')) as FixedOutcomeFixture
-}
-
 const upsert = (db: AppDatabase, input: {
   uid: string
   itemId: string
@@ -53,6 +35,7 @@ const upsert = (db: AppDatabase, input: {
   description: string
   issueType?: string
   module?: string
+  persistCard?: boolean
 }): void => {
   db.upsertRecord({
     uid: input.uid,
@@ -69,7 +52,7 @@ const upsert = (db: AppDatabase, input: {
     },
     normalizedText: `${input.name}\n${input.description}\n${input.module ?? '需求管理'}`
   })
-  persistReadySemanticCard(db, input.uid)
+  if (input.persistCard !== false) persistReadySemanticCard(db, input.uid)
 }
 
 const persistReadySemanticCard = (db: AppDatabase, uid: string): RequirementSemanticCard => {
@@ -101,7 +84,7 @@ const candidateFor = (db: AppDatabase, uid: string, denseScore = 82): HybridRequ
   const contentHash = db.getRecordContentHash(uid)
   assert.ok(contentHash)
   const card = db.getReadyRequirementSemanticCard({ recordUid: uid, contentHash, ...semanticContext })
-  assert.ok(card, `missing ready semantic card ${uid}`)
+    ?? buildRequirementSemanticCard(record)
   return {
     record,
     card,
@@ -122,38 +105,50 @@ const deterministicReranker = (scoreByUid: ReadonlyMap<string, number>): Require
   }
 })
 
-const reviewContent = (input: ModelChatInput, relationByItemId: ReadonlyMap<string, ReviewRelation>): string => {
+type ExplanationMode = 'missing' | 'unknown' | 'duplicate' | 'forbidden' | 'invalid-evidence' | 'empty'
+
+const explanationContent = (input: ModelChatInput, options: {
+  malformed?: ExplanationMode
+} = {}): string => {
   const message = input.messages.at(-1)?.content ?? '{}'
   const payload = JSON.parse(message) as {
-    requirement?: { evidence?: string }
-    candidates?: Array<{ recordUid: string; itemId: string; evidence?: string }>
+    requirement?: { evidenceSegments?: Array<{ id: string; text: string }> }
+    candidates?: Array<{ recordUid: string; evidenceSegments?: Array<{ id: string; text: string }> }>
   }
-  const baseEvidence = payload.requirement?.evidence?.slice(0, 32) || '需求内容'
-  const items = (payload.candidates ?? []).map((candidate) => {
-    const relation = relationByItemId.get(candidate.itemId) ?? 'topic_only'
-    const score: Record<ReviewRelation, number> = {
-      duplicate: 90,
-      highly_similar: 82,
-      partial_overlap: 55,
-      same_pattern: 45,
-      topic_only: 25,
-      unrelated: 10
-    }
-    return {
+  if (options.malformed === 'empty') return ''
+  const baseEvidence = payload.requirement?.evidenceSegments?.[0]?.id ?? 'B001'
+  const item = (candidate: { recordUid: string; evidenceSegments?: Array<{ id: string; text: string }> }) => ({
       recordUid: candidate.recordUid,
-      relation,
-      score: score[relation],
-      sharedEvidence: '需求都涉及需求管理场景',
-      difference: '业务目标、功能对象或动作范围存在差异',
+      relation: 'partial_overlap',
+      similarities: ['两条需求都涉及同一业务场景。'],
+      differences: ['目标范围或操作动作存在差异。'],
       baseEvidence,
-      candidateEvidence: candidate.evidence?.slice(0, 32) || '候选需求内容'
-    }
-  })
-  return JSON.stringify({ summary: '固定 smoke fixture 的业务关系复核完成。', items })
+      candidateEvidence: candidate.evidenceSegments?.[0]?.id ?? 'C001'
+    })
+  const candidates = payload.candidates ?? []
+  if (options.malformed === 'missing') return JSON.stringify({ summary: '缺少候选解释。', items: candidates.slice(0, 1).map(item) })
+  if (options.malformed === 'unknown') return JSON.stringify({ summary: '包含未知 UID。', items: [{ ...item(candidates[0] ?? { recordUid: 'missing' }), recordUid: 'unknown-smoke-uid' }] })
+  if (options.malformed === 'duplicate') {
+    const first = candidates[0] ? item(candidates[0]) : { recordUid: 'missing', similarities: ['相似'], differences: ['差异'], baseEvidence, candidateEvidence: 'C001' }
+    return JSON.stringify({ summary: '包含重复 UID。', items: [first, first] })
+  }
+  if (options.malformed === 'forbidden') {
+    return JSON.stringify({
+      summary: '包含禁止的决策字段。',
+      items: candidates.map((candidate) => ({ ...item(candidate), relation: 'duplicate', score: 99 }))
+    })
+  }
+  if (options.malformed === 'invalid-evidence') {
+    return JSON.stringify({
+      summary: '包含不在原文中的证据。',
+      items: candidates.map((candidate) => ({ ...item(candidate), baseEvidence: 'B999', candidateEvidence: 'C999' }))
+    })
+  }
+  return JSON.stringify({ summary: '固定 smoke fixture 的批量解释完成。', items: candidates.map(item) })
 }
 
 const fakeModel = (
-  relationByItemId: ReadonlyMap<string, ReviewRelation>,
+  options: { malformed?: ExplanationMode } = {},
   onInput?: (input: ModelChatInput) => void
 ): { client: { chat(input: ModelChatInput): Promise<ModelResponse> }; getCallCount: () => number } => {
   let callCount = 0
@@ -162,7 +157,7 @@ const fakeModel = (
       async chat(input: ModelChatInput): Promise<ModelResponse> {
         callCount += 1
         onInput?.(input)
-        return { message: { role: 'assistant', content: reviewContent(input, relationByItemId) } }
+        return { message: { role: 'assistant', content: explanationContent(input, options) } }
       }
     },
     getCallCount: () => callCount
@@ -188,19 +183,54 @@ const createRetriever = (
   }
 }
 
+type SmokeRetriever = {
+  retrieve(base: RequirementSemanticCard, excludedUids: Set<string>): Promise<HybridRequirementCandidate[]>
+}
+
+const createAgent = (
+  db: AppDatabase,
+  retriever: SmokeRetriever,
+  model: { client: { chat(input: ModelChatInput): Promise<ModelResponse> } },
+  options: {
+    reranker?: RequirementReranker
+    matchModelSignature?: string
+    embeddingModelVersion?: string
+    onProgress?: (event: unknown) => void
+  } = {}
+): RequirementAnalysisAgent => new RequirementAnalysisAgent(
+  db,
+  {} as KnowledgeService,
+  settings,
+  options.onProgress,
+  {
+    retriever,
+    reranker: options.reranker ?? deterministicReranker(new Map()),
+    modelClient: model.client,
+    semanticContext,
+    matchModelSignature: options.matchModelSignature,
+    embeddingModelVersion: options.embeddingModelVersion
+  }
+)
+
+const rowsOf = (response: Awaited<ReturnType<RequirementAnalysisAgent['ask']>>) => (
+  response.dataViews.flatMap((view) => view.groups.flatMap((group) => group.rows))
+)
+
+const rowFor = (
+  response: Awaited<ReturnType<RequirementAnalysisAgent['ask']>>,
+  itemId: string
+): ReturnType<typeof rowsOf>[number] | undefined => rowsOf(response).find((row) => row.itemId === itemId)
+
 const runHappyPath = async (db: AppDatabase): Promise<void> => {
   let orderIssueType = ''
   let orderEvidence = ''
+  const modelInputs: ModelChatInput[] = []
   const retriever = createRetriever(db, new Map([
     ['REQ-1', ['match-order', 'match-topic']],
     ['REQ-2', ['match-stock', 'match-pattern']]
   ]))
-  const model = fakeModel(new Map([
-    ['DATA-1', 'duplicate'],
-    ['DATA-2', 'topic_only'],
-    ['DATA-3', 'highly_similar'],
-    ['DATA-4', 'partial_overlap']
-  ]), (input) => {
+  const model = fakeModel({}, (input) => {
+    modelInputs.push(input)
     const payload = JSON.parse(input.messages.at(-1)?.content ?? '{}') as {
       requirement?: { requirementType?: string; evidence?: string }
     }
@@ -223,120 +253,174 @@ const runHappyPath = async (db: AppDatabase): Promise<void> => {
   const response = await agent.ask({ question: '@需求分析专家 分析需求编号 REQ-1、REQ-2' })
 
   assert.equal(retriever.getCallCount(), 2, 'multi-ID input should retrieve each base independently')
-  assert.equal(model.getCallCount(), 4, 'each base must receive draft and independent verification calls')
+  assert.equal(model.getCallCount(), 2, 'each base must receive one batch explanation call')
+  assert.ok(modelInputs.every((input) => {
+    const payload = JSON.parse(input.messages.at(-1)?.content ?? '{}') as Record<string, unknown>
+    return !Object.prototype.hasOwnProperty.call(payload, 'relation') &&
+      !Object.prototype.hasOwnProperty.call(payload, 'score')
+  }), 'explanation prompts must not carry model-owned relation or score fields')
   assert.equal(orderIssueType, 'Enhancement', 'IssueType must come from the real raw field')
   assert.ok(orderEvidence.includes('"订单" & 详情'), 'HTML entities/tags must be normalized before model evidence')
   assert.ok(!orderEvidence.includes('&quot;') && !orderEvidence.includes('<p>'), 'raw HTML must not reach the model')
   assert.equal(response.dataViews.length, 1)
-  assert.equal(response.dataViews[0]?.groups.length, 3, 'formal and reference results must remain grouped per base')
-  assert.deepEqual(
-    response.dataViews[0]?.groups.map((group) => group.name),
-    ['REQ-1 · 正式匹配', 'REQ-2 · 正式匹配', 'REQ-2 · 参考关联需求']
-  )
-  assert.equal(response.dataViews[0]?.groups[0]?.rows[0]?.itemId, 'DATA-1')
-  assert.equal(response.dataViews[0]?.groups[0]?.rows[0]?.values.requirementType, 'Enhancement')
-  assert.ok(!response.dataViews[0]?.groups.some((group) => group.rows.some((row) => row.itemId === 'DATA-2')), 'topic_only candidates must be hidden')
+  assert.ok(response.dataViews[0]?.groups.length >= 1, 'deterministic results must remain grouped per base')
+  assert.ok(rowFor(response, 'DATA-1'), 'deterministic scoring must retain the highest-ranked order candidate')
+  assert.equal(rowFor(response, 'DATA-1')?.values.requirementType, 'Enhancement')
+  assert.ok(rowsOf(response).every((row) => typeof row.values.relation === 'string' && typeof row.values.matchScore === 'string'))
   assert.match(response.answer, /REQ-1 · 订单查询/)
   assert.match(response.answer, /DATA-1 · 订单详情检索/)
-  assert.match(response.answer, /确认 1 条高度相似或重复需求/)
+  assert.match(response.answer, /一次批量 AI 语义复核/)
 }
 
-const runFixedOutcomes = async (db: AppDatabase, fixture: FixedOutcomeFixture): Promise<void> => {
-  const byItemId = new Map(fixture.expected.map((item) => [item.candidateItemId, item.allowedRelations[0]!]))
-  const uidByItemId = new Map([
-    ['VISSLM-TSIS-889', 'fixed-889'],
-    ['VISSLM-TSIS-376', 'fixed-376'],
-    ['VISSLM-TSIS-613', 'fixed-613'],
-    ['VISSLM-TSIS-395', 'fixed-395'],
-    ['VISSLM-TSIS-528', 'fixed-528'],
-    ['VISSLM-TSIS-1837', 'fixed-1837']
+const runExplanationFallbackAndValidation = async (db: AppDatabase): Promise<void> => {
+  const modes: ExplanationMode[] = ['missing', 'unknown', 'duplicate', 'forbidden', 'invalid-evidence', 'empty']
+  const base = 'base-order'
+  const candidate = 'match-order'
+  const retriever = {
+    async retrieve(_base: RequirementSemanticCard, excludedUids: Set<string>): Promise<HybridRequirementCandidate[]> {
+      return excludedUids.has(base)
+        ? [candidateFor(db, candidate, 90), candidateFor(db, 'match-topic', 80)]
+        : []
+    }
+  }
+  const validModel = fakeModel()
+  const baseline = await createAgent(db, retriever, validModel, { matchModelSignature: 'smoke-baseline-v1' })
+    .ask({ question: '分析需求编号 REQ-1' })
+  const baselineRow = rowFor(baseline, 'DATA-1')
+  assert.ok(baselineRow)
+  const baselineDecision = {
+    relation: baselineRow.values.relation,
+    matchScore: baselineRow.values.matchScore
+  }
+
+  for (const mode of modes) {
+    const model = fakeModel({ malformed: mode })
+    const response = await createAgent(db, retriever, model, {
+      matchModelSignature: `smoke-malformed-${mode}`
+    }).ask({ question: '分析需求编号 REQ-1' })
+    const row = rowFor(response, 'DATA-1')
+    assert.ok(row, `${mode} explanation failure must retain deterministic output`)
+    assert.deepEqual(
+      { relation: row.values.relation, matchScore: row.values.matchScore },
+      baselineDecision,
+      `${mode} explanation failure must not alter deterministic relation or score`
+    )
+    assert.equal(model.getCallCount(), 1, `${mode} must use one batch call and no repair pass`)
+    assert.equal(row.values.explanationStatus, 'AI 语义复核暂不可用，正式关系已降级并保留召回审计')
+  }
+}
+
+const runSourceOnlyMatching = async (db: AppDatabase): Promise<void> => {
+  upsert(db, {
+    uid: 'source-only-base', itemId: 'SOURCE-ONLY-BASE', name: '原文基准',
+    description: '需求管理页面支持查询订单详情。', module: '需求管理', persistCard: false
+  })
+  upsert(db, {
+    uid: 'source-only-candidate', itemId: 'SOURCE-ONLY-CANDIDATE', name: '原文候选',
+    description: '需求管理页面支持查询订单明细。', module: '需求管理', persistCard: false
+  })
+  const modelInputs: ModelChatInput[] = []
+  const model = fakeModel({}, (input) => modelInputs.push(input))
+  const retriever = {
+    async retrieve(_base: RequirementSemanticCard, excludedUids: Set<string>): Promise<HybridRequirementCandidate[]> {
+      return excludedUids.has('source-only-base') ? [candidateFor(db, 'source-only-candidate', 95)] : []
+    }
+  }
+  const response = await createAgent(db, retriever, model).ask({ question: '分析需求编号 SOURCE-ONLY-BASE' })
+  const payload = JSON.parse(modelInputs[0]?.messages.at(-1)?.content ?? '{}') as {
+    requirement?: { semanticCardStatus?: string }
+    candidates?: Array<{ recordUid: string; semanticCardStatus?: string }>
+  }
+  assert.equal(payload.requirement?.semanticCardStatus, 'source_only')
+  assert.deepEqual(payload.candidates?.map((item) => [item.recordUid, item.semanticCardStatus]), [
+    ['source-only-candidate', 'source_only']
   ])
-  const retriever = {
-    async retrieve(_base: ReturnType<typeof buildRequirementSemanticCard>, excludedUids: Set<string>): Promise<HybridRequirementCandidate[]> {
-      return [...uidByItemId.values()]
-        .filter((uid) => !excludedUids.has(uid))
-        .map((uid, index) => candidateFor(db, uid, 90 - index))
-    }
-  }
-  const model = fakeModel(byItemId)
-  const agent = new RequirementAnalysisAgent(
-    db,
-    {} as KnowledgeService,
-    settings,
-    undefined,
-    { retriever, reranker: deterministicReranker(new Map()), modelClient: model.client, semanticContext }
-  )
-  const response = await agent.ask({ question: `分析需求编号 ${fixture.baseItemId}` })
-  assert.equal(model.getCallCount(), 4, 'fixed outcome should use two independent passes across two candidate batches')
-  const rows = response.dataViews.flatMap((view) => view.groups.flatMap((group) => group.rows))
-  for (const expected of fixture.expected) {
-    const row = rows.find((candidate) => candidate.itemId === expected.candidateItemId)
-    const suppliedRelation = expected.allowedRelations[0]
-    if (suppliedRelation === 'topic_only' || suppliedRelation === 'unrelated') {
-      assert.equal(row, undefined, `non-visible ${suppliedRelation} candidate ${expected.candidateItemId} must be filtered`)
-    } else {
-      assert.ok(row, `fixed candidate ${expected.candidateItemId} should be visible in the result`)
-      assert.ok(expected.allowedRelations.includes(String(row.values.relation) as ReviewRelation), `unexpected relation for ${expected.candidateItemId}`)
-    }
-  }
-  assert.ok(!rows.some((row) => row.values.relation === 'duplicate' || row.values.relation === 'highly_similar'), 'fixed fixture must have no formal matches')
-  if (fixture.noFormalMatch) {
-    assert.match(response.answer, /未发现业务目标一致的高度相似或重复需求/)
-    assert.ok(!response.dataViews.some((view) => view.groups.some((group) => group.name.endsWith('正式匹配'))))
-  }
+  assert.equal(db.getRequirementSemanticCardState('source-only-base'), null, 'matching must not create a base semantic card')
+  assert.equal(db.getRequirementSemanticCardState('source-only-candidate'), null, 'matching must not create a candidate semantic card')
+  assert.equal(model.getCallCount(), 1)
+  assert.ok(response.sources.some((source) => source.uid === 'source-only-candidate'))
 }
 
-const runInvalidReview = async (db: AppDatabase, mode: 'missing' | 'unknown' | 'duplicate'): Promise<void> => {
-  const retriever = {
-    async retrieve(_base: ReturnType<typeof buildRequirementSemanticCard>, _excludedUids: Set<string>): Promise<HybridRequirementCandidate[]> {
-      return [candidateFor(db, 'invalid-candidate-a'), candidateFor(db, 'invalid-candidate-b')]
+const runTopBounds = async (db: AppDatabase): Promise<void> => {
+  upsert(db, {
+    uid: 'bounds-base', itemId: 'BOUNDS-BASE', name: '边界基准',
+    description: '需求管理页面支持查询订单详情。', module: '需求管理'
+  })
+  const candidateUids: string[] = []
+  for (let index = 0; index < 25; index += 1) {
+    const uid = `bounds-candidate-${index}`
+    candidateUids.push(uid)
+    upsert(db, {
+      uid, itemId: `BOUNDS-CANDIDATE-${index}`, name: `订单候选 ${index}`,
+      description: `需求管理页面支持查询订单详情 ${index}。`, module: '需求管理'
+    })
+  }
+  let rerankerInputLength = 0
+  let explanationCandidateCount = 0
+  const model = fakeModel({}, (input) => {
+    const payload = JSON.parse(input.messages.at(-1)?.content ?? '{}') as { candidates?: unknown[] }
+    explanationCandidateCount = payload.candidates?.length ?? 0
+  })
+  const reranker: RequirementReranker = {
+    modelId: 'smoke-bounds-reranker',
+    async rerank(_base, candidates) {
+      rerankerInputLength = candidates.length
+      return candidates.map((candidate, index) => ({ recordUid: candidate.record.uid, score: 100 - index }))
     }
   }
-  let callCount = 0
-  const model = {
-    async chat(input: ModelChatInput): Promise<ModelResponse> {
-      callCount += 1
-      const payload = JSON.parse(input.messages.at(-1)?.content ?? '{}') as {
-        requirement?: { evidence?: string }
-        candidates?: Array<{ recordUid: string; evidence?: string }>
-      }
-      const candidates = payload.candidates ?? []
-      const item = (candidate: { recordUid: string; evidence?: string }) => ({
-        recordUid: candidate.recordUid,
-        relation: 'topic_only',
-        score: 20,
-        sharedEvidence: '同属需求场景',
-        difference: '功能对象不同',
-        baseEvidence: payload.requirement?.evidence?.slice(0, 20) || '需求',
-        candidateEvidence: candidate.evidence?.slice(0, 20) || '候选'
-      })
-      const first = candidates[0]
-      const second = candidates[1]
-      const items = mode === 'missing'
-        ? (first ? [item(first)] : [])
-        : mode === 'unknown'
-          ? [item({ recordUid: 'unknown-uid', evidence: '未知候选' })]
-          : (first ? [item(first), item(first), ...(second ? [item(second)] : [])] : [])
-      return { message: { role: 'assistant', content: JSON.stringify({ summary: `invalid ${mode}`, items }) } }
+  const response = await createAgent(db, {
+    async retrieve(_base, excludedUids) {
+      return candidateUids.filter((uid) => !excludedUids.has(uid)).map((uid) => candidateFor(db, uid, 80))
     }
-  }
-  const agent = new RequirementAnalysisAgent(
-    db,
-    {} as KnowledgeService,
-    settings,
-    undefined,
-    { retriever, reranker: deterministicReranker(new Map()), modelClient: model, semanticContext }
-  )
-  const response = await agent.ask({ question: '分析需求编号 UNKNOWN-BASE' })
-  assert.equal(callCount, 0, 'unknown base IDs must not call the model')
-  assert.equal(response.dataViews.length, 0)
-  assert.match(response.answer, /不存在/)
+  }, model, { reranker }).ask({ question: '分析需求编号 BOUNDS-BASE' })
+  assert.equal(rerankerInputLength, 25, 'Cross-Encoder must receive all retrieved candidates')
+  assert.equal(explanationCandidateCount, 10, 'only the top ten of deterministic Top20 may enter explanation')
+  assert.equal(model.getCallCount(), 1)
+  assert.ok(response.sources.every((source) => candidateUids.slice(0, 10).includes(source.uid)))
+}
 
-  const validResponse = await agent.ask({ question: '分析需求编号 VALID-BASE' })
-  assert.equal(callCount, 2, `${mode} model output should retry exactly once before failing closed`)
-  assert.equal(validResponse.dataViews.length, 0)
-  assert.equal(validResponse.sources.length, 0)
-  assert.match(validResponse.answer, /精准匹配失败关闭/)
+const runCacheAndGenericIds = async (db: AppDatabase): Promise<void> => {
+  upsert(db, { uid: 'generic-base-one', itemId: 'GENERIC-BASE-ONE', name: '通用基准一', description: '需求页面支持查询详情。' })
+  upsert(db, { uid: 'generic-base-two', itemId: 'GENERIC-BASE-TWO', name: '通用基准二', description: '需求页面支持查询详情。' })
+  upsert(db, { uid: 'generic-candidate', itemId: 'GENERIC-CANDIDATE', name: '通用候选', description: '需求页面支持查询明细。' })
+  const model = fakeModel()
+  const retriever = {
+    async retrieve(_base: RequirementSemanticCard, excludedUids: Set<string>): Promise<HybridRequirementCandidate[]> {
+      return excludedUids.has('generic-base-one') || excludedUids.has('generic-base-two')
+        ? [candidateFor(db, 'generic-candidate', 90)]
+        : []
+    }
+  }
+  const agent = createAgent(db, retriever, model, {
+    matchModelSignature: 'smoke-cache-v1',
+    embeddingModelVersion: 'smoke-embedding-v1'
+  })
+  const first = await agent.ask({ question: '分析需求编号 GENERIC-BASE-ONE' })
+  assert.equal(model.getCallCount(), 1)
+  const second = await agent.ask({ question: '分析需求编号 GENERIC-BASE-ONE' })
+  assert.equal(model.getCallCount(), 1, 'repeated verified input must hit persistent cache without a model call')
+  assert.ok(second.sources.some((source) => source.uid === 'generic-candidate'))
+  await agent.ask({ question: '请分析需求编号 GENERIC-BASE-ONE' })
+  assert.equal(model.getCallCount(), 2, 'query text changes must invalidate the cache')
+  const changedSignature = createAgent(db, retriever, model, {
+    matchModelSignature: 'smoke-cache-v2',
+    embeddingModelVersion: 'smoke-embedding-v1'
+  })
+  await changedSignature.ask({ question: '分析需求编号 GENERIC-BASE-ONE' })
+  assert.equal(model.getCallCount(), 3, 'explanation model signature changes must invalidate the cache')
+  assert.ok(first.sources.some((source) => source.uid === 'generic-candidate'))
+  assert.deepEqual(
+    extractRequirementAnalysisIds('分析需求编号 GENERIC-BASE-ONE、GENERIC-BASE-TWO、GENERIC-BASE-ONE'),
+    ['GENERIC-BASE-ONE', 'GENERIC-BASE-TWO']
+  )
+  const multiModel = fakeModel()
+  const multiAgent = createAgent(db, retriever, multiModel, {
+    matchModelSignature: 'smoke-cache-v1',
+    embeddingModelVersion: 'smoke-embedding-v1'
+  })
+  const multi = await multiAgent.ask({ question: '分析需求编号 GENERIC-BASE-ONE、GENERIC-BASE-TWO' })
+  assert.equal(multiModel.getCallCount(), 2, 'generic IDs must use the same one-batch branch independently')
+  assert.equal(multi.sources.length, 2)
 }
 
 const runRerankerFailure = async (db: AppDatabase): Promise<void> => {
@@ -371,7 +455,7 @@ const runRerankerFailure = async (db: AppDatabase): Promise<void> => {
   assert.equal(modelCallCount, 0)
   assert.equal(response.dataViews.length, 0)
   assert.equal(response.sources.length, 0)
-  assert.match(response.answer, /精准匹配失败关闭/)
+  assert.match(response.answer, /匹配流程失败：Cross-Encoder 返回未知 UID/)
 }
 
 const main = async (): Promise<void> => {
@@ -400,47 +484,6 @@ const main = async (): Promise<void> => {
     upsert(db, { uid: 'match-stock', itemId: 'DATA-3', name: '库存明细查询', description: '按库存编号查看库存明细和状态。', module: '库存管理' })
     upsert(db, { uid: 'match-pattern', itemId: 'DATA-4', name: '库存状态展示', description: '支持按库存编号展示库存状态。', module: '库存管理' })
 
-    const fixedFixture = await readFixedOutcomes()
-    upsert(db, {
-      uid: 'fixed-base-779',
-      itemId: fixedFixture.baseItemId,
-      name: '基线管理名称修改',
-      description: '1、配置管理中基线管理界面第二次创建基线时“变更基线”按钮建议改为“创建基线”，因为点击“变更基线”后创建的仍然是“基线创建申请单”。',
-      issueType: 'Enhancement',
-      module: '配置管理'
-    })
-    for (const expected of fixedFixture.expected) {
-      const uid = expected.candidateItemId.replace('VISSLM-TSIS-', 'fixed-')
-      const actionText = expected.candidateItemId === 'VISSLM-TSIS-1837'
-        ? '测试报告页面中的“生成报告”按钮建议改为“导出报告”，以便用户明确当前操作是生成测试报告。'
-        : expected.candidateItemId === 'VISSLM-TSIS-889'
-          ? '基线管理支持直接查看两条基线之间的变更情况和差异；选择不同版本基线后显示配置项及配置项版本的差异，并高亮提醒。'
-          : expected.candidateItemId === 'VISSLM-TSIS-376'
-            ? '客户要求基线管理预设子页中的“创建基线”按钮支持权限设置，由项目负责人完成创建。'
-            : expected.candidateItemId === 'VISSLM-TSIS-613'
-              ? '建立分配基线时支持选择上溯的功能基线及对应版本，建立产品基线时支持选择上溯的分配基线版本。'
-              : expected.candidateItemId === 'VISSLM-TSIS-395'
-                ? '基于某个基线创建新基线时，申请单中仍保留已经从基线裁剪删除的配置项，导致用户无法创建基线。'
-                : '基线建立申请单支持删除尚未入受控库的配置项，在部分配置项未完成时仍允许建立基线。'
-      upsert(db, {
-        uid,
-        itemId: expected.candidateItemId,
-        name: expected.candidateItemId === 'VISSLM-TSIS-889'
-          ? '基线管理的基线比较功能'
-          : expected.candidateItemId === 'VISSLM-TSIS-376'
-            ? '基线管理预设子页中的创建基线按钮不可设置权限'
-            : expected.candidateItemId === 'VISSLM-TSIS-1837'
-              ? '测试报告生成按钮名称修改'
-              : `基线管理相关能力 ${expected.candidateItemId}`,
-        description: actionText,
-        issueType: expected.candidateItemId === 'VISSLM-TSIS-1837' ? 'Defect' : 'Enhancement',
-        module: expected.candidateItemId === 'VISSLM-TSIS-1837' ? '测试管理' : '配置管理'
-      })
-    }
-    upsert(db, { uid: 'invalid-candidate-a', itemId: 'INVALID-A', name: '候选 A', description: '需求管理模块的候选内容。' })
-    upsert(db, { uid: 'invalid-candidate-b', itemId: 'INVALID-B', name: '候选 B', description: '需求管理模块的另一候选内容。' })
-    upsert(db, { uid: 'valid-base', itemId: 'VALID-BASE', name: '有效基准', description: '有效基准需求内容。' })
-    upsert(db, { uid: 'invalid-base', itemId: 'INVALID-BASE', name: '无效测试基准', description: '无效测试基准需求内容。' })
     upsert(db, { uid: 'reranker-base', itemId: 'RERANKER-BASE', name: '重排基准', description: '重排失败关闭测试需求。' })
     upsert(db, { uid: 'reranker-candidate', itemId: 'RERANKER-CANDIDATE', name: '重排候选', description: '重排失败关闭测试候选。' })
 
@@ -450,8 +493,10 @@ const main = async (): Promise<void> => {
       'multi-ID parser must preserve order and remove duplicate IDs'
     )
     await runHappyPath(db)
-    await runFixedOutcomes(db, fixedFixture)
-    for (const mode of ['missing', 'unknown', 'duplicate'] as const) await runInvalidReview(db, mode)
+    await runExplanationFallbackAndValidation(db)
+    await runSourceOnlyMatching(db)
+    await runTopBounds(db)
+    await runCacheAndGenericIds(db)
     await runRerankerFailure(db)
 
     console.log(JSON.stringify({
@@ -460,15 +505,18 @@ const main = async (): Promise<void> => {
         'multi-id grouping',
         'HTML entity normalization',
         'IssueType extraction',
-        'two model passes',
-        'fixed VISSLM-TSIS-779 outcomes',
-        'missing/unknown/duplicate UID fail-closed validation',
+        'single batch explanation with deterministic score/relation preservation',
+        'strict UID/evidence/forbidden-decision fallback validation',
+        'source-only matching without query-time card generation',
+        'Cross-Encoder Top20 and explanation Top10 bounds',
+        'persistent cache hit and invalidation',
+        'generic IDs use the same matching branch',
         'reranker fail-closed validation'
       ]
     }))
   } finally {
     db?.close()
-    await rm(directory, { recursive: true, force: true })
+    await rm(directory, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 })
   }
 }
 

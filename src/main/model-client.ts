@@ -1,4 +1,8 @@
-import type { ConnectionResult, ModelSettings } from '../shared/types'
+import type {
+  ConnectionResult,
+  ModelSettings,
+  RequirementSemanticizationModelUsage
+} from '../shared/types'
 
 export interface ModelMessage {
   role: 'system' | 'user' | 'assistant' | 'tool'
@@ -15,6 +19,7 @@ export interface ModelMessage {
 export interface ModelResponse {
   message?: ModelMessage
   done_reason?: string
+  usage?: RequirementSemanticizationModelUsage
 }
 
 export interface ModelChatInput {
@@ -22,12 +27,105 @@ export interface ModelChatInput {
   tools?: unknown[]
   think?: boolean
   forceThinking?: boolean
+  stream?: boolean
+  numCtx?: number
   format?: 'json' | Record<string, unknown>
   temperature?: number
   numPredict?: number
+  timeoutMs?: number
 }
 
 const trimBaseUrl = (value: string): string => value.replace(/\/+$/, '')
+const defaultChatTimeoutMs = 180_000
+
+const chatTimeoutSignal = (input: ModelChatInput): AbortSignal => AbortSignal.timeout(
+  Math.max(1_000, Math.round(input.timeoutMs ?? defaultChatTimeoutMs))
+)
+
+class OllamaProtocolError extends Error {}
+
+const errorCause = (error: unknown): unknown => (
+  typeof error === 'object' && error !== null && 'cause' in error
+    ? (error as { cause?: unknown }).cause
+    : undefined
+)
+
+const errorCode = (error: unknown): string | undefined => {
+  let current: unknown = error
+  const visited = new Set<unknown>()
+  while (typeof current === 'object' && current !== null && !visited.has(current)) {
+    visited.add(current)
+    const code = (current as { code?: unknown }).code
+    if (typeof code === 'string' && code.trim()) return code.trim()
+    current = errorCause(current)
+  }
+  return undefined
+}
+
+const errorMessages = (error: unknown): string[] => {
+  const messages: string[] = []
+  let current: unknown = error
+  const visited = new Set<unknown>()
+  while (current !== undefined && current !== null && !visited.has(current)) {
+    visited.add(current)
+    const message = current instanceof Error
+      ? current.message
+      : typeof current === 'string'
+        ? current
+        : undefined
+    if (message && !messages.includes(message)) messages.push(message)
+    current = errorCause(current)
+  }
+  return messages
+}
+
+const ollamaConnectionError = (error: unknown): Error => {
+  if (error instanceof DOMException && error.name === 'TimeoutError') return error
+  if (error instanceof Error && error.name === 'TimeoutError') return error
+
+  const code = errorCode(error)
+  const combinedMessage = errorMessages(error).join(' / ')
+  const classification = code === 'UND_ERR_HEADERS_TIMEOUT'
+    ? `响应头等待超时（${code}）`
+    : code === 'UND_ERR_BODY_TIMEOUT'
+      ? `响应数据等待超时（${code}）`
+      : code === 'ECONNREFUSED'
+        ? `连接被拒绝（${code}）`
+        : code === 'ECONNRESET'
+          ? `连接被重置（${code}）`
+          : code === 'UND_ERR_SOCKET'
+            ? `模型连接意外关闭（${code}）`
+            : [combinedMessage || '未知网络错误', code ? `（${code}）` : ''].join('')
+  const detail = code && combinedMessage
+    ? `${classification}：${combinedMessage}`
+    : classification
+  return new Error(`Ollama 模型连接失败：${detail}`, { cause: error })
+}
+
+const finiteNumber = (value: unknown): number | undefined => {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return undefined
+  return value
+}
+
+const ollamaUsage = (chunk: Record<string, unknown>): RequirementSemanticizationModelUsage | undefined => {
+  const usage: RequirementSemanticizationModelUsage = {
+    promptTokens: finiteNumber(chunk.prompt_eval_count),
+    completionTokens: finiteNumber(chunk.eval_count),
+    promptDurationMs: finiteNumber(chunk.prompt_eval_duration)
+      ? Number(chunk.prompt_eval_duration) / 1_000_000
+      : undefined,
+    completionDurationMs: finiteNumber(chunk.eval_duration)
+      ? Number(chunk.eval_duration) / 1_000_000
+      : undefined,
+    totalDurationMs: finiteNumber(chunk.total_duration)
+      ? Number(chunk.total_duration) / 1_000_000
+      : undefined,
+    loadDurationMs: finiteNumber(chunk.load_duration)
+      ? Number(chunk.load_duration) / 1_000_000
+      : undefined
+  }
+  return Object.values(usage).some((value) => value !== undefined) ? usage : undefined
+}
 
 export class ModelClient {
   constructor(private readonly settings: ModelSettings) {}
@@ -131,26 +229,108 @@ export class ModelClient {
   }
 
   private async chatOllama(input: ModelChatInput): Promise<ModelResponse> {
-    const response = await fetch(`${trimBaseUrl(this.settings.baseUrl)}/api/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: this.settings.model,
-        messages: input.messages,
-        tools: input.tools,
-        think: this.resolveThinking(input),
-        stream: false,
-        ...(input.format ? { format: input.format } : {}),
-        options: {
-          temperature: input.temperature ?? 0.1,
-          num_ctx: 32768,
-          num_predict: input.numPredict ?? 2048
-        }
-      }),
-      signal: AbortSignal.timeout(180_000)
-    })
+    let response: Response
+    try {
+      response = await fetch(`${trimBaseUrl(this.settings.baseUrl)}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: this.settings.model,
+          messages: input.messages,
+          tools: input.tools,
+          think: this.resolveThinking(input),
+          stream: input.stream === true,
+          ...(input.format ? { format: input.format } : {}),
+          options: {
+            temperature: input.temperature ?? 0.1,
+            num_ctx: Math.max(1_024, Math.round(input.numCtx ?? 32768)),
+            num_predict: input.numPredict ?? 2048
+          }
+        }),
+        signal: chatTimeoutSignal(input)
+      })
+    } catch (error) {
+      throw ollamaConnectionError(error)
+    }
     if (!response.ok) throw await this.httpError(response)
-    return (await response.json()) as ModelResponse
+    if (!input.stream) {
+      const payload = (await response.json()) as ModelResponse & Record<string, unknown>
+      const usage = ollamaUsage(payload)
+      return usage ? { ...payload, usage } : payload
+    }
+
+    try {
+      return await this.readOllamaStream(response)
+    } catch (error) {
+      if (error instanceof OllamaProtocolError) throw error
+      throw ollamaConnectionError(error)
+    }
+  }
+
+  private async readOllamaStream(response: Response): Promise<ModelResponse> {
+    if (!response.body) throw new OllamaProtocolError('Ollama 流式响应缺少响应体')
+
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    let content = ''
+    let done = false
+    let doneReason: string | undefined
+    let usage: RequirementSemanticizationModelUsage | undefined
+    let lineNumber = 0
+    const toolCalls: NonNullable<ModelMessage['tool_calls']> = []
+
+    const consumeLine = (rawLine: string): void => {
+      const line = rawLine.trim()
+      if (!line) return
+      lineNumber += 1
+      let chunk: {
+        error?: string
+        done?: boolean
+        done_reason?: string
+        message?: {
+          content?: string
+          tool_calls?: ModelMessage['tool_calls']
+        }
+      }
+      try {
+        chunk = JSON.parse(line) as typeof chunk
+      } catch {
+        throw new OllamaProtocolError(`Ollama 流式响应第 ${lineNumber} 个分片不是有效 JSON`)
+      }
+      if (chunk.error) throw new OllamaProtocolError(`Ollama 模型生成失败：${chunk.error}`)
+      if (typeof chunk.message?.content === 'string') content += chunk.message.content
+      if (chunk.message?.tool_calls?.length) toolCalls.push(...chunk.message.tool_calls)
+      usage = ollamaUsage(chunk as unknown as Record<string, unknown>) ?? usage
+      if (chunk.done === true) {
+        done = true
+        doneReason = chunk.done_reason
+      }
+    }
+
+    while (true) {
+      const result = await reader.read()
+      if (result.done) break
+      buffer += decoder.decode(result.value, { stream: true })
+      const lines = buffer.split(/\r?\n/)
+      buffer = lines.pop() ?? ''
+      lines.forEach(consumeLine)
+    }
+    buffer += decoder.decode()
+    if (buffer.trim()) consumeLine(buffer)
+
+    if (!done) {
+      throw new OllamaProtocolError('Ollama 流式响应意外中断：未收到完成标记')
+    }
+    return {
+      done_reason: doneReason,
+      message: {
+        role: 'assistant',
+        content,
+        ...(toolCalls.length ? { tool_calls: toolCalls } : {})
+      },
+      ...(usage ? { usage } : {})
+    }
   }
 
   private async chatOpenAi(input: ModelChatInput): Promise<ModelResponse> {
@@ -203,7 +383,7 @@ export class ModelClient {
       method: 'POST',
       headers: this.onlineHeaders(),
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(180_000)
+      signal: chatTimeoutSignal(input)
     })
     if (!response.ok) throw await this.httpError(response)
     const payload = (await response.json()) as {
@@ -311,7 +491,7 @@ export class ModelClient {
               max_tokens: input.numPredict ?? 2048
             })
       }),
-      signal: AbortSignal.timeout(180_000)
+      signal: chatTimeoutSignal(input)
     })
     if (!response.ok) throw await this.httpError(response)
     const payload = (await response.json()) as {

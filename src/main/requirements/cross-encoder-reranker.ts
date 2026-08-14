@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { HybridRequirementCandidate } from './hybrid-retrieval'
-import type { RequirementSemanticCard } from './semantic-card'
+import type { RequirementMatchCard } from './semantic-card'
 
 export interface RequirementRerankItem {
   recordUid: string
@@ -12,7 +12,7 @@ export interface RequirementRerankItem {
 
 export interface RequirementReranker {
   readonly modelId: string
-  rerank(base: RequirementSemanticCard, candidates: HybridRequirementCandidate[]): Promise<RequirementRerankItem[]>
+  rerank(base: RequirementMatchCard, candidates: HybridRequirementCandidate[]): Promise<RequirementRerankItem[]>
 }
 
 export const REQUIREMENT_RERANKER_MODEL_ID = 'Xenova/bge-reranker-base'
@@ -60,7 +60,7 @@ export class LocalRequirementReranker implements RequirementReranker {
   private model: any | null = null
   private preparing: Promise<void> | null = null
 
-  async rerank(base: RequirementSemanticCard, candidates: HybridRequirementCandidate[]): Promise<RequirementRerankItem[]> {
+  async rerank(base: RequirementMatchCard, candidates: HybridRequirementCandidate[]): Promise<RequirementRerankItem[]> {
     if (!candidates.length) return []
     await this.prepare()
     if (!this.tokenizer || !this.model) throw new Error('本地 Cross-Encoder 重排模型不可用')
