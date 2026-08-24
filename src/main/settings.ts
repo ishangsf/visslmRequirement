@@ -5,6 +5,8 @@ import type {
   FeatureModuleKey,
   FeatureModuleSettings,
   ModelSettings,
+  ModelSettingsProfile,
+  ModelSource,
   PlatformSettingsInput,
   ProjectMatchingSettings,
   SystemSettingsInput,
@@ -26,6 +28,28 @@ const USER_PROPERTY_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_.]*$/
 const USER_PROPERTY_KEYS_SETTING = 'system.userPropertyKeys'
 const LEGACY_USER_PROPERTY_KEYS_SETTING = 'platform.userPropertyKeys'
 const PROJECT_MATCH_SCORE_SETTING = 'projectMatching.minScore'
+
+const MODEL_API_KEY_LEGACY_COMPATIBLE_PROVIDER = 'openai-compatible'
+const MODEL_PROFILE_PREFIX = 'model.profile.'
+
+const DEFAULT_MODEL_PROFILES: Record<ModelSource, ModelSettingsProfile> = {
+  local: {
+    source: 'local',
+    provider: 'ollama',
+    baseUrl: DEFAULT_MODEL_URL,
+    model: 'qwen3:8b',
+    thinking: false,
+    hasApiKey: false
+  },
+  online: {
+    source: 'online',
+    provider: 'openai',
+    baseUrl: 'https://api.openai.com/v1',
+    model: 'gpt-5.2',
+    thinking: true,
+    hasApiKey: false
+  }
+}
 
 const normalizeUserPropertyKeys = (input: unknown): string[] => {
   if (!Array.isArray(input)) return []
@@ -63,6 +87,12 @@ export class SettingsService {
   constructor(private readonly db: AppDatabase) {}
 
   getAll(): AppSettings {
+    const source = this.readModelSource()
+    const modelProfiles = {
+      local: this.getModelProfile('local', source),
+      online: this.getModelProfile('online', source)
+    }
+    const activeProfile = modelProfiles[source]
     return {
       platform: {
         baseUrl: this.db.getSetting('platform.baseUrl') ?? DEFAULT_PLATFORM_URL,
@@ -72,14 +102,8 @@ export class SettingsService {
       system: {
         userPropertyKeys: this.getUserPropertyKeys()
       },
-      model: {
-        source: (this.db.getSetting('model.source') ?? 'local') as ModelSettings['source'],
-        provider: (this.db.getSetting('model.provider') ?? 'ollama') as ModelSettings['provider'],
-        baseUrl: this.db.getSetting('model.baseUrl') ?? DEFAULT_MODEL_URL,
-        model: this.db.getSetting('model.model') ?? 'qwen3:8b',
-        thinking: (this.db.getSetting('model.thinking') ?? 'false') === 'true',
-        hasApiKey: Boolean(this.db.getSetting(`model.apiKey.${this.db.getSetting('model.provider') ?? 'ollama'}`))
-      },
+      model: activeProfile,
+      modelProfiles,
       projectMatching: {
         minScore: normalizeProjectMatchScore(this.db.getSetting(PROJECT_MATCH_SCORE_SETTING))
       },
@@ -146,6 +170,14 @@ export class SettingsService {
   saveModel(input: ModelSettings): AppSettings {
     const source = input.source ?? 'local'
     const provider = input.provider ?? (source === 'local' ? 'ollama' : 'openai-compatible')
+    this.migrateLegacyActiveModelProfile()
+    this.db.setSetting(`${MODEL_PROFILE_PREFIX}${source}.provider`, provider)
+    this.db.setSetting(`${MODEL_PROFILE_PREFIX}${source}.baseUrl`, input.baseUrl.trim().replace(/\/+$/, ''))
+    this.db.setSetting(`${MODEL_PROFILE_PREFIX}${source}.model`, input.model.trim())
+    this.db.setSetting(`${MODEL_PROFILE_PREFIX}${source}.thinking`, String(input.thinking))
+
+    // Keep the legacy active keys synchronized for older packaged versions;
+    // source-specific profiles remain the authoritative values for this build.
     this.db.setSetting('model.source', source)
     this.db.setSetting('model.provider', provider)
     this.db.setSetting('model.baseUrl', input.baseUrl.trim().replace(/\/+$/, ''))
@@ -192,23 +224,76 @@ export class SettingsService {
   }
 
   getModelCredentials(override?: ModelSettings): ModelSettings {
-    const saved = this.getAll().model
-    const source = override?.source ?? saved.source
+    const all = this.getAll()
+    const source = override?.source ?? all.model.source
+    const saved = all.modelProfiles[source]
+    const provider = override?.provider ?? saved.provider
+    const apiKey = source === 'online'
+      ? override?.apiKey?.trim() || this.readModelApiKey(provider)
+      : undefined
     return {
       source,
-      provider: override?.provider ?? saved.provider,
+      provider,
       baseUrl: override?.baseUrl?.trim() || saved.baseUrl,
       model: override?.model?.trim() || saved.model,
       thinking: override?.thinking ?? saved.thinking,
-      apiKey:
-        source === 'online'
-          ? override?.apiKey?.trim() || this.readSecret(`model.apiKey.${override?.provider ?? saved.provider}`)
-          : undefined,
+      apiKey,
       hasApiKey:
         source === 'online'
-          ? Boolean(this.db.getSetting(`model.apiKey.${override?.provider ?? saved.provider}`))
+          ? Boolean(apiKey)
           : false
     }
+  }
+
+  private readModelApiKey(provider: ModelSettings['provider']): string {
+    const primary = this.readSecret(`model.apiKey.${provider}`)
+    if (primary || provider !== 'rawchat-codex') return primary
+    // Configurations created before the dedicated RawChat provider existed
+    // stored the same credential under the generic compatible-provider key.
+    return this.readSecret(`model.apiKey.${MODEL_API_KEY_LEGACY_COMPATIBLE_PROVIDER}`)
+  }
+
+  private readModelSource(): ModelSource {
+    return this.db.getSetting('model.source') === 'online' ? 'online' : 'local'
+  }
+
+  private modelProfileSetting(source: ModelSource, field: 'provider' | 'baseUrl' | 'model' | 'thinking'): string | null {
+    return this.db.getSetting(`${MODEL_PROFILE_PREFIX}${source}.${field}`)
+  }
+
+  private getModelProfile(source: ModelSource, activeSource: ModelSource): ModelSettingsProfile {
+    const defaults = DEFAULT_MODEL_PROFILES[source]
+    const legacyValues = source === activeSource
+      ? {
+          provider: this.db.getSetting('model.provider'),
+          baseUrl: this.db.getSetting('model.baseUrl'),
+          model: this.db.getSetting('model.model'),
+          thinking: this.db.getSetting('model.thinking')
+        }
+      : { provider: null, baseUrl: null, model: null, thinking: null }
+    const provider = this.modelProfileSetting(source, 'provider') ?? legacyValues.provider ?? defaults.provider
+    const baseUrl = this.modelProfileSetting(source, 'baseUrl') ?? legacyValues.baseUrl ?? defaults.baseUrl
+    const model = this.modelProfileSetting(source, 'model') ?? legacyValues.model ?? defaults.model
+    const thinkingValue = this.modelProfileSetting(source, 'thinking') ?? legacyValues.thinking
+    return {
+      source,
+      provider: provider as ModelSettings['provider'],
+      baseUrl,
+      model,
+      thinking: thinkingValue === null ? defaults.thinking : thinkingValue === 'true',
+      hasApiKey: source === 'online' ? Boolean(this.readModelApiKey(provider as ModelSettings['provider'])) : false
+    }
+  }
+
+  private migrateLegacyActiveModelProfile(): void {
+    const source = this.readModelSource()
+    if (this.modelProfileSetting(source, 'provider')) return
+    const provider = this.db.getSetting('model.provider')
+    if (!provider) return
+    this.db.setSetting(`${MODEL_PROFILE_PREFIX}${source}.provider`, provider)
+    this.db.setSetting(`${MODEL_PROFILE_PREFIX}${source}.baseUrl`, this.db.getSetting('model.baseUrl') ?? DEFAULT_MODEL_URL)
+    this.db.setSetting(`${MODEL_PROFILE_PREFIX}${source}.model`, this.db.getSetting('model.model') ?? 'qwen3:8b')
+    this.db.setSetting(`${MODEL_PROFILE_PREFIX}${source}.thinking`, this.db.getSetting('model.thinking') ?? 'false')
   }
 
   getSyncConfig(): SyncScopeConfig | null {

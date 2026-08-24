@@ -1,6 +1,14 @@
 import { app, BrowserWindow, dialog, ipcMain } from 'electron'
 import { execFile } from 'node:child_process'
-import { mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import {
+  createWriteStream,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync
+} from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
@@ -65,11 +73,14 @@ import { diagnoseDashboard } from './dashboards/diagnostics'
 import { repairDashboardComponent } from './dashboards/component-repair'
 import { dashboardSpecHash } from './dashboards/spec-hash'
 import { ExpertRouter } from './experts/router'
+import { autoRequirementIds, resolveAutoChatRoute } from './experts/auto-routing'
 import { RequirementAnalysisAgent } from './experts/requirement-analysis-agent'
 import { RequirementSemanticizationService } from './requirements/semanticization-service'
 import { VisualizationAgent } from './experts/visualization-agent'
 import { resolveVisualizationRequestMode } from './experts/visualization-intent'
 import { OllamaAgent } from './ollama'
+import { PlainChatAgent } from './plain-chat'
+import { DirectRequirementDataAnalysisAgent } from './direct-data-analysis'
 import { SettingsService } from './settings'
 import { PushService, SyncService, VisslmClient } from './visslm'
 import { KnowledgeService } from './knowledge'
@@ -105,6 +116,73 @@ const execFileAsync = promisify(execFile)
 const updateErrorMessage = (error: unknown): string => {
   if (error instanceof Error && error.message.trim()) return error.message.trim()
   return String(error || '未知错误')
+}
+
+const writeExportChunk = async (
+  stream: ReturnType<typeof createWriteStream>,
+  chunk: string
+): Promise<void> => {
+  if (stream.write(chunk)) return
+  await new Promise<void>((resolve, reject) => {
+    const cleanup = (): void => {
+      stream.removeListener('drain', onDrain)
+      stream.removeListener('error', onError)
+    }
+    const onDrain = (): void => {
+      cleanup()
+      resolve()
+    }
+    const onError = (error: Error): void => {
+      cleanup()
+      reject(error)
+    }
+    stream.once('drain', onDrain)
+    stream.once('error', onError)
+  })
+}
+
+const finishExportStream = (
+  stream: ReturnType<typeof createWriteStream>
+): Promise<void> => new Promise((resolve, reject) => {
+  const cleanup = (): void => {
+    stream.removeListener('finish', onFinish)
+    stream.removeListener('error', onError)
+  }
+  const onFinish = (): void => {
+    cleanup()
+    resolve()
+  }
+  const onError = (error: Error): void => {
+    cleanup()
+    reject(error)
+  }
+  stream.once('finish', onFinish)
+  stream.once('error', onError)
+  stream.end()
+})
+
+const replaceExportFile = (temporaryPath: string, targetPath: string): void => {
+  const backupPath = `${targetPath}.previous-${process.pid}-${Date.now()}`
+  let movedExisting = false
+  try {
+    const existing = statSync(targetPath)
+    if (!existing.isFile()) throw new Error('导出目标路径不是文件')
+    renameSync(targetPath, backupPath)
+    movedExisting = true
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
+  try {
+    renameSync(temporaryPath, targetPath)
+  } catch (error) {
+    if (movedExisting) {
+      try { renameSync(backupPath, targetPath) } catch {}
+    }
+    throw error
+  }
+  if (movedExisting) {
+    try { unlinkSync(backupPath) } catch {}
+  }
 }
 
 const getUpdateFallbackStatus = (): UpdateStatus => ({
@@ -450,7 +528,63 @@ const registerIpc = (): void => {
     db.deleteChatSession(id)
   )
   ipcMain.handle('agent:ask', (ipcEvent, request: ChatRequest) => {
-    const route = expertRouter.route(request)
+    const autoRequirementIdsForRequest = request.chatMode === 'auto' && request.entrypoint !== 'dashboard'
+      ? autoRequirementIds(request.question, request.history)
+      : null
+    const autoRoute = request.chatMode === 'auto' && request.entrypoint !== 'dashboard'
+      ? resolveAutoChatRoute(request.question, request.history)
+      : null
+    const routedRequest = autoRoute === 'general'
+      ? {
+          ...request,
+          expertId: 'general' as const,
+          chatMode: 'expert' as const
+        }
+      : request
+    const route = expertRouter.route(routedRequest)
+    if (autoRequirementIdsForRequest?.length) {
+      const agent = new DirectRequirementDataAnalysisAgent(db, settings.getModelCredentials())
+      return agent.ask({
+        ...request,
+        question: request.question,
+        extractedRequirementIds: autoRequirementIdsForRequest
+      }).then((response) => response).catch((error: unknown) => {
+        const errorMessage = error instanceof Error ? error.message : String(error)
+        return {
+          answer: `本次需求数据分析没有完成。\n\n${errorMessage}\n\n请检查需求编号对应的本地数据后重试。`,
+          sources: [],
+          dataViews: [],
+          events: [{
+            type: 'error' as const,
+            code: 'DIRECT_REQUIREMENT_DATA_ANALYSIS_FAILED',
+            message: errorMessage,
+            recoverable: true,
+            stage: 'answer'
+          }]
+        }
+      })
+    }
+    if (request.entrypoint !== 'dashboard' && (
+      request.chatMode === 'plain' ||
+      (request.chatMode === 'auto' && autoRoute === 'plain')
+    )) {
+      const agent = new PlainChatAgent(settings.getModelCredentials())
+      return agent.ask({ ...request, question: route.question }).then((response) => response).catch((error: unknown) => {
+        const errorMessage = error instanceof Error ? error.message : String(error)
+        return {
+          answer: `本次普通对话没有完成。\n\n${errorMessage}\n\n你可以检查模型连接后重试。`,
+          sources: [],
+          dataViews: [],
+          events: [{
+            type: 'error' as const,
+            code: 'PLAIN_CHAT_FAILED',
+            message: errorMessage,
+            recoverable: true,
+            stage: 'answer'
+          }]
+        }
+      })
+    }
     if (route.expert.id === 'visualization') {
       const activeArtifact = request.activeArtifact
       const focusComponentId = request.focusComponentId?.trim() || undefined
@@ -981,8 +1115,19 @@ const registerIpc = (): void => {
   })
 
   ipcMain.handle('data:export', async () => {
+    let filePath: string | undefined
+    let tempFilePath: string | undefined
+    let stream: ReturnType<typeof createWriteStream> | undefined
+    let completed = false
     try {
-      const result = await dialog.showSaveDialog(mainWindow!, {
+      if (!mainWindow || mainWindow.isDestroyed()) {
+        return {
+          ok: false,
+          recordCount: 0,
+          message: '主窗口不可用，无法导出数据'
+        }
+      }
+      const result = await dialog.showSaveDialog(mainWindow, {
         title: '导出数据 JSONL',
         defaultPath: `visslm-data-${new Date().toISOString().slice(0, 10)}.jsonl`,
         filters: [{ name: 'JSON Lines', extensions: ['jsonl'] }]
@@ -995,22 +1140,43 @@ const registerIpc = (): void => {
         })
         return { ok: false, canceled: true, recordCount: 0, message: '已取消导出' }
       }
-      const rows = db.exportRows()
-      const lines = rows.map((row) => JSON.stringify(row)).join('\n')
-      writeFileSync(result.filePath, lines, 'utf8')
+      filePath = result.filePath
+      tempFilePath = `${filePath}.part-${process.pid}-${Date.now()}`
+      stream = createWriteStream(tempFilePath, { encoding: 'utf8' })
+      let streamError: Error | undefined
+      stream.on('error', (error) => {
+        streamError = error
+      })
+      let recordCount = 0
+      for (const row of db.iterateExportRows()) {
+        if (streamError) throw streamError
+        await writeExportChunk(stream, `${JSON.stringify(row)}\n`)
+        recordCount += 1
+      }
+      await finishExportStream(stream)
+      if (streamError) throw streamError
+      replaceExportFile(tempFilePath, filePath)
+      tempFilePath = undefined
+      completed = true
       recordDashboardAudit({
         action: 'export-data',
         status: 'success',
         format: 'jsonl',
-        metadata: { recordCount: rows.length }
+        metadata: { recordCount }
       })
       return {
         ok: true,
-        path: result.filePath,
-        recordCount: rows.length,
-        message: `已导出 ${rows.length} 条数据`
+        path: filePath,
+        recordCount,
+        message: `已导出 ${recordCount} 条数据`
       }
     } catch (error) {
+      if (!completed) {
+        stream?.destroy()
+        if (tempFilePath) {
+          try { unlinkSync(tempFilePath) } catch {}
+        }
+      }
       recordDashboardAudit({
         action: 'export-data',
         status: 'failed',

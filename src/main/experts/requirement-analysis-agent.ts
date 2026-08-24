@@ -58,6 +58,7 @@ import {
 type AgentStatusEvent = Extract<AgentEvent, { type: 'status' }>
 
 const MAX_REQUIREMENT_IDS = 20
+export const MAX_DIRECT_REQUIREMENT_IDS = 200
 const HYBRID_CANDIDATE_LIMIT = 50
 const RERANK_CANDIDATE_LIMIT = 20
 const EXPLANATION_CANDIDATE_LIMIT = 10
@@ -378,20 +379,74 @@ const parsedCachedResult = (
   }
 }
 
-export const extractRequirementAnalysisIds = (question: string): string[] => {
+export const extractRequirementAnalysisIds = (
+  question: string,
+  maxIds = MAX_REQUIREMENT_IDS
+): string[] => {
   const ids: string[] = []
   const seen = new Set<string>()
+  const sharedPrefix = question.match(
+    /(?:前缀|前面(?:都)?有(?:统一)?前缀)[^A-Za-z0-9]*([A-Za-z][A-Za-z0-9]*(?:[-_.][A-Za-z0-9]+)*-)(?=\s*$)/iu
+  )?.[1] ?? ''
+  const sharedPrefixStem = sharedPrefix.replace(/[-_.]+$/u, '').toLocaleLowerCase()
   const add = (value: string): void => {
     const normalized = value.trim().replace(/^[#【\[（(]+|[#】\]）)]+$/g, '')
     if (!normalized || seen.has(normalized.toLocaleLowerCase())) return
+    if (sharedPrefixStem && normalized.toLocaleLowerCase() === sharedPrefixStem) return
     seen.add(normalized.toLocaleLowerCase())
     ids.push(normalized)
   }
-  for (const match of question.matchAll(/[A-Za-z][A-Za-z0-9]*(?:[-_.][A-Za-z0-9]+)+/g)) add(match[0])
-  for (const match of question.matchAll(/(?:需求编号|编号|\bID\b)\s*(?:为|是|[:：#])?\s*([A-Za-z0-9][A-Za-z0-9._-]*(?:\s*[、,，;；]\s*[A-Za-z0-9][A-Za-z0-9._-]*)*)/gi)) {
-    match[1].split(/[、,，;；]/).forEach(add)
+
+  const addNumericWithPrefix = (rawStart: string, rawEnd?: string): void => {
+    const start = Number(rawStart)
+    const end = rawEnd === undefined ? start : Number(rawEnd)
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start) return
+    // A range in a user request means each requirement in that range. Keep a
+    // finite guard so malformed text cannot create an unbounded extraction.
+    const rangeEnd = Math.min(end, start + 200)
+    for (let value = start; value <= rangeEnd && ids.length < maxIds; value += 1) {
+      add(`${sharedPrefix}${value}`)
+    }
   }
-  return ids.slice(0, MAX_REQUIREMENT_IDS)
+
+  for (const match of question.matchAll(/[A-Za-z][A-Za-z0-9]*(?:[-_.][A-Za-z0-9]+)+/g)) {
+    const token = match[0]
+    const range = sharedPrefix
+      ? token.match(/^(.*?)(\d+)\s*[-~～至到]\s*(\d+)$/u)
+      : null
+    if (range) {
+      const prefix = range[1].endsWith('-') || range[1].endsWith('_') || range[1].endsWith('.')
+        ? range[1]
+        : `${range[1]}-`
+      // Explicit prefixed ranges are unambiguous even when the shared prefix
+      // is stated at the end of the sentence.
+      for (let value = Number(range[2]); value <= Math.min(Number(range[3]), Number(range[2]) + 200) && ids.length < maxIds; value += 1) {
+        add(`${prefix}${value}`)
+      }
+      continue
+    }
+    add(token)
+  }
+
+  if (sharedPrefix) {
+    // Numeric shorthand is only interpreted as a requirement ID when it is
+    // not immediately followed by a Chinese label (e.g. “5000平台”). This
+    // avoids treating section numbers and platform names as record IDs.
+    for (const match of question.matchAll(/(?<![A-Za-z0-9])(\d+)(?:\s*[-~～至到]\s*(\d+))?(?![A-Za-z0-9])/gu)) {
+      const after = question.slice((match.index ?? 0) + match[0].length)
+      if (/^\s*[\u3400-\u9fff]/u.test(after)) continue
+      if (/^\s*[、,，]\s*\d+\s*[\u3400-\u9fff]+\s*[:：]/u.test(after)) continue
+      addNumericWithPrefix(match[1], match[2])
+      if (ids.length >= maxIds) break
+    }
+  }
+
+  if (!sharedPrefix) {
+    for (const match of question.matchAll(/(?:需求(?:编号)?|编号|\bID\b)\s*(?:(?:为|是)\s*[:：#]?|[:：#])?\s*([A-Za-z0-9][A-Za-z0-9._-]*(?:\s*[、,，;；]\s*[A-Za-z0-9][A-Za-z0-9._-]*)*)/gi)) {
+      match[1].split(/[、,，;；]/).forEach(add)
+    }
+  }
+  return ids.slice(0, maxIds)
 }
 
 export class RequirementAnalysisAgent {
@@ -443,6 +498,7 @@ export class RequirementAnalysisAgent {
 
   async ask(request: ChatRequest): Promise<ChatResponse> {
     const requestedItemIds = extractRequirementAnalysisIds(request.question)
+      .map((itemId) => this.resolveRequirementItemId(itemId))
     this.progressState = {
       totalRequirements: requestedItemIds.length,
       currentRequirement: 0,
@@ -479,6 +535,16 @@ export class RequirementAnalysisAgent {
       this.progress('summary', `${requestedItemId} 已完成需求分析`, 1, 1)
     }
     return this.buildResponse(entries, requestedItemIds)
+  }
+
+  private resolveRequirementItemId(requestedItemId: string): string {
+    const exact = this.db.findRecordByItemId(requestedItemId)
+    if (exact) return exact.itemId
+    if (!/^\d+$/.test(requestedItemId)) return requestedItemId
+    const suffixMatches = this.db.findRecordsByItemIdSuffix(requestedItemId)
+    return suffixMatches.length === 1
+      ? suffixMatches[0]!.itemId
+      : requestedItemId
   }
 
   private async analyzeOne(

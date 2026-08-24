@@ -38,6 +38,28 @@ export interface ModelChatInput {
 const trimBaseUrl = (value: string): string => value.replace(/\/+$/, '')
 const defaultChatTimeoutMs = 180_000
 
+/**
+ * RawChat's Codex channel speaks the Responses API rather than the
+ * OpenAI-compatible Chat Completions API used by the other online providers.
+ * Keep this URL check deliberately narrow so an arbitrary compatible endpoint
+ * is never sent a different wire format by accident.
+ */
+export const isRawChatResponsesBaseUrl = (value: string): boolean => {
+  try {
+    const url = new URL(value.trim())
+    const pathname = url.pathname.replace(/\/+$/, '')
+    return /(?:^|\.)rawchat\.cn$/i.test(url.hostname) && /^\/codex(?:\/v1)?(?:\/responses)?$/i.test(pathname)
+  } catch {
+    return false
+  }
+}
+
+const rawChatBaseUrl = (value: string): string => trimBaseUrl(value).replace(/\/responses$/i, '')
+
+const rawChatModelsUrl = (value: string): string => `${rawChatBaseUrl(value)}/models`
+
+const rawChatResponsesUrl = (value: string): string => `${rawChatBaseUrl(value)}/responses`
+
 const chatTimeoutSignal = (input: ModelChatInput): AbortSignal => AbortSignal.timeout(
   Math.max(1_000, Math.round(input.timeoutMs ?? defaultChatTimeoutMs))
 )
@@ -127,8 +149,123 @@ const ollamaUsage = (chunk: Record<string, unknown>): RequirementSemanticization
   return Object.values(usage).some((value) => value !== undefined) ? usage : undefined
 }
 
+const rawChatUsage = (value: unknown): RequirementSemanticizationModelUsage | undefined => {
+  if (typeof value !== 'object' || value === null) return undefined
+  const usage = value as Record<string, unknown>
+  const normalized: RequirementSemanticizationModelUsage = {
+    promptTokens: finiteNumber(usage.input_tokens),
+    completionTokens: finiteNumber(usage.output_tokens)
+  }
+  return Object.values(normalized).some((item) => item !== undefined) ? normalized : undefined
+}
+
+const asRecord = (value: unknown): Record<string, unknown> | undefined => (
+  typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
+)
+
+const asString = (value: unknown): string | undefined => (
+  typeof value === 'string' ? value : undefined
+)
+
+const parseToolArguments = (value: unknown): Record<string, unknown> => {
+  if (asRecord(value)) return value as Record<string, unknown>
+  if (typeof value !== 'string' || !value.trim()) return {}
+  try {
+    const parsed: unknown = JSON.parse(value)
+    return asRecord(parsed) ?? {}
+  } catch {
+    return {}
+  }
+}
+
+const responseInputForMessage = (message: ModelMessage): Array<Record<string, unknown>> => {
+  if (message.role === 'tool') {
+    if (!message.tool_call_id) return []
+    return [{
+      type: 'function_call_output',
+      call_id: message.tool_call_id,
+      output: message.content
+    }]
+  }
+
+  if (message.role === 'assistant' && message.tool_calls?.length) {
+    const items: Array<Record<string, unknown>> = []
+    if (message.content.trim()) {
+      items.push({
+        role: 'assistant',
+        // This is a historical input message, not a raw response item. The
+        // Responses API expects input_text even when the role is assistant.
+        content: [{ type: 'input_text', text: message.content }]
+      })
+    }
+    for (const call of message.tool_calls) {
+      if (!call.id || !call.function.name) continue
+      items.push({
+        type: 'function_call',
+        call_id: call.id,
+        name: call.function.name,
+        arguments: JSON.stringify(call.function.arguments ?? {})
+      })
+    }
+    return items
+  }
+
+  if (!message.content.trim()) return []
+  return [{
+    role: message.role,
+    // All messages in `input` are inputs. `output_text` is reserved for
+    // response output items returned by the model.
+    content: [{ type: 'input_text', text: message.content }]
+  }]
+}
+
+const rawChatInput = (messages: ModelMessage[]): Array<Record<string, unknown>> => messages.flatMap(responseInputForMessage)
+
+const rawChatTools = (tools: unknown[] | undefined): Array<Record<string, unknown>> | undefined => {
+  if (!tools?.length) return undefined
+  const mapped = tools.flatMap((tool) => {
+    const record = asRecord(tool)
+    if (!record) return []
+    const nested = asRecord(record.function)
+    const source = nested ?? record
+    const name = asString(source.name)?.trim()
+    if (!name) return []
+    return [{
+      type: 'function',
+      name,
+      ...(asString(source.description) ? { description: source.description } : {}),
+      ...(source.parameters !== undefined ? { parameters: source.parameters } : {})
+    }]
+  })
+  return mapped.length ? mapped : undefined
+}
+
+const rawChatTextFormat = (format: ModelChatInput['format']): Record<string, unknown> | undefined => {
+  if (!format) return undefined
+  if (format === 'json') return { type: 'json_object' }
+  return {
+    type: 'json_schema',
+    name: 'response',
+    // RawChat's Codex models can spend the entire budget trying to satisfy
+    // OpenAI strict-schema's "all properties required" rule.  VISSLM's
+    // schemas intentionally contain optional presentation/query fields, so
+    // use the Responses schema guidance without strict constrained decoding.
+    strict: false,
+    schema: format
+  }
+}
+
 export class ModelClient {
   constructor(private readonly settings: ModelSettings) {}
+
+  private usesRawChatResponses(): boolean {
+    return this.settings.source === 'online' && (
+      this.settings.provider === 'rawchat-codex' ||
+      isRawChatResponsesBaseUrl(this.settings.baseUrl)
+    )
+  }
 
   async test(probeChat = false): Promise<ConnectionResult> {
     try {
@@ -147,10 +284,15 @@ export class ModelClient {
         return { ...connection, message: `${connection.message}，最小问答测试通过` }
       }
       if (!this.settings.apiKey) throw new Error('请输入 API Key')
-      const response = await fetch(`${trimBaseUrl(this.settings.baseUrl)}/models`, {
-        headers: this.onlineHeaders(),
-        signal: AbortSignal.timeout(15_000)
-      })
+      const response = await fetch(
+        this.usesRawChatResponses()
+          ? rawChatModelsUrl(this.settings.baseUrl)
+          : `${trimBaseUrl(this.settings.baseUrl)}/models`,
+        {
+          headers: this.onlineHeaders(),
+          signal: AbortSignal.timeout(15_000)
+        }
+      )
       if (!response.ok) throw await this.httpError(response)
       const payload = (await response.json()) as {
         data?: Array<{ id?: string }>
@@ -197,6 +339,8 @@ export class ModelClient {
   async chat(input: ModelChatInput): Promise<ModelResponse> {
     return this.settings.source === 'local'
       ? this.chatOllama(input)
+      : this.usesRawChatResponses()
+        ? this.chatRawChatResponses(input)
       : this.settings.provider === 'anthropic'
         ? this.chatAnthropic(input)
         : this.chatOpenAi(input)
@@ -425,6 +569,95 @@ export class ModelClient {
     }
   }
 
+  private async chatRawChatResponses(input: ModelChatInput): Promise<ModelResponse> {
+    if (!this.settings.apiKey) throw new Error('未配置 API Key')
+    const thinking = this.resolveThinking(input)
+    const format = rawChatTextFormat(input.format)
+    const tools = rawChatTools(input.tools)
+    const body: Record<string, unknown> = {
+      model: this.settings.model,
+      input: rawChatInput(input.messages),
+      ...(tools ? { tools } : {}),
+      ...(format ? { text: { format } } : {}),
+      // RawChat's Codex channel is backed by reasoning models.  Temperature
+      // and Chat Completions-only token fields are intentionally omitted.
+      reasoning: { effort: thinking ? 'high' : 'none' },
+      // Responses API requires at least 16 output tokens (including any
+      // reasoning tokens counted against the budget).
+      max_output_tokens: Math.max(16, Math.round(input.numPredict ?? 2048))
+    }
+    let response: Response
+    try {
+      response = await fetch(rawChatResponsesUrl(this.settings.baseUrl), {
+        method: 'POST',
+        headers: this.onlineHeaders(),
+        body: JSON.stringify(body),
+        signal: chatTimeoutSignal(input)
+      })
+    } catch (error) {
+      throw new Error(`RawChat Codex 连接失败：${error instanceof Error ? error.message : String(error)}`, { cause: error })
+    }
+    if (!response.ok) throw await this.httpError(response)
+
+    const payload = asRecord(await response.json())
+    if (!payload) throw new Error('RawChat Codex 返回的响应不是有效对象')
+    const output = Array.isArray(payload.output) ? payload.output.flatMap((item) => {
+      const record = asRecord(item)
+      return record ? [record] : []
+    }) : []
+    const textParts: string[] = []
+    const toolCalls: NonNullable<ModelMessage['tool_calls']> = []
+    for (const item of output) {
+      if (item.type === 'output_text' && typeof item.text === 'string') {
+        textParts.push(item.text)
+      }
+      if (item.type === 'message') {
+        const content = Array.isArray(item.content) ? item.content : []
+        for (const part of content) {
+          const block = asRecord(part)
+          if (!block) continue
+          if ((block.type === 'output_text' || block.type === 'text') && typeof block.text === 'string') {
+            textParts.push(block.text)
+          }
+        }
+        if (typeof item.content === 'string') textParts.push(item.content)
+      }
+      if (item.type === 'function_call') {
+        const name = asString(item.name)?.trim()
+        if (!name) continue
+        const id = asString(item.call_id) ?? asString(item.id)
+        toolCalls.push({
+          id,
+          function: {
+            name,
+            arguments: parseToolArguments(item.arguments)
+          }
+        })
+      }
+    }
+    if (!textParts.length && typeof payload.output_text === 'string') {
+      textParts.push(payload.output_text)
+    }
+    if (!textParts.length && !toolCalls.length) {
+      throw new Error('RawChat Codex 响应中没有可用的文本或工具调用')
+    }
+    const incompleteReason = asString(asRecord(payload.incomplete_details)?.reason)
+    const status = asString(payload.status)
+    const doneReason = status === 'incomplete' && incompleteReason === 'max_output_tokens'
+      ? 'length'
+      : incompleteReason ?? (status === 'completed' ? 'stop' : status)
+    const usage = rawChatUsage(payload.usage)
+    return {
+      done_reason: doneReason,
+      message: {
+        role: 'assistant',
+        content: textParts.join('\n'),
+        ...(toolCalls.length ? { tool_calls: toolCalls } : {})
+      },
+      ...(usage ? { usage } : {})
+    }
+  }
+
   private async chatAnthropic(input: ModelChatInput): Promise<ModelResponse> {
     if (!this.settings.apiKey) throw new Error('未配置 API Key')
     const thinking = this.resolveThinking(input)
@@ -587,13 +820,24 @@ export class ModelClient {
       zhipu: '智谱 AI',
       moonshot: 'Moonshot',
       minimax: 'MiniMax',
+      'rawchat-codex': 'RawChat Codex',
       'openai-compatible': 'OpenAI 兼容服务'
     }
-    return names[this.settings.provider] ?? this.settings.provider
+    return this.usesRawChatResponses() ? 'RawChat Codex' : (names[this.settings.provider] ?? this.settings.provider)
   }
 
   private async httpError(response: Response): Promise<Error> {
     const body = (await response.text()).slice(0, 500)
+    if (this.usesRawChatResponses() && /Codex is not enabled/i.test(body)) {
+      return new Error(
+        `${this.providerName()} HTTP ${response.status}：当前 API Key 未开通 RawChat Codex 服务，请在 RawChat 控制台启用 Codex 权限或更换 Key。`
+      )
+    }
+    if (this.usesRawChatResponses() && /invalid api key|incorrect api key|unauthorized/i.test(body)) {
+      return new Error(
+        `${this.providerName()} HTTP ${response.status}：API Key 无效、已撤销或未正确填写，请重新生成并保存新的 Key。`
+      )
+    }
     if (this.settings.provider === 'openai-compatible' && /Codex is not enabled/i.test(body)) {
       return new Error(
         `${this.providerName()} HTTP ${response.status}：当前 API Key 未开通该地址对应的 Codex 聊天服务。请在服务商控制台启用相应权限，或改用已开通 Chat Completions 的 API 地址和模型。`

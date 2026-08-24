@@ -4887,7 +4887,7 @@ export class AppDatabase {
       total,
       rows: rows.map((row) => {
         const record = this.mapRecord(row)
-        return {
+      return {
           requirementId: query.requirementId,
           recordUid: record.uid,
           recordName: record.name,
@@ -6323,6 +6323,29 @@ export class AppDatabase {
     return row ? this.mapRecord(row) : null
   }
 
+  /**
+   * Resolve the numeric shorthand commonly copied from a requirement list,
+   * e.g. `4101` -> `VISSLM-TSIS-4101`. Keep this separate from exact item-ID
+   * lookup so imports and other callers never silently accept an ambiguous
+   * suffix match.
+   */
+  findRecordsByItemIdSuffix(suffix: string): RecordRow[] {
+    const normalized = suffix.trim()
+    if (!/^\d+$/.test(normalized)) return []
+    const rows = this.db
+      .prepare(
+        `SELECT r.*, COUNT(i.id) AS image_count
+         FROM records r
+         LEFT JOIN images i ON i.record_uid = r.uid
+         WHERE LOWER(r.item_id) LIKE LOWER('%-' || ?)
+         GROUP BY r.uid
+         ORDER BY r.synced_at DESC, r.uid DESC
+         LIMIT 20`
+      )
+      .all(normalized) as SqlRow[]
+    return rows.map((row) => this.mapRecord(row))
+  }
+
   stageDataReview(input: {
     batchId: string
     source: DataReviewSource
@@ -7450,43 +7473,62 @@ export class AppDatabase {
     }))
   }
 
-  exportRows(): Array<Record<string, unknown>> {
-    const rows = this.db
-      .prepare('SELECT * FROM records ORDER BY project_id, node_type, uid')
-      .all() as SqlRow[]
-    return rows.map((row) => {
-      const images = (
-        this.db.prepare('SELECT * FROM images WHERE record_uid=?').all(String(row.uid)) as SqlRow[]
-      ).map((image) => {
-        const mapped = this.mapImage(image, true)
+  private mapExportRow(row: SqlRow): Record<string, unknown> {
+    const images = (
+      this.db.prepare('SELECT * FROM images WHERE record_uid=?').all(String(row.uid)) as SqlRow[]
+    ).map((image) => {
+      let base64 = ''
+      try {
+        base64 = readFileSync(String(image.base64_path), 'utf8')
+      } catch {
+        // A missing image file should not prevent the remaining records from exporting.
+      }
         return {
-          id: mapped.id,
-          name: mapped.name,
-          mimeType: mapped.mimeType,
-          sourceUrl: mapped.sourceUrl,
-          sha256: mapped.sha256,
-          base64: mapped.dataUri?.split(',', 2)[1] ?? ''
-        }
-      })
-      return {
-        documentId: `${row.node_type}:${row.uid}`,
-        title: String(row.name),
-        content: String(row.normalized_text),
-        metadata: {
-          projectId: String(row.project_id),
-          recordType: String(row.node_type),
-          sourceId: String(row.uid),
-          itemId: String(row.item_id),
-          updatedAt: String(row.last_modify_time),
-          pushStatus: String(row.push_status ?? 'pending'),
-          pushMessage: String(row.push_message ?? ''),
-          pushedAt: String(row.pushed_at ?? ''),
-          pushedUid: String(row.pushed_uid ?? '')
-        },
-        raw: JSON.parse(String(row.raw_json)),
-        images
+        id: String(image.id),
+        name: String(image.name),
+        mimeType: String(image.mime_type),
+        sourceUrl: String(image.source_url),
+        sha256: String(image.sha256),
+        base64
       }
     })
+    return {
+      documentId: `${row.node_type}:${row.uid}`,
+      title: String(row.name),
+      content: String(row.normalized_text),
+      metadata: {
+        projectId: String(row.project_id),
+        recordType: String(row.node_type),
+        sourceId: String(row.uid),
+        itemId: String(row.item_id),
+        updatedAt: String(row.last_modify_time),
+        pushStatus: String(row.push_status ?? 'pending'),
+        pushMessage: String(row.push_message ?? ''),
+        pushedAt: String(row.pushed_at ?? ''),
+        pushedUid: String(row.pushed_uid ?? '')
+      },
+      raw: (() => {
+        try {
+          return JSON.parse(String(row.raw_json))
+        } catch {
+          return {}
+        }
+      })(),
+      images
+    }
+  }
+
+  *iterateExportRows(): Generator<Record<string, unknown>> {
+    const rows = this.db
+      .prepare('SELECT * FROM records ORDER BY project_id, node_type, uid')
+      .iterate() as Iterable<SqlRow>
+    for (const row of rows) {
+      yield this.mapExportRow(row)
+    }
+  }
+
+  exportRows(): Array<Record<string, unknown>> {
+    return [...this.iterateExportRows()]
   }
 
   importRows(

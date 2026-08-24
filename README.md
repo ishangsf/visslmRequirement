@@ -25,6 +25,8 @@ VISSLM Agent 是一个面向 Windows 的数据智能工作台，用于采集 VIS
 
 ### AI 助手与可视化专家
 
+- 未在当前消息 `@` 专家时自动判断问题类型：普通问题使用普通对话，明确涉及本地数据或需求编号时自动调用对应数据能力；也可以明确 `@通用数据助手`、`@需求分析专家` 或 `@数据可视化专家`。
+- 无 `@` 的需求编号分析只按编号精确提取本地记录并把原文/字段交给大模型，不执行内置需求匹配、召回、重排或评分；需要内置匹配时请使用 `@需求分析专家`。
 - 通用数据助手通过工具调用检索本地记录、字段、统计结果和知识库内容，不直接执行任意 SQL 或代码。
 - 回答可以附带来源引用、查询数据表和记录详情；无证据时会明确说明未检索到结果。
 - `@需求分析专家` 支持一个或多个需求编号定位数据中心记录；编号先做精确查找，不把自然语言相似度当作编号定位依据。
@@ -93,7 +95,9 @@ ollama pull qwen3:8b
 
 ### 在线模型
 
-设置页内置以下服务商适配：OpenAI、Anthropic、DeepSeek、通义千问、智谱 AI、Moonshot、MiniMax，以及 OpenAI 兼容接口。配置时需要填写对应的 API 地址、模型名称和 API Key。
+设置页内置以下服务商适配：OpenAI、Anthropic、DeepSeek、通义千问、智谱 AI、Moonshot、MiniMax、RawChat Codex（Responses），以及 OpenAI 兼容接口。配置时需要填写对应的 API 地址、模型名称和 API Key。
+
+RawChat Codex 使用 Responses API，不是 Chat Completions。请选择“RawChat Codex（Responses）”，API 地址填写 `https://rawchat.cn/codex`，模型填写 RawChat 控制台已开通的模型（例如 `gpt-5.6-sol`），再保存并点击“测试模型”。为兼容旧配置，选择“OpenAI 兼容接口”但仍填写该 RawChat 地址时，客户端也会自动切换到 Responses 协议。
 
 在线模型也支持配置“思考模式”。应用会按服务商协议传递开关：OpenAI 推理模型使用 `reasoning_effort`，DeepSeek 和智谱 AI 使用 `thinking.type`，通义千问使用 `enable_thinking`，Anthropic 使用对应的 `thinking` 配置。MiniMax M 系列等思考模型的能力可能由模型固定提供，不能通过通用接口关闭。是否真正生效仍取决于所选模型；不支持该参数的模型可能忽略开关或返回接口错误。
 
@@ -300,6 +304,13 @@ buildResources/                  # 打包时生成的模型与 OCR 资源
 ollama list
 ollama pull qwen3:8b
 ```
+
+### RawChat Codex 测试失败
+
+- 若提示 API Key 无效、已撤销或未正确填写，请在 RawChat 控制台重新生成 Key，并在设置页重新保存；不要把 Key 写入源码、日志或截图。
+- 若提示当前 Key 未开通 Codex，请确认账户/Key 已启用 Codex 权限，或更换已开通 Codex 的 Key。
+- 确认地址是 `https://rawchat.cn/codex`，不要把 `/chat/completions` 拼到地址后；客户端会自动请求 `/models` 和 `/responses`。
+- 你曾经在聊天中公开过的 Key 应立即撤销，即使之后不再使用它也不能继续视为安全凭据。
 
 ### 同步没有记录
 

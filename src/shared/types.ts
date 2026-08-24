@@ -85,16 +85,21 @@ export type ModelProvider =
   | 'zhipu'
   | 'moonshot'
   | 'minimax'
+  | 'rawchat-codex'
   | 'openai-compatible'
 
-export interface ModelSettings {
+export interface ModelSettingsProfile {
   source: ModelSource
   provider: ModelProvider
   baseUrl: string
   model: string
   thinking: boolean
-  apiKey?: string
   hasApiKey?: boolean
+}
+
+export interface ModelSettings extends ModelSettingsProfile {
+  /** Only present for an explicit save/test request; never returned by settings:get. */
+  apiKey?: string
 }
 
 export type FeatureModuleKey =
@@ -154,6 +159,8 @@ export interface AppSettings {
   platform: PlatformSettings
   system: SystemSettings
   model: ModelSettings
+  /** The last saved configuration for each model source, without plaintext keys. */
+  modelProfiles: Record<ModelSource, ModelSettingsProfile>
   projectMatching: ProjectMatchingSettings
   features: FeatureModuleSettings
   navigationOrder: FeatureNavigationOrder
@@ -979,6 +986,14 @@ export interface ChatRequest {
   projectId?: string
   conversationId?: string
   expertId?: ExpertId
+  /**
+   * The renderer sets plain mode for messages without an explicit expert
+   * mention. Keeping this separate from expertId preserves the IPC contract
+   * for callers that intentionally request the general data assistant.
+   */
+  chatMode?: 'plain' | 'auto' | 'expert'
+  /** Internal IDs extracted for automatic direct data analysis; the model still receives question verbatim. */
+  extractedRequirementIds?: string[]
   entrypoint?: 'chat' | 'dashboard'
   dataScope?: DataScope
   focusComponentId?: string

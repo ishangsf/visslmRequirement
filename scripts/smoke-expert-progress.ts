@@ -98,7 +98,8 @@ try {
   assert.equal(route.expert.id, 'general')
   assert.equal(route.reason, 'explicit-mention')
   assert.equal(route.question, '汇总当前数据')
-  const requirementRoute = new ExpertRouter().route({
+  const routingSmoke = new ExpertRouter()
+  const requirementRoute = routingSmoke.route({
     question: '@需求分析专家 分析需求编号 REQ-1、REQ-2',
     conversationId: 'requirement-routing-smoke',
     entrypoint: 'chat',
@@ -106,6 +107,14 @@ try {
   })
   assert.equal(requirementRoute.expert.id, 'requirement-analysis')
   assert.equal(requirementRoute.question, '分析需求编号 REQ-1、REQ-2')
+  const unmentionedFollowUp = routingSmoke.route({
+    question: '请继续说明这批数据',
+    conversationId: 'requirement-routing-smoke',
+    entrypoint: 'chat'
+  })
+  assert.equal(unmentionedFollowUp.expert.id, 'general')
+  assert.equal(unmentionedFollowUp.reason, 'default')
+  assert.equal(unmentionedFollowUp.question, '请继续说明这批数据')
   console.log(JSON.stringify({
     ok: true,
     stages,

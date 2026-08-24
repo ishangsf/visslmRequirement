@@ -68,7 +68,7 @@ React 页面 -> window.visslm -> preload/index.ts -> ipcRenderer.invoke(channel)
 
 | 编号 | IPC channel / preload 方法 | 请求参数 | 响应与错误 | 调用页面；Handler / Service / 表 |
 | --- | --- | --- | --- | --- |
-| API-IPC-025 | `agent:ask` / `askAgent` | `ChatRequest {question,projectId?,conversationId?,expertId?,entrypoint?,dataScope?,activeArtifact?,history?}` | `ChatResponse {answer,sources,dataViews,expertId?,dashboard?,events?}`；`expertId='requirement-analysis'` 或 `@需求分析专家` 时按编号返回分组匹配数据视图；可视化无数据时返回 event code `NO_ANALYTICS_DATA`，模型/查询校验失败 rejection | `ChatPage`：`App.tsx:1407`；`index.ts:190-265` / `ExpertRouter`、`VisualizationAgent`、`RequirementAnalysisAgent` 或 `OllamaAgent`；`records`,`knowledge_*`,`visualization_runs` |
+| API-IPC-025 | `agent:ask` / `askAgent` | `ChatRequest {question,projectId?,conversationId?,expertId?,chatMode?,entrypoint?,dataScope?,activeArtifact?,history?}` | `ChatResponse {answer,sources,dataViews,expertId?,dashboard?,events?}`；`chatMode='auto'` 时按当前问题自动选择普通对话、通用数据或需求分析能力；`chatMode='plain'` 时只执行普通模型对话；明确 `@` 或 `chatMode='expert'` 时进入对应专家；可视化无数据时返回 event code `NO_ANALYTICS_DATA`，模型/查询校验失败 rejection | `ChatPage`：`App.tsx:1407`；`index.ts:190-265` / `ExpertRouter`、`PlainChatAgent`、`VisualizationAgent`、`RequirementAnalysisAgent` 或 `OllamaAgent`；`records`,`knowledge_*`,`visualization_runs` |
 | API-IPC-026 | `chat:sessions` / `listChatSessions` | `limit?: number` | `ChatSessionSummary[]` | `ChatPage`：`App.tsx` 会话历史；`index.ts:182` / DB；`chat_sessions` |
 | API-IPC-027 | `chat:session` / `getChatSession` | `id: string` | `ChatSession|null` | `ChatPage` 加载历史；`index.ts:183` / DB；`chat_sessions` |
 | API-IPC-028 | `chat:save-session` / `saveChatSession` | `ChatSessionSaveInput {id,title?,messages}` | `ChatSession`；消息结构会被清洗/截断 | `ChatPage`；`index.ts:184-186` / DB；`chat_sessions` |
@@ -208,6 +208,8 @@ VISSLM 请求统一使用 `AbortSignal.timeout(30_000)`。GET/POST 业务错误�
 | API-EXT-009 | online `GET {baseUrl}/models` | OpenAI 兼容在线服务连接测试 | `Authorization: Bearer <API Key>`；响应支持 `data[].id` 或 `models[].id` | `src/main/model-client.ts:34-63,355-367` |
 | API-EXT-010 | online `POST {baseUrl}/chat/completions` | OpenAI、DeepSeek、Qwen、智谱、Moonshot、MiniMax、兼容服务 | Bearer；JSON messages/tools/model，根据 provider 写 thinking/reasoning 参数 | `src/main/model-client.ts:121-211` |
 | API-EXT-011 | Anthropic `POST {baseUrl}/messages` | Anthropic 对话和工具调用 | `x-api-key`、`anthropic-version: 2023-06-01`；system/messages/tools/thinking | `src/main/model-client.ts:213-306,355-361` |
+| API-EXT-012 | RawChat Codex `GET {baseUrl}/models` | RawChat Codex（Responses）连接测试 | `Authorization: Bearer <API Key>`；地址通常为 `https://rawchat.cn/codex`；响应支持 `data[].id` 或 `models[].id` | `src/main/model-client.ts:284-302,47-57` |
+| API-EXT-013 | RawChat Codex `POST {baseUrl}/responses` | RawChat Codex 对话、结构化输出和工具调用 | Bearer；JSON 使用 `input`、`text.format`、`reasoning.effort`、`max_output_tokens`，工具续接使用 `function_call_output` | `src/main/model-client.ts:572-654` |
 
 线上模型上下文可能包含用户问题、检索证据、结构化查询结果、协议内容和大屏生成数据；是否允许技术协议外发由 `projects:upload-agreement` 的 `allowExternalProcessing` 显式确认控制，但普通 AI 问答的外发范围仍取决于用户选择的在线模型配置，见 `src/main/project-management.ts:191-194`、`src/main/model-client.ts`。
 

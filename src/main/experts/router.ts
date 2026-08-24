@@ -43,8 +43,6 @@ const byId = new Map<ExpertId, ExpertDefinition>(
 )
 
 export class ExpertRouter {
-  private readonly conversationExperts = new Map<string, ExpertId>()
-
   route(input: ExpertRouteInput): ExpertRouteResult {
     const visualization = byId.get('visualization')!
     const general = byId.get('general')!
@@ -79,16 +77,9 @@ export class ExpertRouter {
         reason: 'request',
         question: input.question.trim()
       }
-    } else if (input.conversationId && this.conversationExperts.has(input.conversationId)) {
-      result = {
-        expert: byId.get(this.conversationExperts.get(input.conversationId)!) ?? general,
-        reason: 'conversation',
-        question: input.question.trim()
-      }
     } else {
       result = { expert: general, reason: 'default', question: input.question.trim() }
     }
-    if (input.conversationId) this.conversationExperts.set(input.conversationId, result.expert.id)
     return result
   }
 }

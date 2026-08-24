@@ -390,7 +390,7 @@ const testMathTypeCurrentIndexCandidateFlowsToReview = async (db: AppDatabase): 
       modelClient,
       semanticContext
     }
-  ).ask({ question: '分析需求编号 VISSLM-TSIS-4072' })
+  ).ask({ question: '分析需求编号 4072' })
 
   assert.equal(rerankerInputs.length, 1, 'Cross-Encoder should receive one hybrid candidate batch')
   assert.deepEqual(rerankerInputs[0]?.map((candidate) => candidate.record.uid), [indexedCandidate.uid])

@@ -133,14 +133,14 @@ VISSLM Agent 将 VISSLM 平台数据复制到本地，提供本地检索、文�
 
 #### FR-CONFIG-002 模型配置
 
-- 支持本地 `ollama` 和在线 `openai/anthropic/deepseek/qwen/zhipu/moonshot/minimax/openai-compatible`。
+- 支持本地 `ollama` 和在线 `openai/anthropic/deepseek/qwen/zhipu/moonshot/minimax/rawchat-codex/openai-compatible`；RawChat Codex 使用 Responses API。
 - 输入：来源、服务商、地址、模型、thinking、在线 API Key。
 - 规则：本地不发送 API Key；在线 Key 按提供商保存；UI 只返回 `hasApiKey`。
 - 依据：`shared/types.ts:66-89`、`settings.ts:96-158`、`model-client.ts`。
 
 #### FR-CONFIG-003 连接测试
 
-- 平台测试调用 VISSLM API；本地模型检查 `/api/tags`；在线模型检查 `/models`。
+- 平台测试调用 VISSLM API；本地模型检查 `/api/tags`；在线模型检查 `/models`，RawChat Codex 随后使用 `/responses` 做最小问答探测。
 - 结果：`ConnectionResult { ok, message, details? }`。
 - 依据：`main/index.ts:146-154`、`model-client.ts:23-76`。
 
@@ -365,6 +365,13 @@ VISSLM Agent 将 VISSLM 平台数据复制到本地，提供本地检索、文�
 - 没有正式匹配时返回“未发现业务目标一致的高度相似或重复需求。检索到的记录仅存在主题、模块或操作模式上的关联。”分数统一称为“综合匹配度”，未做概率解释。
 - `scripts/smoke-agent-requirement-analysis.ts` 包含多编号、HTML/IssueType、批量解释、UID 严格校验、确定性评分、缓存命中和模型失败回退回归。`test-data/requirement-matching` 只保留固定行为夹具和模型资源清单；不建设人工标注数据集或人工标签评测流程。
 - 依据：`experts/router.ts`、`experts/requirement-analysis-agent.ts`、`requirements/semantic-card.ts`、`requirements/hybrid-retrieval.ts`、`requirements/cross-encoder-reranker.ts`、`knowledge.ts`、`database.ts`、`scripts/smoke-agent-requirement-analysis.ts`。
+
+#### FR-AI-010 普通对话模式
+
+- 当前消息未明确 `@` 专家时，AI 助手先根据当前问题和必要的会话上下文自动判断：普通问题使用普通模型对话，明确涉及本地数据或需求编号时自动调用对应数据能力。
+- 自动判断只使用当前问题的确定性数据意图；不会因为上一轮选择过专家而隐式沿用。用户也可以明确指定 `@通用数据助手`、`@需求分析专家` 或 `@数据可视化专家`。
+- 普通对话不返回本地来源或查询数据视图；自动数据模式必须使用本地工具或匹配流程取得证据，模型不得把记忆内容冒充为本地数据事实。
+- 无 `@` 的需求编号分析仅精确读取编号对应记录并把原文/字段交给模型，不执行内置需求匹配、召回、重排或评分；需要这些内置能力时必须使用 `@需求分析专家`。
 
 ### 6.7 本地分析查询
 

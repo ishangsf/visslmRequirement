@@ -413,6 +413,27 @@ const runCacheAndGenericIds = async (db: AppDatabase): Promise<void> => {
     extractRequirementAnalysisIds('分析需求编号 GENERIC-BASE-ONE、GENERIC-BASE-TWO、GENERIC-BASE-ONE'),
     ['GENERIC-BASE-ONE', 'GENERIC-BASE-TWO']
   )
+  assert.deepEqual(
+    extractRequirementAnalysisIds('帮我分析需求:4101, 4095，4085'),
+    ['4101', '4095', '4085'],
+    'numeric requirement shorthand must be parsed after the 需求 keyword'
+  )
+  assert.deepEqual(
+    extractRequirementAnalysisIds(
+      '按区域分析：PM：4101、4095；华东区：4059-4063；所有编号前面都有前缀VISSLM-TSIS-',
+      200
+    ),
+    [
+      'VISSLM-TSIS-4101',
+      'VISSLM-TSIS-4095',
+      'VISSLM-TSIS-4059',
+      'VISSLM-TSIS-4060',
+      'VISSLM-TSIS-4061',
+      'VISSLM-TSIS-4062',
+      'VISSLM-TSIS-4063'
+    ],
+    'shared prefixes and numeric ranges must resolve to complete requirement IDs'
+  )
   const multiModel = fakeModel()
   const multiAgent = createAgent(db, retriever, multiModel, {
     matchModelSignature: 'smoke-cache-v1',
@@ -511,6 +532,7 @@ const main = async (): Promise<void> => {
         'Cross-Encoder Top20 and explanation Top10 bounds',
         'persistent cache hit and invalidation',
         'generic IDs use the same matching branch',
+        'numeric requirement shorthand parsing and suffix resolution',
         'reranker fail-closed validation'
       ]
     }))

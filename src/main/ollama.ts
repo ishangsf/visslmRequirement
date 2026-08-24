@@ -1393,7 +1393,7 @@ export class OllamaAgent {
     for (let turn = 0; turn < 5; turn += 1) {
       const response = await this.chat(messages)
       const assistant = response.message
-      if (!assistant) throw new Error('Ollama 未返回有效消息')
+      if (!assistant) throw new Error('模型服务未返回有效消息')
       messages.push(assistant)
       if (!assistant.tool_calls?.length) {
         const hasEvidence = [...usedTools].some((tool) => evidenceTools.has(tool))

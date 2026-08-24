@@ -1101,6 +1101,7 @@ const onlineModelProviders: Array<{
   { value: 'zhipu', label: '智谱 AI', baseUrl: 'https://open.bigmodel.cn/api/paas/v4', models: ['glm-4.5', 'glm-4-plus', 'glm-4-flash'] },
   { value: 'moonshot', label: 'Moonshot', baseUrl: 'https://api.moonshot.cn/v1', models: ['moonshot-v1-8k', 'moonshot-v1-32k', 'kimi-k2-0711-preview'] },
   { value: 'minimax', label: 'MiniMax', baseUrl: 'https://api.minimax.chat/v1', models: ['MiniMax-M2.5', 'MiniMax-M2.1'] },
+  { value: 'rawchat-codex', label: 'RawChat Codex（Responses）', baseUrl: 'https://rawchat.cn/codex', models: ['gpt-5.6-sol', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.3-codex'] },
   { value: 'openai-compatible', label: 'OpenAI 兼容接口', baseUrl: '', models: [] }
 ]
 
@@ -3832,6 +3833,7 @@ function ChatPage({
     setAgentProgress([])
     setLoading(true)
     try {
+      const hasExplicitExpertMention = /@(?:数据可视化专家|通用数据助手|需求分析专家)(?:\s|$)/.test(text)
       const requestsVisualization = /@数据可视化专家(?:\s|$)/.test(text)
       const requestArtifact = requestsVisualization && artifactAttached ? activeArtifact : null
       const contextMessages = messages
@@ -3846,6 +3848,7 @@ function ChatPage({
         conversationId: sessionId,
         entrypoint: 'chat',
         expertId: 'general',
+        chatMode: hasExplicitExpertMention ? 'expert' : 'auto',
         ...(dataScope ? { dataScope } : {}),
         ...(requestArtifact
           ? {
@@ -4198,15 +4201,18 @@ function ChatPage({
                     className="message-bubble"
                     role={message.contextOutcome === 'failed' ? 'alert' : undefined}
                   >
-                    {message.role === 'assistant' ? (
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
-                    ) : (
-                      <Paragraph>{message.content}</Paragraph>
-                    )}
+                    <div className="message-body">
+                      {message.role === 'assistant' ? (
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
+                      ) : (
+                        <Paragraph>{message.content}</Paragraph>
+                      )}
+                    </div>
                     {message.role === 'assistant' && (
                       <div className="message-tools">
                         <Tooltip title="复制回答">
                           <Button
+                            className="message-copy-button"
                             type="text"
                             size="small"
                             icon={<CopyOutlined />}
@@ -4474,7 +4480,7 @@ function ChatPage({
               }}
               autoSize={{ minRows: 1, maxRows: 5 }}
               variant="borderless"
-              placeholder="向本地知识库提问…"
+              placeholder="直接向 VISSLM AI 提问；需要专业数据处理时 @ 专家…"
             />
             <div className="composer-footer">
               <span className="composer-hint">
@@ -4507,7 +4513,7 @@ function ChatPage({
           <Text type="secondary" className="composer-disclaimer">
             {modelOnline === false
               ? '模型未连接，发送前请先完成系统配置'
-              : `${modelName || '当前模型'} · 回答可通过“查看查询数据”核实`}
+              : `${modelName || '当前模型'} · 未 @ 专家时自动判断问题类型`}
           </Text>
         </div>
       </Card>
@@ -6298,6 +6304,7 @@ function SettingsPage({
   const [matchingForm] = Form.useForm<ProjectMatchingSettings>()
   const [modelSource, setModelSource] = useState<ModelSource>('local')
   const [modelProvider, setModelProvider] = useState<ModelProvider>('ollama')
+  const modelDraftsRef = useRef<Partial<Record<ModelSource, ModelSettings>>>({})
   const [featureSettings, setFeatureSettings] = useState<FeatureModuleSettings>(
     DEFAULT_FEATURE_MODULE_SETTINGS
   )
@@ -6311,8 +6318,10 @@ function SettingsPage({
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null)
   const [updateAction, setUpdateAction] = useState<'check' | 'download' | 'install' | null>(null)
   const selectedProvider = onlineModelProviders.find((item) => item.value === modelProvider)
+  const savedModelProfile = settings?.modelProfiles?.[modelSource]
+    ?? (settings?.model.source === modelSource ? settings.model : undefined)
   const hasSavedModelApiKey = Boolean(
-    settings?.model.provider === modelProvider && settings.model.hasApiKey
+    savedModelProfile?.provider === modelProvider && savedModelProfile.hasApiKey
   )
   const modelThinkingHint = modelSource === 'local'
     ? 'Ollama 使用原生 think 参数；开启后会增加响应时间。'
@@ -6326,6 +6335,8 @@ function SettingsPage({
             ? '按 Anthropic 模型能力发送 thinking 配置；请使用支持思考模式的模型。'
             : modelProvider === 'minimax'
               ? 'MiniMax M 系列为模型内置思考模型，当前兼容接口不提供通用的关闭参数。'
+              : modelProvider === 'rawchat-codex'
+                ? 'RawChat Codex 使用 Responses API；思考强度会映射到 reasoning.effort，建议选择支持 Codex 的模型。'
               : modelProvider === 'openai-compatible'
                 ? '通用兼容接口不发送厂商专有思考参数；深度分析由 Agent 提示和结构化解释校验保证。'
                 : '当前服务商没有通用思考参数；深度分析能力取决于所选模型。'
@@ -6340,6 +6351,7 @@ function SettingsPage({
       })
     }
     if (settingsTab === 'model') {
+      modelDraftsRef.current = {}
       modelForm.setFieldsValue({ ...settings.model, apiKey: '' })
     }
     if (settingsTab === 'general') {
@@ -6442,7 +6454,12 @@ function SettingsPage({
   }
 
   const saveModel = async (values: ModelSettings): Promise<void> => {
-    const next = await window.visslm.saveModelSettings(values)
+    const next = await window.visslm.saveModelSettings({
+      ...values,
+      source: modelSource,
+      provider: modelProvider,
+      apiKey: modelSource === 'online' ? values.apiKey : undefined
+    })
     onChanged(next)
     modelForm.setFieldValue('apiKey', '')
     message.success('模型配置已保存')
@@ -6567,29 +6584,39 @@ function SettingsPage({
   const updateBusy = updateAction !== null || updateStatus?.phase === 'checking' || updateDownloading
 
   const changeModelSource = (source: string | number): void => {
-    const thinking = Boolean(modelForm.getFieldValue('thinking'))
-    if (source === 'local') {
-      setModelSource('local')
-      setModelProvider('ollama')
-      modelForm.setFieldsValue({
-        source: 'local',
-        provider: 'ollama',
-        baseUrl: 'http://127.0.0.1:11434',
-        model: 'qwen3:8b',
-        thinking
-      })
-      return
+    if (source !== 'local' && source !== 'online') return
+    const currentValues = modelForm.getFieldsValue(true) as ModelSettings
+    modelDraftsRef.current[modelSource] = {
+      ...currentValues,
+      source: modelSource,
+      provider: modelProvider,
+      apiKey: modelSource === 'online' ? currentValues.apiKey : undefined
     }
-    const provider = onlineModelProviders.find((item) => item.value === modelProvider && item.value !== 'ollama')
-      ?? onlineModelProviders[0]
-    setModelSource('online')
-    setModelProvider(provider.value)
+    const savedProfile = settings?.modelProfiles?.[source]
+      ?? (settings?.model.source === source ? settings.model : undefined)
+    const draft = modelDraftsRef.current[source]
+    const fallbackProvider = source === 'local'
+      ? 'ollama' as const
+      : onlineModelProviders[0]?.value ?? 'openai'
+    const fallbackPreset = source === 'online'
+      ? onlineModelProviders.find((item) => item.value === fallbackProvider) ?? onlineModelProviders[0]
+      : undefined
+    const target = draft ?? savedProfile ?? {
+      source,
+      provider: fallbackProvider,
+      baseUrl: source === 'local' ? 'http://127.0.0.1:11434' : fallbackPreset?.baseUrl ?? '',
+      model: source === 'local' ? 'qwen3:8b' : fallbackPreset?.models[0] ?? '',
+      thinking: Boolean(modelForm.getFieldValue('thinking'))
+    }
+    setModelSource(source)
+    setModelProvider(target.provider)
     modelForm.setFieldsValue({
-      source: 'online',
-      provider: provider.value,
-      baseUrl: provider.baseUrl,
-      model: provider.models[0] ?? '',
-      thinking
+      source,
+      provider: target.provider,
+      baseUrl: target.baseUrl,
+      model: target.model,
+      thinking: target.thinking,
+      apiKey: source === 'online' ? (target as ModelSettings).apiKey ?? '' : undefined
     })
   }
 
@@ -6683,7 +6710,11 @@ function SettingsPage({
                     <Form.Item
                       label={modelSource === 'local' ? 'Ollama 地址' : 'API 地址'}
                       name="baseUrl"
-                      extra={modelProvider === 'openai-compatible' ? '填写兼容 OpenAI Chat Completions API 的基础地址，通常以 /v1 结尾' : undefined}
+                      extra={modelProvider === 'rawchat-codex'
+                        ? '填写 RawChat Codex 基础地址（例如 https://rawchat.cn/codex），客户端会使用 Responses API。'
+                        : modelProvider === 'openai-compatible'
+                          ? '填写兼容 OpenAI Chat Completions API 的基础地址，通常以 /v1 结尾'
+                          : undefined}
                       rules={[{ required: true, message: '请输入服务地址' }]}
                     >
                       <Input placeholder={modelSource === 'local' ? 'http://127.0.0.1:11434' : selectedProvider?.baseUrl || 'https://example.com/v1'} />

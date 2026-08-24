@@ -162,7 +162,7 @@ React 页面 -> window.visslm (preload) -> ipcMain.handle (main/index.ts)
 |---|---|---|
 | VISSLM/ALM HTTP API | 项目/节点查询、附件下载、数据推送 | `src/main/visslm.ts`；凭据由用户配置；README 说明正式环境应启用 HTTPS |
 | Ollama | 本地模型连接 `/api/tags`、`/api/chat` | `src/main/model-client.ts`；默认 `127.0.0.1:11434` |
-| 在线模型服务 | OpenAI、Anthropic、DeepSeek、Qwen、Zhipu、Moonshot、MiniMax、OpenAI-compatible | `src/main/model-client.ts`、`App.tsx:190-230`；请求上下文会离开本机 |
+| 在线模型服务 | OpenAI、Anthropic、DeepSeek、Qwen、Zhipu、Moonshot、MiniMax、RawChat Codex（Responses）、OpenAI-compatible | `src/main/model-client.ts`、`App.tsx`；请求上下文会离开本机 |
 | Hugging Face/本地模型资源 | 下载并加载 embedding | `scripts/prepare-local-resources.mjs`、`knowledge.ts`；运行时默认禁止远程下载 |
 | Tesseract 语言包 | 扫描型 PDF OCR | `knowledge.ts:300-330`；需要 `chi_sim`、`eng` |
 | Windows 用户数据目录 | SQLite、WAL、附件、知识库源文件路径 | Electron `app.getPath('userData')` |
