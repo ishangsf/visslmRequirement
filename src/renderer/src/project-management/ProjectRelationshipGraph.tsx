@@ -19,7 +19,6 @@ import {
 import { Button, Empty, Input, Segmented, Space, Tag, Tooltip, Typography } from 'antd'
 import type { EChartsOption } from 'echarts'
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
-import ReactECharts from 'echarts-for-react'
 import type {
   ManagedProject,
   ProjectAsset,
@@ -29,6 +28,7 @@ import type {
   ProjectPlanTask,
   ProjectRequirement
 } from '../../../shared/project-types'
+import LightweightECharts from '../components/LightweightECharts'
 
 const { Text, Title } = Typography
 
@@ -1053,7 +1053,7 @@ export function ProjectRelationshipGraph({
           </div>
           <div className="project-relationship-chart">
             {(viewMode === 'flow' ? flowDisplayGraph.nodes.length : visibleNodes.length) > 1 ? (
-              <ReactECharts
+              <LightweightECharts
                 key={`${graphKey}:${viewMode}`}
                 option={option}
                 notMerge

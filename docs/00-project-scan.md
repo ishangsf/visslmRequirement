@@ -77,7 +77,7 @@ visslmRequirement/
 | 主进程 | `src/main/index.ts`，构建后 `out/main/index.js` | `package.json:4`、`electron.vite.config.ts` |
 | preload | `src/preload/index.ts`，构建为 `out/preload/index.cjs` | `electron.vite.config.ts` |
 | renderer | `src/renderer/index.html` -> `src/renderer/src/main.tsx` -> `App.tsx` | `electron.vite.config.ts`、`src/renderer/src/main.tsx` |
-| 数据初始化 | `app.whenReady()` 创建 `<userData>/visslm-agent.db` 和 `<userData>/assets/base64` | `src/main/index.ts:860-888` |
+| 数据初始化 | `app.whenReady()` 创建 `<userData>/visslm-agent.db` 和 `<userData>/assets`，图片二进制写入 `assets/blobs` | `src/main/index.ts` |
 | 构建 | `npm run build` -> electron-vite 三目标构建 | `package.json:11` |
 | Windows 安装包 | `npm run package` -> 资源准备 + build + electron-builder NSIS x64 | `package.json:25`、`package.json:60-97` |
 | 目录包 | `npm run package:dir` | `package.json:26` |
@@ -168,7 +168,7 @@ React 页面 -> window.visslm (preload) -> ipcMain.handle (main/index.ts)
 | Windows 用户数据目录 | SQLite、WAL、附件、知识库源文件路径 | Electron `app.getPath('userData')` |
 | CDP WebSocket | UI smoke 回归 | `scripts/smoke-*.mjs`；不是产品运行依赖 |
 
-未发现消息队列、Redis、定时任务调度器或独立对象存储。同步、索引、协议分析和匹配任务都是主进程内异步任务；无 `setInterval`/cron/队列基础设施证据，详见架构和风险文档。
+未发现消息队列、Redis、定时任务调度器或独立对象存储。同步、索引、协议分析和匹配任务都是主进程内异步任务；知识库索引新增了内存任务控制器和 cooperative 取消边界，但仍无持久队列、`setInterval`/cron 基础设施证据，详见架构和风险文档。
 
 ## 11. 测试方式
 
@@ -203,7 +203,7 @@ React 页面 -> window.visslm (preload) -> ipcMain.handle (main/index.ts)
 4. 根目录运行数据目录、构建产物和临时文件是否应从版本库清理或加入忽略规则；当前 `.gitignore` 未覆盖全部现存运行目录。
 5. 在线模型是否允许发送项目协议、业务记录和字段值；代码有“外发确认”选项，但无组织级数据分级策略。
 6. 是否需要跨设备备份/恢复知识库源文件、附件和数据库；当前项目导出支持 JSON 快照和 Excel 报表，数据中心导出支持 JSON/JSONL，但不等同于完整数据库备份。
-7. 是否需要后台任务在应用退出后继续执行；当前任务在主进程内运行，退出时只关闭数据库。
+7. 是否需要后台任务在应用退出后继续执行；当前任务仍在主进程内运行，退出时请求取消并关闭数据库，不提供持久恢复队列。
 9. 是否要求所有表格都接入统一列宽组件；当前多数表格使用 `ResizableTable`，项目匹配/人员/参与人/计划等仍在页面内自定义实现。
 
 ## 14. 代码依据索引

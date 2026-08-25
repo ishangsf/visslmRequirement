@@ -1,8 +1,8 @@
 import { ArrowUpOutlined, BulbOutlined } from '@ant-design/icons'
 import { Empty, Progress } from 'antd'
-import ReactECharts from 'echarts-for-react'
 import { memo, useMemo } from 'react'
 import type { DashboardComponentSpec, DashboardThemeId } from '../../../shared/dashboard'
+import LightweightECharts from '../components/LightweightECharts'
 
 type ChartThemeTokens = {
   textColor: string
@@ -427,7 +427,7 @@ function DashboardComponentRendererView({
   }
 
   return (
-    <ReactECharts
+    <LightweightECharts
       key={`${component.id}-${component.layout.w}-${component.layout.h}`}
       option={chartOption}
       notMerge

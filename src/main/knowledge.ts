@@ -22,6 +22,11 @@ import {
 } from './database'
 import type { RecordMaintenanceOperation } from '../shared/types'
 import { AsyncMutex } from './record-index-lock'
+import {
+  BackgroundTaskRunner,
+  TaskCancelledError,
+  type BackgroundTaskHandle
+} from './background-task-runner'
 
 export const MAX_KNOWLEDGE_FILE_BYTES = 100 * 1024 * 1024
 export const EMBEDDING_MODEL_ID = 'Xenova/bge-small-zh-v1.5'
@@ -30,6 +35,12 @@ const FALLBACK_MODEL_VERSION = 'local-hash-v1'
 const CHUNK_SIZE = 1000
 const CHUNK_OVERLAP = 20
 const EMBEDDING_DIMENSION = 384
+export const VECTOR_PREFILTER_THRESHOLD = 4_096
+export const VECTOR_PREFILTER_MAX_CANDIDATES = 2_048
+export const VECTOR_COARSE_STEP = 8
+export const KNOWLEDGE_MAX_CONCURRENT_TASKS = 2
+const SEARCH_RESULT_CACHE_TTL_MS = 15_000
+const SEARCH_RESULT_CACHE_MAX_ENTRIES = 64
 const OCR_RENDER_SCALE = 2.5
 const OCR_PAGE_SEGMENTATION_MODE = '3'
 const SUPPORTED_EXTENSIONS = new Set(['.docx', '.pdf', '.xlsx', '.xls', '.txt'])
@@ -48,6 +59,102 @@ export interface KnowledgeRecordMatch {
   score: number
   chunkId: string
   snippet: string
+}
+
+type KnowledgeVectorSearchRow = ReturnType<AppDatabase['listKnowledgeVectorRows']>[number] & {
+  norm: number
+  coarse: Float32Array
+}
+
+export interface CoarseVectorCandidate {
+  coarse: Float32Array
+}
+
+export const buildCoarseVector = (vector: Float32Array): Float32Array => {
+  const coarse = new Float32Array(Math.ceil(vector.length / VECTOR_COARSE_STEP))
+  for (let index = 0, coarseIndex = 0; index < vector.length; index += VECTOR_COARSE_STEP, coarseIndex += 1) {
+    coarse[coarseIndex] = vector[index]
+  }
+  let norm = 0
+  for (const value of coarse) norm += value * value
+  if (norm > 0) {
+    const inverseNorm = 1 / Math.sqrt(norm)
+    for (let index = 0; index < coarse.length; index += 1) coarse[index] *= inverseNorm
+  }
+  return coarse
+}
+
+/**
+ * Select a bounded exact-scoring shortlist for a large vector corpus. The
+ * caller can use the returned rows with the full-dimensional cosine scorer.
+ * Corpora below the threshold retain the exact all-candidate behavior.
+ */
+export const prefilterVectorCandidates = <T extends CoarseVectorCandidate>(
+  queryVector: Float32Array,
+  candidates: T[],
+  requestedLimit: number
+): T[] => {
+  if (candidates.length <= VECTOR_PREFILTER_THRESHOLD) return candidates
+  const queryCoarse = buildCoarseVector(queryVector)
+  const safeLimit = Number.isFinite(requestedLimit)
+    ? Math.max(1, Math.trunc(requestedLimit))
+    : VECTOR_PREFILTER_MAX_CANDIDATES
+  const exactLimit = Math.min(
+    candidates.length,
+    Math.max(256, Math.min(VECTOR_PREFILTER_MAX_CANDIDATES, safeLimit * 16))
+  )
+
+  // Keep only the best exactLimit coarse scores while scanning. The previous
+  // implementation allocated and sorted one scored object per candidate,
+  // making a large corpus pay O(N log N) before exact ranking. A bounded
+  // min-heap keeps the same stable score order with O(N log K) work and O(K)
+  // temporary memory, where K is the exact-ranking shortlist size.
+  type ScoredCandidate = { row: T; score: number; index: number }
+  const heap: ScoredCandidate[] = []
+  const isWorse = (left: ScoredCandidate, right: ScoredCandidate): boolean => (
+    left.score < right.score || (left.score === right.score && left.index > right.index)
+  )
+  const siftUp = (index: number): void => {
+    let current = index
+    while (current > 0) {
+      const parent = Math.floor((current - 1) / 2)
+      if (!isWorse(heap[current], heap[parent])) break
+      ;[heap[current], heap[parent]] = [heap[parent], heap[current]]
+      current = parent
+    }
+  }
+  const siftDown = (index: number): void => {
+    let current = index
+    while (true) {
+      const left = current * 2 + 1
+      const right = left + 1
+      let smallest = current
+      if (left < heap.length && isWorse(heap[left], heap[smallest])) smallest = left
+      if (right < heap.length && isWorse(heap[right], heap[smallest])) smallest = right
+      if (smallest === current) break
+      ;[heap[current], heap[smallest]] = [heap[smallest], heap[current]]
+      current = smallest
+    }
+  }
+
+  for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex += 1) {
+    const row = candidates[candidateIndex]
+    const length = Math.min(queryCoarse.length, row.coarse.length)
+    let score = 0
+    for (let index = 0; index < length; index += 1) score += queryCoarse[index] * row.coarse[index]
+    const scored = { row, score, index: candidateIndex }
+    if (heap.length < exactLimit) {
+      heap.push(scored)
+      siftUp(heap.length - 1)
+    } else if (isWorse(heap[0], scored)) {
+      heap[0] = scored
+      siftDown(0)
+    }
+  }
+
+  return heap
+    .sort((left, right) => right.score - left.score || left.index - right.index)
+    .map(({ row }) => row)
 }
 
 interface ParsedPage {
@@ -487,8 +594,19 @@ class EmbeddingService {
 export class KnowledgeService {
   private readonly parser = new DocumentParser()
   private readonly embeddings = new EmbeddingService()
+  private readonly taskRunner = new BackgroundTaskRunner(KNOWLEDGE_MAX_CONCURRENT_TASKS)
   private initializationPromise: Promise<void> | null = null
   private indexingPromise: Promise<void> | null = null
+  private vectorRowsCache: {
+    modelVersion: string
+    createdAt: number
+    rows: KnowledgeVectorSearchRow[]
+  } | null = null
+  private readonly searchResultCache = new Map<string, {
+    createdAt: number
+    result: KnowledgeSearchHit[]
+  }>()
+  private readonly taskStartedAt = new Map<string, number>()
 
   constructor(
     private readonly db: AppDatabase,
@@ -496,8 +614,42 @@ export class KnowledgeService {
     private readonly recordIndexLock: AsyncMutex = new AsyncMutex()
   ) {}
 
+  private clearVectorCaches(): void {
+    this.vectorRowsCache = null
+    this.searchResultCache.clear()
+  }
+
+  private rememberSearchResult(cacheKey: string, result: KnowledgeSearchHit[]): void {
+    this.searchResultCache.set(cacheKey, { createdAt: Date.now(), result })
+    while (this.searchResultCache.size > SEARCH_RESULT_CACHE_MAX_ENTRIES) {
+      const oldestKey = this.searchResultCache.keys().next().value as string | undefined
+      if (!oldestKey) break
+      this.searchResultCache.delete(oldestKey)
+    }
+  }
+
   get modelVersion(): string {
     return this.embeddings.modelVersion
+  }
+
+  cancelTask(taskId: string): boolean {
+    const normalized = taskId.trim()
+    const cancelled = this.taskRunner.cancel(normalized)
+    if (cancelled) {
+      this.emit({
+        taskId: normalized,
+        phase: 'error',
+        message: '知识库后台任务已请求停止',
+        current: 0,
+        total: 0,
+        status: 'failed'
+      })
+    }
+    return cancelled
+  }
+
+  cancelAllTasks(): void {
+    this.taskRunner.cancelAll()
   }
 
   async initialize(): Promise<void> {
@@ -519,6 +671,7 @@ export class KnowledgeService {
       return
     }
     try {
+      await this.resumePendingDocuments()
       if (this.db.knowledgeDocumentsNeedReindex(this.modelVersion)) await this.rebuildIndex()
       await this.syncRecordIndex()
     } catch (error) {
@@ -533,126 +686,180 @@ export class KnowledgeService {
     }
   }
 
+  /**
+   * A restart converts interrupted documents back to `queued`. Replaying the
+   * parser/embedding pipeline is safe because document chunks are replaced in
+   * one transaction, and it lets the delayed startup recovery finish work
+   * without requiring the user to discover each failed document manually.
+   */
+  private async resumePendingDocuments(): Promise<void> {
+    const documents = this.db.listKnowledgeDocumentsForResume()
+    if (!documents.length) return
+    const taskId = randomUUID()
+    const task = this.taskRunner.begin(taskId)
+    try {
+      for (let index = 0; index < documents.length; index += 1) {
+        await task.checkpoint()
+        await this.processDocument(
+          documents[index],
+          taskId,
+          index + 1,
+          documents.length,
+          undefined,
+          task
+        )
+      }
+    } finally {
+      task.dispose()
+    }
+  }
+
   async processFiles(
     filePaths: string[],
     onProgress?: (progress: KnowledgeIndexProgress) => void
   ): Promise<KnowledgeUploadResult> {
     const taskId = randomUUID()
-    const documents: KnowledgeDocument[] = []
-    const skipped: Array<{ fileName: string; reason: string }> = []
-    let failedCount = 0
-    let acceptedCount = 0
-    let reusedCount = 0
-    for (const filePath of [...new Set(filePaths)]) {
-      const fileName = filePath.split(/[\\/]/).pop() ?? filePath
-      const extension = extensionFor(filePath)
-      if (!SUPPORTED_EXTENSIONS.has(extension)) {
-        skipped.push({ fileName, reason: `不支持 ${extension || '无扩展名'} 文件` })
-        continue
-      }
-      let bytes: Buffer
-      let byteSize: number
-      try {
-        const stats = statSync(filePath)
-        byteSize = stats.size
-        if (!stats.isFile()) throw new Error('路径不是文件')
-        if (byteSize > MAX_KNOWLEDGE_FILE_BYTES) throw new Error('文件超过 100 MB 限制')
-        bytes = readFileSync(filePath)
-      } catch (error) {
-        skipped.push({ fileName, reason: error instanceof Error ? error.message : String(error) })
-        continue
-      }
-      const sha256 = fileHash(bytes)
-      const existing = this.db.findKnowledgeDocumentByHash(sha256)
-      if (existing) {
-        const managedPath = this.db.storeKnowledgeDocumentFile(bytes, sha256, extension)
-        this.db.updateKnowledgeDocumentFilePath(existing.id, managedPath)
-        const managedDocument = { ...existing, filePath: managedPath }
-        const reused = existing.status === 'ready'
-          ? managedDocument
-          : await this.processDocument(managedDocument, taskId, documents.length + 1, filePaths.length, onProgress)
-        documents.push(reused)
-        reusedCount += 1
-        if (reused.status === 'failed') failedCount += 1
-        if (existing.status === 'ready') {
-          this.emitAndNotify(onProgress, {
-            taskId,
-            phase: 'done',
-            documentId: reused.id,
-            fileName: reused.fileName,
-            message: `${reused.fileName} 已复用现有知识库索引`,
-            current: documents.length,
-            total: filePaths.length,
-            status: 'success'
-          })
+    const task = this.taskRunner.begin(taskId)
+    try {
+      const documents: KnowledgeDocument[] = []
+      const skipped: Array<{ fileName: string; reason: string }> = []
+      let failedCount = 0
+      let acceptedCount = 0
+      let reusedCount = 0
+      for (const filePath of [...new Set(filePaths)]) {
+        await task.checkpoint()
+        const fileName = filePath.split(/[\\/]/).pop() ?? filePath
+        const extension = extensionFor(filePath)
+        if (!SUPPORTED_EXTENSIONS.has(extension)) {
+          skipped.push({ fileName, reason: `不支持 ${extension || '无扩展名'} 文件` })
+          continue
         }
-        skipped.push({ fileName, reason: `重复文件，已复用知识库索引（${existing.fileName}）` })
-        continue
-      }
-      const managedPath = this.db.storeKnowledgeDocumentFile(bytes, sha256, extension)
-      const document = this.db.insertKnowledgeDocument({
-        id: randomUUID(),
-        fileName,
-        filePath: managedPath,
-        extension,
-        mimeType: mimeFor(extension),
-        byteSize,
-        sha256,
-        modelVersion: this.modelVersion
-      })
-      this.emitAndNotify(onProgress, {
-        taskId,
-        phase: 'queued',
-        documentId: document.id,
-        fileName,
-        message: `已加入解析队列: ${fileName}`,
-        current: documents.length,
-        total: filePaths.length,
-        status: 'running'
-      })
-      documents.push(document)
-      acceptedCount += 1
-      let processed: KnowledgeDocument
-      try {
-        if (!bytes.length) throw new Error('文件内容为空')
-        validateDocumentSignature(bytes, extension)
-        processed = await this.processDocument(document, taskId, documents.length, filePaths.length, onProgress)
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error)
-        processed = this.db.updateKnowledgeDocument(document.id, {
-          status: 'failed',
-          errorMessage: message,
-          processedAt: ''
-        }) ?? { ...document, status: 'failed', errorMessage: message }
+        let bytes: Buffer
+        let byteSize: number
+        try {
+          const stats = statSync(filePath)
+          byteSize = stats.size
+          if (!stats.isFile()) throw new Error('路径不是文件')
+          if (byteSize > MAX_KNOWLEDGE_FILE_BYTES) throw new Error('文件超过 100 MB 限制')
+          bytes = readFileSync(filePath)
+        } catch (error) {
+          skipped.push({ fileName, reason: error instanceof Error ? error.message : String(error) })
+          continue
+        }
+        const sha256 = fileHash(bytes)
+        const existing = this.db.findKnowledgeDocumentByHash(sha256)
+        if (existing) {
+          const managedPath = this.db.storeKnowledgeDocumentFile(bytes, sha256, extension)
+          this.db.updateKnowledgeDocumentFilePath(existing.id, managedPath)
+          const managedDocument = { ...existing, filePath: managedPath }
+          const reused = existing.status === 'ready'
+            ? managedDocument
+            : await this.processDocument(
+                managedDocument,
+                taskId,
+                documents.length + 1,
+                filePaths.length,
+                onProgress,
+                task
+              )
+          documents.push(reused)
+          reusedCount += 1
+          if (reused.status === 'failed') failedCount += 1
+          if (existing.status === 'ready') {
+            this.emitAndNotify(onProgress, {
+              taskId,
+              phase: 'done',
+              documentId: reused.id,
+              fileName: reused.fileName,
+              message: `${reused.fileName} 已复用现有知识库索引`,
+              current: documents.length,
+              total: filePaths.length,
+              status: 'success'
+            })
+          }
+          skipped.push({ fileName, reason: `重复文件，已复用知识库索引（${existing.fileName}）` })
+          continue
+        }
+        const managedPath = this.db.storeKnowledgeDocumentFile(bytes, sha256, extension)
+        const document = this.db.insertKnowledgeDocument({
+          id: randomUUID(),
+          fileName,
+          filePath: managedPath,
+          extension,
+          mimeType: mimeFor(extension),
+          byteSize,
+          sha256,
+          modelVersion: this.modelVersion
+        })
         this.emitAndNotify(onProgress, {
           taskId,
-          phase: 'error',
+          phase: 'queued',
           documentId: document.id,
           fileName,
-          message: `${fileName}: ${message}`,
+          message: `已加入解析队列: ${fileName}`,
           current: documents.length,
           total: filePaths.length,
-          status: 'failed'
+          status: 'running'
         })
+        documents.push(document)
+        acceptedCount += 1
+        let processed: KnowledgeDocument
+        try {
+          if (!bytes.length) throw new Error('文件内容为空')
+          validateDocumentSignature(bytes, extension)
+          processed = await this.processDocument(
+            document,
+            taskId,
+            documents.length,
+            filePaths.length,
+            onProgress,
+            task
+          )
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          processed = this.db.updateKnowledgeDocument(document.id, {
+            status: 'failed',
+            errorMessage: message,
+            processedAt: ''
+          }) ?? { ...document, status: 'failed', errorMessage: message }
+          this.emitAndNotify(onProgress, {
+            taskId,
+            phase: 'error',
+            documentId: document.id,
+            fileName,
+            message: `${fileName}: ${message}`,
+            current: documents.length,
+            total: filePaths.length,
+            status: 'failed'
+          })
+        }
+        if (processed.status === 'failed') failedCount += 1
       }
-      if (processed.status === 'failed') failedCount += 1
-    }
-    return {
-      ok: documents.length > failedCount || skipped.length === 0,
-      acceptedCount,
-      reusedCount,
-      skippedCount: skipped.length,
-      failedCount,
-      documents: documents.map((document) => this.db.getKnowledgeDocument(document.id) as KnowledgeDocument),
-      skipped,
-      message: `知识库处理完成：${acceptedCount} 个新增，${reusedCount} 个复用，${failedCount} 个失败，${skipped.length - reusedCount} 个跳过`
+      return {
+        ok: failedCount === 0 && (documents.length > 0 || skipped.length === 0),
+        acceptedCount,
+        reusedCount,
+        skippedCount: skipped.length,
+        failedCount,
+        documents: documents.map((document) => this.db.getKnowledgeDocument(document.id) as KnowledgeDocument),
+        skipped,
+        message: `知识库处理完成：${acceptedCount} 个新增，${reusedCount} 个复用，${failedCount} 个失败，${skipped.length - reusedCount} 个跳过`
+      }
+    } finally {
+      task.dispose()
     }
   }
 
   async retryDocument(id: string): Promise<KnowledgeDocument | null> {
     const document = this.db.getKnowledgeDocument(id)
     if (!document) return null
-    return this.processDocument(document, randomUUID(), 1, 1)
+    const taskId = randomUUID()
+    const task = this.taskRunner.begin(taskId)
+    try {
+      return await this.processDocument(document, taskId, 1, 1, undefined, task)
+    } finally {
+      task.dispose()
+    }
   }
 
   updateDocumentTags(id: string, tags: string[]): KnowledgeDocument | null {
@@ -662,6 +869,7 @@ export class KnowledgeService {
 
   deleteDocument(id: string): { ok: boolean; message: string } {
     const result = this.db.deleteKnowledgeDocument(id)
+    if (result.deleted) this.clearVectorCaches()
     return result.deleted
       ? { ok: true, message: `已从知识库删除 ${id}` }
       : { ok: false, message: '文档不存在或已经删除' }
@@ -678,46 +886,54 @@ export class KnowledgeService {
   private async rebuildIndexInternal(): Promise<KnowledgeRebuildResult> {
     await this.embeddings.prepare()
     if (!this.embeddings.available) throw new Error(this.embeddings.unavailableReason)
+    this.clearVectorCaches()
     const taskId = randomUUID()
-    const chunks = this.db.listKnowledgeChunksForRebuild()
-    this.db.deleteKnowledgeVectors()
-    const vectors: KnowledgeVectorInput[] = []
+    const task = this.taskRunner.begin(taskId)
+    try {
+      const chunks = this.db.listKnowledgeChunksForRebuild()
+      this.db.deleteKnowledgeVectors()
+      const vectors: KnowledgeVectorInput[] = []
       for (let index = 0; index < chunks.length; index += 32) {
+        await task.checkpoint()
         const batch = chunks.slice(index, index + 32)
         const embeddings = await this.embeddings.embedMany(batch.map((chunk) => chunk.content))
         if (embeddings.length !== batch.length) throw new Error(this.embeddings.unavailableReason)
-      vectors.push(...batch.map((chunk, batchIndex) => ({
-        chunkId: chunk.id,
-        vector: embeddings[batchIndex],
-        modelVersion: this.modelVersion
-      })))
+        vectors.push(...batch.map((chunk, batchIndex) => ({
+          chunkId: chunk.id,
+          vector: embeddings[batchIndex],
+          modelVersion: this.modelVersion
+        })))
+        this.emit({
+          taskId,
+          phase: 'embedding',
+          message: `正在重建向量索引（${Math.min(index + batch.length, chunks.length)}/${chunks.length}）`,
+          current: Math.min(index + batch.length, chunks.length),
+          total: chunks.length,
+          status: 'running'
+        })
+      }
+      this.db.saveKnowledgeVectors(vectors)
+      this.clearVectorCaches()
+      this.db.markKnowledgeDocumentsModelVersion(this.modelVersion)
+      const stats = this.db.getKnowledgeStats(this.modelVersion)
       this.emit({
         taskId,
-        phase: 'embedding',
-        message: `正在重建向量索引（${Math.min(index + batch.length, chunks.length)}/${chunks.length}）`,
-        current: Math.min(index + batch.length, chunks.length),
+        phase: 'done',
+        message: '知识库向量索引已重建',
+        current: chunks.length,
         total: chunks.length,
-        status: 'running'
+        status: 'success'
       })
-    }
-    this.db.saveKnowledgeVectors(vectors)
-    this.db.markKnowledgeDocumentsModelVersion(this.modelVersion)
-    const stats = this.db.getKnowledgeStats(this.modelVersion)
-    this.emit({
-      taskId,
-      phase: 'done',
-      message: '知识库向量索引已重建',
-      current: chunks.length,
-      total: chunks.length,
-      status: 'success'
-    })
-    return {
-      ok: true,
-      taskId,
-      documentCount: stats.documentCount,
-      recordCount: stats.recordCount,
-      chunkCount: chunks.length,
-      message: '知识库向量索引已重建'
+      return {
+        ok: true,
+        taskId,
+        documentCount: stats.documentCount,
+        recordCount: stats.recordCount,
+        chunkCount: chunks.length,
+        message: '知识库向量索引已重建'
+      }
+    } finally {
+      task.dispose()
     }
   }
 
@@ -738,49 +954,95 @@ export class KnowledgeService {
     taskId = '',
     operation: RecordMaintenanceOperation | '' = ''
   ): Promise<number> {
-    await this.embeddings.prepare()
-    if (!this.embeddings.available) throw new Error(this.embeddings.unavailableReason)
-    const row = this.db.getKnowledgeRecordIndexRow(recordUid)
-    if (!row) throw new Error('记录不存在或已被删除')
-    const pages: ParsedPage[] = [{ text: row.content, location: '采集记录' }]
-    const chunks = chunkKnowledgePages(pages)
-    const embeddings = await this.embeddings.embedMany(chunks.map((chunk) => chunk.text))
-    if (embeddings.length !== chunks.length) throw new Error(this.embeddings.unavailableReason)
-    const inputs: KnowledgeChunkInput[] = []
-    const vectors: KnowledgeVectorInput[] = []
-    chunks.forEach((chunk, chunkIndex) => {
-      const chunkId = randomUUID()
-      inputs.push({
-        id: chunkId,
-        recordUid: row.uid,
-        sourceType: 'record',
-        sourceName: row.name,
-        sourceHash: row.contentHash,
-        content: chunk.text,
-        chunkIndex,
-        location: chunk.location,
-        charStart: chunk.charStart,
-        charEnd: chunk.charEnd
+    const activeTaskId = taskId || randomUUID()
+    const task = this.taskRunner.begin(activeTaskId)
+    try {
+      await this.embeddings.prepare()
+      if (!this.embeddings.available) throw new Error(this.embeddings.unavailableReason)
+      const row = this.db.getKnowledgeRecordIndexRow(recordUid)
+      if (!row) throw new Error('记录不存在或已被删除')
+      const pages: ParsedPage[] = [{ text: row.content, location: '采集记录' }]
+      const chunks = chunkKnowledgePages(pages)
+      await task.checkpoint()
+      const embeddings = await this.embeddings.embedMany(chunks.map((chunk) => chunk.text))
+      if (embeddings.length !== chunks.length) throw new Error(this.embeddings.unavailableReason)
+      const inputs: KnowledgeChunkInput[] = []
+      const vectors: KnowledgeVectorInput[] = []
+      chunks.forEach((chunk, chunkIndex) => {
+        const chunkId = randomUUID()
+        inputs.push({
+          id: chunkId,
+          recordUid: row.uid,
+          sourceType: 'record',
+          sourceName: row.name,
+          sourceHash: row.contentHash,
+          content: chunk.text,
+          chunkIndex,
+          location: chunk.location,
+          charStart: chunk.charStart,
+          charEnd: chunk.charEnd
+        })
+        vectors.push({ chunkId, vector: embeddings[chunkIndex], modelVersion: this.modelVersion })
       })
-      vectors.push({ chunkId, vector: embeddings[chunkIndex], modelVersion: this.modelVersion })
-    })
-    this.db.replaceKnowledgeRecordChunks(row.uid, inputs, vectors, taskId, operation)
-    return inputs.length
+      this.db.replaceKnowledgeRecordChunks(row.uid, inputs, vectors, taskId, operation)
+      this.clearVectorCaches()
+      return inputs.length
+    } finally {
+      task.dispose()
+    }
+  }
+
+  private vectorRowsForSearch(): KnowledgeVectorSearchRow[] {
+    const modelVersion = this.modelVersion
+    const now = Date.now()
+    if (
+      this.vectorRowsCache &&
+      this.vectorRowsCache.modelVersion === modelVersion &&
+      now - this.vectorRowsCache.createdAt <= 30_000
+    ) {
+      return this.vectorRowsCache.rows
+    }
+    // Existing databases may not have coarse blobs yet. Backfill a bounded
+    // batch on each cache refresh; the remaining rows still use the exact
+    // in-memory fallback and are progressively prepared for future sharding.
+    this.db.backfillKnowledgeVectorCoarseIndex(modelVersion, 512)
+    const rows = this.db.listKnowledgeVectorRows(modelVersion).map((row) => ({
+      ...row,
+      // Vectors written by the current embedding service are normalized, but
+      // older databases may contain unnormalized blobs.  Cache the norm once
+      // per refresh so each query only performs a dot product per candidate.
+      norm: this.vectorNorm(row.vector),
+      coarse: row.coarse ?? buildCoarseVector(row.vector)
+    }))
+    this.vectorRowsCache = { modelVersion, createdAt: now, rows }
+    return rows
   }
 
   async search(question: string, limit = 8): Promise<KnowledgeSearchHit[]> {
     const query = question.trim()
     if (!query) return []
+    const safeLimit = Math.min(20, Math.max(1, Math.trunc(Number.isFinite(limit) ? limit : 8)))
     await this.waitForIndexReady()
     await this.embeddings.prepare()
     if (!this.embeddings.available) return []
+    const cacheKey = `${this.modelVersion}:${safeLimit}:${query.replace(/\s+/g, ' ').toLocaleLowerCase()}`
+    const cached = this.searchResultCache.get(cacheKey)
+    if (cached && Date.now() - cached.createdAt <= SEARCH_RESULT_CACHE_TTL_MS) {
+      return cached.result
+    }
+    if (cached) this.searchResultCache.delete(cacheKey)
     const [queryVector] = await this.embeddings.embedMany([query])
     await this.waitForIndexReady()
-    const candidates = this.db.listKnowledgeVectorRows(this.modelVersion)
-    if (!queryVector || !candidates.length) return []
+    const allCandidates = this.vectorRowsForSearch()
+    if (!queryVector || !allCandidates.length) {
+      this.rememberSearchResult(cacheKey, [])
+      return []
+    }
+    const candidates = prefilterVectorCandidates(queryVector, allCandidates, safeLimit)
+    const queryNorm = this.vectorNorm(queryVector)
     const terms = new Set((query.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).filter((term) => term.length > 1))
-    const ranked = candidates.map(({ chunk, vector }) => {
-      const cosine = this.cosine(queryVector, vector)
+    const ranked = candidates.map(({ chunk, vector, norm }) => {
+      const cosine = this.cosine(queryVector, vector, norm, queryNorm)
       const haystack = chunk.content.toLocaleLowerCase()
       const lexical = [...terms].filter((term) => haystack.includes(term)).length / Math.max(terms.size, 1)
       const score = cosine * 0.75 + lexical * 0.25
@@ -815,7 +1077,8 @@ export class KnowledgeService {
     })
       .filter((item) => item.score >= 0.18)
       .sort((left, right) => right.score - left.score)
-      .slice(0, Math.min(20, Math.max(1, limit)))
+      .slice(0, safeLimit)
+    this.rememberSearchResult(cacheKey, ranked)
     return ranked
   }
 
@@ -842,18 +1105,22 @@ export class KnowledgeService {
     await this.embeddings.prepare()
     if (!this.embeddings.available) return []
     const [queryVector] = await this.embeddings.embedMany([query])
-    const candidates = this.db.listKnowledgeVectorRows(this.modelVersion)
-      .filter(({ chunk }) => chunk.sourceType === 'record' && Boolean(chunk.recordUid))
+    const allCandidates = this.vectorRowsForSearch()
+    const candidates = queryVector
+      ? prefilterVectorCandidates(queryVector, allCandidates
+        .filter(({ chunk }) => chunk.sourceType === 'record' && Boolean(chunk.recordUid)), limit)
+      : []
     if (!queryVector || !candidates.length) return []
+    const queryNorm = this.vectorNorm(queryVector)
 
     const terms = new Set(
       (query.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [])
         .filter((term) => term.length > 1)
     )
     const bestByRecord = new Map<string, KnowledgeRecordMatch>()
-    for (const { chunk, vector } of candidates) {
+    for (const { chunk, vector, norm } of candidates) {
       const recordUid = chunk.recordUid as string
-      const cosine = Math.max(0, this.cosine(queryVector, vector))
+      const cosine = Math.max(0, this.cosine(queryVector, vector, norm, queryNorm))
       const haystack = chunk.content.toLocaleLowerCase()
       const lexical = [...terms].filter((term) => haystack.includes(term)).length / Math.max(terms.size, 1)
       // Full-requirement semantics drive recall; literal overlap is only a small supporting signal.
@@ -888,16 +1155,22 @@ export class KnowledgeService {
     if (!this.embeddings.available) throw new Error(this.embeddings.unavailableReason)
     const [queryVector] = await this.embeddings.embedMany([query])
     if (!queryVector) throw new Error(this.embeddings.unavailableReason || '本地 embedding 未返回查询向量')
-    const candidates = this.db.listKnowledgeVectorRows(this.modelVersion)
-      .filter(({ chunk }) => chunk.sourceType === 'record' && Boolean(chunk.recordUid))
+    const allCandidates = this.vectorRowsForSearch()
+      .filter(({ chunk }) =>
+        chunk.sourceType === 'record' &&
+        Boolean(chunk.recordUid) &&
+        (!allowedRecordUids || allowedRecordUids.has(chunk.recordUid as string))
+      )
+    const candidates = prefilterVectorCandidates(queryVector, allCandidates, limit)
     if (!candidates.length) {
       throw new Error(`数据中心记录向量索引不可用或尚未使用模型 ${this.modelVersion} 建立`)
     }
+    const queryNorm = this.vectorNorm(queryVector)
     const bestByRecord = new Map<string, KnowledgeRecordMatch>()
-    for (const { chunk, vector } of candidates) {
+    for (const { chunk, vector, norm } of candidates) {
       const recordUid = chunk.recordUid as string
       if (allowedRecordUids && !allowedRecordUids.has(recordUid)) continue
-      const score = Math.max(0, Math.min(1, this.cosine(queryVector, vector))) * 100
+      const score = Math.max(0, Math.min(1, this.cosine(queryVector, vector, norm, queryNorm))) * 100
       const existing = bestByRecord.get(recordUid)
       if (existing && existing.score >= score) continue
       bestByRecord.set(recordUid, {
@@ -932,13 +1205,15 @@ export class KnowledgeService {
     taskId: string,
     current: number,
     total: number,
-    onProgress?: (progress: KnowledgeIndexProgress) => void
+    onProgress?: (progress: KnowledgeIndexProgress) => void,
+    task?: BackgroundTaskHandle
   ): Promise<KnowledgeDocument> {
     this.db.updateKnowledgeDocument(document.id, {
       status: 'processing',
       errorMessage: '',
       processedAt: ''
     })
+    this.clearVectorCaches()
     this.db.clearKnowledgeDocumentChunks(document.id)
     try {
       this.emitAndNotify(onProgress, {
@@ -967,6 +1242,7 @@ export class KnowledgeService {
       const vectors: KnowledgeVectorInput[] = []
       const inputs: KnowledgeChunkInput[] = []
       for (let index = 0; index < chunks.length; index += 32) {
+        await task?.checkpoint()
         const batch = chunks.slice(index, index + 32)
         const embeddings = await this.embeddings.embedMany(batch.map((chunk) => chunk.text))
         if (embeddings.length !== batch.length) throw new Error(this.embeddings.unavailableReason)
@@ -1023,9 +1299,10 @@ export class KnowledgeService {
       return result
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
+      const interrupted = error instanceof TaskCancelledError
       const updated = this.db.updateKnowledgeDocument(document.id, {
-        status: 'failed',
-        errorMessage: message,
+        status: interrupted ? 'queued' : 'failed',
+        errorMessage: interrupted ? '知识库任务已取消，文档保留在恢复队列' : message,
         processedAt: ''
       })
       this.emitAndNotify(onProgress, {
@@ -1033,12 +1310,16 @@ export class KnowledgeService {
         phase: 'error',
         documentId: document.id,
         fileName: document.fileName,
-        message: `${document.fileName}: ${message}`,
+        message: `${document.fileName}: ${interrupted ? '任务已取消，可在下次启动时自动恢复' : message}`,
         current,
         total,
         status: 'failed'
       })
-      return updated ?? { ...document, status: 'failed', errorMessage: message }
+      return updated ?? {
+        ...document,
+        status: interrupted ? 'queued' : 'failed',
+        errorMessage: interrupted ? '知识库任务已取消，文档保留在恢复队列' : message
+      }
     }
   }
 
@@ -1055,96 +1336,126 @@ export class KnowledgeService {
       })
       return
     }
+    this.clearVectorCaches()
     const taskId = randomUUID()
-    const rows = this.db.listKnowledgeRecordIndexRows()
-    const known = new Set(rows.map((row) => row.uid))
-    for (const uid of this.db.listKnowledgeIndexedRecordUids()) {
-      if (!known.has(uid)) this.db.deleteKnowledgeRecordIndex(uid)
-    }
-    if (!rows.length) return
-    for (let index = 0; index < rows.length; index += 1) {
-      const row = rows[index]
-      if (
-        this.db.getKnowledgeRecordIndexHash(row.uid) === row.contentHash &&
-        this.db.getKnowledgeRecordIndexModelVersion(row.uid) === this.modelVersion
-      ) {
-        this.db.markRecordMaintenanceVectorReady(
-          row.uid,
-          this.modelVersion,
-          this.db.getKnowledgeRecordIndexChunkCount(row.uid, this.modelVersion)
-        )
-        continue
+    const task = this.taskRunner.begin(taskId)
+    try {
+      const rows = this.db.listKnowledgeRecordIndexRows()
+      const known = new Set(rows.map((row) => row.uid))
+      for (const uid of this.db.listKnowledgeIndexedRecordUids()) {
+        await task.checkpoint()
+        if (!known.has(uid)) this.db.deleteKnowledgeRecordIndex(uid)
       }
-      const pages: ParsedPage[] = [{
-        // row.content is already restricted to business evidence. Keep
-        // identity and audit metadata out of embedding input.
-        text: row.content,
-        location: '采集记录'
-      }]
-      const chunks = chunkKnowledgePages(pages)
-      const embeddings = await this.embeddings.embedMany(chunks.map((chunk) => chunk.text))
-      if (embeddings.length !== chunks.length) throw new Error(this.embeddings.unavailableReason)
-      const inputs: KnowledgeChunkInput[] = []
-      const vectors: KnowledgeVectorInput[] = []
-      chunks.forEach((chunk, chunkIndex) => {
-        const chunkId = randomUUID()
-        inputs.push({
-          id: chunkId,
-          recordUid: row.uid,
-          sourceType: 'record',
-          sourceName: row.name,
-          sourceHash: row.contentHash,
-          content: chunk.text,
-          chunkIndex,
-          location: chunk.location,
-          charStart: chunk.charStart,
-          charEnd: chunk.charEnd
+      if (!rows.length) return
+      for (let index = 0; index < rows.length; index += 1) {
+        await task.checkpoint()
+        const row = rows[index]
+        if (
+          this.db.getKnowledgeRecordIndexHash(row.uid) === row.contentHash &&
+          this.db.getKnowledgeRecordIndexModelVersion(row.uid) === this.modelVersion
+        ) {
+          this.db.markRecordMaintenanceVectorReady(
+            row.uid,
+            this.modelVersion,
+            this.db.getKnowledgeRecordIndexChunkCount(row.uid, this.modelVersion)
+          )
+          continue
+        }
+        const pages: ParsedPage[] = [{
+          // row.content is already restricted to business evidence. Keep
+          // identity and audit metadata out of embedding input.
+          text: row.content,
+          location: '采集记录'
+        }]
+        const chunks = chunkKnowledgePages(pages)
+        const embeddings = await this.embeddings.embedMany(chunks.map((chunk) => chunk.text))
+        if (embeddings.length !== chunks.length) throw new Error(this.embeddings.unavailableReason)
+        const inputs: KnowledgeChunkInput[] = []
+        const vectors: KnowledgeVectorInput[] = []
+        chunks.forEach((chunk, chunkIndex) => {
+          const chunkId = randomUUID()
+          inputs.push({
+            id: chunkId,
+            recordUid: row.uid,
+            sourceType: 'record',
+            sourceName: row.name,
+            sourceHash: row.contentHash,
+            content: chunk.text,
+            chunkIndex,
+            location: chunk.location,
+            charStart: chunk.charStart,
+            charEnd: chunk.charEnd
+          })
+          vectors.push({ chunkId, vector: embeddings[chunkIndex], modelVersion: this.modelVersion })
         })
-        vectors.push({ chunkId, vector: embeddings[chunkIndex], modelVersion: this.modelVersion })
-      })
-      this.db.replaceKnowledgeRecordChunks(row.uid, inputs, vectors)
+        this.db.replaceKnowledgeRecordChunks(row.uid, inputs, vectors)
+        this.clearVectorCaches()
+        this.emit({
+          taskId,
+          phase: 'records',
+          message: `采集记录向量索引 ${index + 1}/${rows.length}`,
+          current: index + 1,
+          total: rows.length,
+          status: 'running'
+        })
+      }
       this.emit({
         taskId,
-        phase: 'records',
-        message: `采集记录向量索引 ${index + 1}/${rows.length}`,
-        current: index + 1,
+        phase: 'done',
+        message: '采集记录向量索引已同步',
+        current: rows.length,
         total: rows.length,
-        status: 'running'
+        status: 'success'
       })
+    } finally {
+      task.dispose()
     }
-    this.emit({
-      taskId,
-      phase: 'done',
-      message: '采集记录向量索引已同步',
-      current: rows.length,
-      total: rows.length,
-      status: 'success'
-    })
   }
 
-  private cosine(left: Float32Array, right: Float32Array): number {
+  private vectorNorm(vector: Float32Array): number {
+    let norm = 0
+    for (const value of vector) norm += value * value
+    return norm > 0 ? Math.sqrt(norm) : 0
+  }
+
+  private cosine(
+    left: Float32Array,
+    right: Float32Array,
+    rightNorm = this.vectorNorm(right),
+    leftNorm = this.vectorNorm(left)
+  ): number {
     const length = Math.min(left.length, right.length)
     let dot = 0
-    let leftNorm = 0
-    let rightNorm = 0
     for (let index = 0; index < length; index += 1) {
       dot += left[index] * right[index]
-      leftNorm += left[index] * left[index]
-      rightNorm += right[index] * right[index]
     }
-    return leftNorm && rightNorm ? dot / Math.sqrt(leftNorm * rightNorm) : 0
+    return leftNorm && rightNorm ? dot / (leftNorm * rightNorm) : 0
   }
 
-  private emit(progress: KnowledgeIndexProgress): void {
-    this.db.saveKnowledgeIndexProgress(progress)
-    this.progress?.(progress)
+  private emit(progress: KnowledgeIndexProgress): KnowledgeIndexProgress {
+    const now = Date.now()
+    const startedAt = this.taskStartedAt.get(progress.taskId) ?? now
+    this.taskStartedAt.set(progress.taskId, startedAt)
+    const elapsedMs = Math.max(0, now - startedAt)
+    const completed = Math.max(0, Math.trunc(progress.current))
+    const enriched: KnowledgeIndexProgress = {
+      ...progress,
+      elapsedMs,
+      ...(completed > 0 && elapsedMs > 0
+        ? { throughputPerSecond: Number((completed / (elapsedMs / 1000)).toFixed(2)) }
+        : {})
+    }
+    this.db.saveKnowledgeIndexProgress(enriched)
+    this.progress?.(enriched)
+    if (progress.status !== 'running') this.taskStartedAt.delete(progress.taskId)
+    return enriched
   }
 
   private emitAndNotify(
     onProgress: ((progress: KnowledgeIndexProgress) => void) | undefined,
     progress: KnowledgeIndexProgress
   ): void {
-    this.emit(progress)
-    onProgress?.(progress)
+    const enriched = this.emit(progress)
+    onProgress?.(enriched)
   }
 }

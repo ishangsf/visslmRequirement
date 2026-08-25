@@ -11,9 +11,12 @@ VISSLM Agent 是一个面向 Windows 的数据智能工作台，用于采集 VIS
 - 配置 VISSLM 地址、用户名和 API Token，支持连接测试。
 - 递归同步项目、集合、任务等节点，并保存原始 JSON 与规范化文本。
 - 同步前按数据类型配置字段过滤条件、返回字段和采集范围，支持预览实际请求与匹配结果。
+- 每次同步都会按 `_valm_ItemID` 刷新已有本地记录的最新属性值；本地 UID 和项目关联保持不变，新增字段需加入对应类型的 `ReturnProperty`。
 - 查看项目、节点类型、记录详情、附件图片、数据统计和采集请求日志。
-- 记录支持全文检索、项目/类型筛选、批量删除，以及 JSON/JSONL 导入和 JSONL 导出。
-- 附件图片下载后转为 Base64，并按 SHA-256 去重后单独保存。
+- 记录支持全文检索、项目/类型筛选、批量删除，以及 `.visslmpack` 二进制资源包导出；仍兼容旧 JSON/JSONL 导入。
+- 旧 JSON/JSONL 导入按 256 条批次流式解析和提交，避免把大文件与完整记录数组同时驻留内存；导入过程中可继续使用应用内的记录索引能力。
+- 正文图片下载后按 SHA-256 内容寻址保存到二进制资源目录；富文本只保存资源令牌，避免 Base64 放大数据文件。
+- 下载失败、签名/MIME 校验失败的正文图片会标记为 `unresolved`；这类记录不会被资源包完整导出，也不会调用平台创建接口。
 
 ### 本地知识库
 
@@ -30,7 +33,7 @@ VISSLM Agent 是一个面向 Windows 的数据智能工作台，用于采集 VIS
 - 通用数据助手通过工具调用检索本地记录、字段、统计结果和知识库内容，不直接执行任意 SQL 或代码。
 - 回答可以附带来源引用、查询数据表和记录详情；无证据时会明确说明未检索到结果。
 - `@需求分析专家` 支持一个或多个需求编号定位数据中心记录；编号先做精确查找，不把自然语言相似度当作编号定位依据。
-- 需求分析会先清洗原始需求文本并构建语义卡片，再执行 Dense、本地 FTS5/BM25 和结构化字段的 RRF 混合召回（保留前 50 条），由本地 Cross-Encoder 重排后交给 AI 做业务关系初审和独立复核（前 20 条）。
+- 需求分析会先清洗原始需求文本并构建语义卡片，再执行 Dense、本地 FTS5/BM25 和结构化字段的 RRF 混合召回（大索引先做粗向量候选预筛，最终保留前 50 条），由本地 Cross-Encoder 重排后交给 AI 做业务关系初审和独立复核（前 20 条）。
 - 复核只允许 `duplicate`、`highly_similar`、`partial_overlap`、`same_pattern`、`topic_only`、`unrelated` 六类关系；结果按“正式匹配”和“参考关联需求”分组，并校验原始证据。必要阶段失败时不回退到向量分，也不输出未经验证的候选结论。
 - 通过 `@数据可视化专家` 或“可视化大屏”入口生成结构化 Dashboard。
 - 支持字段画像、数据范围、指标聚合、趋势分析、全局筛选器、组件数据口径和受限自定义公式。
@@ -41,6 +44,7 @@ VISSLM Agent 是一个面向 Windows 的数据智能工作台，用于采集 VIS
 - 在“数据推送”中选择本地记录，预览将要发送的请求和消息体。
 - 支持目标节点类型、项目 UID、父节点、插入位置和源字段到目标字段的映射。
 - 预览不会发送请求；真实推送使用 VISSLM `POST /alm/rest/items` 接口，并保留请求日志和逐条成功/失败状态。
+- 正文图片会先通过 `FileCenterImg/UploadRichImg` 上传或复用缓存地址，全部成功后才创建记录；图片失败时不会调用 `/rest/items`。
 - `_valm_Uid`、`_valm_NodeType` 和 `_valm_ItemID` 会从推送消息体中强制移除，避免把本地标识误当作新记录标识。
 
 ## 快速开始
@@ -163,12 +167,14 @@ npm run prepare:model
 ```text
 <userData>\
 ├─ visslm-agent.db       # SQLite 数据库，包含 WAL、FTS5、配置和索引数据
-└─ assets\base64\        # 按 SHA-256 保存的附件 Base64 文件
+└─ assets\
+   ├─ blobs\<sha 前 2 位>\<sha256>  # 按 SHA-256 保存的二进制图片资源
+   └─ base64\                  # 旧版本迁移兼容目录（迁移成功后清理无引用文件）
 ```
 
 SQLite 保存平台记录、原始 JSON、规范化文本、知识库文档与分块、向量、Dashboard 版本、同步/推送日志和审计记录。Token、API Key 的密文也保存在数据库中，但只能通过当前操作系统用户的安全存储解密。
 
-备份或迁移数据前请先退出应用，再一起保存数据库文件和 `assets\base64` 目录。知识库源文件仍保留原始文件路径；如果需要重新解析或重建索引，应确保源文件路径仍然有效。
+备份或迁移数据前请先退出应用，再一起保存数据库文件和 `assets` 目录。跨设备传输优先使用“导出资源包”，它会把记录元数据、令牌化富文本和去重后的二进制图片打包到一个 `.visslmpack` 文件中。知识库源文件仍保留原始文件路径；如果需要重新解析或重建索引，应确保源文件路径仍然有效。
 
 ## 验证与回归
 
@@ -177,6 +183,7 @@ SQLite 保存平台记录、原始 JSON、规范化文本、知识库文档与�
 ```powershell
 npm run typecheck
 npm run build
+npm run smoke:visslm-pack
 ```
 
 ### 端到端 smoke
@@ -210,9 +217,23 @@ npm run smoke:agent-requirement-analysis
 自动化回归和性能基准命令：
 
 ```powershell
+npm run smoke:performance-regressions
+npm run smoke:data-import-stream
+npm run smoke:request-retry
+npm run smoke:itemid-dedup
+npm run smoke:vector-prefilter
+npm run smoke:dashboard-performance
 npm run benchmark:requirement-matching -- --records 5000 --report-only
 npm run compare:requirement-rerankers -- --manifest test-data/requirement-matching/reranker-model-manifest.json --report-only
 ```
+
+知识库上传、重建和记录索引均有可取消的后台任务边界，最多同时保留 2 个重任务；应用重启会把遗留索引任务标为可重试，并自动恢复排队文档。进度事件会显示耗时和单位吞吐，指标也会保存到任务快照，便于重启后诊断大文件处理速度。新向量会持久化低维粗向量和分片提示，旧数据按批渐进回填；完全相同的问题在 15 秒内复用有界搜索结果，大于 4096 条候选的向量检索先用固定容量小顶堆做粗向量预筛，再进行精确重排。当前任务边界是主进程内的 cooperative checkpoint，单次原生 embedding/OCR/模型调用不会被强制中断；需要更强隔离时再迁移到 worker/子进程。
+
+旧 JSON/JSONL 导入会返回 `importRunId`，并在本地 `data_import_runs` 中记录批次数、源行数、解析错误数、重复审查批次和中断状态；数据中心的“导入运行记录”抽屉可在重启后查看这些检查点，并从原文件继续未提交前缀之后的批次。启动时会把遗留运行标记为失败并保留已提交批次的诊断线索。该记录不改变批次提交边界，若业务要求全有或全无仍需另行确认。
+
+Renderer 和离线大屏使用按需注册的 ECharts 组件，PNG 导出库也只在点击导出时加载，避免把不常用依赖打入首屏；最近一次构建中 ECharts vendor chunk 约 1.62 MB，离线 viewer 约 1.49 MB。
+
+VISSLM 查询、附件下载和采集预览等幂等 GET 请求对瞬时网络错误及 408/425/429/5xx 使用最多 3 次退避重试；创建记录和图片上传不会盲目重放，待平台明确幂等键后再启用可审计的 POST 重试。
 
 `test-data/requirement-matching` 仅保留固定行为回归和模型资源清单。项目不再建设人工金标、双人标注/裁决、Excel 标注样本包或依赖人工标签的质量门禁。匹配百分比继续称为“综合匹配度”，表示经过确定性评分、硬规则校验和可选 AI 解释后的业务判断分，不解释为统计概率。
 

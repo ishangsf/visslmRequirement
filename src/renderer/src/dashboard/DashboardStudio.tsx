@@ -44,7 +44,6 @@ import {
   Tooltip,
   Typography
 } from 'antd'
-import { toPng } from 'html-to-image'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type {
   CSSProperties,
@@ -1157,6 +1156,9 @@ export function DashboardStudio({
         setCaptureMode(true)
         await nextFrame()
         if (!canvasRef.current) throw new Error('大屏画布尚未就绪')
+        // PNG export is an infrequent action; keep html-to-image out of the
+        // initial dashboard editor chunk and load it only when requested.
+        const { toPng } = await import('html-to-image')
         const dataUrl = await toPng(canvasRef.current, {
           width: 1920,
           height: 1080,

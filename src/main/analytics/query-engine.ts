@@ -93,6 +93,39 @@ const safeRevision = (db: AnalyticsDatabase): number => {
   return Number.isSafeInteger(revision) && revision >= 0 ? revision : 0
 }
 
+type RecordSnapshot = {
+  revision: number
+  createdAt: number
+  records: AnalyticsRecord[]
+}
+
+// A single dashboard interaction can ask for field profiles and several
+// component queries in quick succession. Reusing the short-lived snapshot
+// avoids parsing the same raw_json payload once per IPC request while keeping
+// the cache bounded and revision-aware.
+const recordSnapshotCache = new WeakMap<AnalyticsDatabase, Map<string, RecordSnapshot>>()
+const recordSnapshotTtlMs = 1_500
+const recordSnapshotLimit = 8
+
+const scanRecords = (db: AnalyticsDatabase, scope: DataScope): AnalyticsRecord[] => {
+  const revision = safeRevision(db)
+  const key = `${revision}:${scopeCacheKey(scope)}`
+  const now = Date.now()
+  const cache = recordSnapshotCache.get(db) ?? new Map<string, RecordSnapshot>()
+  recordSnapshotCache.set(db, cache)
+  const cached = cache.get(key)
+  if (cached && now - cached.createdAt <= recordSnapshotTtlMs) return cached.records
+
+  const records = db.scanAnalyticsRecords(scope)
+  cache.set(key, { revision, createdAt: now, records })
+  if (cache.size > recordSnapshotLimit) {
+    const oldest = [...cache.entries()]
+      .sort((left, right) => left[1].createdAt - right[1].createdAt)[0]?.[0]
+    if (oldest) cache.delete(oldest)
+  }
+  return records
+}
+
 const readPath = (record: AnalyticsRecord, path: string): unknown[] => {
   const metadata = metadataFields[path]
   if (metadata) return [record[metadata]]
@@ -569,7 +602,7 @@ export class QueryEngine {
     const cached = this.db.getFieldProfiles?.(cacheKey, dataRevision)
     if (cached) return applyFieldLabels(cached)
 
-    const records = this.db.scanAnalyticsRecords(scope)
+    const records = scanRecords(this.db, scope)
     const fields = new Map<string, {
       values: Array<string | number | boolean>
       nonNullRecords: number
@@ -707,7 +740,7 @@ export class QueryEngine {
     const profiles = this.profile(spec.scope)
     const errors = this.validate(spec, profiles)
     if (errors.length) throw new Error(`QuerySpec 校验失败: ${errors.join('；')}`)
-    const records = this.db.scanAnalyticsRecords(spec.scope)
+    const records = scanRecords(this.db, spec.scope)
     const filters = [...(spec.scope.baseFilters ?? []), ...(spec.filters ?? [])]
     const filtered = records.filter((record) => filters.every((filter) => matchesFilter(record, filter)))
     const dimensions = spec.dimensions ?? []

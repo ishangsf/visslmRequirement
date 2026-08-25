@@ -40,12 +40,13 @@
 
 | 编号 | 问题描述 | 影响范围 | 严重程度 | 代码位置 | 建议方案 | 需业务确认 |
 | --- | --- | --- | --- | --- | --- | --- |
-| PERF-001 | SQLite、网络、embedding、OCR、模型和项目长任务都在主进程；同步 DatabaseSync 和大文件处理可能阻塞窗口 | 大数据同步、知识库、协议解析和 UI 响应 | 高 | `src/main/index.ts` 服务装配；`src/main/database.ts`；`src/main/knowledge.ts` | 将重任务移入 worker/子进程，提供取消、队列和资源上限 | 是，需要确认数据规模和响应目标 |
-| PERF-002 | 向量检索在应用侧遍历候选并计算相似度，SQLite 是单文件；数据增长后耗时和内存线性上升 | 知识搜索、项目匹配、AI 问答 | 中 | `src/main/knowledge.ts:730-775`、`src/main/project-management.ts:990-1085` | 增加候选预过滤、向量索引/分片或专用检索引擎，并定义规模基准 | 是 |
-| PERF-003 | PDF 预览通过 IPC 返回 `contentBase64`，虽然 handler 有 50 MB 限制，仍会产生大内存复制 | 知识库预览、项目协议预览 | 中 | `src/main/index.ts:627-642`、`src/shared/types.ts` | 使用临时文件/流式协议或分页预览，避免把大文件完整放入 IPC | 否 |
-| PERF-004 | 附件以 Base64 文件和数据库元数据保存，推送/导出可能重复构造大 payload | 同步、资产中心、推送和备份 | 中 | `src/main/visslm.ts:460-505`、`src/main/database.ts` | 明确单附件/总附件上限，采用流式或内容引用，压测导出 | 是 |
-| REL-001 | 长任务仅部分依赖状态字段和内存中的 running 集合；应用退出不会继续执行，也没有全局任务队列 | 同步、协议分析、匹配和索引 | 中 | `src/main/visslm.ts`、`src/main/project-management.ts`、`src/main/index.ts:892-902` | 持久化任务状态、启动恢复、取消和重试策略，避免重复执行 | 是 |
-| REL-002 | 外部请求的重试、限流、幂等和断点续传没有形成统一策略；推送按记录逐条执行 | 同步/推送失败恢复和重复写入 | 中 | `src/main/visslm.ts:148-217,517-670` | 引入请求策略、幂等键、退避和可恢复批次；明确平台端幂等契约 | 是 |
+| PERF-001 | SQLite、网络、embedding、OCR、模型和项目长任务仍在主进程；已通过首屏后初始化、批量写入、知识库重任务并发上限 2、`BackgroundTaskRunner` cooperative checkpoint、启动恢复队列降低峰值并支持主动停止，但无法消除主进程结构性影响，也不能中断已进入原生调用的单次操作 | 大数据同步、知识库、协议解析和 UI 响应 | 高 | `src/main/index.ts` 服务装配；`src/main/database.ts`；`src/main/knowledge.ts`；`src/main/background-task-runner.ts` | 后续按数据规模把模型/OCR/embedding 移入 worker/子进程，并持久化更细粒度恢复点 | 是，需要确认数据规模和响应目标 |
+| PERF-002 | 向量检索已增加 30 秒候选缓存、向量范数缓存、15 秒/64 项有界重复问题结果缓存和 8 倍低维粗向量预筛（超过 4096 条候选最多精排 2048 条）；粗筛使用固定容量小顶堆避免为全部候选完整排序；新向量持久化粗向量/分片提示，旧数据按 512 条批量回填，但新问题仍需从 SQLite 枚举候选，且大索引属于近似召回 | 知识搜索、项目匹配、AI 问答 | 中 | `src/main/database.ts`、`src/main/knowledge.ts`、`src/main/project-management.ts` | 引入 ANN/真正分片索引并定义召回率与 P95 基准；必要时把候选元数据迁移到专用索引 | 是 |
+| PERF-003 | 已改为主进程短期 token + `visslm-preview://` 流协议，避免 PDF/DOCX 内容通过 IPC 返回 Base64；仍保留 50 MB 限制和 TTL 清理 | 知识库预览、项目协议预览 | 低（已缓解） | `src/main/index.ts`、`src/shared/types.ts`、`ProjectManagementPage.tsx` | 后续可增加分页渲染和预览取消；保持 token 不可猜测且不暴露任意路径 | 否 |
+| PERF-005 | 旧 `.json/.jsonl` 导入已改为 JSONL/JSON 数组流式解析与 256 条批量提交，并返回 `importRunId`、批次数、源行数、解析错误数和耗时；`data_import_runs` 会在启动时归档遗留运行，原文件仍在时可从最后一个已提交检查点继续，但批次之间不是单一全局事务，导入中断仍可能留下已提交的前置批次 | 大文件导入、重复审查和索引重建 | 中 | `src/main/index.ts`、`src/main/data-import-stream.ts`、`src/main/database.ts` | 若业务要求全有或全无，增加批次回滚/清理策略；当前通过运行记录和前缀跳过避免重复提交 | 是 |
+| PERF-004 | 图片附件已改为内容寻址的二进制 blob，资源包导入/导出不再复制 Base64；推送请求仍需在平台协议处构造单条图片 payload | 同步、资产中心、推送和备份 | 低（已缓解） | `src/main/visslm.ts`、`src/main/database.ts`、`src/main/transfer-pack.ts` | 继续压测大附件总量，并为平台端上传增加统一重试/断点策略 | 是 |
+| REL-001 | 长任务仍主要依赖进程内 running 集合；知识库索引进度已持久化，重启会把遗留任务安全标为可重试并把处理中断文档放回恢复队列，记录维护/协议分析也会清理遗留 processing；同步、采集请求和推送日志在下次打开数据库时会被明确标记为 failed，但不会自动续跑 | 同步、协议分析、匹配和索引 | 中 | `src/main/database.ts`、`src/main/knowledge.ts`、`src/main/visslm.ts`、`src/main/project-management.ts` | 若业务需要跨退出继续同步/推送，再引入统一持久化任务队列、幂等键和断点策略 | 是 |
+| REL-002 | 平台 GET 查询、附件下载和范围预览已对超时、网络失败及 408/425/429/5xx 使用最多 3 次的指数退避重试；创建记录和富文本图片上传仍不自动重试，避免平台未提供幂等键时重复写入 | 同步/推送失败恢复和重复写入 | 中 | `src/main/visslm.ts:40-80,729-810,1265-1280` | 与平台确认幂等键/批量 API 后，再为 POST 增加可审计的幂等重试和断点批次 | 是 |
 
 ## 5. 重复代码、过度耦合和可维护性
 

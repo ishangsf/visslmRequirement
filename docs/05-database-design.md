@@ -16,7 +16,7 @@
 | 连接模式 | 单个主进程实例持有一个连接；renderer 不直接访问 SQLite |
 | 事务/并发 | `PRAGMA journal_mode=WAL`、`foreign_keys=ON`、`busy_timeout=5000`；部分批量写入显式使用 `BEGIN IMMEDIATE` |
 | 全文检索 | `records_fts` FTS5 content table，优先 `trigram` tokenizer，失败时回退默认 tokenizer |
-| 文件资产 | 附件 Base64 在 `<userData>\assets\base64`；知识库文件在 `<userData>\assets\base64\documents` |
+| 文件资产 | 图片二进制资源在 `<userData>\assets\blobs\<sha 前 2 位>\<sha256>`；旧 Base64 目录仅用于迁移兼容；知识库文件仍在 `<userData>\assets\documents` |
 | 迁移 | 每次启动执行 `CREATE TABLE/INDEX IF NOT EXISTS`，随后逐条尝试 `ALTER TABLE`；没有独立 schema version 表 |
 | 时间格式 | 业务写入统一使用 `new Date().toISOString()`，字段类型为 SQLite `TEXT` |
 | JSON 字段 | 多个复杂对象、数组和原始平台响应以 JSON 字符串保存，读取时由 `database.ts` 映射和解析 |
@@ -30,7 +30,11 @@
 | DB-03 | `projects` | 表 | VISSLM 外部项目缓存 | `upsertProject/listProjects`；同步和导入 |
 | DB-04 | `records` | 表 | VISSLM 节点/业务记录、原始 JSON、规范化全文和推送状态 | `upsertRecord/listRecords/getRecord`；采集、导入、删除、推送 |
 | DB-05 | `images` | 表 | 记录附件或正文图片的 hash、元数据和文件路径 | `saveImage/getRecord/exportRows/deleteData` |
+| DB-31 | `asset_blobs` | 表 | 全局内容寻址的图片二进制、MIME、字节数和路径 | `saveAssetBlob/getAssetBlob/readAssetBytes` |
+| DB-32 | `record_image_refs` | 表 | 富文本字段中的图片令牌、出现顺序、来源和资源 hash | `saveRecordImageReference/listRecordImageReferences` |
+| DB-33 | `push_asset_uploads` | 表 | 目标地址/项目/SHA-256 到远程上传路径的复用缓存 | `getPushAssetUpload/savePushAssetUpload` |
 | DB-06 | `sync_runs` | 表 | 同步运行摘要 | `beginSync/finishSync/listSyncRuns` |
+| DB-34 | `data_import_runs` | 表 | JSON/JSONL 流式导入的批次、解析错误、耗时、源文件指纹和中断状态 | `start/update/finish/resume/reconcileDataImportRun` |
 | DB-07 | `push_logs` | 表 | 每条推送请求、脱敏参数、body、响应和结果 | `beginPushLog/finishPushLog/listPushLogs` |
 | DB-08 | `collection_request_logs` | 表 | 采集阶段每个 GET 请求的脱敏追踪信息 | `beginCollectionRequestLog/finishCollectionRequestLog/listCollectionRequestLogs` |
 | DB-09 | `dashboards` | 表 | Dashboard 当前版本和摘要 | `listDashboards/getDashboard/saveDashboard` |
@@ -122,10 +126,13 @@
 | `record_uid` | `TEXT NOT NULL` + FK `records(uid) ON DELETE CASCADE` | 所属记录 |
 | `name` | `TEXT NOT NULL DEFAULT ''` | 图片名称或来源字段名称 |
 | `mime_type` | `TEXT NOT NULL DEFAULT 'application/octet-stream'` | MIME 类型 |
-| `source_url` | `TEXT NOT NULL DEFAULT ''` | 原始 URL；内嵌图片会写 `inline:data-uri` |
+| `source_url` | `TEXT NOT NULL DEFAULT ''` | 原始 URL；内嵌图片写为不含 Base64 的 `inline:data-uri:<sha256>` 标记 |
 | `sha256` | `TEXT NOT NULL` | 图片内容 hash |
-| `base64_path` | `TEXT NOT NULL` | 本地 Base64 文件路径 |
+| `base64_path` | `TEXT NOT NULL` | 旧版本 Base64 文件路径，仅用于启动迁移，迁移后为空 |
+| `binary_path` | `TEXT NOT NULL DEFAULT ''` | 当前内容寻址二进制路径；真实文件位于 `asset_blobs.binary_path` |
 | `byte_size` | `INTEGER NOT NULL DEFAULT 0` | 原始字节数 |
+| `state` | `TEXT NOT NULL DEFAULT 'ready'` | `ready`、`unresolved` 或迁移后缺失资源的状态 |
+| `error_message` | `TEXT NOT NULL DEFAULT ''` | 图片下载、校验或 MIME 失败原因 |
 | `created_at` | `TEXT NOT NULL` | 保存时间 |
 
 唯一约束：`UNIQUE(record_uid, sha256)`。同一记录不会重复保存同一 hash 的图片；跨记录可以复用相同内容但会有不同记录关联行。
@@ -141,6 +148,25 @@
 | `record_count` | `INTEGER NOT NULL DEFAULT 0` | 本次成功写入/保留的记录数 |
 | `image_count` | `INTEGER NOT NULL DEFAULT 0` | 本次保存图片数 |
 | `error_message` | `TEXT NOT NULL DEFAULT ''` | 失败原因 |
+
+应用启动打开数据库时会把遗留的 `running` 同步、采集请求和 `sending` 推送日志统一标记为 `failed` 并写入中断原因；这只修复可观测状态，不会自动重放外部 POST。
+
+#### `data_import_runs`
+
+| 字段 | 类型/约束 | 业务含义 |
+| --- | --- | --- |
+| `id` | `TEXT PRIMARY KEY` | 本次 JSON/JSONL 流式导入诊断 ID，返回在 `DataImportResult.importRunId` |
+| `path` / `format` | `TEXT NOT NULL` | 导入文件路径和 `json`/`jsonl` 格式 |
+| `file_size` / `file_mtime_ms` | `INTEGER NOT NULL DEFAULT 0` | 启动时记录的文件大小和修改时间，用于继续导入前验证源文件未被替换 |
+| `status` | `TEXT NOT NULL` | `running`、`success`、`failed` |
+| `batch_count` / `source_row_count` | `INTEGER NOT NULL DEFAULT 0` | 已提交批次数和解析到的源行数 |
+| `imported_record_count` / `skipped_count` | `INTEGER NOT NULL DEFAULT 0` | 已写入记录数和跳过数 |
+| `parse_error_count` | `INTEGER NOT NULL DEFAULT 0` | 流式解析错误数 |
+| `review_batch_id` | `TEXT NOT NULL DEFAULT ''` | 跨批次复用的数据重复审查批次 |
+| `error_message` | `TEXT NOT NULL DEFAULT ''` | 中断或失败原因 |
+| `started_at` / `updated_at` / `finished_at` | `TEXT NOT NULL` | 运行时间；运行中结束时间为空 |
+
+应用启动时会将遗留 `running` 运行标记为 `failed`，保留已提交批次和诊断指标；确认文件大小/修改时间未变化后，失败运行可以从 `source_row_count`/`parse_error_count` 检查点继续；终态运行记录按 30 天清理。该表不改变批次事务边界，因此仍不承诺全有或全无。
 
 #### `push_logs`
 
@@ -305,6 +331,9 @@
 | `vector_blob` | `BLOB NOT NULL` | `Float32Array` 二进制 |
 | `dimension` | `INTEGER NOT NULL` | 向量维度 |
 | `model_version` | `TEXT NOT NULL` | 向量模型版本 |
+| `coarse_vector_blob` | `BLOB` | 8 步长抽样并归一化的低维粗向量；旧数据按 512 条/批渐进回填 |
+| `coarse_dimension` | `INTEGER NOT NULL DEFAULT 0` | 粗向量维度 |
+| `coarse_bucket` | `INTEGER NOT NULL DEFAULT -1` | 4 位符号桶，供后续分片/ANN 适配使用；当前精排仍由服务层完成 |
 | `created_at` | `TEXT NOT NULL` | 向量生成时间 |
 
 #### `knowledge_index_tasks`
@@ -315,8 +344,12 @@
 | `phase` | `TEXT NOT NULL` | `queued`、`parsing`、`embedding`、`records`、`done`、`error` |
 | `status` | `TEXT NOT NULL` | `running`、`success`、`failed` |
 | `current_count` / `total_count` | `INTEGER NOT NULL DEFAULT 0` | 当前进度 |
+| `elapsed_ms` | `INTEGER NOT NULL DEFAULT 0` | 任务耗时（毫秒），用于重启后恢复诊断 |
+| `throughput_per_second` | `REAL NOT NULL DEFAULT 0` | 最近一次进度快照的单位吞吐 |
 | `message` | `TEXT NOT NULL DEFAULT ''` | 可读进度信息 |
 | `created_at` / `updated_at` | `TEXT NOT NULL` | 任务时间 |
+
+启动时会把遗留的 `running` 知识索引任务标为可重试的 `failed`，把 `processing` 文档放回 `queued` 恢复队列，并清理超过 30 天的终态进度记录。文档分块替换和记录增量索引均保持幂等，恢复不依赖继续使用原任务 ID。
 
 ### 3.4 项目管理
 
@@ -583,8 +616,8 @@ erDiagram
 ## 6. 数据生命周期和删除策略
 
 1. 应用启动时创建或迁移 schema；应用退出时 `AppDatabase.close()` 关闭 SQLite 连接，见 `src/main/index.ts:860-902`、`src/main/database.ts:1039-1041`。
-2. VISSLM 同步通过 `upsertProject/upsertRecord` 保存数据；同步成功后 `retainRecords()` 删除本次未保留的记录，见 `src/main/visslm.ts:682-825`、`src/main/database.ts:4076-4150`。
-3. 记录删除由 `deleteData()` 在事务中执行；由于外键开启，图片、记录分块、项目资产和匹配结果级联删除；Base64 文件在事务后检查是否仍被引用，未引用则删除，见 `src/main/database.ts:5140-5200`。
+2. VISSLM 同步通过 `upsertProject/upsertRecord` 保存新增数据；按 `_valm_ItemID` 命中已有记录时沿用本地 UID，合并并写入本次返回的最新属性，再同步可能变化的图片；同步成功后 `retainRecords()` 删除本次未保留的记录，见 `src/main/visslm.ts`、`src/main/database.ts`。
+3. 记录删除由 `deleteData()` 在事务中执行；由于外键开启，图片、记录分块、项目资产和匹配结果级联删除；共享二进制资源在事务后检查 `images`/`record_image_refs` 引用，未引用则删除。
 4. 删除知识库文档会先删除数据库行和关联分块/向量，并尝试删除受管文件，见 `src/main/database.ts:1297-1311`。
 5. 删除本地项目会级联删除项目管理子表，但不会删除共享的 `records` 或 `knowledge_documents`，见 `src/main/database.ts:1875-1895`。
 6. Dashboard 使用追加版本策略；恢复历史版本会创建新版本，不物理删除历史版本，见 `src/main/database.ts:3783-3839`。

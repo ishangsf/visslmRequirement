@@ -1905,8 +1905,98 @@ body {
   min-width: 0;
 }
 
+.push-record-selection-card,
+.push-record-selection-card .ant-card-body {
+  min-width: 0;
+}
+
+.push-record-selection-title {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--ds-space-2);
+}
+
+.push-record-selection-count,
+.push-record-selection-total {
+  white-space: nowrap;
+}
+
+.push-record-selection-toolbar {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--ds-space-2);
+  margin-bottom: var(--ds-space-3);
+}
+
+.push-record-selection-toolbar > .ant-input-search {
+  width: 320px !important;
+  min-width: 220px;
+  flex: 1 1 320px;
+}
+
+.push-record-selection-toolbar > .push-release-filter {
+  width: 280px !important;
+  min-width: 240px;
+  flex: 1 1 280px;
+}
+
+.push-record-selection-toolbar > .ant-input-search .ant-input,
+.push-record-selection-toolbar > .push-release-filter .ant-select-selector {
+  min-height: 36px;
+}
+
+.push-record-selection-meta {
+  min-width: 0;
+  margin-bottom: var(--ds-space-4);
+  line-height: 1.5;
+}
+
+.push-record-selection-meta > .ant-typography {
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.push-release-option {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--ds-space-2);
+}
+
+.push-release-option-value {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.push-release-option-count {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
 .push-request-collapse {
   margin-top: 16px;
+}
+
+@media (max-width: 680px) {
+  .push-record-selection-toolbar > .ant-input-search,
+  .push-record-selection-toolbar > .push-release-filter {
+    width: 100% !important;
+    min-width: 0;
+    flex-basis: 100%;
+  }
+
+  .push-record-selection-toolbar > .ant-btn {
+    flex: 1 1 auto;
+  }
 }
 
 .preview-metrics {
@@ -1961,7 +2051,75 @@ body {
 
 .sync-progress {
   width: 100%;
-  padding: 4px 2px;
+  min-width: 0;
+  padding: var(--ds-space-1) 0;
+}
+
+.sync-progress .ant-progress,
+.sync-progress .ant-progress-outer,
+.sync-progress .ant-progress-inner {
+  min-width: 0;
+}
+
+.sync-progress-message {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: var(--ds-space-2);
+  margin-top: var(--ds-space-2);
+  padding: var(--ds-space-2) var(--ds-space-3);
+  overflow: hidden;
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  color: var(--text-main);
+  background: var(--surface-soft);
+  line-height: 1.5;
+}
+
+.sync-progress-state {
+  flex: 0 0 auto;
+  color: var(--state-info);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.sync-progress-message-text {
+  display: block;
+  min-width: 0;
+  flex: 1 1 180px;
+  max-width: 100%;
+  color: inherit;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.sync-progress--error .sync-progress-message {
+  border-color: color-mix(in srgb, var(--state-error) 42%, var(--stroke));
+  background: color-mix(in srgb, var(--state-error) 10%, var(--surface-soft));
+}
+
+.sync-progress--error .sync-progress-state {
+  color: var(--state-error);
+}
+
+.sync-progress--done .sync-progress-message {
+  border-color: color-mix(in srgb, var(--state-success) 42%, var(--stroke));
+  background: color-mix(in srgb, var(--state-success) 10%, var(--surface-soft));
+}
+
+.sync-progress--done .sync-progress-state {
+  color: var(--state-success);
+}
+
+.sync-progress--error .ant-progress-bg {
+  background: var(--state-error) !important;
+}
+
+.sync-progress--done .ant-progress-bg {
+  background: var(--state-success) !important;
 }
 
 .sync-progress-card {
@@ -12267,6 +12425,30 @@ body {
   border-top-color: var(--stroke);
 }
 
+.data-import-runs-drawer-shell .ant-drawer-content-wrapper {
+  width: min(960px, calc(100vw - 32px)) !important;
+}
+
+.data-import-runs-drawer .ant-drawer-body {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.data-import-runs-panel {
+  display: flex;
+  min-height: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: var(--ds-space-4);
+}
+
+.data-import-runs-panel .resizable-table {
+  min-height: 0;
+  overflow: hidden;
+}
+
 /* Asset center has two filter rows plus pagination; reserve their height before
  * sizing the table so the card remains inside the viewport at full screen. */
 .asset-center-page {
@@ -16255,5 +16437,75 @@ html[data-theme='light'] .dashboard-style-color-control .ant-color-picker-trigge
 
   .chat-workspace-v2 .source-chips {
     grid-template-columns: 1fr;
+  }
+}
+
+/* Binary resource pack and rich-image push status. Keep the panel theme-aware
+ * so the same status hierarchy remains legible in light and dark workspaces. */
+.push-image-summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.push-image-summary .ant-tag {
+  margin: 0;
+  white-space: nowrap;
+}
+
+.push-image-blocking-alert {
+  margin-top: 12px;
+}
+
+.push-request-image-summary {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.push-request-image-summary > .ant-typography-secondary {
+  white-space: nowrap;
+}
+
+.push-request-image-errors {
+  max-height: 120px;
+  margin: 0;
+  padding-left: 20px;
+  overflow: auto;
+  color: var(--state-error);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.push-confirm-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.push-confirm-warning {
+  color: var(--state-warning);
+  font-size: 12px;
+}
+
+@media (max-width: 680px) {
+  .push-image-summary {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .push-request-image-summary > .ant-typography-secondary {
+    white-space: normal;
   }
 }

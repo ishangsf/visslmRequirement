@@ -76,16 +76,12 @@ import {
   Typography
 } from 'antd'
 import type { TablePaginationConfig } from 'antd'
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import ReactECharts from 'echarts-for-react'
-import ReactMarkdown from 'react-markdown'
+import React, { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import remarkGfm from 'remark-gfm'
 import appIconDark from './assets/visslm-icon.png'
 import appIconLight from './assets/visslm-icon-light.png'
-import { DashboardStudio } from './dashboard/DashboardStudio'
 import { RichDescription } from './RichDescription'
 import { ResizableTable } from './ResizableTable'
-import { ProjectManagementPage } from './project-management/ProjectManagementPage'
 import type { AppThemeMode } from './theme'
 import type { DashboardSpec } from '../../shared/dashboard'
 import type { DataScope } from '../../shared/query-spec'
@@ -102,6 +98,8 @@ import type {
   ChatMessage,
   ChatSessionSummary,
   CollectionRequestLogRow,
+  DataImportResult,
+  DataImportRunSnapshot,
   DataReviewApplyResult,
   DataReviewItem,
   DataReviewSource,
@@ -132,6 +130,7 @@ import type {
   RecordMaintenanceTaskStatus,
   RecordMaintenanceState,
   RecordMaintenancePreview,
+  RecordReleaseValue,
   RecordRow,
   RequirementSemanticizationControl as SemanticizationControlAction,
   RequirementSemanticizationStage as SemanticizationTaskStage,
@@ -151,10 +150,83 @@ import type {
 const { Content, Sider } = Layout
 const { Title, Text, Paragraph } = Typography
 
+// Keep the two largest route modules out of the shell's initial chunk. The
+// remaining legacy page components currently live in this module, so these
+// route boundaries are also the safe seam for progressively extracting them.
+const DashboardStudio = lazy(() => import('./dashboard/DashboardStudio').then(({ DashboardStudio: Component }) => ({ default: Component })))
+const ProjectManagementPage = lazy(() => import('./project-management/ProjectManagementPage').then(({ ProjectManagementPage: Component }) => ({ default: Component })))
+const ReactECharts = lazy(() => import('./components/LightweightECharts').then(({ LightweightECharts: Component }) => ({ default: Component })))
+const ReactMarkdown = lazy(() => import('react-markdown'))
+
 type PageKey = 'dashboard' | 'visualization' | 'projects' | 'data' | 'semanticization' | 'chat' | 'sync' | 'push' | 'settings'
 type AppProps = {
   themeMode: AppThemeMode
   onThemeModeChange: (next: AppThemeMode) => void
+}
+
+type SyncProgressListener = () => void
+
+let syncProgressSnapshot: SyncProgress | null = null
+let syncProgressPending: SyncProgress | null = null
+let syncProgressTimer: number | null = null
+let syncProgressCleanup: (() => void) | null = null
+const syncProgressListeners = new Set<SyncProgressListener>()
+
+const notifySyncProgress = (next: SyncProgress): void => {
+  syncProgressSnapshot = next
+  syncProgressListeners.forEach((listener) => listener())
+}
+
+const publishSyncProgress = (next: SyncProgress, immediate = false): void => {
+  syncProgressPending = next
+  const terminal = next.phase === 'done' || next.phase === 'error'
+  if (immediate || terminal) {
+    if (syncProgressTimer !== null) {
+      window.clearTimeout(syncProgressTimer)
+      syncProgressTimer = null
+    }
+    const current = syncProgressPending
+    syncProgressPending = null
+    if (current) notifySyncProgress(current)
+    return
+  }
+  if (syncProgressTimer !== null) return
+  syncProgressTimer = window.setTimeout(() => {
+    syncProgressTimer = null
+    const current = syncProgressPending
+    syncProgressPending = null
+    if (current) notifySyncProgress(current)
+  }, 200)
+}
+
+const ensureSyncProgressSubscription = (): void => {
+  if (syncProgressCleanup) return
+  syncProgressCleanup = window.visslm.onSyncProgress((next) => publishSyncProgress(next))
+}
+
+const useSyncProgress = (): SyncProgress | null => {
+  const [progress, setProgress] = useState<SyncProgress | null>(syncProgressSnapshot)
+
+  useEffect(() => {
+    ensureSyncProgressSubscription()
+    const listener: SyncProgressListener = () => setProgress(syncProgressSnapshot)
+    syncProgressListeners.add(listener)
+    listener()
+    return () => {
+      syncProgressListeners.delete(listener)
+    }
+  }, [])
+
+  return progress
+}
+
+function PageLoadingFallback(): React.JSX.Element {
+  return (
+    <div className="page-loading-fallback" role="status" aria-live="polite">
+      <Spin size="large" />
+      <Text type="secondary">正在加载模块…</Text>
+    </div>
+  )
 }
 
 const AppIconThemeContext = React.createContext<AppThemeMode>('dark')
@@ -1231,6 +1303,98 @@ const plainTextFromHtml = (value?: string): string => {
   return (document.body.textContent ?? '').replace(/\s+/g, ' ').trim()
 }
 
+type DataTransferMeta = {
+  format?: 'json' | 'jsonl' | 'visslmpack'
+  importRunId?: string
+  packVersion?: number
+  assetCount?: number
+  assetBytes?: number
+  checksumVerified?: boolean
+  batchCount?: number
+  sourceRowCount?: number
+  parseErrorCount?: number
+  durationMs?: number
+}
+
+const formatTransferBytes = (bytes?: number): string | undefined => {
+  if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes < 0) return undefined
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`
+}
+
+const dataTransferMetaText = (result: DataTransferMeta): string => {
+  const formatLabel = result.format === 'visslmpack'
+    ? `.visslmpack 资源包${result.packVersion ? ` v${result.packVersion}` : ''}`
+    : result.format === 'jsonl'
+      ? '旧 JSONL'
+      : result.format === 'json'
+        ? '旧 JSON'
+        : undefined
+  const parts = [formatLabel]
+  if (typeof result.assetCount === 'number') parts.push(`${result.assetCount} 个二进制资源`)
+  const assetBytes = formatTransferBytes(result.assetBytes)
+  if (assetBytes) parts.push(assetBytes)
+  if (result.checksumVerified === true) parts.push('校验通过')
+  if (typeof result.batchCount === 'number') parts.push(`${result.batchCount} 批流式导入`)
+  if (typeof result.sourceRowCount === 'number') parts.push(`${result.sourceRowCount} 行源数据`)
+  if (typeof result.parseErrorCount === 'number' && result.parseErrorCount > 0) {
+    parts.push(`${result.parseErrorCount} 条解析错误`)
+  }
+  if (result.importRunId) parts.push(`运行 ${result.importRunId.slice(0, 8)}`)
+  if (typeof result.durationMs === 'number' && result.durationMs >= 1000) {
+    parts.push(`${(result.durationMs / 1000).toFixed(1)} 秒`)
+  }
+  return parts.filter((part): part is string => Boolean(part)).join(' · ')
+}
+
+const dataImportRunStatusMeta: Record<DataImportRunSnapshot['status'], {
+  label: string
+  color: string
+}> = {
+  running: { label: '进行中', color: 'processing' },
+  success: { label: '已完成', color: 'success' },
+  failed: { label: '已中断', color: 'error' }
+}
+
+const pushImageStats = (result: PushResult): {
+  total: number
+  uploaded: number
+  reused: number
+  failed: number
+  available: boolean
+} => {
+  const requestStats = result.requests.reduce(
+    (summary, request) => ({
+      total: summary.total + (request.imageTotal ?? 0),
+      uploaded: summary.uploaded + (request.imageUpload ?? 0),
+      reused: summary.reused + (request.imageReuse ?? 0),
+      failed: summary.failed + (request.imageFailed ?? 0)
+    }),
+    { total: 0, uploaded: 0, reused: 0, failed: 0 }
+  )
+  const hasResultStats = [
+    result.imageTotal,
+    result.imageUpload,
+    result.imageReuse,
+    result.imageFailed
+  ].some((value) => typeof value === 'number')
+  const hasRequestStats = result.requests.some((request) => [
+    request.imageTotal,
+    request.imageUpload,
+    request.imageReuse,
+    request.imageFailed
+  ].some((value) => typeof value === 'number'))
+  return {
+    total: result.imageTotal ?? requestStats.total,
+    uploaded: result.imageUpload ?? requestStats.uploaded,
+    reused: result.imageReuse ?? requestStats.reused,
+    failed: result.imageFailed ?? requestStats.failed,
+    available: hasResultStats || hasRequestStats
+  }
+}
+
 const renderPushStatus = (record: Pick<
   RecordRow,
   'pushStatus' | 'pushMessage' | 'pushedAt' | 'pushedUid'
@@ -1464,7 +1628,7 @@ function DashboardPage({ refreshKey, themeMode }: { refreshKey: number; themeMod
       key: 'images',
       label: '图片资产',
       value: stats.imageCount,
-      detail: '已提取 Base64 图片',
+      detail: '已提取二进制图片资源',
       icon: <PictureOutlined />,
       tone: 'warning'
     }
@@ -1885,6 +2049,10 @@ function DataPage({
   const [detail, setDetail] = useState<RecordDetail | null>(null)
   const [selectedRowKeys, setSelectedRowKeys] = useState<string[]>([])
   const [importing, setImporting] = useState(false)
+  const [importRunsOpen, setImportRunsOpen] = useState(false)
+  const [importRuns, setImportRuns] = useState<DataImportRunSnapshot[]>([])
+  const [importRunsLoading, setImportRunsLoading] = useState(false)
+  const [resumingImportRunId, setResumingImportRunId] = useState<string | null>(null)
   const [exporting, setExporting] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [review, setReview] = useState<{ batchId: string; items: DataReviewItem[] } | null>(null)
@@ -1942,6 +2110,22 @@ function DataPage({
   const openDetail = async (uid: string): Promise<void> => {
     setDetail(await window.visslm.getRecord(uid))
   }
+
+  const loadImportRuns = useCallback(async (): Promise<void> => {
+    if (typeof window.visslm.listDataImportRuns !== 'function') return
+    setImportRunsLoading(true)
+    try {
+      setImportRuns(await window.visslm.listDataImportRuns(50))
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : String(error))
+    } finally {
+      setImportRunsLoading(false)
+    }
+  }, [message])
+
+  useEffect(() => {
+    if (importRunsOpen) void loadImportRuns()
+  }, [importRunsOpen, loadImportRuns, refreshKey])
 
   const applyMaintenanceSnapshot = useCallback((snapshot: RecordMaintenanceTaskSnapshot): void => {
     setMaintenanceTask(snapshot)
@@ -2135,35 +2319,56 @@ function DataPage({
     })
   }
 
+  const applyImportResult = (result: DataImportResult): boolean => {
+    if (result.canceled) return false
+    if (!result.ok) {
+      message.error(result.message)
+      return false
+    }
+    const transferMeta = dataTransferMetaText(result)
+    message.success(transferMeta ? `${result.message}（${transferMeta}）` : result.message)
+    if (result.errors.length) {
+      modal.warning({
+        title: '部分数据未导入',
+        content: (
+          <pre className="import-error-list">
+            {result.errors.slice(0, 20).join('\n')}
+          </pre>
+        )
+      })
+    }
+    if (result.reviewBatchId && result.duplicates.length) {
+      setReview({ batchId: result.reviewBatchId, items: result.duplicates })
+    }
+    void loadImportRuns()
+    setSelectedRowKeys([])
+    onDataChanged()
+    return true
+  }
+
   const importData = async (): Promise<void> => {
     setImporting(true)
     try {
       const result = await window.visslm.importData()
-      if (result.canceled) return
-      if (!result.ok) {
-        message.error(result.message)
-        return
-      }
-      message.success(result.message)
-      if (result.errors.length) {
-        modal.warning({
-          title: '部分数据未导入',
-          content: (
-            <pre className="import-error-list">
-              {result.errors.slice(0, 20).join('\n')}
-            </pre>
-          )
-        })
-      }
-      if (result.reviewBatchId && result.duplicates.length) {
-        setReview({ batchId: result.reviewBatchId, items: result.duplicates })
-      }
-      setSelectedRowKeys([])
-      onDataChanged()
+      applyImportResult(result)
     } catch (error) {
       message.error(error instanceof Error ? error.message : String(error))
     } finally {
       setImporting(false)
+    }
+  }
+
+  const resumeImportRun = async (run: DataImportRunSnapshot): Promise<void> => {
+    if (run.status !== 'failed' || typeof window.visslm.resumeDataImportRun !== 'function') return
+    setResumingImportRunId(run.id)
+    try {
+      const result = await window.visslm.resumeDataImportRun(run.id)
+      applyImportResult(result)
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : String(error))
+      void loadImportRuns()
+    } finally {
+      setResumingImportRunId(null)
     }
   }
 
@@ -2172,7 +2377,12 @@ function DataPage({
     try {
       const result = await window.visslm.exportData()
       if (result.canceled) return
-      result.ok ? message.success(result.message) : message.error(result.message)
+      if (!result.ok) {
+        message.error(result.message)
+        return
+      }
+      const transferMeta = dataTransferMetaText(result)
+      message.success(transferMeta ? `${result.message}（${transferMeta}）` : result.message)
     } catch (error) {
       message.error(error instanceof Error ? error.message : String(error))
     } finally {
@@ -2187,7 +2397,7 @@ function DataPage({
       title: deletingAll ? '确认删除全部数据？' : `确认删除选中的 ${count} 条数据？`,
       content: deletingAll
         ? '将清空数据中心内的项目、记录和图片。平台连接、模型和采集范围配置不会被删除。'
-        : '记录关联的本地 Base64 图片也会一并清理，此操作不可撤销。',
+        : '记录关联的本地二进制图片资源也会一并清理，此操作不可撤销。',
       okText: deletingAll ? '全部删除' : '删除',
       okType: 'danger',
       cancelText: '取消',
@@ -2255,16 +2465,24 @@ function DataPage({
           <Button
             icon={<ImportOutlined />}
             loading={importing}
+            title="支持 .visslmpack 资源包，也兼容旧 JSON/JSONL 数据"
             onClick={() => void importData()}
           >
-            导入数据
+            导入资源包或旧数据
+          </Button>
+          <Button
+            icon={<HistoryOutlined />}
+            onClick={() => setImportRunsOpen(true)}
+          >
+            导入运行记录
           </Button>
           <Button
             icon={<ExportOutlined />}
             loading={exporting}
+            title="默认导出 .visslmpack 二进制资源包；图片不会嵌入 Base64"
             onClick={() => void exportData()}
           >
-            导出数据
+            导出资源包（.visslmpack）
           </Button>
           <Button
             icon={<ThunderboltOutlined />}
@@ -2436,6 +2654,113 @@ function DataPage({
         />
       </Card>
       <Drawer
+        rootClassName="data-import-runs-drawer-shell"
+        className="data-import-runs-drawer"
+        title={(
+          <div className="drawer-context-title">
+            <HistoryOutlined />
+            <span>数据导入</span>
+            <strong>运行记录</strong>
+          </div>
+        )}
+        extra={(
+          <Button
+            size="small"
+            icon={<ReloadOutlined />}
+            loading={importRunsLoading}
+            aria-label="刷新导入运行记录"
+            onClick={() => void loadImportRuns()}
+          >
+            刷新
+          </Button>
+        )}
+        size={960}
+        open={importRunsOpen}
+        onClose={() => setImportRunsOpen(false)}
+      >
+        <div className="data-import-runs-panel">
+          <Text type="secondary">
+            运行记录用于查看大文件旧 JSON/JSONL 导入的批次检查点。应用在导入中途退出时，已提交批次会保留并标记为中断；确认原文件仍在后，可从最后一个已提交批次继续，记录默认保留 30 天。
+          </Text>
+          <ResizableTable<DataImportRunSnapshot>
+            tableKey="data-import-runs"
+            rowKey="id"
+            loading={importRunsLoading}
+            dataSource={importRuns}
+            pagination={false}
+            scroll={{ x: 1680, y: 'min(560px, max(260px, calc(100vh - 260px)))' }}
+            locale={{ emptyText: '暂无导入运行记录' }}
+            columns={[
+              {
+                title: '状态',
+                dataIndex: 'status',
+                width: 100,
+                render: (status: DataImportRunSnapshot['status']) => {
+                  const meta = dataImportRunStatusMeta[status] ?? { label: '未知', color: 'default' }
+                  return <Tag color={meta.color}>{meta.label}</Tag>
+                }
+              },
+              {
+                title: '文件',
+                dataIndex: 'path',
+                width: 280,
+                ellipsis: true,
+                render: (path: string) => <span title={path}>{path || '—'}</span>
+              },
+              {
+                title: '格式',
+                dataIndex: 'format',
+                width: 100,
+                render: (format: DataImportRunSnapshot['format']) => format.toUpperCase()
+              },
+              { title: '批次', dataIndex: 'batchCount', width: 84 },
+              { title: '源行', dataIndex: 'sourceRowCount', width: 100 },
+              { title: '已导入', dataIndex: 'importedRecordCount', width: 100 },
+              { title: '跳过', dataIndex: 'skippedCount', width: 84 },
+              { title: '解析错误', dataIndex: 'parseErrorCount', width: 104 },
+              {
+                title: '审查批次',
+                dataIndex: 'reviewBatchId',
+                width: 180,
+                ellipsis: true,
+                render: (value: string) => <span title={value}>{value || '—'}</span>
+              },
+              {
+                title: '更新时间',
+                dataIndex: 'updatedAt',
+                width: 180,
+                render: formatDate
+              },
+              {
+                title: '错误信息',
+                dataIndex: 'errorMessage',
+                width: 300,
+                ellipsis: true,
+                render: (value: string) => <span title={value}>{value || '—'}</span>
+              },
+              {
+                title: '操作',
+                key: 'actions',
+                width: 112,
+                render: (_value, run) => run.status === 'failed' && typeof window.visslm.resumeDataImportRun === 'function'
+                  ? (
+                    <Button
+                      size="small"
+                      type="link"
+                      loading={resumingImportRunId === run.id}
+                      disabled={Boolean(resumingImportRunId && resumingImportRunId !== run.id)}
+                      onClick={() => void resumeImportRun(run)}
+                    >
+                      继续导入
+                    </Button>
+                  )
+                  : '—'
+              }
+            ]}
+          />
+        </div>
+      </Drawer>
+      <Drawer
         rootClassName="record-detail-drawer-shell"
         className="record-detail-drawer"
         title={detail ? (
@@ -2514,7 +2839,7 @@ function DataPage({
                   <div className="image-grid">
                     {detail.images.map((image) => (
                       <div className="image-tile" key={image.id}>
-                        <Image src={image.dataUri} alt={image.name} />
+                        <Image src={image.assetUrl ?? ''} alt={image.name} fallback="" />
                         <Text ellipsis>{image.name || image.sha256.slice(0, 12)}</Text>
                       </div>
                     ))}
@@ -3313,6 +3638,13 @@ function KnowledgeBasePage({ refreshKey }: { refreshKey: number }): React.JSX.El
     }
   }
 
+  const cancelKnowledgeTask = async (): Promise<void> => {
+    const taskId = progress?.taskId?.trim()
+    if (!taskId || progress?.status !== 'running') return
+    const cancelled = await window.visslm.cancelKnowledgeTask(taskId)
+    if (cancelled) message.info('已请求停止知识库后台任务')
+  }
+
   const saveTags = async (): Promise<void> => {
     if (!detail) return
     const result = await window.visslm.updateKnowledgeDocumentTags(
@@ -3336,6 +3668,14 @@ function KnowledgeBasePage({ refreshKey }: { refreshKey: number }): React.JSX.El
           <Button icon={<ReloadOutlined />} loading={rebuilding} onClick={() => void rebuild()}>
             重建向量索引
           </Button>
+          <Button
+            danger
+            icon={<StopOutlined />}
+            disabled={!progress || progress.status !== 'running'}
+            onClick={() => void cancelKnowledgeTask()}
+          >
+            停止后台任务
+          </Button>
         </Space>
         <Text type="secondary">支持 DOCX、PDF、XLSX/XLS、TXT，单文件不超过 100 MB</Text>
       </div>
@@ -3350,6 +3690,14 @@ function KnowledgeBasePage({ refreshKey }: { refreshKey: number }): React.JSX.El
           <div className="knowledge-progress-heading">
             <Text strong>{progress.message}</Text>
             {progress.total > 0 && <Text type="secondary">{progress.current}/{progress.total}</Text>}
+            {typeof progress.elapsedMs === 'number' && progress.elapsedMs >= 1000 && (
+              <Text type="secondary">
+                {(progress.elapsedMs / 1000).toFixed(1)} 秒
+                {typeof progress.throughputPerSecond === 'number' && progress.throughputPerSecond > 0
+                  ? ` · ${progress.throughputPerSecond.toFixed(1)}/秒`
+                  : ''}
+              </Text>
+            )}
           </div>
           <Progress
             percent={progress.total ? Math.min(100, Math.round((progress.current / progress.total) * 100)) : undefined}
@@ -4601,7 +4949,7 @@ function ChatPage({
                         {activeRecordDetail.images.map((image) => (
                           <div className="image-tile" key={image.id}>
                             <Image
-                              src={image.dataUri ?? image.sourceUrl}
+                              src={image.assetUrl ?? ''}
                               alt={image.name}
                               fallback=""
                             />
@@ -4734,17 +5082,16 @@ function ChatPage({
 }
 
 function SyncPage({
-  progress,
   syncing,
   onSync,
   onDataChanged
 }: {
-  progress: SyncProgress | null
   syncing: boolean
   onSync: (config: SyncScopeConfig) => Promise<SyncResult | null>
   onDataChanged: () => void
 }): React.JSX.Element {
   const { message } = AntApp.useApp()
+  const progress = useSyncProgress()
   const [config, setConfig] = useState<SyncScopeConfig>({ selectedTypes: [], rules: [] })
   const [typeInput, setTypeInput] = useState('')
   const [activeTypes, setActiveTypes] = useState<string[]>([])
@@ -4806,6 +5153,18 @@ function SyncPage({
     progress && progress.total > 0
       ? Math.min(100, Math.round((progress.current / progress.total) * 100))
       : 0
+
+  const progressState = progress?.phase === 'error'
+    ? 'error'
+    : progress?.phase === 'done'
+      ? 'done'
+      : 'active'
+  const progressStateLabel = progressState === 'error'
+    ? '采集失败'
+    : progressState === 'done'
+      ? '采集完成'
+      : '采集中'
+  const progressMessage = progress?.message ?? '准备采集'
 
   const filtersFor = (nodeType: string): SyncFieldFilter[] =>
     config.rules.find((rule) => rule.nodeType === nodeType)?.filters ?? []
@@ -5466,7 +5825,13 @@ function SyncPage({
             </Space>
           }
         >
-          <div className="sync-progress">
+          <div
+            className={`sync-progress sync-progress--${progressState}`}
+            role={progressState === 'error' ? 'alert' : 'status'}
+            aria-live={progressState === 'error' ? 'assertive' : 'polite'}
+            aria-atomic="true"
+            aria-label={`${progressStateLabel}：${progressMessage}`}
+          >
             <Progress
               percent={progress?.phase === 'done' ? 100 : percent}
               status={
@@ -5476,8 +5841,16 @@ function SyncPage({
                     ? 'success'
                     : 'active'
               }
+              aria-label={`${progressStateLabel}，${progress?.current ?? 0} / ${progress?.total ?? 0}`}
             />
-            <Text>{progress?.message ?? '准备采集'}</Text>
+            <div className="sync-progress-message">
+              <span className="sync-progress-state" aria-hidden="true">
+                {progressStateLabel}
+              </span>
+              <Text className="sync-progress-message-text" title={progressMessage}>
+                {progressMessage}
+              </Text>
+            </div>
           </div>
         </Card>
       )}
@@ -5486,7 +5859,7 @@ function SyncPage({
         showIcon
         type="info"
         title="安全说明"
-        description="数据采集只读访问 VISSLM，不会修改平台数据。图片会转换为 Base64 并按内容哈希去重；平台当前使用 HTTP，正式环境建议启用 HTTPS。"
+        description="数据采集只读访问 VISSLM，不会修改平台数据。图片会保存为按 SHA-256 去重的本地二进制资源，导出时写入 .visslmpack；平台当前使用 HTTP，正式环境建议启用 HTTPS。"
       />}
       {review && (
         <DataReviewModal
@@ -5524,10 +5897,14 @@ function PushPage({
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(20)
   const [search, setSearch] = useState('')
+  const [releaseText, setReleaseText] = useState<string | undefined>(undefined)
+  const [releaseValues, setReleaseValues] = useState<RecordReleaseValue[]>([])
+  const [releaseValuesLoading, setReleaseValuesLoading] = useState(false)
   const [loading, setLoading] = useState(false)
   const [previewing, setPreviewing] = useState(false)
   const [pushing, setPushing] = useState(false)
   const [selectedRowKeys, setSelectedRowKeys] = useState<string[]>([])
+  const [selectingAll, setSelectingAll] = useState(false)
   const [result, setResult] = useState<PushResult | null>(null)
   const [pushLogs, setPushLogs] = useState<PushLogRow[]>([])
   const [pushLogTotal, setPushLogTotal] = useState(0)
@@ -5540,14 +5917,26 @@ function PushPage({
       const data = await window.visslm.listRecords({
         page,
         pageSize,
-        search
+        search,
+        ...(releaseText !== undefined ? { releaseText } : {})
       })
       setRecords(data.rows)
       setTotal(data.total)
     } finally {
       setLoading(false)
     }
-  }, [page, pageSize, search])
+  }, [page, pageSize, search, releaseText])
+
+  const loadReleaseValues = useCallback(async (): Promise<void> => {
+    setReleaseValuesLoading(true)
+    try {
+      setReleaseValues(await window.visslm.listRecordReleaseValues())
+    } catch (error) {
+      message.error(`读取发布属性候选失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setReleaseValuesLoading(false)
+    }
+  }, [message])
 
   const loadPushLogs = useCallback(async (): Promise<void> => {
     setLogsLoading(true)
@@ -5564,6 +5953,49 @@ function PushPage({
     void load()
     void loadPushLogs()
   }, [load, loadPushLogs, refreshKey])
+
+  useEffect(() => {
+    void loadReleaseValues()
+  }, [loadReleaseValues, refreshKey])
+
+  const clearSelection = (): void => {
+    setSelectedRowKeys([])
+    setResult(null)
+  }
+
+  const applyRecordFilter = (nextSearch: string, nextReleaseText?: string): void => {
+    setSearch(nextSearch)
+    setReleaseText(nextReleaseText)
+    setPage(1)
+    clearSelection()
+  }
+
+  const selectAllFiltered = async (): Promise<void> => {
+    if (!total) {
+      clearSelection()
+      message.info('当前筛选范围没有可选择的数据')
+      return
+    }
+    setSelectingAll(true)
+    try {
+      const uids = await window.visslm.listRecordUids({
+        search,
+        ...(releaseText !== undefined ? { releaseText } : {})
+      })
+      const uniqueUids = [...new Set(uids.map(String))]
+      setSelectedRowKeys(uniqueUids)
+      setResult(null)
+      if (uniqueUids.length) {
+        message.success(`已选择当前筛选结果 ${uniqueUids.length} 条`)
+      } else {
+        message.info('当前筛选范围没有可选择的数据')
+      }
+    } catch (error) {
+      message.error(`选择筛选结果失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setSelectingAll(false)
+    }
+  }
 
   const getConfig = async (): Promise<PushConfig> => {
     const values = await form.validateFields()
@@ -5636,7 +6068,12 @@ function PushPage({
       const preview = await window.visslm.previewPush(config)
       setResult(preview)
       setActiveTab('logs')
-      message.success(`已生成 ${preview.total} 条 POST 请求预览，未访问真实平台`)
+      const imageStats = pushImageStats(preview)
+      message.success(
+        imageStats.available
+          ? `已生成 ${preview.total} 条 POST 请求预览，图片资源 ${imageStats.total} 个（未上传，未访问真实平台）`
+          : `已生成 ${preview.total} 条 POST 请求预览，未访问真实平台`
+      )
     } catch (error) {
       message.error(error instanceof Error ? error.message : String(error))
     } finally {
@@ -5655,9 +6092,14 @@ function PushPage({
     modal.confirm({
       title: `确认向平台新建 ${config.recordUids.length} 条数据？`,
       content: (
-        <span>
-          将调用 <code>/alm/rest/items</code> 执行真实 POST 写入，请先检查请求预览中的参数和消息体。
-        </span>
+        <div className="push-confirm-copy">
+          <span>
+            图片资源会先逐项上传或复用，然后才调用 <code>/alm/rest/items</code> 执行真实 POST 写入。
+          </span>
+          <span className="push-confirm-warning">
+            任一记录的图片上传失败时，该记录不会创建；请先检查请求预览中的资源状态、参数和消息体。
+          </span>
+        </div>
       ),
       okText: '确认推送',
       cancelText: '取消',
@@ -5667,7 +6109,12 @@ function PushPage({
           const pushed = await window.visslm.startPush(config)
           setResult(pushed)
           setActiveTab('logs')
-          if (pushed.failedCount) {
+          const imageStats = pushImageStats(pushed)
+          if (imageStats.failed) {
+            message.warning(
+              `图片资源失败 ${imageStats.failed} 个；对应记录未创建。成功 ${pushed.successCount} 条，失败 ${pushed.failedCount} 条`
+            )
+          } else if (pushed.failedCount) {
             message.warning(
               `推送完成：成功 ${pushed.successCount} 条，失败 ${pushed.failedCount} 条`
             )
@@ -5685,6 +6132,8 @@ function PushPage({
       }
     })
   }
+
+  const resultImageStats = result ? pushImageStats(result) : null
 
   return (
     <div className="page-stack">
@@ -5874,30 +6323,82 @@ function PushPage({
           showIcon
           type="warning"
           className="compact-push-alert"
-          title="预览不发送请求；真实推送前会强制移除 _valm_Uid、_valm_NodeType 和 _valm_ItemID"
+          title="图片先上传/复用；失败会阻止对应记录创建"
+          description="测试预览不上传图片也不发送请求；真实推送会先完成全部图片资源处理，再调用 /alm/rest/items，并强制移除 _valm_Uid、_valm_NodeType 和 _valm_ItemID。"
         />
       </Card>}
 
       {activeTab === 'config' && <Card
-        title={`选择待推送数据（已选 ${selectedRowKeys.length} 条）`}
-        extra={
+        className="push-record-selection-card"
+        title={(
+          <div className="push-record-selection-title">
+            <span>选择待推送数据</span>
+            <Text type="secondary" className="push-record-selection-count">
+              已选 {selectedRowKeys.length} 条 · 当前筛选 {total} 条
+            </Text>
+          </div>
+        )}
+      >
+        <div className="push-record-selection-toolbar">
           <Input.Search
             allowClear
+            aria-label="搜索待推送数据"
             placeholder="搜索名称、编号和正文"
-            onSearch={(value) => {
-              setSearch(value)
-              setPage(1)
-            }}
+            onSearch={(value) => applyRecordFilter(value, releaseText)}
             style={{ width: 320 }}
           />
-        }
-      >
+          <Select<string>
+            allowClear
+            showSearch
+            className="push-release-filter"
+            loading={releaseValuesLoading}
+            value={releaseText}
+            placeholder="发布属性（_valm_Release_text）"
+            aria-label="按发布属性（_valm_Release_text）筛选"
+            style={{ width: 280 }}
+            filterOption={(input, option) => String(option?.value ?? '').toLocaleLowerCase().includes(input.trim().toLocaleLowerCase())}
+            options={releaseValues.map(({ value, count }) => ({
+              value,
+              label: (
+                <span className="push-release-option">
+                  <span className="push-release-option-value" title={value || '空值'}>
+                    {value || '（空值）'}
+                  </span>
+                  <span className="push-release-option-count">{count} 条</span>
+                </span>
+              )
+            }))}
+            onChange={(value) => applyRecordFilter(search, value)}
+          />
+          <Button
+            icon={<CheckCircleOutlined />}
+            loading={selectingAll}
+            disabled={loading || selectingAll || !total}
+            onClick={() => void selectAllFiltered()}
+          >
+            选择全部筛选结果
+          </Button>
+          <Button
+            icon={<ClearOutlined />}
+            disabled={!selectedRowKeys.length || selectingAll}
+            onClick={clearSelection}
+          >
+            清空选择
+          </Button>
+        </div>
+        <div className="push-record-selection-meta" role="status" aria-live="polite">
+          <Text type="secondary">
+            当前筛选范围：{search.trim() ? `搜索“${search.trim()}”` : '全部搜索内容'} ·{' '}
+            {releaseText !== undefined ? `发布属性“${releaseText || '空值'}”` : '全部发布属性'} · 共{' '}
+            <span className="push-record-selection-total">{total} 条</span>；推送仅使用已选记录。
+          </Text>
+        </div>
         <ResizableTable<RecordRow>
           tableKey="push-record-selection"
           rowKey="uid"
           loading={loading}
           dataSource={records}
-          scroll={{ y: appTableScrollY }}
+          scroll={{ x: 1120, y: appTableScrollY }}
           rowSelection={{
             selectedRowKeys,
             preserveSelectedRowKeys: true,
@@ -5923,6 +6424,14 @@ function PushPage({
             { title: '对象编号', dataIndex: 'itemId', width: 200, ellipsis: true },
             { title: 'UID', dataIndex: 'uid', width: 140 },
             {
+              title: '发布属性',
+              dataIndex: 'releaseText',
+              width: 220,
+              ellipsis: true,
+              render: (value: string) => value || '—'
+            },
+            { title: '图片资源', dataIndex: 'imageCount', width: 100 },
+            {
               title: '数据状态',
               key: 'pushStatus',
               width: 120,
@@ -5947,6 +6456,29 @@ function PushPage({
           <Text type="secondary">
             共 {result.requests.length} 次 POST 请求，认证 Token 已脱敏
           </Text>
+          {resultImageStats?.available && (
+            <div className="push-image-summary" role="status" aria-label="图片资源推送统计">
+              <Tag color="processing">图片资源 {resultImageStats.total}</Tag>
+              <Tag color="success">本次上传 {resultImageStats.uploaded}</Tag>
+              <Tag color="default">复用已有 {resultImageStats.reused}</Tag>
+              <Tag color={resultImageStats.failed ? 'error' : 'default'}>
+                失败 {resultImageStats.failed}
+              </Tag>
+            </div>
+          )}
+          {resultImageStats && resultImageStats.failed > 0 && (
+            <Alert
+              showIcon
+              type="error"
+              className="push-image-blocking-alert"
+              title="图片资源失败会阻止对应记录创建"
+              description={
+                result.preview
+                  ? '预览已标记失败资源；真实推送时必须先完成全部图片上传或复用，才会调用 /alm/rest/items。'
+                  : `有 ${resultImageStats.failed} 个图片资源未上传成功，对应记录未调用 /alm/rest/items。`
+              }
+            />
+          )}
           <Collapse
             className="preview-request-collapse push-request-collapse"
             items={result.requests.map((request) => ({
@@ -5956,13 +6488,39 @@ function PushPage({
                   <Tag color={request.error ? 'error' : 'blue'}>POST</Tag>
                   <Text>{request.recordName}</Text>
                   <Text ellipsis title={request.endpoint}>{request.endpoint}</Text>
-                  <Tag color={request.error ? 'error' : result.preview ? 'default' : 'success'}>
-                    {request.error ? '失败' : result.preview ? '未发送' : '成功'}
+                  <Tag
+                    color={request.imageFailed ? 'error' : request.error ? 'error' : result.preview ? 'default' : 'success'}
+                  >
+                    {request.imageFailed
+                      ? '未创建（图片失败）'
+                      : request.error
+                        ? '失败'
+                        : result.preview
+                          ? '未发送'
+                          : '成功'}
                   </Tag>
                 </div>
               ),
               children: (
                 <div className="preview-request-detail">
+                  {typeof request.imageTotal === 'number' && (
+                    <div className="push-request-image-summary" aria-label="当前记录图片资源状态">
+                      <Text strong>图片资源</Text>
+                      <Text type="secondary">
+                        共 {request.imageTotal} 个 · 上传 {request.imageUpload ?? 0} · 复用 {request.imageReuse ?? 0} · 失败 {request.imageFailed ?? 0}
+                      </Text>
+                      {request.imageFailed ? (
+                        <Text type="danger">
+                          图片失败，当前记录不会创建
+                        </Text>
+                      ) : null}
+                      {request.imageErrors?.length ? (
+                        <ul className="push-request-image-errors">
+                          {request.imageErrors.slice(0, 5).map((error) => <li key={error}>{error}</li>)}
+                        </ul>
+                      ) : null}
+                    </div>
+                  )}
                   <Text strong>请求参数</Text>
                   <pre className="json-preview">
                     {JSON.stringify(request.params, null, 2)}
@@ -7117,7 +7675,6 @@ function AppShell({ themeMode, onThemeModeChange }: AppProps): React.JSX.Element
   const [page, setPage] = useState<PageKey>('dashboard')
   const [settings, setSettings] = useState<AppSettings | null>(null)
   const [syncing, setSyncing] = useState(false)
-  const [progress, setProgress] = useState<SyncProgress | null>(null)
   const [refreshKey, setRefreshKey] = useState(0)
   const [modelOnline, setModelOnline] = useState<boolean | null>(null)
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
@@ -7137,7 +7694,6 @@ function AppShell({ themeMode, onThemeModeChange }: AppProps): React.JSX.Element
 
   useEffect(() => {
     void window.visslm.getSettings().then(setSettings)
-    return window.visslm.onSyncProgress(setProgress)
   }, [])
 
   useEffect(() => {
@@ -7168,11 +7724,14 @@ function AppShell({ themeMode, onThemeModeChange }: AppProps): React.JSX.Element
 
   const startSync = async (config?: SyncScopeConfig): Promise<SyncResult | null> => {
     setSyncing(true)
-    setProgress({ phase: 'start', message: '准备采集', current: 0, total: 0 })
+    publishSyncProgress({ phase: 'start', message: '准备采集', current: 0, total: 0 }, true)
     try {
       const result = await window.visslm.startSync(config)
       if (result.ok) {
-        message.success(result.message)
+        const imageMeta = typeof result.imageCount === 'number'
+          ? `，已保存 ${result.imageCount} 个二进制图片资源`
+          : ''
+        message.success(`${result.message}${imageMeta}`)
         setRefreshKey((key) => key + 1)
       } else {
         message.error(result.message)
@@ -7280,7 +7839,6 @@ function AppShell({ themeMode, onThemeModeChange }: AppProps): React.JSX.Element
     if (page === 'sync') {
       return (
         <SyncPage
-          progress={progress}
           syncing={syncing}
           onSync={startSync}
           onDataChanged={() => setRefreshKey((key) => key + 1)}
@@ -7307,7 +7865,6 @@ function AppShell({ themeMode, onThemeModeChange }: AppProps): React.JSX.Element
     generatedDashboardVersion,
     modelOnline,
     page,
-    progress,
     refreshKey,
     settings,
     settingsInitialTab,
@@ -7360,7 +7917,9 @@ function AppShell({ themeMode, onThemeModeChange }: AppProps): React.JSX.Element
               <div className="content-page-title">{pageMeta[page].title}</div>
               <div className="content-page-subtitle">{pageMeta[page].description}</div>
             </div>
-            {currentPage}
+            <Suspense fallback={<PageLoadingFallback />}>
+              {currentPage}
+            </Suspense>
           </Content>
         </Layout>
       </Layout>

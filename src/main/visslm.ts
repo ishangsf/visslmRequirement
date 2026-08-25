@@ -1,8 +1,7 @@
+import { randomBytes } from 'node:crypto'
 import type {
   ConnectionResult,
   DataReviewApplyResult,
-  DataReviewItem,
-  DataReviewSummary,
   FieldDefinition,
   PushConfig,
   PushRequestTrace,
@@ -14,6 +13,11 @@ import type {
   SyncScopeConfig
 } from '../shared/types'
 import { AppDatabase, type RecordInput } from './database'
+import {
+  findRichTextImageSources,
+  parseAssetToken,
+  replaceRichTextImageSources
+} from './rich-text-assets'
 
 type JsonObject = Record<string, unknown>
 
@@ -47,6 +51,47 @@ class VisslmRequestError extends Error {
   ) {
     super(message)
     this.name = 'VisslmRequestError'
+  }
+}
+
+const REQUEST_TIMEOUT_MS = 30_000
+const SAFE_REQUEST_MAX_ATTEMPTS = 3
+const SAFE_REQUEST_BACKOFF_MS = [200, 500]
+const RETRYABLE_HTTP_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504])
+
+const isRetryableNetworkError = (error: unknown): boolean => {
+  if (!(error instanceof Error)) return false
+  // undici uses TypeError for connection failures and TimeoutError/AbortError
+  // for AbortSignal.timeout().  These are safe to retry for GET/downloads,
+  // but never for the non-idempotent POST endpoints below.
+  return error.name === 'TypeError' || error.name === 'TimeoutError' || error.name === 'AbortError'
+}
+
+const retryAfterDelayMs = (response: Response): number | undefined => {
+  const value = response.headers.get('retry-after')?.trim()
+  if (!value) return undefined
+  const seconds = Number(value)
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.min(10_000, Math.round(seconds * 1_000))
+  }
+  const timestamp = Date.parse(value)
+  if (!Number.isFinite(timestamp)) return undefined
+  return Math.min(10_000, Math.max(0, timestamp - Date.now()))
+}
+
+class AssetPreparationError extends Error {
+  constructor(
+    message: string,
+    readonly stats: {
+      imageTotal: number
+      imageUpload: number
+      imageReuse: number
+      imageFailed: number
+      imageErrors?: string[]
+    }
+  ) {
+    super(message)
+    this.name = 'AssetPreparationError'
   }
 }
 
@@ -109,6 +154,18 @@ export const normalizeText = (
 
 const imageExtension = /\.(png|jpe?g|gif|webp|bmp|svg)(?:$|[?#])/i
 
+const imageBytesMatchMime = (mimeType: string, bytes: Buffer): boolean => {
+  const mime = mimeType.trim().toLowerCase()
+  if (!mime.startsWith('image/')) return false
+  if (mime === 'image/png') return bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+  if (mime === 'image/jpeg' || mime === 'image/jpg') return bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff
+  if (mime === 'image/gif') return bytes.subarray(0, 6).toString('ascii') === 'GIF87a' || bytes.subarray(0, 6).toString('ascii') === 'GIF89a'
+  if (mime === 'image/webp') return bytes.length >= 12 && bytes.subarray(0, 4).toString('ascii') === 'RIFF' && bytes.subarray(8, 12).toString('ascii') === 'WEBP'
+  if (mime === 'image/bmp') return bytes.subarray(0, 2).toString('ascii') === 'BM'
+  if (mime === 'image/svg+xml') return /^\s*(?:<\?xml[^>]*>\s*)?<svg\b/i.test(bytes.subarray(0, 4096).toString('utf8'))
+  return true
+}
+
 const ITEM_BASE_PROPERTIES = [
   '_valm_Uid',
   '_valm_ParentId',
@@ -121,6 +178,87 @@ const ITEM_BASE_PROPERTIES = [
 
 const identifierPattern = /^[A-Za-z_][A-Za-z0-9_.]*$/
 const pureNumericPattern = /^\d+$/
+const DISPLAY_LOOKUP_CONCURRENCY = 8
+
+/**
+ * Run asynchronous work in a bounded number of workers while preserving the
+ * input order.  Workers keep draining after an individual mapper failure so
+ * the bounded version retains Promise.all's side-effect/error semantics: all
+ * scheduled items are allowed to settle and the first observed error is
+ * re-thrown afterwards.
+ */
+const mapWithConcurrency = async <T, R>(
+  items: readonly T[],
+  mapper: (item: T, index: number) => Promise<R>,
+  concurrency = DISPLAY_LOOKUP_CONCURRENCY
+): Promise<R[]> => {
+  if (!items.length) return []
+  const results = new Array<R>(items.length)
+  const workerCount = Math.min(
+    items.length,
+    Math.max(1, Math.floor(concurrency))
+  )
+  let nextIndex = 0
+  let failed = false
+  let firstError: unknown
+
+  const worker = async (): Promise<void> => {
+    while (true) {
+      const index = nextIndex
+      nextIndex += 1
+      if (index >= items.length) return
+      try {
+        results[index] = await mapper(items[index], index)
+      } catch (error) {
+        if (!failed) {
+          failed = true
+          firstError = error
+        }
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: workerCount }, () => worker()))
+  if (failed) throw firstError
+  return results
+}
+
+/** Shared cap for display-value lookups made while syncing large datasets. */
+class AsyncTaskLimiter {
+  private active = 0
+  private readonly pending: Array<{
+    task: () => Promise<unknown> | unknown
+    resolve: (value: unknown) => void
+    reject: (reason?: unknown) => void
+  }> = []
+
+  constructor(private readonly maxConcurrency: number) {}
+
+  run<T>(task: () => Promise<T> | T): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      this.pending.push({
+        task,
+        resolve: resolve as (value: unknown) => void,
+        reject
+      })
+      this.drain()
+    })
+  }
+
+  private drain(): void {
+    while (this.active < this.maxConcurrency && this.pending.length) {
+      const entry = this.pending.shift()!
+      this.active += 1
+      Promise.resolve()
+        .then(entry.task)
+        .then(entry.resolve, entry.reject)
+        .finally(() => {
+          this.active -= 1
+          this.drain()
+        })
+    }
+  }
+}
 
 const FIELD_KEY_KEYS = [
   '_valm_MemberName',
@@ -207,6 +345,90 @@ const describeInvalidJsonResponse = (response: Response, body: string): string =
   return `VISSLM 返回${responseKind}而不是 JSON（HTTP ${response.status}${contentHint}）。请检查接口地址、登录状态或接口权限`
 }
 
+const decodeJavaScriptString = (input: string): string | null => {
+  let output = ''
+  for (let index = 0; index < input.length; index += 1) {
+    const current = input[index]
+    if (current !== '\\') {
+      if (/[\u0000-\u001f\u007f]/.test(current)) return null
+      output += current
+      continue
+    }
+    if (index + 1 >= input.length) return null
+    const escaped = input[++index]
+    const simple: Record<string, string> = {
+      n: '\n', r: '\r', t: '\t', b: '\b', f: '\f', v: '\v',
+      '0': '\0', '\\': '\\', '/': '/', "'": "'", '"': '"'
+    }
+    if (simple[escaped] !== undefined) {
+      output += simple[escaped]
+      continue
+    }
+    if (escaped === 'x' && /^[0-9a-f]{2}$/i.test(input.slice(index + 1, index + 3))) {
+      output += String.fromCharCode(Number.parseInt(input.slice(index + 1, index + 3), 16))
+      index += 2
+      continue
+    }
+    if (escaped === 'u' && /^[0-9a-f]{4}$/i.test(input.slice(index + 1, index + 5))) {
+      output += String.fromCharCode(Number.parseInt(input.slice(index + 1, index + 5), 16))
+      index += 4
+      continue
+    }
+    // A line continuation is legal JavaScript but not useful in a URL.  Keep
+    // the parser strict so arbitrary callback code cannot be interpreted.
+    return null
+  }
+  return output
+}
+
+/** Parse only CKEditor's callback path; never evaluate the returned script. */
+export const parseRichImageUploadCallback = (body: string): string => {
+  const callbackPattern = /window\s*\.\s*parent\s*\.\s*CKEDITOR\s*\.\s*tools\s*\.\s*callFunction\s*\(/gi
+  for (const match of body.matchAll(callbackPattern)) {
+    let index = (match.index ?? 0) + match[0].length
+    while (/\s/.test(body[index] ?? '')) index += 1
+    const functionStart = index
+    while (/\d/.test(body[index] ?? '')) index += 1
+    if (body.slice(functionStart, index) !== '0') continue
+    while (/\s/.test(body[index] ?? '')) index += 1
+    if (body[index] !== ',') continue
+    index += 1
+    while (/\s/.test(body[index] ?? '')) index += 1
+    const quote = body[index]
+    if (quote !== "'" && quote !== '"') continue
+    index += 1
+    let raw = ''
+    let closed = false
+    while (index < body.length) {
+      const current = body[index]
+      if (current === quote) {
+        closed = true
+        index += 1
+        break
+      }
+      if (current === '\\' && index + 1 < body.length) {
+        raw += current + body[++index]
+      } else {
+        raw += current
+      }
+      index += 1
+    }
+    if (!closed) continue
+    const path = decodeJavaScriptString(raw)
+    if (!path) continue
+    let decodedPath = path
+    if (path.includes('%')) {
+      try { decodedPath = decodeURIComponent(path) } catch { continue }
+    }
+    if ([path, decodedPath].some((candidate) =>
+      candidate.includes('://') || /[\\\u0000-\u001f\u007f]/.test(candidate) || candidate.includes('..')
+    )) continue
+    if (!/^\/?FileCenterImg\/Index\/[^\s?#]+$/i.test(path)) continue
+    return path.replace(/^\/+/, '')
+  }
+  throw new Error('图片上传响应未返回合法的 CKEditor 图片路径')
+}
+
 const validFieldKey = (field: string): boolean =>
   field.length > 0 && field.length <= 240 && field !== '_valm_NodeType' &&
   !FIELD_COLLECTION_KEYS.has(field.toLocaleLowerCase())
@@ -286,36 +508,6 @@ const hasDisplayText = (input: unknown): boolean => {
   if (Array.isArray(input)) return input.some(hasDisplayText)
   if (input === null || input === undefined) return false
   return String(input).trim() !== ''
-}
-
-const isJsonObject = (input: unknown): input is JsonObject =>
-  Boolean(input) && typeof input === 'object' && !Array.isArray(input)
-
-const mergeDerivedDisplayValues = (target: unknown, source: unknown): boolean => {
-  if (Array.isArray(target) && Array.isArray(source)) {
-    let changed = false
-    source.forEach((value, index) => {
-      if (index >= target.length) return
-      changed = mergeDerivedDisplayValues(target[index], value) || changed
-    })
-    return changed
-  }
-  if (!isJsonObject(target) || !isJsonObject(source)) return false
-
-  let changed = false
-  for (const [key, value] of Object.entries(source)) {
-    if (key.endsWith('_text')) {
-      if (!hasDisplayText(value)) continue
-      if (JSON.stringify(target[key]) === JSON.stringify(value)) continue
-      target[key] = value
-      changed = true
-      continue
-    }
-    if (target[key] !== undefined && value && typeof value === 'object') {
-      changed = mergeDerivedDisplayValues(target[key], value) || changed
-    }
-  }
-  return changed
 }
 
 const userLookupValue = (input: unknown): string[] => {
@@ -463,6 +655,8 @@ export class VisslmClient {
 
   private readonly userDisplayNameRequests = new Map<string, Promise<string>>()
 
+  private readonly displayLookupLimiter = new AsyncTaskLimiter(DISPLAY_LOOKUP_CONCURRENCY)
+
   private readonly userPropertyKeys: ReadonlySet<string>
 
   constructor(private readonly credentials: Credentials) {
@@ -472,6 +666,10 @@ export class VisslmClient {
     this.userPropertyKeys = new Set(
       (credentials.userPropertyKeys ?? []).map((key) => key.trim()).filter(Boolean)
     )
+  }
+
+  get baseUrl(): string {
+    return this.credentials.baseUrl.replace(/\/+$/, '')
   }
 
   private endpoint(path: string): URL {
@@ -492,10 +690,54 @@ export class VisslmClient {
     return url
   }
 
+  /**
+   * Retry only idempotent reads.  POST requests deliberately opt out because
+   * the platform contract does not expose an idempotency key; replaying a
+   * timed-out create/upload could otherwise duplicate remote data.
+   */
+  private async requestWithRetry(
+    url: URL,
+    init: RequestInit,
+    safe = false
+  ): Promise<Response> {
+    const maxAttempts = safe ? SAFE_REQUEST_MAX_ATTEMPTS : 1
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        const response = await fetch(url, {
+          ...init,
+          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+        })
+        if (
+          safe &&
+          attempt < maxAttempts &&
+          RETRYABLE_HTTP_STATUSES.has(response.status)
+        ) {
+          try {
+            await response.body?.cancel()
+          } catch {
+            // Best effort: releasing a retry response should not hide the
+            // eventual request result.
+          }
+          const delay = retryAfterDelayMs(response) ?? SAFE_REQUEST_BACKOFF_MS[attempt - 1] ?? 500
+          await new Promise((resolve) => setTimeout(resolve, delay))
+          continue
+        }
+        return response
+      } catch (error) {
+        if (!safe || attempt >= maxAttempts || !isRetryableNetworkError(error)) throw error
+        const delay = SAFE_REQUEST_BACKOFF_MS[attempt - 1] ?? 500
+        await new Promise((resolve) => setTimeout(resolve, delay))
+      }
+    }
+    throw new Error('VISSLM 请求重试次数已用尽')
+  }
+
   private async getJson(path: string, query?: Record<string, string>): Promise<AlmResponse | unknown> {
-    const response = await fetch(this.authenticatedUrl(path, query), {
-      signal: AbortSignal.timeout(30_000)
-    })
+    const response = await this.requestWithRetry(
+      this.authenticatedUrl(path, query),
+      { method: 'GET' },
+      true
+    )
     const responseText = await response.text()
     if (!response.ok) throw new Error(`VISSLM HTTP ${response.status}`)
     let data: AlmResponse | unknown = null
@@ -518,11 +760,10 @@ export class VisslmClient {
     query: Record<string, string>,
     body: Record<string, unknown>
   ): Promise<PostJsonResult> {
-    const response = await fetch(this.authenticatedUrl(path, query), {
+    const response = await this.requestWithRetry(this.authenticatedUrl(path, query), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json; charset=utf-8' },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(30_000)
+      body: JSON.stringify(body)
     })
     const responseText = await response.text()
     let data: AlmResponse | unknown = responseText
@@ -566,6 +807,50 @@ export class VisslmClient {
     return this.postJson('/rest/items', params, body)
   }
 
+  /** Upload one rich-text image using the CKEditor File Browser contract. */
+  async uploadRichImage(input: {
+    projectId: string
+    bytes: Buffer
+    mimeType: string
+    fileName: string
+  }): Promise<{ remotePath: string; httpStatus: number }> {
+    const projectId = input.projectId.trim()
+    if (!projectId) throw new Error('图片上传缺少目标项目 UID')
+    if (!input.bytes.byteLength) throw new Error('不能上传空图片')
+    const token = randomBytes(32).toString('hex')
+    const url = this.authenticatedUrl('/FileCenterImg/UploadRichImg', {
+      type: 'image',
+      proId: projectId,
+      CKEditor: 'Replyrecord',
+      CKEditorFuncNum: '0',
+      langCode: 'zh-cn'
+    })
+    const form = new FormData()
+    const mimeType = input.mimeType.trim().toLowerCase() || 'application/octet-stream'
+    const safeName = input.fileName.trim().replace(/[\\/\u0000-\u001f\u007f]/g, '_').slice(0, 180) || 'image'
+    const uploadBytes = new ArrayBuffer(input.bytes.byteLength)
+    new Uint8Array(uploadBytes).set(input.bytes)
+    form.append('upload', new Blob([uploadBytes], { type: mimeType }), safeName)
+    form.append('ckCsrfToken', token)
+    const response = await this.requestWithRetry(url, {
+      method: 'POST',
+      headers: {
+        // Do not set Content-Type: undici must add the multipart boundary.
+        accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        cookie: `ckCsrfToken=${token}`
+      },
+      body: form
+    })
+    const responseText = await response.text()
+    if (!response.ok) {
+      throw new VisslmRequestError(`图片上传失败 HTTP ${response.status}`, response.status)
+    }
+    return {
+      remotePath: parseRichImageUploadCallback(responseText),
+      httpStatus: response.status
+    }
+  }
+
   async test(): Promise<ConnectionResult> {
     try {
       const [version, dbVersion] = await Promise.all([
@@ -607,14 +892,18 @@ export class VisslmClient {
   }
 
   async resolveNumericFieldDisplayValues(records: JsonObject[]): Promise<JsonObject[]> {
-    return (await Promise.all(
-      records.map((record) => this.resolveNumericFieldValue(record))
+    return (await mapWithConcurrency(
+      records,
+      (record) => this.resolveNumericFieldValue(record)
     )) as JsonObject[]
   }
 
   private async resolveNumericFieldValue(input: unknown, path = ''): Promise<unknown> {
     if (Array.isArray(input)) {
-      return Promise.all(input.map((item) => this.resolveNumericFieldValue(item, path)))
+      return mapWithConcurrency(
+        input,
+        (item) => this.resolveNumericFieldValue(item, path)
+      )
     }
     if (!input || typeof input !== 'object') return input
 
@@ -648,8 +937,9 @@ export class VisslmClient {
         if (numericValues.every((value): value is string => Boolean(value))) {
           const textKey = `${key}_text`
           if (!hasDisplayText(source[textKey])) {
-            const texts = await Promise.all(
-              numericValues.map((value) => this.lookupItemName(value))
+            const texts = await mapWithConcurrency(
+              numericValues,
+              (value) => this.lookupItemName(value)
             )
             if (texts.some(Boolean)) result[textKey] = texts
           }
@@ -679,7 +969,10 @@ export class VisslmClient {
     const values = userLookupValue(input)
     if (!values.length) return
 
-    const names = await Promise.all(values.map((value) => this.lookupUserDisplayName(value)))
+    const names = await mapWithConcurrency(
+      values,
+      (value) => this.lookupUserDisplayName(value)
+    )
     if (!names.some(Boolean)) return
 
     if (input && typeof input === 'object' && !Array.isArray(input)) {
@@ -702,10 +995,10 @@ export class VisslmClient {
     const pending = this.itemNameRequests.get(uid)
     if (pending) return pending
 
-    const request = this.getJson('/rest/items', {
+    const request = this.displayLookupLimiter.run(() => this.getJson('/rest/items', {
       ReturnProperty: '_valm_Uid,_valm_Name',
       'q._valm_Uid': uid
-    })
+    }))
       .then((data) => {
         const response = data as AlmResponse
         const candidates = [
@@ -737,7 +1030,9 @@ export class VisslmClient {
     const pending = this.userDisplayNameRequests.get(loginName)
     if (pending) return pending
 
-    const request = this.getJson('/ssf/user/getUserByName', { name: loginName })
+    const request = this.displayLookupLimiter.run(() =>
+      this.getJson('/ssf/user/getUserByName', { name: loginName })
+    )
       .then((data) => {
         const name = findUserDisplayName(data, loginName)
         this.userDisplayNameCache.set(loginName, name)
@@ -978,7 +1273,7 @@ export class VisslmClient {
     }
     url.searchParams.set('user', this.credentials.username)
     url.searchParams.set('ApiToken', this.credentials.token)
-    const response = await fetch(url, { signal: AbortSignal.timeout(30_000) })
+    const response = await this.requestWithRetry(url, { method: 'GET' }, true)
     if (!response.ok) throw new Error(`图片下载失败 HTTP ${response.status}`)
     const bytes = Buffer.from(await response.arrayBuffer())
     return {
@@ -1078,6 +1373,7 @@ export class PushService {
       }
       for (const field of forbiddenBodyFields) delete body[field]
       if (!body._valm_Name) body._valm_Name = detail.name
+      const previewAssets = this.inspectBodyAssets(client, config.projectId.trim(), body)
       return {
         id: index + 1,
         recordUid: detail.uid,
@@ -1085,16 +1381,25 @@ export class PushService {
         method: 'POST' as const,
         endpoint: client.createItemEndpoint(),
         params: client.createItemTraceParams(params),
-        body
+        body,
+        ...(previewAssets.imageTotal || previewAssets.imageFailed ? previewAssets : {})
       }
     })
 
     if (!execute) {
+      const previewImageStats = requests.reduce((summary, request) => ({
+        imageTotal: summary.imageTotal + (request.imageTotal ?? 0),
+        imageUpload: summary.imageUpload + (request.imageUpload ?? 0),
+        imageReuse: summary.imageReuse + (request.imageReuse ?? 0),
+        imageFailed: summary.imageFailed + (request.imageFailed ?? 0),
+        imageErrors: [...summary.imageErrors, ...(request.imageErrors ?? [])].slice(0, 50)
+      }), { imageTotal: 0, imageUpload: 0, imageReuse: 0, imageFailed: 0, imageErrors: [] as string[] })
       return {
         preview: true,
         total: requests.length,
         successCount: 0,
         failedCount: 0,
+        ...previewImageStats,
         requests: requests.map((request) => ({
           ...request,
           response: { preview: true, message: '请求预览，未向真实平台发送 POST' }
@@ -1105,12 +1410,74 @@ export class PushService {
     return this.execute(client, requests)
   }
 
+  private inspectBodyAssets(
+    client: VisslmClient,
+    projectId: string,
+    body: Record<string, unknown>
+  ): Pick<PushRequestTrace, 'imageTotal' | 'imageUpload' | 'imageReuse' | 'imageFailed' | 'imageErrors'> {
+    const tokenPattern = /visslm-asset:\/\/([a-f0-9]{64})\/[A-Za-z0-9_-]{1,128}/gi
+    const hashes = new Set<string>()
+    const failedHashes = new Set<string>()
+    let imageTotal = 0
+    let imageFailed = 0
+    const imageErrors: string[] = []
+    const addError = (message: string): void => {
+      if (imageErrors.length < 20 && !imageErrors.includes(message)) imageErrors.push(message)
+    }
+    const visit = (input: unknown): void => {
+      if (typeof input === 'string') {
+        const matches = [...input.matchAll(tokenPattern)]
+        imageTotal += matches.length
+        for (const match of matches) {
+          const sha256 = match[1].toLowerCase()
+          hashes.add(sha256)
+          if (!this.db.getAssetBlob(sha256) || !this.db.readAssetBytes(sha256)) {
+            imageFailed += 1
+            failedHashes.add(sha256)
+            addError(`图片资源 ${sha256.slice(0, 12)}… 不存在或校验失败`)
+          }
+        }
+        for (const source of findRichTextImageSources(input)) {
+          if (parseAssetToken(source.source)) continue
+          imageTotal += 1
+          imageFailed += 1
+          addError('富文本中存在未解析图片')
+        }
+        return
+      }
+      if (Array.isArray(input)) {
+        input.forEach(visit)
+        return
+      }
+      if (input && typeof input === 'object') {
+        Object.values(input as JsonObject).forEach(visit)
+      }
+    }
+    visit(body)
+    let imageReuse = 0
+    for (const sha256 of hashes) {
+      if (!failedHashes.has(sha256) && this.db.getPushAssetUpload(client.baseUrl, projectId, sha256)) imageReuse += 1
+    }
+    return {
+      imageTotal,
+      imageUpload: Math.max(0, hashes.size - imageReuse - failedHashes.size),
+      imageReuse,
+      imageFailed,
+      ...(imageErrors.length ? { imageErrors } : {})
+    }
+  }
+
   private async execute(
     client: VisslmClient,
     requests: PushRequestTrace[]
   ): Promise<PushResult> {
     let successCount = 0
     let failedCount = 0
+    let imageTotal = 0
+    let imageUpload = 0
+    let imageReuse = 0
+    let imageFailed = 0
+    const imageErrors: string[] = []
     const completed: PushRequestTrace[] = []
     for (const request of requests) {
       const params = Object.fromEntries(
@@ -1123,8 +1490,16 @@ export class PushService {
         params: request.params,
         body: request.body
       })
+      let requestImageStats: Pick<PushRequestTrace, 'imageTotal' | 'imageUpload' | 'imageReuse' | 'imageFailed'> = {}
       try {
-        const created = await client.createItem(params, request.body)
+        const projectId = String(params.projectId ?? '').trim()
+        const prepared = await this.resolveBodyAssets(client, projectId, request.recordUid, request.body)
+        requestImageStats = prepared
+        imageTotal += prepared.imageTotal
+        imageUpload += prepared.imageUpload
+        imageReuse += prepared.imageReuse
+        imageFailed += prepared.imageFailed
+        const created = await client.createItem(params, prepared.body)
         const response = created.data
         const result = response as AlmResponse
         const pushedUid =
@@ -1136,17 +1511,40 @@ export class PushService {
           remoteUid: pushedUid
         })
         this.db.markPushResult(request.recordUid, 'success', '推送成功', pushedUid)
-        completed.push({ ...request, response })
+        completed.push({
+          ...request,
+          body: prepared.body,
+          response,
+          ...(prepared.imageTotal ? {
+            imageTotal: prepared.imageTotal,
+            imageUpload: prepared.imageUpload,
+            imageReuse: prepared.imageReuse,
+            imageFailed: prepared.imageFailed
+          } : {})
+        })
         successCount += 1
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
+        const assetStats = error instanceof AssetPreparationError ? error.stats : undefined
+        if (assetStats) {
+          imageTotal += assetStats.imageTotal
+          imageUpload += assetStats.imageUpload
+          imageReuse += assetStats.imageReuse
+          imageFailed += assetStats.imageFailed
+          imageErrors.push(...(assetStats.imageErrors ?? []))
+        }
         this.db.finishPushLog(logId, 'failed', {
           httpStatus: error instanceof VisslmRequestError ? error.httpStatus : 0,
           response: error instanceof VisslmRequestError ? error.response : undefined,
           errorMessage: message
         })
         this.db.markPushResult(request.recordUid, 'failed', message)
-        completed.push({ ...request, error: message })
+        completed.push({
+          ...request,
+          ...requestImageStats,
+          ...(assetStats ? assetStats : {}),
+          error: message
+        })
         failedCount += 1
       }
     }
@@ -1155,13 +1553,150 @@ export class PushService {
       total: requests.length,
       successCount,
       failedCount,
-      requests: completed
+      requests: completed,
+      ...(imageTotal || imageUpload || imageReuse || imageFailed ? {
+        imageTotal,
+        imageUpload,
+        imageReuse,
+        imageFailed,
+        ...(imageErrors.length ? { imageErrors: imageErrors.slice(0, 50) } : {})
+      } : {})
+    }
+  }
+
+  private async resolveBodyAssets(
+    client: VisslmClient,
+    projectId: string,
+    recordUid: string,
+    body: Record<string, unknown>
+  ): Promise<{
+    body: Record<string, unknown>
+    imageTotal: number
+    imageUpload: number
+    imageReuse: number
+    imageFailed: number
+  }> {
+    let imageTotal = 0
+    let imageUpload = 0
+    let imageReuse = 0
+    let imageFailed = 0
+    const fail = (message: string): never => {
+      throw new AssetPreparationError(message, {
+        imageTotal,
+        imageUpload,
+        imageReuse,
+        imageFailed,
+        imageErrors: [message]
+      })
+    }
+    if (!projectId) fail('图片上传缺少目标项目 UID')
+    const references = new Map(
+      this.db.listRecordImageReferences(recordUid).map((reference) => [reference.id, reference])
+    )
+    const tokenPattern = /visslm-asset:\/\/([a-f0-9]{64})\/([A-Za-z0-9_-]{1,128})/gi
+    const remoteBySha = new Map<string, string>()
+
+    const resolveString = async (valueInput: string): Promise<string> => {
+      const richSources = findRichTextImageSources(valueInput)
+      const tokenSources = new Set(richSources
+        .map((source) => source.source)
+        .filter((source) => Boolean(parseAssetToken(source))))
+      const matches = [...valueInput.matchAll(tokenPattern)]
+      const replacements: Array<{ start: number; end: number; value: string }> = []
+      for (const match of matches) {
+        const token = match[0]
+        const parsed = parseAssetToken(token)
+        if (!parsed) continue
+        imageTotal += 1
+        let remotePath = remoteBySha.get(parsed.sha256)
+        if (!remotePath) {
+          const cached = this.db.getPushAssetUpload(client.baseUrl, projectId, parsed.sha256)
+          if (cached?.remotePath?.trim()) {
+            remotePath = cached.remotePath
+            imageReuse += 1
+          } else {
+            const blob = this.db.getAssetBlob(parsed.sha256)
+            const bytes = this.db.readAssetBytes(parsed.sha256)
+            if (!blob) {
+              imageFailed += 1
+              fail(`图片资源 ${parsed.sha256.slice(0, 12)}… 不存在或校验失败`)
+            }
+            if (!bytes) {
+              imageFailed += 1
+              fail(`图片资源 ${parsed.sha256.slice(0, 12)}… 不存在或校验失败`)
+            }
+            const resolvedBlob = blob as NonNullable<typeof blob>
+            const resolvedBytes = bytes as Buffer
+            const reference = references.get(parsed.referenceId)
+            try {
+              const uploaded = await client.uploadRichImage({
+                projectId,
+                bytes: resolvedBytes,
+                mimeType: resolvedBlob.mimeType,
+                fileName: reference?.sourceName || `image-${parsed.sha256.slice(0, 12)}`
+              })
+              remotePath = uploaded.remotePath
+              this.db.savePushAssetUpload({
+                baseUrl: client.baseUrl,
+                projectId,
+                sha256: parsed.sha256,
+                remotePath: uploaded.remotePath
+              })
+              imageUpload += 1
+            } catch (error) {
+              imageFailed += 1
+              fail(error instanceof Error ? error.message : String(error))
+            }
+          }
+          const resolvedRemotePath = remotePath || fail(`图片资源 ${parsed.sha256.slice(0, 12)}… 未返回远端路径`)
+          remoteBySha.set(parsed.sha256, resolvedRemotePath)
+        }
+        const resolvedRemotePath = remotePath || fail(`图片资源 ${parsed.sha256.slice(0, 12)}… 未返回远端路径`)
+        const start = match.index ?? 0
+        replacements.push({ start, end: start + token.length, value: resolvedRemotePath })
+      }
+      // An un-tokenized image means collection/import could not retain the
+      // binary resource.  Refuse to create a partial remote record.
+      for (const source of richSources) {
+        if (!tokenSources.has(source.source)) {
+          imageFailed += 1
+          fail('富文本中存在未解析图片，已阻止推送')
+        }
+      }
+      let result = valueInput
+      for (const replacement of replacements.sort((left, right) => right.start - left.start)) {
+        result = result.slice(0, replacement.start) + replacement.value + result.slice(replacement.end)
+      }
+      return result
+    }
+
+    const visit = async (input: unknown): Promise<unknown> => {
+      if (typeof input === 'string') return resolveString(input)
+      if (Array.isArray(input)) {
+        return mapWithConcurrency(input, (item) => visit(item))
+      }
+      if (!input || typeof input !== 'object') return input
+      const result: JsonObject = {}
+      for (const [key, valueInput] of Object.entries(input as JsonObject)) {
+        result[key] = await visit(valueInput)
+      }
+      return result
+    }
+    const prepared = await visit(body)
+    return {
+      body: prepared as Record<string, unknown>,
+      imageTotal,
+      imageUpload,
+      imageReuse,
+      imageFailed
     }
   }
 }
 
 export class SyncService {
   private running = false
+
+  private static readonly writeBatchSize = 256
 
   constructor(
     private readonly db: AppDatabase,
@@ -1174,27 +1709,50 @@ export class SyncService {
     this.running = true
     const runId = this.db.beginSync()
     const counts = { projects: 0, records: 0, images: 0 }
+    let updatedCount = 0
     const retainedUids: string[] = []
-    const duplicates: DataReviewItem[] = []
-    const stagedItemIds = new Set<string>()
     let skippedCount = 0
     let invalidItemIdCount = 0
-    const reviewBatchId = `sync:${runId}`
-    const summary = (record: {
-      uid: string
-      projectId: string
-      nodeType: string
-      name: string
-      lastModifyTime: string
-    }): DataReviewSummary => ({
-      uid: record.uid,
-      projectId: record.projectId,
-      nodeType: record.nodeType,
-      name: record.name,
-      lastModifyTime: record.lastModifyTime
-    })
     try {
       const client = this.clientFactory()
+      const pendingRecords: RecordInput[] = []
+      const pendingItemIds = new Set<string>()
+      const flushPendingRecords = async (): Promise<void> => {
+        if (!pendingRecords.length) return
+        const batch = pendingRecords.splice(0, pendingRecords.length)
+        pendingItemIds.clear()
+        // Keep project-row ordering compatible with the previous per-record
+        // path, then persist records in one transaction.  Images are handled
+        // only after records exist so foreign-key and rich-text asset behavior
+        // remains unchanged.
+        for (const record of batch) {
+          if (record.nodeType === 'Project') {
+            this.db.upsertProject({
+              uid: record.uid,
+              name: record.name,
+              itemId: record.itemId,
+              lastModifyTime: record.lastModifyTime,
+              raw: record.raw
+            })
+          }
+        }
+        this.db.upsertRecords(batch)
+        for (const record of batch) {
+          const imageSync = await this.syncImages(client, record.uid, record.raw)
+          counts.images += imageSync.count
+          if (JSON.stringify(imageSync.raw) !== JSON.stringify(record.raw)) {
+            const refreshedLabels = this.db.getFieldDisplayNames(
+              record.nodeType,
+              Object.keys(imageSync.raw)
+            )
+            this.db.updateRecordRawAndNormalizedText(
+              record.uid,
+              imageSync.raw,
+              normalizeText(imageSync.raw, refreshedLabels)
+            )
+          }
+        }
+      }
       this.progress({ phase: 'connect', message: '正在验证平台连接', current: 0, total: 1 })
       const connection = await client.test()
       if (!connection.ok) throw new Error(connection.message)
@@ -1305,62 +1863,121 @@ export class SyncService {
             total: records.length
           })
 
+          // A duplicate can occur within one response before the current
+          // write batch is flushed. Flush first so the existing row is visible
+          // and the latest occurrence wins deterministically.
+          const itemKey = itemId.toLowerCase()
+          if (pendingItemIds.has(itemKey)) await flushPendingRecords()
           const existing = this.db.findRecordByItemId(itemId)
           if (existing) {
             retainedUids.push(existing.uid)
-            skippedCount += 1
             const existingDetail = this.db.getRecord(existing.uid, false)
-            if (existingDetail) {
-              const mergedRaw = structuredClone(existingDetail.raw) as JsonObject
-              mergeDerivedDisplayValues(mergedRaw, record.raw)
-              const existingLabels = this.db.getFieldDisplayNames(
-                existingDetail.nodeType,
-                Object.keys(mergedRaw)
+            // Keep the local primary key stable so project assets, knowledge
+            // chunks and PM links remain attached even if the platform sends a
+            // different UID for the same business ItemID.  Properties returned
+            // by this run win; fields omitted by ReturnProperty remain intact.
+            const hasIncomingField = (field: string): boolean =>
+              Object.prototype.hasOwnProperty.call(record.raw, field)
+            const mergedRaw: JsonObject = {
+              ...(existingDetail?.raw ?? {}),
+              ...record.raw,
+              _valm_Uid: existing.uid,
+              _valm_ItemID: itemId,
+              _valm_NodeType: value(record.raw, '_valm_NodeType') ||
+                value(existingDetail?.raw ?? {}, '_valm_NodeType') ||
+                record.nodeType ||
+                existing.nodeType
+            }
+            // Derive the row metadata from the merged payload so a field that
+            // is omitted by ReturnProperty remains intact, while an explicitly
+            // returned latest value (including an empty value) is respected.
+            const mergedNodeType = value(mergedRaw, '_valm_NodeType') || record.nodeType || existing.nodeType
+            const hasIncomingProjectId = hasIncomingField('_valm_ProjectId') ||
+              hasIncomingField('_valm_ProjectUid') ||
+              record.nodeType === 'Project'
+            const mergedProjectId = hasIncomingProjectId ? record.projectId : existing.projectId
+            const mergedParentId = hasIncomingField('_valm_ParentId')
+              ? value(record.raw, '_valm_ParentId')
+              : existing.parentId
+            const mergedName = hasIncomingField('_valm_Name')
+              ? (value(record.raw, '_valm_Name') || existing.name || record.name)
+              : existing.name
+            const mergedLastModifyTime = hasIncomingField('_valm_LastModifyTime')
+              ? value(record.raw, '_valm_LastModifyTime')
+              : existing.lastModifyTime
+            mergedRaw._valm_NodeType = mergedNodeType
+            const mergedLabels = this.db.getFieldDisplayNames(
+              mergedNodeType,
+              Object.keys(mergedRaw)
+            )
+            const mergedNormalizedText = normalizeText(mergedRaw, mergedLabels)
+            const recordChanged = !existingDetail ||
+              existingDetail.projectId !== mergedProjectId ||
+              existingDetail.nodeType !== mergedNodeType ||
+              existingDetail.parentId !== mergedParentId ||
+              existingDetail.name !== mergedName ||
+              existingDetail.lastModifyTime !== mergedLastModifyTime ||
+              JSON.stringify(existingDetail.raw) !== JSON.stringify(mergedRaw) ||
+              existingDetail.normalizedText !== mergedNormalizedText
+            if (recordChanged) {
+              this.db.upsertRecord({
+                ...record,
+                uid: existing.uid,
+                projectId: mergedProjectId,
+                nodeType: mergedNodeType,
+                parentId: mergedParentId,
+                name: mergedName,
+                lastModifyTime: mergedLastModifyTime,
+                raw: mergedRaw,
+                normalizedText: mergedNormalizedText
+              })
+            }
+            const imageSync = recordChanged || record.uid !== existing.uid
+              ? await this.syncImages(client, existing.uid, mergedRaw, record.uid)
+              : { count: 0, raw: mergedRaw }
+            counts.images += imageSync.count
+            const imageRawChanged = JSON.stringify(imageSync.raw) !== JSON.stringify(mergedRaw)
+            if (imageRawChanged) {
+              const imageLabels = this.db.getFieldDisplayNames(
+                mergedNodeType,
+                Object.keys(imageSync.raw)
               )
-              const refreshedText = normalizeText(mergedRaw, existingLabels)
-              if (
-                JSON.stringify(mergedRaw) !== JSON.stringify(existingDetail.raw) ||
-                refreshedText !== existingDetail.normalizedText
-              ) {
-                this.db.updateRecordRawAndNormalizedText(existing.uid, mergedRaw, refreshedText)
-              }
+              this.db.updateRecordRawAndNormalizedText(
+                existing.uid,
+                imageSync.raw,
+                normalizeText(imageSync.raw, imageLabels)
+              )
             }
-            if (!stagedItemIds.has(itemId)) {
-              duplicates.push(this.db.stageDataReview({
-                batchId: reviewBatchId,
-                source: 'sync',
+            if (mergedNodeType === 'Project') {
+              this.db.upsertProject({
+                uid: existing.uid,
+                name: mergedName,
                 itemId,
-                existing: summary(existing),
-                incoming: summary(record),
-                payload: record
-              }))
-              stagedItemIds.add(itemId)
+                lastModifyTime: mergedLastModifyTime,
+                raw: imageSync.raw
+              })
             }
+            if (recordChanged || imageRawChanged) updatedCount += 1
             this.progress({
               phase: 'records',
-              message: `跳过已存在的 _valm_ItemID：${itemId}`,
+              message: `已自动更新 _valm_ItemID：${itemId}`,
               current: index + 1,
               total: records.length
             })
             continue
           }
 
-          if (nodeType === 'Project') {
-            this.db.upsertProject({
-              uid,
-              name,
-              itemId,
-              lastModifyTime,
-              raw: normalizedRaw
-            })
-            counts.projects += 1
-          }
-
-          this.db.upsertRecord(record)
+          if (nodeType === 'Project') counts.projects += 1
+          pendingRecords.push(record)
+          pendingItemIds.add(itemKey)
           retainedUids.push(uid)
           counts.records += 1
-          counts.images += await this.syncImages(client, uid, normalizedRaw)
+          if (pendingRecords.length >= SyncService.writeBatchSize) {
+            await flushPendingRecords()
+          }
         }
+
+        await flushPendingRecords()
 
         this.progress({
           phase: 'projects',
@@ -1375,24 +1992,24 @@ export class SyncService {
       this.progress({
         phase: 'done',
         message:
-          `同步完成：新增 ${counts.records} 条记录，跳过 ${skippedCount} 条` +
-          (duplicates.length ? `，发现 ${duplicates.length} 条已有数据待审查` : '') +
+          `同步完成：新增 ${counts.records} 条，自动更新 ${updatedCount} 条` +
+          (skippedCount ? `，跳过 ${skippedCount} 条` : '') +
           (invalidItemIdCount ? `，${invalidItemIdCount} 条缺少 _valm_ItemID` : ''),
-        current: counts.records,
-        total: counts.records
+        current: counts.records + updatedCount,
+        total: counts.records + updatedCount
       })
       return {
         ok: true,
         projectCount: counts.projects,
         recordCount: counts.records,
+        updatedCount,
         imageCount: counts.images,
         skippedCount,
         invalidItemIdCount,
-        ...(duplicates.length ? { reviewBatchId } : {}),
-        duplicates,
+        duplicates: [],
         message:
-          `同步完成：新增 ${counts.records} 条，跳过 ${skippedCount} 条` +
-          (duplicates.length ? `，发现 ${duplicates.length} 条已有数据待审查` : '') +
+          `同步完成：新增 ${counts.records} 条，自动更新 ${updatedCount} 条` +
+          (skippedCount ? `，跳过 ${skippedCount} 条` : '') +
           (invalidItemIdCount ? `，${invalidItemIdCount} 条缺少 _valm_ItemID` : '')
       }
     } catch (error) {
@@ -1403,10 +2020,11 @@ export class SyncService {
         ok: false,
         projectCount: counts.projects,
         recordCount: counts.records,
+        updatedCount,
         imageCount: counts.images,
         skippedCount,
         invalidItemIdCount,
-        duplicates,
+        duplicates: [],
         message
       }
     } finally {
@@ -1476,12 +2094,21 @@ export class SyncService {
             raw
           })
         }
-        imageCount += await this.syncImages(
+        const imageSync = await this.syncImages(
           client,
           targetUid,
           raw,
           review.incoming.uid
         )
+        imageCount += imageSync.count
+        if (JSON.stringify(imageSync.raw) !== JSON.stringify(raw)) {
+          const refreshedLabels = this.db.getFieldDisplayNames(nodeType, Object.keys(imageSync.raw))
+          this.db.updateRecordRawAndNormalizedText(
+            targetUid,
+            imageSync.raw,
+            normalizeText(imageSync.raw, refreshedLabels)
+          )
+        }
         updatedCount += 1
         resolvedReviewIds.push(review.id)
       } catch (error) {
@@ -1507,22 +2134,25 @@ export class SyncService {
     recordUid: string,
     raw: JsonObject,
     attachmentUid = recordUid
-  ): Promise<number> {
+  ): Promise<{ count: number; raw: JsonObject }> {
     const candidates = new Map<string, string>()
-    const visit = (input: unknown): void => {
+    const description = typeof raw._valm_Description === 'string' ? raw._valm_Description : ''
+    for (const source of findRichTextImageSources(description)) {
+      if (!parseAssetToken(source.source)) candidates.set(source.source, '富文本图片')
+    }
+    const visitNonDescription = (input: unknown): void => {
       if (typeof input === 'string') {
-        for (const match of input.matchAll(/<img[^>]+src=["']([^"']+)["']/gi)) {
-          candidates.set(match[1], '富文本图片')
-        }
-        if (input.startsWith('data:image/')) candidates.set(input, '内嵌图片')
+        if (/^data:image\//i.test(input)) candidates.set(input, '内嵌图片')
         else if (imageExtension.test(input)) candidates.set(input, '图片字段')
       } else if (Array.isArray(input)) {
-        input.forEach(visit)
+        input.forEach(visitNonDescription)
       } else if (input && typeof input === 'object') {
-        Object.values(input as JsonObject).forEach(visit)
+        Object.values(input as JsonObject).forEach(visitNonDescription)
       }
     }
-    visit(raw)
+    for (const [key, valueInput] of Object.entries(raw)) {
+      if (key !== '_valm_Description') visitNonDescription(valueInput)
+    }
 
     const attachments = await client.getAttachments(attachmentUid)
     for (const attachment of attachments) {
@@ -1532,15 +2162,34 @@ export class SyncService {
     }
 
     let saved = 0
+    const savedBySource = new Map<string, { id: string; sha256: string; name: string }>()
     for (const [source, name] of candidates) {
+      let mimeType = 'application/octet-stream'
+      const markUnresolved = (message: string): void => {
+        if (name !== '富文本图片' || typeof this.db.saveUnresolvedImage !== 'function') return
+        try {
+          this.db.saveUnresolvedImage({
+            recordUid,
+            name,
+            mimeType,
+            sourceUrl: source,
+            errorMessage: message
+          })
+        } catch {
+          // The unresolved marker is best-effort; the original HTML remains
+          // un-tokenized and therefore still blocks export and push.
+        }
+      }
       try {
         let bytes: Buffer
-        let mimeType: string
         let sourceUrl = source
-        if (source.startsWith('data:image/')) {
-          const match = source.match(/^data:([^;]+);base64,(.+)$/s)
-          if (!match) continue
-          mimeType = match[1]
+        if (/^data:image\//i.test(source)) {
+          const match = source.match(/^data:([^;,]+);base64,([A-Za-z0-9+/]*={0,2})$/s)
+          if (!match || match[2].length % 4 === 1) {
+            markUnresolved('内嵌图片 Base64 格式无效')
+            continue
+          }
+          mimeType = match[1].toLowerCase()
           bytes = Buffer.from(match[2], 'base64')
           sourceUrl = 'inline:data-uri'
         } else {
@@ -1549,13 +2198,44 @@ export class SyncService {
           mimeType = downloaded.mimeType
           sourceUrl = downloaded.sourceUrl
         }
-        if (!mimeType.startsWith('image/') && !imageExtension.test(name || source)) continue
-        this.db.saveImage({ recordUid, name, mimeType, sourceUrl, bytes })
+        if (!imageBytesMatchMime(mimeType, bytes)) {
+          markUnresolved('图片 MIME 与文件签名不匹配')
+          continue
+        }
+        const savedImage = this.db.saveImage({ recordUid, name, mimeType, sourceUrl, bytes })
+        savedBySource.set(source, {
+          id: savedImage.id,
+          sha256: savedImage.sha256,
+          name
+        })
         saved += 1
-      } catch {
+      } catch (error) {
         // A broken or unauthorized image should not fail the whole sync.
+        markUnresolved(error instanceof Error ? error.message : '图片下载失败')
       }
     }
-    return saved
+    if (typeof description !== 'string') return { count: saved, raw }
+    const tokenized = replaceRichTextImageSources(description, (source) => {
+      const savedImage = savedBySource.get(source.source)
+      if (!savedImage) return undefined
+      const reference = this.db.saveRecordImageReference({
+        recordUid,
+        fieldPath: '_valm_Description',
+        ordinal: source.occurrence,
+        assetSha256: savedImage.sha256,
+        sourceType: 'rich-text',
+        sourceName: savedImage.name,
+        originalSource: source.source
+      })
+      return `visslm-asset://${savedImage.sha256}/${reference.id}`
+    })
+    if (!tokenized.replacements.length) return { count: saved, raw }
+    return {
+      count: saved,
+      raw: {
+        ...raw,
+        _valm_Description: tokenized.html
+      }
+    }
   }
 }

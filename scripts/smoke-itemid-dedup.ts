@@ -11,7 +11,7 @@ const db = new AppDatabase(join(root, 'dedup.db'), join(root, 'assets'))
 
 const config: SyncScopeConfig = {
   selectedTypes: ['Task'],
-  rules: [{ nodeType: 'Task', filters: [], returnProperty: '_valm_Name' }]
+  rules: [{ nodeType: 'Task', filters: [], returnProperty: '_valm_Name,Status,NewField' }]
 }
 
 let remoteRows = [
@@ -19,13 +19,19 @@ let remoteRows = [
     _valm_Uid: 'remote-1',
     _valm_NodeType: 'Task',
     _valm_ItemID: 'ITEM-1',
-    _valm_Name: 'Original task'
+    _valm_Name: 'Original task',
+    Status: 'Open'
   },
   {
     _valm_Uid: 'remote-2',
     _valm_NodeType: 'Task',
     _valm_ItemID: 'ITEM-2',
-    _valm_Name: 'Second task'
+    _valm_Name: 'Second task',
+    _valm_ParentId: 'parent-2',
+    _valm_LastModifyTime: '2026-01-01T00:00:00Z',
+    _valm_Description: 'Description retained when omitted',
+    Status: 'Open',
+    KeepField: 'old value'
   }
 ]
 
@@ -47,9 +53,18 @@ try {
   remoteRows = [
     {
       ...remoteRows[0],
-      _valm_Name: 'Updated task'
+      _valm_Uid: 'remote-1-latest',
+      _valm_Name: 'Updated task',
+      Status: 'Done',
+      NewField: 'Latest value'
     },
-    remoteRows[1],
+    {
+      _valm_Uid: 'remote-2-latest',
+      _valm_NodeType: 'Task',
+      _valm_ItemID: 'ITEM-2',
+      Status: 'Done',
+      NewField: 'Partial response'
+    },
     {
       _valm_Uid: 'remote-3',
       _valm_NodeType: 'Task',
@@ -60,13 +75,24 @@ try {
   const second = await service.run(config)
   assert.equal(second.ok, true)
   assert.equal(second.recordCount, 1)
-  assert.equal(second.skippedCount, 2)
-  assert.equal(second.duplicates.length, 2)
+  assert.equal(second.updatedCount, 2)
+  assert.equal(second.skippedCount, 0)
+  assert.equal(second.duplicates.length, 0)
   assert.equal(db.listRecords({ page: 1, pageSize: 20 }).total, 3)
-
-  const syncOverwrite = await service.applyDataReviews(second.reviewBatchId!, second.duplicates.map((item) => item.id))
-  assert.equal(syncOverwrite.updatedCount, 2)
   assert.equal(db.getRecord('remote-1')?.name, 'Updated task')
+  assert.equal(db.findRecordByItemId('ITEM-1')?.uid, 'remote-1')
+  assert.equal(db.getRecord('remote-1', false)?.raw._valm_Uid, 'remote-1')
+  assert.equal(db.getRecord('remote-1', false)?.raw.Status, 'Done')
+  assert.equal(db.getRecord('remote-1', false)?.raw.NewField, 'Latest value')
+  const partial = db.getRecord('remote-2', false)
+  assert(partial)
+  assert.equal(partial.name, 'Second task')
+  assert.equal(partial.parentId, 'parent-2')
+  assert.equal(partial.lastModifyTime, '2026-01-01T00:00:00Z')
+  assert.equal(partial.raw._valm_Description, 'Description retained when omitted')
+  assert.equal(partial.raw.KeepField, 'old value')
+  assert.equal(partial.raw.Status, 'Done')
+  assert.equal(partial.raw.NewField, 'Partial response')
 
   const imported = db.importRows([{
     documentId: 'Task:import-3',
@@ -105,7 +131,7 @@ try {
   console.log(JSON.stringify({
     firstRun: first.recordCount,
     skippedOnSecondRun: second.skippedCount,
-    syncUpdated: syncOverwrite.updatedCount,
+    syncUpdated: second.updatedCount,
     importUpdated: importOverwrite.updatedCount,
     missingItemIdRejected: missingItemId.recordCount === 0
   }, null, 2))

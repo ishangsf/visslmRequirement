@@ -213,6 +213,7 @@ export interface RecordRow {
   parentId: string
   name: string
   description: string
+  releaseText: string
   lastModifyTime: string
   syncedAt: string
   imageCount: number
@@ -225,6 +226,11 @@ export interface RecordRow {
   semanticStatusReason: RequirementSemanticizationStatusReason
   semanticError: string
   semanticUpdatedAt: string
+}
+
+export interface RecordReleaseValue {
+  value: string
+  count: number
 }
 
 export interface FieldDefinition {
@@ -344,7 +350,26 @@ export interface ImageAsset {
   sourceUrl: string
   sha256: string
   byteSize: number
+  /** A secure local asset URL; preferred over dataUri for new records. */
+  assetUrl?: string
+  state: 'ready' | 'unresolved' | 'missing'
+  errorMessage?: string
+  /** @deprecated New code must not materialize image data as Base64. */
   dataUri?: string
+}
+
+export interface RecordImageReference {
+  id: string
+  recordUid: string
+  fieldPath: string
+  /** Source occurrence in the original field. */
+  occurrence: number
+  ordinal?: number
+  assetSha256: string
+  sourceType: string
+  sourceName: string
+  originalSource: string
+  createdAt: string
 }
 
 export interface RecordQuery {
@@ -354,6 +379,7 @@ export interface RecordQuery {
   projectId?: string
   nodeType?: string
   excludeProjectAssetProjectId?: string
+  releaseText?: string
   semanticStatus?: RequirementSemanticizationStatus
 }
 
@@ -536,6 +562,8 @@ export interface DataImportResult {
   ok: boolean
   canceled?: boolean
   path?: string
+  /** Stable local identifier for diagnostics when a streamed import is interrupted. */
+  importRunId?: string
   recordCount: number
   imageCount: number
   skippedCount: number
@@ -543,6 +571,37 @@ export interface DataImportResult {
   message: string
   reviewBatchId?: string
   duplicates: DataReviewItem[]
+  format?: 'json' | 'jsonl' | 'visslmpack'
+  packVersion?: number
+  assetCount?: number
+  assetBytes?: number
+  checksumVerified?: boolean
+  /** Streaming legacy import metrics; absent for older/resource-pack callers. */
+  batchCount?: number
+  sourceRowCount?: number
+  parseErrorCount?: number
+  durationMs?: number
+}
+
+export type DataImportRunStatus = 'running' | 'success' | 'failed'
+
+export interface DataImportRunSnapshot {
+  id: string
+  path: string
+  format: 'json' | 'jsonl'
+  fileSize: number
+  fileMtimeMs: number
+  status: DataImportRunStatus
+  batchCount: number
+  sourceRowCount: number
+  importedRecordCount: number
+  skippedCount: number
+  parseErrorCount: number
+  reviewBatchId: string
+  errorMessage: string
+  startedAt: string
+  updatedAt: string
+  finishedAt: string
 }
 
 export type DataReviewSource = 'sync' | 'import'
@@ -585,6 +644,10 @@ export interface DataExportResult {
   path?: string
   recordCount: number
   message: string
+  format?: 'jsonl' | 'visslmpack'
+  packVersion?: number
+  assetCount?: number
+  assetBytes?: number
 }
 
 export interface DataDeleteResult {
@@ -619,6 +682,11 @@ export interface PushRequestTrace {
   endpoint: string
   params: Record<string, string>
   body: Record<string, unknown>
+  imageTotal?: number
+  imageUpload?: number
+  imageReuse?: number
+  imageFailed?: number
+  imageErrors?: string[]
   response?: unknown
   error?: string
 }
@@ -629,6 +697,11 @@ export interface PushResult {
   successCount: number
   failedCount: number
   requests: PushRequestTrace[]
+  imageTotal?: number
+  imageUpload?: number
+  imageReuse?: number
+  imageFailed?: number
+  imageErrors?: string[]
 }
 
 export type PushLogStatus = 'sending' | 'success' | 'failed'
@@ -728,6 +801,7 @@ export interface SyncResult {
   ok: boolean
   projectCount: number
   recordCount: number
+  updatedCount: number
   imageCount: number
   skippedCount: number
   invalidItemIdCount: number
@@ -895,6 +969,9 @@ export interface KnowledgeDocumentDetail extends KnowledgeDocument {
 
 export interface KnowledgeDocumentPreview {
   document: KnowledgeDocumentDetail
+  /** Prefer the short-lived streaming URL for large source files. */
+  contentUrl?: string
+  contentByteSize?: number
   contentBase64?: string
   renderFormat?: 'docx' | 'pdf'
   errorMessage?: string
@@ -935,6 +1012,10 @@ export interface KnowledgeIndexProgress {
   current: number
   total: number
   status: 'running' | 'success' | 'failed'
+  /** Elapsed wall-clock time for the current in-process task. */
+  elapsedMs?: number
+  /** Completed units per second when a positive progress denominator exists. */
+  throughputPerSecond?: number
 }
 
 export interface KnowledgeStats {
@@ -1038,6 +1119,8 @@ export interface AppApi {
   listProjects(): Promise<ProjectRow[]>
   listNodeTypes(): Promise<string[]>
   listRecords(query: RecordQuery): Promise<RecordPage>
+  listRecordReleaseValues(): Promise<RecordReleaseValue[]>
+  listRecordUids(query: Omit<RecordQuery, 'page' | 'pageSize'>): Promise<string[]>
   getRecord(uid: string): Promise<RecordDetail | null>
   previewRecordMaintenance(input: Pick<RecordMaintenanceStartInput, 'scope' | 'recordUids'>): Promise<RecordMaintenancePreview>
   startRecordMaintenance(input: RecordMaintenanceStartInput): Promise<RecordMaintenanceTaskSnapshot>
@@ -1091,6 +1174,9 @@ export interface AppApi {
   listVisualizationRuns(limit?: number): Promise<VisualizationRun[]>
   listDashboardAuditLogs(dashboardId?: string, limit?: number): Promise<DashboardAuditLog[]>
   importData(): Promise<DataImportResult>
+  listDataImportRuns(limit?: number): Promise<DataImportRunSnapshot[]>
+  getDataImportRun(id: string): Promise<DataImportRunSnapshot | null>
+  resumeDataImportRun(id: string): Promise<DataImportResult>
   exportData(): Promise<DataExportResult>
   deleteData(uids?: string[]): Promise<DataDeleteResult>
   previewPush(config: PushConfig): Promise<PushResult>
@@ -1105,6 +1191,7 @@ export interface AppApi {
   updateKnowledgeDocumentTags(id: string, tags: string[]): Promise<KnowledgeDocument | null>
   deleteKnowledgeDocument(id: string): Promise<{ ok: boolean; message: string }>
   rebuildKnowledgeIndex(): Promise<KnowledgeRebuildResult>
+  cancelKnowledgeTask(taskId: string): Promise<boolean>
   getKnowledgeStats(): Promise<KnowledgeStats>
   onKnowledgeProgress(callback: (progress: KnowledgeIndexProgress) => void): () => void
   listManagedProjects(query: ManagedProjectListQuery): Promise<ManagedProjectPage>

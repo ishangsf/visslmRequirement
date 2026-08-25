@@ -187,7 +187,7 @@ export interface DashboardAuditLogInput {
   action: DashboardAuditAction
   status: DashboardAuditStatus
   version?: number
-  format?: 'json' | 'pdf' | 'png' | 'offline' | 'jsonl'
+  format?: 'json' | 'pdf' | 'png' | 'offline' | 'jsonl' | 'visslmpack'
   metadata?: Record<string, string | number | boolean | null>
   errorMessage?: string
 }

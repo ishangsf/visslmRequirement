@@ -53,6 +53,28 @@ export default defineConfig({
   renderer: {
     root: resolve(__dirname, 'src/renderer'),
     plugins: [stripSvarRemoteFontFaces(), react()],
+    build: {
+      rollupOptions: {
+        output: {
+          manualChunks(id) {
+            const normalizedId = id.replaceAll('\\', '/')
+            if (normalizedId.includes('/src/renderer/src/dashboard/DashboardStudio.')) {
+              return 'page-dashboard-studio'
+            }
+            if (normalizedId.includes('/src/renderer/src/project-management/ProjectManagementPage.')) {
+              return 'page-project-management'
+            }
+            if (normalizedId.includes('/node_modules/echarts/')) {
+              return 'vendor-echarts'
+            }
+            if (normalizedId.includes('/node_modules/react-markdown/') || normalizedId.includes('/node_modules/remark-gfm/')) {
+              return 'vendor-markdown'
+            }
+            return undefined
+          }
+        }
+      }
+    },
     server: {
       host: '127.0.0.1'
     },

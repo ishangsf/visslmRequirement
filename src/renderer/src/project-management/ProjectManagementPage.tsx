@@ -237,6 +237,17 @@ const decodeBase64Bytes = (contentBase64: string): Uint8Array => {
   return Uint8Array.from(binary, (character) => character.charCodeAt(0))
 }
 
+const loadPreviewBytes = async (
+  contentBase64?: string,
+  contentUrl?: string
+): Promise<Uint8Array> => {
+  if (contentBase64) return decodeBase64Bytes(contentBase64)
+  if (!contentUrl) throw new Error('预览内容地址缺失')
+  const response = await fetch(contentUrl)
+  if (!response.ok) throw new Error(`预览内容加载失败（HTTP ${response.status}）`)
+  return new Uint8Array(await response.arrayBuffer())
+}
+
 type PdfPreviewPage = {
   getViewport: (options: { scale: number }) => { width: number; height: number }
   render: (options: { canvasContext: CanvasRenderingContext2D; viewport: { width: number; height: number } }) => { promise: Promise<void> }
@@ -248,7 +259,7 @@ type PdfPreviewDocument = {
   destroy?: () => Promise<void>
 }
 
-function PdfDocumentPreview({ contentBase64, fileName, onPageCount }: { contentBase64: string; fileName: string; onPageCount?: (count: number) => void }): React.JSX.Element {
+function PdfDocumentPreview({ contentBase64, contentUrl, fileName, onPageCount }: { contentBase64?: string; contentUrl?: string; fileName: string; onPageCount?: (count: number) => void }): React.JSX.Element {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -267,7 +278,7 @@ function PdfDocumentPreview({ contentBase64, fileName, onPageCount }: { contentB
           getDocument: (options: Record<string, unknown>) => { promise: Promise<PdfPreviewDocument> }
         }
         pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl
-        const bytes = decodeBase64Bytes(contentBase64)
+        const bytes = await loadPreviewBytes(contentBase64, contentUrl)
         const pdf = await pdfjs.getDocument({
           data: bytes,
           isEvalSupported: false
@@ -311,7 +322,7 @@ function PdfDocumentPreview({ contentBase64, fileName, onPageCount }: { contentB
       disposed = true
       containerRef.current?.querySelectorAll('.project-document-pdf-page').forEach((page) => page.remove())
     }
-  }, [contentBase64, fileName])
+  }, [contentBase64, contentUrl, fileName])
 
   return (
     <div ref={containerRef} className="project-document-pdf-preview" aria-label={`预览协议附件：${fileName}`}>
@@ -330,7 +341,7 @@ const documentZoomMin = 60
 const documentZoomMax = 160
 const documentZoomStep = 10
 
-function DocxDocumentPreview({ contentBase64, fileName }: { contentBase64: string; fileName: string }): React.JSX.Element {
+function DocxDocumentPreview({ contentBase64, contentUrl, fileName }: { contentBase64?: string; contentUrl?: string; fileName: string }): React.JSX.Element {
   const rendererRef = useRef<HTMLDivElement | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -348,7 +359,7 @@ function DocxDocumentPreview({ contentBase64, fileName }: { contentBase64: strin
       setPageCount(0)
       try {
         const { renderAsync } = await import('docx-preview')
-        await renderAsync(decodeBase64Bytes(contentBase64), renderer, renderer, {
+        await renderAsync(await loadPreviewBytes(contentBase64, contentUrl), renderer, renderer, {
           className: 'visslm-docx',
           inWrapper: true,
           breakPages: true,
@@ -393,7 +404,7 @@ function DocxDocumentPreview({ contentBase64, fileName }: { contentBase64: strin
       disposed = true
       rendererRef.current?.replaceChildren()
     }
-  }, [contentBase64, fileName])
+  }, [contentBase64, contentUrl, fileName])
 
   const updateZoom = (nextZoom: number): void => {
     setZoom(Math.max(documentZoomMin, Math.min(documentZoomMax, nextZoom)))
@@ -455,7 +466,7 @@ function DocxDocumentPreview({ contentBase64, fileName }: { contentBase64: strin
   )
 }
 
-function WordDocumentPreview({ contentBase64, fileName }: { contentBase64: string; fileName: string }): React.JSX.Element {
+function WordDocumentPreview({ contentBase64, contentUrl, fileName }: { contentBase64?: string; contentUrl?: string; fileName: string }): React.JSX.Element {
   const [pageCount, setPageCount] = useState(0)
 
   return (
@@ -466,7 +477,7 @@ function WordDocumentPreview({ contentBase64, fileName }: { contentBase64: strin
           <Text type="secondary">{pageCount > 0 ? `${pageCount} 页 · ` : ''}Word 引擎只读渲染，保留原文档分页与版式</Text>
         </div>
       </div>
-      <PdfDocumentPreview contentBase64={contentBase64} fileName={fileName} onPageCount={setPageCount} />
+      <PdfDocumentPreview contentBase64={contentBase64} contentUrl={contentUrl} fileName={fileName} onPageCount={setPageCount} />
     </div>
   )
 }
@@ -2389,6 +2400,9 @@ function ProjectDetail({
   const [requirementForm] = Form.useForm<ProjectRequirementInput>()
   const [splitForm] = Form.useForm<{ parts: string }>()
   const analysisLogRequestRef = useRef(0)
+  const analysisLogRefreshTimerRef = useRef<number | null>(null)
+  const lastAnalysisLogRefreshAtRef = useRef(Date.now())
+  const terminalProgressReloadKeyRef = useRef<string | null>(null)
 
   const applyAnalysisLogs = useCallback((nextLogs: ProjectAnalysisLogEntry[]): void => {
     setAnalysisLogs(nextLogs)
@@ -2444,15 +2458,42 @@ function ProjectDetail({
 
   useEffect(() => {
     void reload()
-  }, [reload, progress?.taskId, progress?.phase])
+  }, [reload])
 
   useEffect(() => {
     if (!progress || progress.projectId !== current.id) return
-    const timer = window.setTimeout(() => {
+    const terminal = progress.status === 'success' || progress.status === 'failed'
+    if (terminal) {
+      const reloadKey = `${progress.taskId}:${progress.status}`
+      if (terminalProgressReloadKeyRef.current === reloadKey) return
+      terminalProgressReloadKeyRef.current = reloadKey
+      if (analysisLogRefreshTimerRef.current !== null) {
+        window.clearTimeout(analysisLogRefreshTimerRef.current)
+        analysisLogRefreshTimerRef.current = null
+      }
+      lastAnalysisLogRefreshAtRef.current = Date.now()
+      // A terminal event is the one point where the full project snapshot is
+      // useful; intermediate events only update the progress panel/log tail.
+      void reload()
+      return
+    }
+
+    if (analysisLogRefreshTimerRef.current !== null) return
+    const elapsed = Date.now() - lastAnalysisLogRefreshAtRef.current
+    const delay = Math.max(0, 750 - elapsed)
+    analysisLogRefreshTimerRef.current = window.setTimeout(() => {
+      analysisLogRefreshTimerRef.current = null
+      lastAnalysisLogRefreshAtRef.current = Date.now()
       void reloadAnalysisLogs()
-    }, 220)
-    return () => window.clearTimeout(timer)
-  }, [current.id, progress?.current, progress?.message, progress?.phase, progress?.projectId, progress?.status, progress?.taskId, reloadAnalysisLogs])
+    }, delay)
+  }, [current.id, progress?.current, progress?.message, progress?.phase, progress?.projectId, progress?.status, progress?.taskId, reload, reloadAnalysisLogs])
+
+  useEffect(() => () => {
+    if (analysisLogRefreshTimerRef.current !== null) {
+      window.clearTimeout(analysisLogRefreshTimerRef.current)
+      analysisLogRefreshTimerRef.current = null
+    }
+  }, [])
 
   useEffect(() => {
     if (!participantModalOpen && !editModalOpen && activeTab !== 'plan') return
@@ -3893,21 +3934,24 @@ function ProjectDetail({
               description={documentPreviewError}
             />
           )}
-          {!documentPreviewLoading && !documentPreviewError && documentPreview?.document.extension === '.pdf' && documentPreview.contentBase64 && (
+          {!documentPreviewLoading && !documentPreviewError && documentPreview?.document.extension === '.pdf' && (documentPreview.contentUrl || documentPreview.contentBase64) && (
             <PdfDocumentPreview
               contentBase64={documentPreview.contentBase64}
+              contentUrl={documentPreview.contentUrl}
               fileName={documentPreview.document.fileName}
             />
           )}
-          {!documentPreviewLoading && !documentPreviewError && documentPreview?.document.extension === '.docx' && documentPreview.renderFormat === 'pdf' && documentPreview.contentBase64 && (
+          {!documentPreviewLoading && !documentPreviewError && documentPreview?.document.extension === '.docx' && documentPreview.renderFormat === 'pdf' && (documentPreview.contentUrl || documentPreview.contentBase64) && (
             <WordDocumentPreview
               contentBase64={documentPreview.contentBase64}
+              contentUrl={documentPreview.contentUrl}
               fileName={documentPreview.document.fileName}
             />
           )}
-          {!documentPreviewLoading && !documentPreviewError && documentPreview?.document.extension === '.docx' && documentPreview.renderFormat !== 'pdf' && documentPreview.contentBase64 && (
+          {!documentPreviewLoading && !documentPreviewError && documentPreview?.document.extension === '.docx' && documentPreview.renderFormat !== 'pdf' && (documentPreview.contentUrl || documentPreview.contentBase64) && (
             <DocxDocumentPreview
               contentBase64={documentPreview.contentBase64}
+              contentUrl={documentPreview.contentUrl}
               fileName={documentPreview.document.fileName}
             />
           )}
@@ -3959,6 +4003,8 @@ export function ProjectManagementPage({
   const [activeSection, setActiveSection] = useState<'projects' | 'people'>('projects')
   const [progress, setProgress] = useState<ProjectAnalysisProgress | null>(null)
   const [createForm] = Form.useForm<ManagedProjectInput>()
+  const progressRefreshTimerRef = useRef<number | null>(null)
+  const lastProgressRefreshAtRef = useRef(0)
 
   const loadProjects = useCallback(async (): Promise<void> => {
     setLoading(true)
@@ -3971,14 +4017,40 @@ export function ProjectManagementPage({
     }
   }, [page, pageSize, search])
 
+  const scheduleProgressRefresh = useCallback((immediate: boolean): void => {
+    if (progressRefreshTimerRef.current !== null) {
+      window.clearTimeout(progressRefreshTimerRef.current)
+      progressRefreshTimerRef.current = null
+    }
+    const elapsed = Date.now() - lastProgressRefreshAtRef.current
+    const delay = immediate ? 0 : Math.max(0, 800 - elapsed)
+    progressRefreshTimerRef.current = window.setTimeout(() => {
+      progressRefreshTimerRef.current = null
+      lastProgressRefreshAtRef.current = Date.now()
+      void loadProjects()
+    }, delay)
+  }, [loadProjects])
+
   useEffect(() => {
     void loadProjects()
   }, [loadProjects, refreshKey])
 
-  useEffect(() => window.visslm.onProjectProgress((next) => {
-    setProgress(next)
-    void loadProjects()
-  }), [loadProjects])
+  useEffect(() => {
+    const unsubscribe = window.visslm.onProjectProgress((next) => {
+      // Progress events update the lightweight progress state immediately.
+      // Project rows are refreshed at most once per 800ms while running and
+      // immediately once a task reaches a terminal state.
+      setProgress(next)
+      scheduleProgressRefresh(next.status !== 'running')
+    })
+    return () => {
+      unsubscribe()
+      if (progressRefreshTimerRef.current !== null) {
+        window.clearTimeout(progressRefreshTimerRef.current)
+        progressRefreshTimerRef.current = null
+      }
+    }
+  }, [scheduleProgressRefresh])
 
   useEffect(() => {
     if (!createModalOpen) return

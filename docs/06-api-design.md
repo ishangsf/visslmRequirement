@@ -58,10 +58,11 @@ React 页面 -> window.visslm -> preload/index.ts -> ipcRenderer.invoke(channel)
 | API-IPC-017 | `sync:get-config` / `getSyncConfig` | 无 | `SyncScopeConfig|null`；版本/JSON 损坏返回 null | `SyncPage`：`App.tsx:2084`；`index.ts:161` / `SettingsService.getSyncConfig`；`settings` |
 | API-IPC-018 | `sync:save-config` / `saveSyncConfig` | `SyncScopeConfig {selectedTypes,rules}` | `Promise<void>`；至少选择一种类型否则 rejection | `SyncPage`：`App.tsx:2256`；`index.ts:162-164` / `SettingsService.saveSyncConfig`；`settings` |
 | API-IPC-019 | `sync:preview` / `previewSync` | 可选 `SyncScopeConfig` | `SyncPreviewResult`，含扫描数、匹配数、样例和脱敏请求；连接/字段非法 rejection | `SyncPage`：`App.tsx:2272`；`index.ts:165-169` / `VisslmClient.previewScope`；外部 VISSLM、`settings` |
-| API-IPC-020 | `sync:start` / `startSync` | 可选 `SyncScopeConfig` | `SyncResult {ok,projectCount,recordCount,imageCount,message}`；运行中、连接失败或平台错误可能返回 `ok:false`，配置错误可 rejection | `AppShell`/`SyncPage`：`App.tsx:2290,3941`；`index.ts:170-177` / `SyncService.run`；`sync_runs`,`projects`,`records`,`images` |
+| API-IPC-020 | `sync:start` / `startSync` | 可选 `SyncScopeConfig` | `SyncResult {ok,projectCount,recordCount,updatedCount,imageCount,message}`；`recordCount` 为新增数，`updatedCount` 为实际发生属性/描述更新的已有记录数；按 `_valm_ItemID` 命中已有记录时自动刷新本次返回的属性值，保留本地 UID 和关联；运行中、连接失败或平台错误可能返回 `ok:false`，配置错误可 rejection | `AppShell`/`SyncPage`：`App.tsx:2290,3941`；`index.ts:170-177` / `SyncService.run`；`sync_runs`,`projects`,`records`,`images` |
 | API-IPC-021 | `sync:request-logs` / `listCollectionRequestLogs` | `page?: number,pageSize?: number` | `CollectionRequestLogPage`；分页参数由 DB clamp | `SyncPage`：`App.tsx:2104`；`index.ts:179-181` / DB；`collection_request_logs` |
-| API-IPC-022 | `data:import` / `importData` | 无；handler 弹出文件选择框，接受 `.jsonl/.json`，最大 512 MB | `DataImportResult`；文件解析、行错误最多积累 50 条；完成后重建记录索引并标记项目匹配 stale | `DataPage`：`App.tsx:532`；`index.ts:558-615` / DB + KnowledgeService + ProjectManagementService；`records`,`images`,`projects` |
-| API-IPC-023 | `data:export` / `exportData` | 无；handler 弹出保存框 | `DataExportResult`；取消返回 `ok:false,canceled:true`；文件写入失败 rejection | `DataPage`：`App.tsx:561`；`index.ts:517-556` / DB；`records`,`images`,`dashboard_audit_logs` |
+| API-IPC-022 | `data:import` / `importData` | 无；handler 弹出文件选择框，接受 `.visslmpack`（最大 1 GB）及旧 `.jsonl/.json`（最大 512 MB） | `DataImportResult`；资源包先流式解包、校验路径/哈希/MIME/总量，再在事务中导入；旧 JSON/JSONL 使用 256 条受控批处理（JSON 数组按元素流式切分），Base64 图片转换为二进制资源；返回 `importRunId` 及 `batchCount/sourceRowCount/parseErrorCount/durationMs` 便于观测，运行状态持久化到 `data_import_runs`；批次完成后重建记录索引并标记项目匹配 stale；大文件导入批次之间不保证单一全局事务 | `DataPage`：`App.tsx:532`；`index.ts` / `data-import-stream.ts` / `transfer-pack.ts` + DB + KnowledgeService + ProjectManagementService；`records`,`images`,`asset_blobs`,`record_image_refs`,`data_import_runs` |
+| API-IPC-022A | `data:import-runs` / `listDataImportRuns`、`data:import-run` / `getDataImportRun`、`data:import-resume` / `resumeDataImportRun` | `limit?: number`（最多 200）、`id: string` | `DataImportRunSnapshot[]` / `DataImportRunSnapshot|null` / `DataImportResult`；带源文件指纹的失败旧 JSON/JSONL 先校验文件大小/修改时间，再从已提交源行/解析错误检查点继续，已提交批次不会重复进入数据库；缺少指纹或文件已变化时要求重新导入 | `DataPage` 导入运行记录抽屉：`App.tsx`；`index.ts` / `AppDatabase.listDataImportRuns/getDataImportRun/resumeDataImportRun` + 流式解析器；`data_import_runs` |
+| API-IPC-023 | `data:export` / `exportData` | 无；handler 弹出保存框，默认 `.visslmpack` | `DataExportResult`；资源包包含 `manifest.json`、`records.jsonl`、去重的 `assets/<sha256>` 和 `checksums.jsonl`，取消返回 `ok:false,canceled:true`；写入失败 rejection | `DataPage`：`App.tsx:561`；`index.ts` + `transfer-pack.ts` / DB；`records`,`images`,`asset_blobs`,`record_image_refs`,`dashboard_audit_logs` |
 | API-IPC-024 | `data:delete` / `deleteData` | `uids?: string[]`；省略表示删除全部 | `DataDeleteResult`；删除后重建记录索引并标记匹配 stale | `DataPage`：`App.tsx:585`；`index.ts:617-621` / DB + 两个服务；`records`,`images`,`knowledge_chunks`,`pm_project_assets`,`pm_requirement_matches` |
 
 ### 2.3 AI 助手、会话和分析查询
@@ -98,7 +99,7 @@ React 页面 -> window.visslm -> preload/index.ts -> ipcRenderer.invoke(channel)
 | 编号 | IPC channel / preload 方法 | 请求参数 | 响应与错误 | 调用页面；Handler / Service / 表 |
 | --- | --- | --- | --- | --- |
 | API-IPC-044 | `push:preview` / `previewPush` | `PushConfig {recordUids,nodeType,projectId,componentId?,parentId?,insertAfterId?,insertBeforeId?,fieldMappings?}` | `PushResult`，`preview:true`，每条 request 显示脱敏参数和“未发送 POST”响应 | `PushPage`：`App.tsx:2920`；`index.ts:841` / `PushService.preview`；`records` |
-| API-IPC-045 | `push:start` / `startPush` | 同 `PushConfig`；目标 field key、重复映射和保留字段会校验 | `PushResult`，逐条统计成功/失败；单条失败继续处理其他记录 | `PushPage`：`App.tsx:2955`；`index.ts:842` / `PushService.push -> VisslmClient.createItem`；`records`,`push_logs` |
+| API-IPC-045 | `push:start` / `startPush` | 同 `PushConfig`；目标 field key、重复映射和保留字段会校验 | `PushResult`，逐条统计图片总数、上传/复用/失败；每条记录先完成全部 `UploadRichImg` 上传，再替换令牌并创建 `/rest/items`；图片失败时不创建记录，单条失败继续处理其他记录 | `PushPage`：`App.tsx:2955`；`index.ts` / `PushService.push -> VisslmClient.uploadRichImage/createItem`；`records`,`push_asset_uploads`,`push_logs` |
 | API-IPC-046 | `push:logs` / `listPushLogs` | `page?:number,pageSize?:number` | `PushLogPage`；日志 body/response 可能含业务敏感数据 | `PushPage`：`App.tsx:2843`；`index.ts:843-845` / DB；`push_logs` |
 
 ### 2.6 知识库
@@ -107,13 +108,14 @@ React 页面 -> window.visslm -> preload/index.ts -> ipcRenderer.invoke(channel)
 | --- | --- | --- | --- | --- |
 | API-IPC-047 | `knowledge:documents` / `listKnowledgeDocuments` | `KnowledgeDocumentQuery {page,pageSize,search?,status?,extension?,tag?}` | `KnowledgeDocumentPage` | `KnowledgeBasePage`：`App.tsx:869`；`index.ts:623-625` / DB；`knowledge_documents` |
 | API-IPC-048 | `knowledge:document` / `getKnowledgeDocument` | `id:string` | `KnowledgeDocumentDetail|null`，含 chunks | `KnowledgeBasePage`、聊天引用：`App.tsx:912,1369`；`index.ts:626` / DB；`knowledge_documents`,`knowledge_chunks` |
-| API-IPC-049 | `knowledge:document-preview` / `getKnowledgeDocumentPreview` | `id:string` | `KnowledgeDocumentPreview|null`；只对 PDF 读取 Base64，文件不存在/空/超过 50 MB 返回 errorMessage | 项目协议详情：`ProjectManagementPage.tsx:2239`；`index.ts:627-641` / fs + DB；`knowledge_documents` |
+| API-IPC-049 | `knowledge:document-preview` / `getKnowledgeDocumentPreview` | `id:string` | `KnowledgeDocumentPreview|null`；对 DOCX/PDF 返回短期 `visslm-preview://` 流地址和字节数，文件不存在/空/超过 50 MB 返回 errorMessage；保留 `contentBase64` 兼容旧调用方 | 项目协议详情：`ProjectManagementPage.tsx`；`index.ts` / `visslm-preview` 协议 + fs + DB；`knowledge_documents` |
 | API-IPC-050 | `knowledge:upload` / `uploadKnowledgeDocuments` | 无；handler 弹出多选文件框，支持 docx/pdf/xlsx/xls/txt | `KnowledgeUploadResult`；单文件最大 100 MB、hash 重复复用、解析/签名/embedding 失败记录 failed | `KnowledgeBasePage`：`App.tsx:892`；`index.ts:643-665` / `KnowledgeService.processFiles`；`knowledge_documents`,`knowledge_chunks`,`knowledge_vectors`,`knowledge_index_tasks` |
 | API-IPC-051 | `knowledge:retry` / `retryKnowledgeDocument` | `id:string` | `KnowledgeDocument|null`；不存在返回 null，处理失败返回 failed 文档 | `KnowledgeBasePage`：`App.tsx:922`；`index.ts:666` / `KnowledgeService.retryDocument`；知识库四表 |
 | API-IPC-052 | `knowledge:tags` / `updateKnowledgeDocumentTags` | `id:string,tags:string[]` | `KnowledgeDocument|null`；标签 trim、去重、最多 20 个 | `KnowledgeBasePage`：`App.tsx:961`；`index.ts:667-669` / Service + DB；`knowledge_documents` |
 | API-IPC-053 | `knowledge:delete` / `deleteKnowledgeDocument` | `id:string` | `{ok:boolean,message:string}`；不存在返回 `ok:false` | `KnowledgeBasePage`：`App.tsx:938`；`index.ts:670` / Service + DB/fs；文档、分块、向量、项目文档关联 |
 | API-IPC-054 | `knowledge:rebuild` / `rebuildKnowledgeIndex` | 无 | `KnowledgeRebuildResult`；embedding 资源不可用 rejection | `KnowledgeBasePage`：`App.tsx:949`；`index.ts:671` / `KnowledgeService.rebuildIndex`；`knowledge_chunks`,`knowledge_vectors` |
 | API-IPC-055 | `knowledge:stats` / `getKnowledgeStats` | 无 | `KnowledgeStats` | `KnowledgeBasePage`：`App.tsx:870`；`index.ts:672` / DB；`knowledge_documents`,`knowledge_chunks`,`knowledge_vectors` |
+| API-IPC-055A | `knowledge:cancel` / `cancelKnowledgeTask` | `taskId:string` | `boolean`；只请求 cooperative checkpoint 停止，已进入单次 embedding/OCR/模型调用的操作会在返回后停止 | `KnowledgeBasePage`；`index.ts` / preload + `KnowledgeService.cancelTask`；内存任务控制器 |
 
 ### 2.7 项目管理、需求、匹配、成本和资产
 
@@ -178,7 +180,7 @@ React 页面 -> window.visslm -> preload/index.ts -> ipcRenderer.invoke(channel)
 | --- | --- | --- | --- |
 | API-EVT-001 | `window:maximized-changed` / `onWindowMaximized` | `boolean` | `BrowserWindow` maximize/unmaximize：`index.ts:101-106`；标题栏更新状态 |
 | API-EVT-002 | `sync:progress` / `onSyncProgress` | `SyncProgress {phase,message,current,total}` | `SyncService` 回调：`index.ts:875-879`；采集页进度和错误 |
-| API-EVT-003 | `knowledge:progress` / `onKnowledgeProgress` | `KnowledgeIndexProgress` | `KnowledgeService` 回调：`index.ts:865-868`；文档解析/向量进度 |
+| API-EVT-003 | `knowledge:progress` / `onKnowledgeProgress` | `KnowledgeIndexProgress`，可选 `elapsedMs`、`throughputPerSecond` | `KnowledgeService` 回调：`index.ts:865-868`；文档解析/向量进度，指标同时写入 `knowledge_index_tasks` |
 | API-EVT-004 | `project:progress` / `onProjectProgress` | `ProjectAnalysisProgress` | `ProjectManagementService` 回调：`index.ts:869-874`；协议解析/匹配进度 |
 | API-EVT-005 | `agent:event` / `onAgentEvent` | `{conversationId,event:AgentEvent}` | `agent:ask` 中由 `VisualizationAgent` 推送：`index.ts:201-209`；可视化专家阶段状态 |
 
@@ -265,6 +267,8 @@ const preview = await window.visslm.previewPush({
 
 预览只构造 body，不发送 POST，也不写 `push_logs`；真实调用 `startPush` 按记录串行执行并逐条写日志，见 `src/main/visslm.ts:517-670`。
 
+平台的查询、附件下载和范围预览属于幂等 GET，客户端对超时、网络失败及 408/425/429/5xx 最多重试 3 次并使用退避；`startPush` 的创建记录和图片上传是非幂等 POST，在平台提供幂等键前不自动重放。
+
 ## 6. 错误码和异常语义
 
 当前没有集中式错误码枚举。可观测到的稳定标识只有以下几类：
@@ -301,7 +305,7 @@ const preview = await window.visslm.previewPush({
 | API-GAP-004 | IPC 参数没有运行时 schema 校验，TypeScript 类型在 renderer 外不构成安全边界 | 手工调用或未来新增 renderer 可能把错误对象传入主进程 |
 | API-GAP-005 | 错误没有统一 `{code,message,details}` | 跨页面无法稳定区分参数错误、权限拒绝、网络失败和数据库失败 |
 | API-GAP-006 | `PushResult.requests[].body` 和日志可携带完整业务 payload | 调试、截图、导出日志时可能泄露业务数据；不应把接口示例中的真实 payload 提交到仓库 |
-| API-GAP-007 | `KnowledgeDocumentPreview` 返回 `contentBase64`，只在 PDF 场景使用 | 大文件会放大 IPC 内存；当前 50 MB 限制只在 handler 读取前检查 |
+| API-GAP-007 | `KnowledgeDocumentPreview` 已改为短期 `visslm-preview://` 流式内容地址，旧 `contentBase64` 字段仅为兼容保留 | 避免把 50 MB 源文件复制进 IPC；地址由主进程 token 和 5 分钟 TTL 控制 |
 | API-GAP-008 | Dashboard 导出 PDF 使用当前主窗口 `printToPDF` | 当前选中的页面/渲染状态可能影响导出，导出契约没有独立渲染上下文 |
 
 ## 8. 代码依据索引

@@ -1,22 +1,25 @@
-import { app, BrowserWindow, dialog, ipcMain } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, protocol } from 'electron'
 import { execFile } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import {
-  createWriteStream,
+  createReadStream,
   mkdirSync,
   readFileSync,
-  renameSync,
   statSync,
   unlinkSync,
   writeFileSync
 } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { Readable } from 'node:stream'
 import { promisify } from 'node:util'
 import * as XLSX from 'xlsx'
 import type {
   ChatRequest,
   ChatSessionDeleteResult,
   ChatSessionSaveInput,
+  DataImportResult,
+  DataImportRunSnapshot,
   DataReviewApplyInput,
   FeatureNavigationOrder,
   FeatureModuleSettings,
@@ -86,7 +89,15 @@ import { PushService, SyncService, VisslmClient } from './visslm'
 import { KnowledgeService } from './knowledge'
 import { RecordMaintenanceService } from './record-maintenance'
 import { AsyncMutex } from './record-index-lock'
+import {
+  detectJsonFirstToken,
+  readJsonArrayImportRows,
+  readJsonlImportRows,
+  type ImportBatchContext,
+  type ImportResumeCheckpoint
+} from './data-import-stream'
 import { ProjectManagementService } from './project-management'
+import { exportVisslmPack, importVisslmPack } from './transfer-pack'
 import type { UpdateManager } from './updater'
 import { createProjectWorkbook } from './project-export'
 import {
@@ -96,6 +107,14 @@ import {
 } from './dashboards/offline-export'
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url))
+
+protocol.registerSchemesAsPrivileged([{
+  scheme: 'visslm-asset',
+  privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true }
+}, {
+  scheme: 'visslm-preview',
+  privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true }
+}])
 let mainWindow: BrowserWindow | null = null
 let updateManager: UpdateManager | null = null
 let updateManagerInitError: string | null = null
@@ -108,80 +127,244 @@ let recordMaintenanceService: RecordMaintenanceService
 let recordIndexLock: AsyncMutex
 let projectManagementService: ProjectManagementService
 let requirementSemanticizationService: RequirementSemanticizationService
+let knowledgeInitializationTimer: ReturnType<typeof setTimeout> | null = null
+let knowledgeInitializationStarted = false
+let isQuitting = false
+let legacyDataImportRunning = false
 const expertRouter = new ExpertRouter()
 const maxKnowledgeDocumentPreviewBytes = 50 * 1024 * 1024
 const sourcePreviewExtensions = new Set(['.docx', '.pdf'])
 const execFileAsync = promisify(execFile)
+const previewUrlTtlMs = 5 * 60 * 1000
+const maxPreviewUrls = 32
+const previewFiles = new Map<string, { filePath: string; byteSize: number; mimeType: string; expiresAt: number }>()
+
+const prunePreviewFiles = (): void => {
+  const now = Date.now()
+  for (const [token, entry] of previewFiles) {
+    if (entry.expiresAt <= now) previewFiles.delete(token)
+  }
+  while (previewFiles.size > maxPreviewUrls) {
+    const oldest = previewFiles.keys().next().value as string | undefined
+    if (!oldest) break
+    previewFiles.delete(oldest)
+  }
+}
+
+const createPreviewUrl = (filePath: string, mimeType: string): { url: string; byteSize: number } => {
+  const stats = statSync(filePath)
+  if (!stats.isFile() || stats.size <= 0 || stats.size > maxKnowledgeDocumentPreviewBytes) {
+    throw new Error('预览文件不可用或超过 50 MB 限制')
+  }
+  prunePreviewFiles()
+  const token = randomUUID()
+  previewFiles.set(token, {
+    filePath,
+    byteSize: stats.size,
+    mimeType,
+    expiresAt: Date.now() + previewUrlTtlMs
+  })
+  prunePreviewFiles()
+  return { url: `visslm-preview://${token}`, byteSize: stats.size }
+}
+
+const cancelKnowledgeInitialization = (): void => {
+  if (!knowledgeInitializationTimer) return
+  clearTimeout(knowledgeInitializationTimer)
+  knowledgeInitializationTimer = null
+}
+
+/**
+ * Knowledge startup loads the local embedding model and can rebuild a large
+ * index.  Defer it until after the first window has been shown so renderer
+ * startup and initial IPC remain responsive.  The timer is unref'ed and
+ * cancelled during shutdown/window destruction to avoid starting work against
+ * a closing application or a stale BrowserWindow.
+ */
+const scheduleKnowledgeInitialization = (): void => {
+  if (
+    knowledgeInitializationStarted ||
+    knowledgeInitializationTimer ||
+    isQuitting ||
+    !knowledgeService
+  ) return
+
+  knowledgeInitializationTimer = setTimeout(() => {
+    knowledgeInitializationTimer = null
+    if (
+      isQuitting ||
+      !mainWindow ||
+      mainWindow.isDestroyed() ||
+      !mainWindow.isVisible() ||
+      !knowledgeService
+    ) return
+    knowledgeInitializationStarted = true
+    void knowledgeService.initialize().catch((error) => {
+      console.error('[knowledge] initialization failed', error)
+    })
+  }, 750)
+  knowledgeInitializationTimer.unref?.()
+}
 
 const updateErrorMessage = (error: unknown): string => {
   if (error instanceof Error && error.message.trim()) return error.message.trim()
   return String(error || '未知错误')
 }
 
-const writeExportChunk = async (
-  stream: ReturnType<typeof createWriteStream>,
-  chunk: string
-): Promise<void> => {
-  if (stream.write(chunk)) return
-  await new Promise<void>((resolve, reject) => {
-    const cleanup = (): void => {
-      stream.removeListener('drain', onDrain)
-      stream.removeListener('error', onError)
-    }
-    const onDrain = (): void => {
-      cleanup()
-      resolve()
-    }
-    const onError = (error: Error): void => {
-      cleanup()
-      reject(error)
-    }
-    stream.once('drain', onDrain)
-    stream.once('error', onError)
-  })
+const mergeDataImportResults = (results: DataImportResult[]): DataImportResult => {
+  const duplicates = results.flatMap((result) => result.duplicates)
+  const errors = results.flatMap((result) => result.errors).slice(0, 50)
+  const recordCount = results.reduce((sum, result) => sum + result.recordCount, 0)
+  const imageCount = results.reduce((sum, result) => sum + result.imageCount, 0)
+  const skippedCount = results.reduce((sum, result) => sum + result.skippedCount, 0)
+  return {
+    ok: results.every((result) => result.ok),
+    recordCount,
+    imageCount,
+    skippedCount,
+    errors,
+    duplicates,
+    reviewBatchId: results.find((result) => result.reviewBatchId)?.reviewBatchId,
+    message: `导入完成：${recordCount} 条记录，${imageCount} 张图片，跳过 ${skippedCount} 条`
+  }
 }
 
-const finishExportStream = (
-  stream: ReturnType<typeof createWriteStream>
-): Promise<void> => new Promise((resolve, reject) => {
-  const cleanup = (): void => {
-    stream.removeListener('finish', onFinish)
-    stream.removeListener('error', onError)
-  }
-  const onFinish = (): void => {
-    cleanup()
-    resolve()
-  }
-  const onError = (error: Error): void => {
-    cleanup()
-    reject(error)
-  }
-  stream.once('finish', onFinish)
-  stream.once('error', onError)
-  stream.end()
-})
+type LegacyImportRunSeed = Pick<
+  DataImportRunSnapshot,
+  | 'batchCount'
+  | 'sourceRowCount'
+  | 'importedRecordCount'
+  | 'skippedCount'
+  | 'parseErrorCount'
+  | 'reviewBatchId'
+>
 
-const replaceExportFile = (temporaryPath: string, targetPath: string): void => {
-  const backupPath = `${targetPath}.previous-${process.pid}-${Date.now()}`
-  let movedExisting = false
-  try {
-    const existing = statSync(targetPath)
-    if (!existing.isFile()) throw new Error('导出目标路径不是文件')
-    renameSync(targetPath, backupPath)
-    movedExisting = true
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+/**
+ * Execute a legacy JSON/JSONL import from a persisted checkpoint. The parser
+ * replays only the source prefix needed to establish valid-row/error counts;
+ * already committed rows never enter another database batch.
+ */
+const runLegacyDataImport = async (
+  filePath: string,
+  importFormat: 'json' | 'jsonl',
+  importRunId: string,
+  resume?: LegacyImportRunSeed
+): Promise<DataImportResult> => {
+  if (legacyDataImportRunning) throw new Error('已有旧 JSON/JSONL 导入任务正在运行')
+  const seed: LegacyImportRunSeed = {
+    batchCount: Math.max(0, Math.trunc(resume?.batchCount ?? 0)),
+    sourceRowCount: Math.max(0, Math.trunc(resume?.sourceRowCount ?? 0)),
+    importedRecordCount: Math.max(0, Math.trunc(resume?.importedRecordCount ?? 0)),
+    skippedCount: Math.max(0, Math.trunc(resume?.skippedCount ?? 0)),
+    parseErrorCount: Math.max(0, Math.trunc(resume?.parseErrorCount ?? 0)),
+    reviewBatchId: resume?.reviewBatchId?.trim() ?? ''
   }
+  legacyDataImportRunning = true
+  const parseErrors: string[] = []
+  const importStartedAt = Date.now()
+  let batchCount = seed.batchCount
+  let checkpointSourceRowCount = seed.sourceRowCount
+  let checkpointParseErrorCount = seed.parseErrorCount
+  let reviewBatchId: string | undefined = seed.reviewBatchId || undefined
+  let totalImportedRecordCount = seed.importedRecordCount
+  let totalSkippedCount = seed.skippedCount
+  let importedRecordCount = 0
+  let importedSkippedCount = 0
+
   try {
-    renameSync(temporaryPath, targetPath)
+    const imported = await recordIndexLock.runExclusive(async () => {
+      const batchResults: DataImportResult[] = []
+      const importBatch = (batch: unknown[], context?: ImportBatchContext): void => {
+        batchCount = context?.batchNumber ?? batchCount + 1
+        checkpointSourceRowCount = context?.sourceRowCount ?? checkpointSourceRowCount
+        checkpointParseErrorCount = context?.parseErrorCount ?? checkpointParseErrorCount
+        const batchResult = db.importRows(batch, {
+          reviewBatchId,
+          importRunId,
+          batchNumber: batchCount,
+          sourceRowCount: checkpointSourceRowCount,
+          parseErrorCount: checkpointParseErrorCount
+        })
+        reviewBatchId ??= batchResult.reviewBatchId
+        importedRecordCount += batchResult.recordCount
+        importedSkippedCount += batchResult.skippedCount
+        totalImportedRecordCount += batchResult.recordCount
+        totalSkippedCount += batchResult.skippedCount
+        batchResults.push(batchResult)
+      }
+      const firstToken = importFormat === 'json' ? await detectJsonFirstToken(filePath) : ''
+      const resumeCheckpoint: ImportResumeCheckpoint = {
+        batchCount: seed.batchCount,
+        sourceRowCount: seed.sourceRowCount,
+        parseErrorCount: seed.parseErrorCount
+      }
+      const parsed = importFormat === 'json' && firstToken === '['
+        ? await readJsonArrayImportRows(filePath, parseErrors, importBatch, resumeCheckpoint)
+        : await readJsonlImportRows(filePath, parseErrors, importBatch, resumeCheckpoint)
+      if (
+        parsed.rowCount < seed.sourceRowCount ||
+        parsed.parseErrorCount < seed.parseErrorCount
+      ) {
+        throw new Error('导入文件内容少于中断时的检查点，无法安全继续')
+      }
+      checkpointSourceRowCount = parsed.rowCount
+      checkpointParseErrorCount = parsed.parseErrorCount
+      const result = mergeDataImportResults(batchResults)
+      await knowledgeService.syncRecordIndexInLock()
+      projectManagementService.markMatchesStale()
+      const newParseErrorCount = Math.max(0, parsed.parseErrorCount - seed.parseErrorCount)
+      result.path = filePath
+      result.format = importFormat
+      result.importRunId = importRunId
+      result.batchCount = batchCount
+      result.sourceRowCount = parsed.rowCount
+      result.parseErrorCount = parsed.parseErrorCount
+      result.durationMs = Math.max(0, Date.now() - importStartedAt)
+      result.skippedCount = importedSkippedCount + newParseErrorCount
+      result.errors = [...parseErrors, ...result.errors].slice(0, 50)
+      result.ok =
+        result.recordCount > 0 ||
+        result.duplicates.length > 0 ||
+        (parsed.rowCount === seed.sourceRowCount && newParseErrorCount === 0)
+      const prefix = seed.batchCount > 0 ? '继续导入完成' : '导入完成'
+      result.message =
+        `${prefix}：${result.recordCount} 条记录，${result.imageCount} 张图片，` +
+        `跳过 ${result.skippedCount} 条` +
+        (seed.batchCount > 0 ? `（累计 ${totalImportedRecordCount} 条记录）` : '') +
+        (result.duplicates.length
+          ? `，发现 ${result.duplicates.length} 条已有 _valm_ItemID，待审查覆盖`
+          : '')
+      totalSkippedCount += newParseErrorCount
+      db.finishDataImportRun(importRunId, 'success', {
+        batchCount,
+        sourceRowCount: parsed.rowCount,
+        importedRecordCount: totalImportedRecordCount,
+        skippedCount: totalSkippedCount,
+        parseErrorCount: parsed.parseErrorCount,
+        reviewBatchId,
+        errorMessage: ''
+      })
+      return result
+    })
+    return imported
   } catch (error) {
-    if (movedExisting) {
-      try { renameSync(backupPath, targetPath) } catch {}
+    try {
+      const newParseErrorCount = Math.max(0, checkpointParseErrorCount - seed.parseErrorCount)
+      db.finishDataImportRun(importRunId, 'failed', {
+        batchCount,
+        sourceRowCount: checkpointSourceRowCount,
+        importedRecordCount: totalImportedRecordCount,
+        skippedCount: totalSkippedCount + newParseErrorCount,
+        parseErrorCount: checkpointParseErrorCount,
+        reviewBatchId,
+        errorMessage: updateErrorMessage(error).slice(0, 1000)
+      })
+    } catch {
+      // Preserve the original import error if diagnostics cannot be saved.
     }
     throw error
-  }
-  if (movedExisting) {
-    try { unlinkSync(backupPath) } catch {}
+  } finally {
+    legacyDataImportRunning = false
   }
 }
 
@@ -235,7 +418,7 @@ try {
 }
 `
 
-const renderDocxSourceWithWord = async (document: { filePath: string; sha256: string }): Promise<Buffer | null> => {
+const renderDocxSourceWithWord = async (document: { filePath: string; sha256: string }): Promise<string | null> => {
   const previewDirectory = join(app.getPath('temp'), 'visslm-word-previews')
   const cacheId = document.sha256.replace(/[^a-z0-9]/gi, '').slice(0, 80) || 'document'
   const outputPath = join(previewDirectory, `${cacheId}-word-v1.pdf`)
@@ -245,7 +428,7 @@ const renderDocxSourceWithWord = async (document: { filePath: string; sha256: st
     const cached = statSync(outputPath)
     if (cached.isFile() && cached.size > 0 && cached.size <= maxKnowledgeDocumentPreviewBytes) {
       const bytes = readFileSync(outputPath)
-      if (bytes.subarray(0, 5).toString('ascii') === '%PDF-') return bytes
+      if (bytes.subarray(0, 5).toString('ascii') === '%PDF-') return outputPath
     }
   } catch {
     // A missing or invalid cache is regenerated from the source document below.
@@ -274,7 +457,7 @@ const renderDocxSourceWithWord = async (document: { filePath: string; sha256: st
     const stats = statSync(outputPath)
     if (!stats.isFile() || stats.size === 0 || stats.size > maxKnowledgeDocumentPreviewBytes) return null
     const bytes = readFileSync(outputPath)
-    return bytes.subarray(0, 5).toString('ascii') === '%PDF-' ? bytes : null
+    return bytes.subarray(0, 5).toString('ascii') === '%PDF-' ? outputPath : null
   } catch (error) {
     try { unlinkSync(outputPath) } catch {}
     console.warn('[document-preview] Word rendering unavailable, using direct DOCX preview', error)
@@ -369,10 +552,12 @@ const createWindow = (): void => {
       showFallback = undefined
     }
     if (!mainWindow.isVisible()) mainWindow.show()
+    scheduleKnowledgeInitialization()
   }
 
   mainWindow.on('closed', () => {
     if (showFallback) clearTimeout(showFallback)
+    if (!knowledgeInitializationStarted) cancelKnowledgeInitialization()
     updateManager?.attachWindow(null)
     mainWindow = null
   })
@@ -452,6 +637,12 @@ const registerIpc = (): void => {
   ipcMain.handle('data:node-types', () => db.listNodeTypes())
   ipcMain.handle('data:records', (_event, query: RecordQuery) =>
     db.listRecords(query, requirementSemanticizationService.context()))
+  ipcMain.handle('data:record-release-values', () => db.listRecordReleaseValues())
+  ipcMain.handle(
+    'data:record-uids',
+    (_event, query: Omit<RecordQuery, 'page' | 'pageSize'>) =>
+      db.listRecordUids(query, requirementSemanticizationService.context())
+  )
   ipcMain.handle('data:record', (_event, uid: string) =>
     db.getRecord(uid, true, requirementSemanticizationService.context(), knowledgeService.modelVersion))
   ipcMain.handle(
@@ -1115,10 +1306,6 @@ const registerIpc = (): void => {
   })
 
   ipcMain.handle('data:export', async () => {
-    let filePath: string | undefined
-    let tempFilePath: string | undefined
-    let stream: ReturnType<typeof createWriteStream> | undefined
-    let completed = false
     try {
       if (!mainWindow || mainWindow.isDestroyed()) {
         return {
@@ -1128,59 +1315,37 @@ const registerIpc = (): void => {
         }
       }
       const result = await dialog.showSaveDialog(mainWindow, {
-        title: '导出数据 JSONL',
-        defaultPath: `visslm-data-${new Date().toISOString().slice(0, 10)}.jsonl`,
-        filters: [{ name: 'JSON Lines', extensions: ['jsonl'] }]
+        title: '导出 VISSLM 资源包',
+        defaultPath: `visslm-data-${new Date().toISOString().slice(0, 10)}.visslmpack`,
+        filters: [{ name: 'VISSLM 二进制资源包', extensions: ['visslmpack'] }]
       })
       if (result.canceled || !result.filePath) {
         recordDashboardAudit({
           action: 'export-data',
           status: 'canceled',
-          format: 'jsonl'
+          format: 'visslmpack'
         })
         return { ok: false, canceled: true, recordCount: 0, message: '已取消导出' }
       }
-      filePath = result.filePath
-      tempFilePath = `${filePath}.part-${process.pid}-${Date.now()}`
-      stream = createWriteStream(tempFilePath, { encoding: 'utf8' })
-      let streamError: Error | undefined
-      stream.on('error', (error) => {
-        streamError = error
-      })
-      let recordCount = 0
-      for (const row of db.iterateExportRows()) {
-        if (streamError) throw streamError
-        await writeExportChunk(stream, `${JSON.stringify(row)}\n`)
-        recordCount += 1
-      }
-      await finishExportStream(stream)
-      if (streamError) throw streamError
-      replaceExportFile(tempFilePath, filePath)
-      tempFilePath = undefined
-      completed = true
+      const exported = await recordIndexLock.runExclusive(() =>
+        exportVisslmPack(db, result.filePath)
+      )
       recordDashboardAudit({
         action: 'export-data',
         status: 'success',
-        format: 'jsonl',
-        metadata: { recordCount }
-      })
-      return {
-        ok: true,
-        path: filePath,
-        recordCount,
-        message: `已导出 ${recordCount} 条数据`
-      }
-    } catch (error) {
-      if (!completed) {
-        stream?.destroy()
-        if (tempFilePath) {
-          try { unlinkSync(tempFilePath) } catch {}
+        format: 'visslmpack',
+        metadata: {
+          recordCount: exported.recordCount,
+          assetCount: exported.assetCount ?? 0,
+          assetBytes: exported.assetBytes ?? 0
         }
-      }
+      })
+      return exported
+    } catch (error) {
       recordDashboardAudit({
         action: 'export-data',
         status: 'failed',
-        format: 'jsonl',
+        format: 'visslmpack',
         errorMessage: error instanceof Error ? error.message : String(error)
       })
       throw error
@@ -1192,7 +1357,7 @@ const registerIpc = (): void => {
       title: '导入数据',
       properties: ['openFile'],
       filters: [
-        { name: 'VISSLM 数据', extensions: ['jsonl', 'json'] }
+        { name: 'VISSLM 资源包或数据', extensions: ['visslmpack', 'jsonl', 'json'] }
       ]
     })
     if (result.canceled || !result.filePaths[0]) {
@@ -1209,50 +1374,60 @@ const registerIpc = (): void => {
     }
 
     const filePath = result.filePaths[0]
-    if (statSync(filePath).size > 512 * 1024 * 1024) {
-      throw new Error('导入文件不能超过 512 MB')
+    const extension = filePath.toLowerCase().slice(filePath.lastIndexOf('.'))
+    const maxImportBytes = extension === '.visslmpack' ? 1024 * 1024 * 1024 : 512 * 1024 * 1024
+    const importStats = statSync(filePath)
+    if (importStats.size > maxImportBytes) {
+      throw new Error(extension === '.visslmpack' ? '资源包不能超过 1 GB' : '导入文件不能超过 512 MB')
     }
-    const content = readFileSync(filePath, 'utf8').replace(/^\uFEFF/, '').trim()
-    const parseErrors: string[] = []
-    let rows: unknown[] = []
-    if (content) {
-      if (content.startsWith('[')) {
-        const parsed = JSON.parse(content) as unknown
-        if (!Array.isArray(parsed)) throw new Error('JSON 文件根节点必须是数组')
-        rows = parsed
-      } else {
-        rows = content
-          .split(/\r?\n/)
-          .filter((line) => line.trim())
-          .flatMap((line, index) => {
-            try {
-              return [JSON.parse(line) as unknown]
-            } catch {
-              parseErrors.push(`第 ${index + 1} 行：JSON 格式错误`)
-              return []
-            }
-          })
-      }
+    if (extension === '.visslmpack') {
+      return recordIndexLock.runExclusive(async () => {
+        const imported = await importVisslmPack(db, filePath)
+        await knowledgeService.syncRecordIndexInLock()
+        projectManagementService.markMatchesStale()
+        imported.path = filePath
+        imported.message = `${imported.message}，资源包校验通过`
+        return imported
+      })
     }
-    return recordIndexLock.runExclusive(async () => {
-      const imported = db.importRows(rows)
-      await knowledgeService.syncRecordIndexInLock()
-      projectManagementService.markMatchesStale()
-      imported.path = filePath
-      imported.skippedCount += parseErrors.length
-      imported.errors = [...parseErrors, ...imported.errors].slice(0, 50)
-      imported.ok =
-        imported.recordCount > 0 ||
-        imported.duplicates.length > 0 ||
-        (rows.length === 0 && !parseErrors.length)
-      imported.message =
-        `导入完成：${imported.recordCount} 条记录，${imported.imageCount} 张图片，` +
-        `跳过 ${imported.skippedCount} 条` +
-        (imported.duplicates.length
-          ? `，发现 ${imported.duplicates.length} 条已有 _valm_ItemID，待审查覆盖`
-          : '')
-      return imported
-    })
+    const importFormat = extension === '.json' ? 'json' : 'jsonl'
+    if (legacyDataImportRunning) throw new Error('已有旧 JSON/JSONL 导入任务正在运行')
+    const importRunId = db.startDataImportRun(filePath, importFormat, importStats.size, importStats.mtimeMs)
+    return runLegacyDataImport(filePath, importFormat, importRunId)
+  })
+
+  ipcMain.handle('data:import-runs', (_event, limit?: number) =>
+    db.listDataImportRuns(limit)
+  )
+  ipcMain.handle('data:import-run', (_event, id: string) =>
+    db.getDataImportRun(typeof id === 'string' ? id : '')
+  )
+  ipcMain.handle('data:import-resume', async (_event, id: string) => {
+    if (legacyDataImportRunning) throw new Error('已有旧 JSON/JSONL 导入任务正在运行')
+    const normalizedId = typeof id === 'string' ? id.trim() : ''
+    const snapshot = db.getDataImportRun(normalizedId)
+    if (!snapshot) throw new Error('导入运行记录不存在')
+    if (snapshot.status !== 'failed') throw new Error('只有已中断的旧 JSON/JSONL 导入可以继续')
+    let stats: ReturnType<typeof statSync>
+    try {
+      stats = statSync(snapshot.path)
+    } catch {
+      throw new Error('原导入文件已不存在，无法继续')
+    }
+    if (!stats.isFile()) throw new Error('原导入路径不是文件，无法继续')
+    if (stats.size > 512 * 1024 * 1024) throw new Error('导入文件不能超过 512 MB')
+    if (snapshot.fileSize <= 0 || snapshot.fileMtimeMs <= 0) {
+      throw new Error('该运行缺少源文件指纹，请重新导入以建立安全检查点')
+    }
+    if (
+      stats.size !== snapshot.fileSize ||
+      Math.trunc(stats.mtimeMs) !== snapshot.fileMtimeMs
+    ) {
+      throw new Error('原导入文件大小或修改时间已变化，请重新导入以避免跳过错误内容')
+    }
+    const resumed = db.resumeDataImportRun(snapshot.id)
+    if (!resumed || resumed.status !== 'running') throw new Error('导入运行已被其他操作继续')
+    return runLegacyDataImport(resumed.path, resumed.format, resumed.id, resumed)
   })
 
   ipcMain.handle('data:delete', async (_event, uids?: string[]) => {
@@ -1278,15 +1453,35 @@ const registerIpc = (): void => {
       if (stats.size > maxKnowledgeDocumentPreviewBytes) {
         return { document, errorMessage: '源文件超过 50 MB，暂不支持在线预览' }
       }
-      const sourceBytes = readFileSync(document.filePath)
       if (document.extension === '.docx') {
         const wordRenderedPdf = await renderDocxSourceWithWord(document)
         if (wordRenderedPdf) {
-          return { document, contentBase64: wordRenderedPdf.toString('base64'), renderFormat: 'pdf' }
+          const preview = createPreviewUrl(wordRenderedPdf, 'application/pdf')
+          return {
+            document,
+            contentUrl: preview.url,
+            contentByteSize: preview.byteSize,
+            renderFormat: 'pdf'
+          }
         }
-        return { document, contentBase64: sourceBytes.toString('base64'), renderFormat: 'docx' }
+        const preview = createPreviewUrl(
+          document.filePath,
+          'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        )
+        return {
+          document,
+          contentUrl: preview.url,
+          contentByteSize: preview.byteSize,
+          renderFormat: 'docx'
+        }
       }
-      return { document, contentBase64: sourceBytes.toString('base64'), renderFormat: 'pdf' }
+      const preview = createPreviewUrl(document.filePath, 'application/pdf')
+      return {
+        document,
+        contentUrl: preview.url,
+        contentByteSize: preview.byteSize,
+        renderFormat: 'pdf'
+      }
     } catch {
       return { document, errorMessage: '用户上传的源文件不可用，请重新上传协议附件' }
     }
@@ -1320,6 +1515,7 @@ const registerIpc = (): void => {
   )
   ipcMain.handle('knowledge:delete', (_event, id: string) => knowledgeService.deleteDocument(id))
   ipcMain.handle('knowledge:rebuild', () => knowledgeService.rebuildIndex())
+  ipcMain.handle('knowledge:cancel', (_event, taskId: string) => knowledgeService.cancelTask(taskId))
   ipcMain.handle('knowledge:stats', () => db.getKnowledgeStats(knowledgeService.modelVersion))
   ipcMain.handle('projects:list', (_event, query: ManagedProjectListQuery) =>
     projectManagementService.listProjects(query)
@@ -1553,7 +1749,56 @@ if (!hasSingleInstanceLock) {
   app.whenReady().then(() => {
     const dataDir = app.getPath('userData')
     mkdirSync(dataDir, { recursive: true })
-    db = new AppDatabase(join(dataDir, 'visslm-agent.db'), join(dataDir, 'assets', 'base64'))
+    db = new AppDatabase(join(dataDir, 'visslm-agent.db'), join(dataDir, 'assets'))
+    protocol.handle('visslm-preview', async (request) => {
+      try {
+        prunePreviewFiles()
+        const token = new URL(request.url).hostname.trim()
+        const entry = previewFiles.get(token)
+        if (!entry || entry.expiresAt <= Date.now()) {
+          previewFiles.delete(token)
+          return new Response('Not Found', { status: 404 })
+        }
+        const stats = statSync(entry.filePath)
+        if (!stats.isFile() || stats.size !== entry.byteSize) {
+          previewFiles.delete(token)
+          return new Response('Not Found', { status: 404 })
+        }
+        const stream = Readable.toWeb(createReadStream(entry.filePath)) as unknown as BodyInit
+        return new Response(stream, {
+          headers: {
+            'content-type': entry.mimeType,
+            'content-length': String(entry.byteSize),
+            'cache-control': 'private, max-age=60'
+          }
+        })
+      } catch {
+        return new Response('Not Found', { status: 404 })
+      }
+    })
+    protocol.handle('visslm-asset', async (request) => {
+      try {
+        const url = new URL(request.url)
+        const sha256 = url.hostname.trim().toLowerCase()
+        if (!/^[a-f0-9]{64}$/.test(sha256)) return new Response('Not Found', { status: 404 })
+        const blob = db.getAssetBlob(sha256)
+        if (!blob) return new Response('Not Found', { status: 404 })
+        const fileStats = statSync(blob.filePath)
+        if (!fileStats.isFile() || fileStats.size !== blob.byteSize) {
+          return new Response('Not Found', { status: 404 })
+        }
+        const stream = Readable.toWeb(createReadStream(blob.filePath)) as unknown as BodyInit
+        return new Response(stream, {
+          headers: {
+            'content-type': blob.mimeType,
+            'content-length': String(blob.byteSize),
+            'cache-control': 'private, max-age=31536000, immutable'
+          }
+        })
+      } catch {
+        return new Response('Not Found', { status: 404 })
+      }
+    })
     recordIndexLock = new AsyncMutex()
     settings = new SettingsService(db)
     requirementSemanticizationService = new RequirementSemanticizationService(
@@ -1590,9 +1835,6 @@ if (!hasSingleInstanceLock) {
       () => new VisslmClient(settings.getPlatformCredentials())
     )
     registerIpc()
-    void knowledgeService.initialize().catch((error) => {
-      console.error('[knowledge] initialization failed', error)
-    })
     createWindow()
     void initializeUpdateManager()
 
@@ -1606,6 +1848,10 @@ if (!hasSingleInstanceLock) {
   })
 
   app.on('before-quit', () => {
+    isQuitting = true
+    cancelKnowledgeInitialization()
+    knowledgeService?.cancelAllTasks()
+    previewFiles.clear()
     db?.close()
   })
 }

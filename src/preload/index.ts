@@ -4,6 +4,7 @@ import type {
   ChatRequest,
   ChatSessionDeleteResult,
   ChatSessionSaveInput,
+  DataImportRunSnapshot,
   DataReviewApplyInput,
   KnowledgeDocumentDetail,
   KnowledgeDocumentPage,
@@ -103,6 +104,9 @@ const api: AppApi = {
   listProjects: () => ipcRenderer.invoke('data:projects'),
   listNodeTypes: () => ipcRenderer.invoke('data:node-types'),
   listRecords: (query: RecordQuery) => ipcRenderer.invoke('data:records', query),
+  listRecordReleaseValues: () => ipcRenderer.invoke('data:record-release-values'),
+  listRecordUids: (query: Omit<RecordQuery, 'page' | 'pageSize'>) =>
+    ipcRenderer.invoke('data:record-uids', query),
   getRecord: (uid: string) => ipcRenderer.invoke('data:record', uid),
   previewRecordMaintenance: (
     input: Pick<RecordMaintenanceStartInput, 'scope' | 'recordUids'>
@@ -195,6 +199,11 @@ const api: AppApi = {
   exportDashboardOffline: (spec: DashboardSpec, version?: number) =>
     ipcRenderer.invoke('dashboards:export-offline', spec, version),
   importData: () => ipcRenderer.invoke('data:import'),
+  listDataImportRuns: (limit?: number): Promise<DataImportRunSnapshot[]> =>
+    ipcRenderer.invoke('data:import-runs', limit),
+  getDataImportRun: (id: string): Promise<DataImportRunSnapshot | null> =>
+    ipcRenderer.invoke('data:import-run', id),
+  resumeDataImportRun: (id: string) => ipcRenderer.invoke('data:import-resume', id),
   exportData: () => ipcRenderer.invoke('data:export'),
   deleteData: (uids?: string[]) => ipcRenderer.invoke('data:delete', uids),
   previewPush: (config: PushConfig) => ipcRenderer.invoke('push:preview', config),
@@ -223,6 +232,8 @@ const api: AppApi = {
     ipcRenderer.invoke('knowledge:delete', id),
   rebuildKnowledgeIndex: (): Promise<KnowledgeRebuildResult> =>
     ipcRenderer.invoke('knowledge:rebuild'),
+  cancelKnowledgeTask: (taskId: string): Promise<boolean> =>
+    ipcRenderer.invoke('knowledge:cancel', taskId),
   getKnowledgeStats: (): Promise<KnowledgeStats> =>
     ipcRenderer.invoke('knowledge:stats'),
   onKnowledgeProgress: (callback: (progress: KnowledgeIndexProgress) => void) => {

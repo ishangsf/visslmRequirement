@@ -1,6 +1,17 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+  writeSync
+} from 'node:fs'
+import { basename, dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import type {
   ChatMessage,
@@ -18,6 +29,8 @@ import type {
   DataReviewSummary,
   DataDeleteResult,
   DataImportResult,
+  DataImportRunSnapshot,
+  DataImportRunStatus,
   DashboardStats,
   FieldDefinition,
   ImageAsset,
@@ -44,6 +57,7 @@ import type {
   RecordMaintenanceTaskSnapshot,
   RecordMaintenanceTaskStatus,
   RecordPage,
+  RecordReleaseValue,
   RecordQuery,
   RecordRow,
   RequirementSemanticizationStatus,
@@ -99,6 +113,11 @@ import {
   RECORD_NORMALIZER_VERSION,
   RECORD_VECTOR_INDEX_VERSION
 } from './record-maintenance-constants'
+import {
+  findRichTextImageSources,
+  parseAssetToken,
+  replaceRichTextImageSources
+} from './rich-text-assets'
 import type {
   DataScope,
   FieldProfile,
@@ -142,13 +161,155 @@ export interface ImageInput {
   bytes: Buffer
 }
 
+export interface AssetBlob {
+  sha256: string
+  mimeType: string
+  byteSize: number
+  filePath: string
+}
+
+export interface RecordImageReference {
+  id: string
+  recordUid: string
+  fieldPath: string
+  occurrence: number
+  ordinal: number
+  assetSha256: string
+  sourceType: string
+  sourceName: string
+  originalSource: string
+  createdAt: string
+}
+
+export interface PushAssetUpload {
+  cacheKey: string
+  baseUrl: string
+  projectId: string
+  sha256: string
+  remotePath: string
+  createdAt: string
+}
+
 export interface PendingDataReview extends DataReviewItem {
   payload: unknown
 }
 
 type SqlRow = Record<string, unknown>
+type SqlStatement = ReturnType<DatabaseSync['prepare']>
 
 const nowIso = (): string => new Date().toISOString()
+const KNOWLEDGE_VECTOR_COARSE_STEP = 8
+const TASK_RETENTION_DAYS = 30
+
+const buildKnowledgeCoarseVector = (vector: Float32Array): Float32Array => {
+  const coarse = new Float32Array(Math.ceil(vector.length / KNOWLEDGE_VECTOR_COARSE_STEP))
+  for (let index = 0, coarseIndex = 0; index < vector.length; index += KNOWLEDGE_VECTOR_COARSE_STEP, coarseIndex += 1) {
+    coarse[coarseIndex] = vector[index]
+  }
+  let norm = 0
+  for (const value of coarse) norm += value * value
+  if (norm > 0) {
+    const inverseNorm = 1 / Math.sqrt(norm)
+    for (let index = 0; index < coarse.length; index += 1) coarse[index] *= inverseNorm
+  }
+  return coarse
+}
+
+const knowledgeCoarseBucket = (coarse: Float32Array): number => {
+  // Four sign bits are deliberately small and stable.  They are only a
+  // future shard hint; exact ranking remains in the service layer.
+  let bucket = 0
+  for (let index = 0; index < Math.min(4, coarse.length); index += 1) {
+    if (coarse[index] >= 0) bucket |= 1 << index
+  }
+  return bucket
+}
+
+const float32FromBlob = (value: unknown): Float32Array | undefined => {
+  if (!value) return undefined
+  const bytes = Uint8Array.from(value as Uint8Array)
+  if (!bytes.byteLength || bytes.byteLength % Float32Array.BYTES_PER_ELEMENT !== 0) return undefined
+  return new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / Float32Array.BYTES_PER_ELEMENT)
+}
+
+const normalizeMimeType = (input: unknown): string => {
+  const candidate = String(input ?? '').trim().toLowerCase().split(';', 1)[0]
+  return /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/.test(candidate)
+    ? candidate
+    : 'application/octet-stream'
+}
+
+const compactImageSource = (sourceInput: unknown, sha256: string): string => {
+  const source = String(sourceInput ?? '')
+  return /^data:image\//i.test(source) ? `inline:data-uri:${sha256}` : source
+}
+
+const unresolvedImageMarker = (recordUid: string, name: string, sourceUrl: string): string =>
+  createHash('sha256')
+    .update(`unresolved\u0000${recordUid}\u0000${name}\u0000${sourceUrl}`)
+    .digest('hex')
+
+const decodeLegacyBase64File = (
+  sourcePath: string,
+  temporaryPath: string
+): { sha256: string; byteSize: number } | null => {
+  let inputFd: number | undefined
+  let outputFd: number | undefined
+  let quartet = ''
+  let sawPadding = false
+  let byteSize = 0
+  const hash = createHash('sha256')
+  const writeFully = (bytes: Buffer): void => {
+    let offset = 0
+    while (offset < bytes.byteLength) {
+      offset += writeSync(outputFd as number, bytes, offset, bytes.byteLength - offset)
+    }
+  }
+  try {
+    mkdirSync(dirname(temporaryPath), { recursive: true })
+    inputFd = openSync(sourcePath, 'r')
+    outputFd = openSync(temporaryPath, 'w')
+    const chunk = Buffer.allocUnsafe(64 * 1024)
+    let bytesRead = 0
+    const pushQuartet = (value: string): boolean => {
+      if (value.length !== 4 || value[0] === '=' || value[1] === '=' ||
+        (value[2] === '=' && value[3] !== '=')) return false
+      const decoded = Buffer.from(value, 'base64')
+      if (!decoded.length) return false
+      writeFully(decoded)
+      hash.update(decoded)
+      byteSize += decoded.byteLength
+      if (value.includes('=')) sawPadding = true
+      return true
+    }
+    while ((bytesRead = readSync(inputFd, chunk, 0, chunk.byteLength, null)) > 0) {
+      const text = chunk.subarray(0, bytesRead).toString('ascii')
+      for (const character of text) {
+        if (/\s/.test(character)) continue
+        if (!/[A-Za-z0-9+/=]/.test(character) || sawPadding) return null
+        quartet += character
+        if (quartet.length === 4) {
+          if (!pushQuartet(quartet)) return null
+          quartet = ''
+        }
+      }
+    }
+    if (quartet.length === 1 || (quartet.length > 1 && !pushQuartet(quartet.padEnd(4, '=')))) {
+      return null
+    }
+    if (!byteSize) return null
+    return { sha256: hash.digest('hex'), byteSize }
+  } catch {
+    return null
+  } finally {
+    if (inputFd !== undefined) {
+      try { closeSync(inputFd) } catch {}
+    }
+    if (outputFd !== undefined) {
+      try { closeSync(outputFd) } catch {}
+    }
+  }
+}
 
 const parseJsonValue = (input: unknown, fallback: unknown): unknown => {
   if (!input) return fallback
@@ -427,6 +588,7 @@ const requirementSemanticSourceHash = (input: {
 export interface KnowledgeVectorRow {
   chunk: KnowledgeChunk
   vector: Float32Array
+  coarse?: Float32Array
 }
 
 const fieldProfileRoles = new Set<FieldProfileRole>([
@@ -716,13 +878,72 @@ const fieldSearchTerms = (search?: string): string[] => {
   return [...new Set(terms)]
 }
 
+const releaseNameFromRaw = (raw: Record<string, unknown>): string => {
+  const displayValue = raw._valm_Release_text
+  const releaseValue =
+    displayValue !== undefined && displayValue !== null && String(displayValue).trim() !== ''
+      ? displayValue
+      : raw._valm_Release
+  if (releaseValue === undefined || releaseValue === null || String(releaseValue).trim() === '') {
+    return '未设置'
+  }
+  return typeof releaseValue === 'object' ? JSON.stringify(releaseValue) : String(releaseValue)
+}
+
+const releaseTextFromRaw = (raw: Record<string, unknown>): string => {
+  const releaseValue = raw._valm_Release_text
+  if (releaseValue === undefined || releaseValue === null) return ''
+  const value = typeof releaseValue === 'object' ? JSON.stringify(releaseValue) : String(releaseValue)
+  return value.trim()
+}
+
+const releaseTextSql = (tableAlias: string): string => `TRIM(CASE
+  WHEN json_valid(${tableAlias}.raw_json) THEN CASE json_type(${tableAlias}.raw_json, '$._valm_Release_text')
+    WHEN 'true' THEN 'true'
+    WHEN 'false' THEN 'false'
+    WHEN 'null' THEN NULL
+    ELSE CAST(json_extract(${tableAlias}.raw_json, '$._valm_Release_text') AS TEXT)
+  END
+  ELSE NULL
+END)`
+
 export class AppDatabase {
   private readonly db: DatabaseSync
   private readonly assetDir: string
+  private readonly binaryAssetDir: string
+  private transactionDepth = 0
+  // Dashboard stats include project-management aggregates as well as record
+  // aggregates.  The analytics revision only changes for record writes, so a
+  // short TTL prevents a project-management mutation from leaving a stale
+  // dashboard indefinitely while still coalescing concurrent IPC reads.
+  private statsCache: { revision: number; createdAt: number; value: DashboardStats } | null = null
+  private recordWriteStatements: {
+    conflict: SqlStatement
+    previous: SqlStatement
+    deleteImageRefs: SqlStatement
+    upsert: SqlStatement
+  } | null = null
+  private requirementSearchStatements: {
+    delete: SqlStatement
+    select: SqlStatement
+    insert: SqlStatement
+  } | null = null
+  private maintenanceWriteStatements: {
+    ensure: SqlStatement
+    update: SqlStatement
+  } | null = null
 
   constructor(databasePath: string, assetDir: string) {
     mkdirSync(assetDir, { recursive: true })
     this.assetDir = assetDir
+    // The current bootstrap still passes the historical `assets/base64`
+    // directory.  Keep documents/legacy files there, while putting new
+    // content-addressed bytes at the plan's `assets/blobs/<prefix>/<sha>`.
+    const assetRoot = basename(assetDir).toLocaleLowerCase() === 'base64'
+      ? dirname(assetDir)
+      : assetDir
+    this.binaryAssetDir = join(assetRoot, 'blobs')
+    mkdirSync(this.binaryAssetDir, { recursive: true })
     this.db = new DatabaseSync(databasePath)
     this.db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;')
     this.migrate()
@@ -791,6 +1012,8 @@ export class AppDatabase {
         sha256 TEXT NOT NULL,
         base64_path TEXT NOT NULL,
         byte_size INTEGER NOT NULL DEFAULT 0,
+        state TEXT NOT NULL DEFAULT 'ready',
+        error_message TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL,
         UNIQUE(record_uid, sha256),
         FOREIGN KEY(record_uid) REFERENCES records(uid) ON DELETE CASCADE
@@ -874,6 +1097,30 @@ export class AppDatabase {
         ON data_review_items(batch_id, source, created_at);
       CREATE INDEX IF NOT EXISTS idx_data_review_item
         ON data_review_items(item_id);
+
+      CREATE TABLE IF NOT EXISTS data_import_runs (
+        id TEXT PRIMARY KEY,
+        path TEXT NOT NULL,
+        format TEXT NOT NULL,
+        file_size INTEGER NOT NULL DEFAULT 0,
+        file_mtime_ms INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'running',
+        batch_count INTEGER NOT NULL DEFAULT 0,
+        source_row_count INTEGER NOT NULL DEFAULT 0,
+        imported_record_count INTEGER NOT NULL DEFAULT 0,
+        skipped_count INTEGER NOT NULL DEFAULT 0,
+        parse_error_count INTEGER NOT NULL DEFAULT 0,
+        review_batch_id TEXT NOT NULL DEFAULT '',
+        error_message TEXT NOT NULL DEFAULT '',
+        started_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        finished_at TEXT NOT NULL DEFAULT ''
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_data_import_runs_status
+        ON data_import_runs(status, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_data_import_runs_updated
+        ON data_import_runs(updated_at DESC);
 
       CREATE TABLE IF NOT EXISTS dashboards (
         id TEXT PRIMARY KEY,
@@ -1047,6 +1294,8 @@ export class AppDatabase {
         current_count INTEGER NOT NULL DEFAULT 0,
         total_count INTEGER NOT NULL DEFAULT 0,
         message TEXT NOT NULL DEFAULT '',
+        elapsed_ms INTEGER NOT NULL DEFAULT 0,
+        throughput_per_second REAL NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
@@ -1435,6 +1684,79 @@ export class AppDatabase {
       CREATE INDEX IF NOT EXISTS idx_pm_analysis_logs_task
         ON pm_analysis_logs(task_id, created_at ASC);
     `)
+    // Persist the low-dimensional vector representation used by the coarse
+    // candidate pass.  Older databases are upgraded lazily; NULL coarse blobs
+    // are backfilled in bounded batches instead of blocking startup.
+    for (const statement of [
+      'ALTER TABLE knowledge_vectors ADD COLUMN coarse_vector_blob BLOB',
+      'ALTER TABLE knowledge_vectors ADD COLUMN coarse_dimension INTEGER NOT NULL DEFAULT 0',
+      'ALTER TABLE knowledge_vectors ADD COLUMN coarse_bucket INTEGER NOT NULL DEFAULT -1'
+    ]) {
+      try {
+        this.db.exec(statement)
+      } catch {
+        // Existing databases may already contain the vector shard columns.
+      }
+    }
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_knowledge_vectors_model_bucket
+        ON knowledge_vectors(model_version, coarse_bucket);
+    `)
+    // v1.5 stores image bytes once under a content-addressed path.  Keep the
+    // legacy base64_path column so existing databases can be migrated lazily
+    // and old imports remain readable.
+    try {
+      this.db.exec("ALTER TABLE images ADD COLUMN binary_path TEXT NOT NULL DEFAULT ''")
+    } catch {
+      // The migration has already run for this database.
+    }
+    try {
+      this.db.exec("ALTER TABLE images ADD COLUMN state TEXT NOT NULL DEFAULT 'ready'")
+    } catch {
+      // The migration has already run for this database.
+    }
+    try {
+      this.db.exec("ALTER TABLE images ADD COLUMN error_message TEXT NOT NULL DEFAULT ''")
+    } catch {
+      // The migration has already run for this database.
+    }
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS asset_blobs (
+        sha256 TEXT PRIMARY KEY,
+        mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+        byte_size INTEGER NOT NULL DEFAULT 0,
+        binary_path TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS record_image_refs (
+        id TEXT PRIMARY KEY,
+        record_uid TEXT NOT NULL,
+        field_path TEXT NOT NULL,
+        ordinal INTEGER NOT NULL,
+        asset_sha256 TEXT NOT NULL,
+        source_type TEXT NOT NULL DEFAULT 'rich-text',
+        source_name TEXT NOT NULL DEFAULT '',
+        original_source TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        UNIQUE(record_uid, field_path, ordinal),
+        FOREIGN KEY(record_uid) REFERENCES records(uid) ON DELETE CASCADE,
+        FOREIGN KEY(asset_sha256) REFERENCES asset_blobs(sha256) ON DELETE RESTRICT
+      );
+      CREATE INDEX IF NOT EXISTS idx_record_image_refs_record
+        ON record_image_refs(record_uid, field_path, ordinal);
+      CREATE INDEX IF NOT EXISTS idx_record_image_refs_hash
+        ON record_image_refs(asset_sha256);
+      CREATE TABLE IF NOT EXISTS push_asset_uploads (
+        cache_key TEXT PRIMARY KEY,
+        base_url TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        sha256 TEXT NOT NULL,
+        remote_path TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(base_url, project_id, sha256)
+      );
+    `)
+    this.migrateLegacyImageFiles()
     try {
       this.db.exec("ALTER TABLE requirement_semantic_cards ADD COLUMN analysis_trace_json TEXT NOT NULL DEFAULT '{}'")
     } catch {
@@ -1476,6 +1798,9 @@ export class AppDatabase {
           completed_at = ?, updated_at = ?
       WHERE status = 'processing'
     `).run(interruptedAt, interruptedAt, interruptedAt)
+    this.reconcileInterruptedKnowledgeTasks()
+    this.reconcileInterruptedDataImports()
+    this.reconcileInterruptedExternalRuns()
 
     for (const statement of [
       "ALTER TABLE records ADD COLUMN push_status TEXT NOT NULL DEFAULT 'pending'",
@@ -1507,7 +1832,11 @@ export class AppDatabase {
       "ALTER TABLE pm_analysis_logs ADD COLUMN input_chars INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE pm_analysis_logs ADD COLUMN output_chars INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE pm_analysis_logs ADD COLUMN done_reason TEXT NOT NULL DEFAULT ''",
-      "ALTER TABLE pm_analysis_logs ADD COLUMN model_name TEXT NOT NULL DEFAULT ''"
+      "ALTER TABLE pm_analysis_logs ADD COLUMN model_name TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE knowledge_index_tasks ADD COLUMN elapsed_ms INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE knowledge_index_tasks ADD COLUMN throughput_per_second REAL NOT NULL DEFAULT 0",
+      "ALTER TABLE data_import_runs ADD COLUMN file_size INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE data_import_runs ADD COLUMN file_mtime_ms INTEGER NOT NULL DEFAULT 0"
     ]) {
       try {
         this.db.exec(statement)
@@ -1589,6 +1918,9 @@ export class AppDatabase {
         DELETE FROM requirement_records_fts WHERE record_uid = old.uid;
       END;
     `)
+    // The migration updates the business search index, so run it only after
+    // requirement_records_fts exists on a fresh database.
+    this.migrateRichTextAssetTokens()
 
     const businessIndexStats = this.db.prepare(`
       SELECT COUNT(*) AS count, COUNT(DISTINCT record_uid) AS distinct_count
@@ -2026,23 +2358,13 @@ export class AppDatabase {
   }
 
   private ensureRecordMaintenanceState(recordUid: string): void {
-    this.db.prepare(`
-      INSERT OR IGNORE INTO record_maintenance_states(record_uid, updated_at)
-      VALUES (?, ?)
-    `).run(recordUid, nowIso())
+    this.getMaintenanceWriteStatements().ensure.run(recordUid, nowIso())
   }
 
   markRecordMaintenanceDataWritten(recordUid: string): void {
     this.ensureRecordMaintenanceState(recordUid)
     const timestamp = nowIso()
-    this.db.prepare(`
-      UPDATE record_maintenance_states
-      SET clean_status = 'ready', clean_version = ?, clean_updated_at = ?, clean_error = '',
-          lexical_status = 'ready', lexical_version = ?, lexical_updated_at = ?, lexical_error = '',
-          vector_status = 'pending', vector_version = '', vector_model_version = '',
-          vector_error = '', updated_at = ?
-      WHERE record_uid = ?
-    `).run(
+    this.getMaintenanceWriteStatements().update.run(
       RECORD_NORMALIZER_VERSION,
       timestamp,
       RECORD_LEXICAL_INDEX_VERSION,
@@ -2498,6 +2820,22 @@ export class AppDatabase {
     return { rows: rows.map((row) => this.mapKnowledgeDocument(row)), total }
   }
 
+  /**
+   * Return documents that can be safely resumed after an interrupted startup.
+   * The migration changes `processing` to `queued`; the extra status predicate
+   * keeps this method safe for databases opened before that cleanup ran.
+   */
+  listKnowledgeDocumentsForResume(limit = 1000): KnowledgeDocument[] {
+    const safeLimit = Math.min(2000, Math.max(1, Math.trunc(limit || 1000)))
+    const rows = this.db.prepare(`
+      SELECT * FROM knowledge_documents
+      WHERE status IN ('queued', 'processing')
+      ORDER BY updated_at ASC, created_at ASC
+      LIMIT ?
+    `).all(safeLimit) as SqlRow[]
+    return rows.map((row) => this.mapKnowledgeDocument(row))
+  }
+
   getKnowledgeDocument(id: string): KnowledgeDocumentDetail | null {
     const row = this.db.prepare('SELECT * FROM knowledge_documents WHERE id = ?').get(id) as SqlRow | undefined
     if (!row) return null
@@ -2594,13 +2932,27 @@ export class AppDatabase {
 
   private insertKnowledgeVectors(vectors: KnowledgeVectorInput[]): void {
     const insert = this.db.prepare(`
-      INSERT INTO knowledge_vectors(chunk_id, vector_blob, dimension, model_version, created_at)
-      VALUES (?, ?, ?, ?, ?)
+      INSERT INTO knowledge_vectors(
+        chunk_id, vector_blob, dimension, model_version, created_at,
+        coarse_vector_blob, coarse_dimension, coarse_bucket
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `)
     const timestamp = nowIso()
     for (const item of vectors) {
       const bytes = Buffer.from(item.vector.buffer, item.vector.byteOffset, item.vector.byteLength)
-      insert.run(item.chunkId, bytes, item.vector.length, item.modelVersion, timestamp)
+      const coarse = buildKnowledgeCoarseVector(item.vector)
+      const coarseBytes = Buffer.from(coarse.buffer, coarse.byteOffset, coarse.byteLength)
+      insert.run(
+        item.chunkId,
+        bytes,
+        item.vector.length,
+        item.modelVersion,
+        timestamp,
+        coarseBytes,
+        coarse.length,
+        knowledgeCoarseBucket(coarse)
+      )
     }
   }
 
@@ -3097,7 +3449,7 @@ export class AppDatabase {
 
   listKnowledgeVectorRows(modelVersion: string): KnowledgeVectorRow[] {
     const rows = this.db.prepare(`
-      SELECT c.*, v.vector_blob
+      SELECT c.*, v.vector_blob, v.coarse_vector_blob, v.coarse_dimension
       FROM knowledge_chunks c
       JOIN knowledge_vectors v ON v.chunk_id = c.id
       LEFT JOIN knowledge_documents d ON d.id = c.document_id
@@ -3109,9 +3461,52 @@ export class AppDatabase {
       const bytes = Uint8Array.from(row.vector_blob as Uint8Array)
       return {
         chunk: this.mapKnowledgeChunk(row),
-        vector: new Float32Array(bytes.buffer)
+        vector: new Float32Array(bytes.buffer),
+        coarse: float32FromBlob(row.coarse_vector_blob)
       }
     })
+  }
+
+  /**
+   * Backfill the persisted coarse representation in small write batches. This
+   * is intentionally incremental so opening an old database never requires a
+   * full-vector rewrite before the UI becomes usable.
+   */
+  backfillKnowledgeVectorCoarseIndex(
+    modelVersion: string,
+    limit = 512
+  ): { updatedCount: number; remainingCount: number } {
+    const safeLimit = Math.min(2048, Math.max(1, Math.trunc(limit || 512)))
+    const rows = this.db.prepare(`
+      SELECT chunk_id, vector_blob
+      FROM knowledge_vectors
+      WHERE model_version = ? AND coarse_vector_blob IS NULL
+      ORDER BY chunk_id
+      LIMIT ?
+    `).all(modelVersion, safeLimit) as SqlRow[]
+    if (rows.length) {
+      this.runInTransaction(() => {
+        const update = this.db.prepare(`
+          UPDATE knowledge_vectors
+          SET coarse_vector_blob = ?, coarse_dimension = ?, coarse_bucket = ?
+          WHERE chunk_id = ? AND model_version = ? AND coarse_vector_blob IS NULL
+        `)
+        for (const row of rows) {
+          const bytes = Uint8Array.from(row.vector_blob as Uint8Array)
+          if (!bytes.byteLength || bytes.byteLength % Float32Array.BYTES_PER_ELEMENT !== 0) continue
+          const vector = new Float32Array(bytes.buffer)
+          const coarse = buildKnowledgeCoarseVector(vector)
+          const coarseBytes = Buffer.from(coarse.buffer, coarse.byteOffset, coarse.byteLength)
+          update.run(coarseBytes, coarse.length, knowledgeCoarseBucket(coarse), String(row.chunk_id), modelVersion)
+        }
+      })
+    }
+    const remaining = this.db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM knowledge_vectors
+      WHERE model_version = ? AND coarse_vector_blob IS NULL
+    `).get(modelVersion) as SqlRow
+    return { updatedCount: rows.length, remainingCount: Number(remaining.count ?? 0) }
   }
 
   searchRequirementRecordsLexical(
@@ -3169,6 +3564,84 @@ export class AppDatabase {
     }
   }
 
+  /**
+   * Mark in-flight knowledge work as retryable after a process restart and
+   * bound the progress table so long-running desktop usage does not grow it
+   * without limit. Document chunks are intentionally left intact: the next
+   * idempotent document/record pass replaces them in one transaction.
+   */
+  reconcileInterruptedKnowledgeTasks(): number {
+    const timestamp = nowIso()
+    const cutoff = new Date(Date.now() - TASK_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString()
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const taskResult = this.db.prepare(`
+        UPDATE knowledge_index_tasks
+        SET status = 'failed',
+            message = CASE
+              WHEN message = '' THEN '应用在知识库索引任务中断，可重试'
+              ELSE message || '（应用重启中断，可重试）'
+            END,
+            updated_at = ?
+        WHERE status = 'running'
+      `).run(timestamp)
+      const documentResult = this.db.prepare(`
+        UPDATE knowledge_documents
+        SET status = 'queued',
+            error_message = '应用在知识库处理中断，已重新加入恢复队列',
+            processed_at = '',
+            updated_at = ?
+        WHERE status = 'processing'
+      `).run(timestamp)
+      this.db.prepare(`
+        DELETE FROM knowledge_index_tasks
+        WHERE status IN ('success', 'failed') AND updated_at < ?
+      `).run(cutoff)
+      this.db.exec('COMMIT')
+      return Number(taskResult.changes ?? 0) + Number(documentResult.changes ?? 0)
+    } catch (error) {
+      try { this.db.exec('ROLLBACK') } catch { /* best effort */ }
+      throw error
+    }
+  }
+
+  private mapKnowledgeIndexProgress(row: SqlRow): KnowledgeIndexProgress {
+    const elapsedMs = Number(row.elapsed_ms ?? 0)
+    const throughputPerSecond = Number(row.throughput_per_second ?? 0)
+    return {
+      taskId: String(row.id),
+      phase: String(row.phase) as KnowledgeIndexProgress['phase'],
+      message: String(row.message ?? ''),
+      current: Number(row.current_count ?? 0),
+      total: Number(row.total_count ?? 0),
+      status: String(row.status) as KnowledgeIndexProgress['status'],
+      ...(Number.isFinite(elapsedMs) && elapsedMs > 0 ? { elapsedMs } : {}),
+      ...(Number.isFinite(throughputPerSecond) && throughputPerSecond > 0 ? { throughputPerSecond } : {})
+    }
+  }
+
+  getKnowledgeIndexProgress(taskId: string): KnowledgeIndexProgress | null {
+    const row = this.db.prepare(`
+      SELECT id, phase, status, current_count, total_count, message,
+             elapsed_ms, throughput_per_second
+      FROM knowledge_index_tasks WHERE id = ? LIMIT 1
+    `).get(taskId.trim()) as SqlRow | undefined
+    if (!row) return null
+    return this.mapKnowledgeIndexProgress(row)
+  }
+
+  listKnowledgeIndexProgress(limit = 100): KnowledgeIndexProgress[] {
+    const safeLimit = Math.min(200, Math.max(1, Math.trunc(limit || 100)))
+    const rows = this.db.prepare(`
+      SELECT id, phase, status, current_count, total_count, message,
+             elapsed_ms, throughput_per_second
+      FROM knowledge_index_tasks
+      ORDER BY updated_at DESC, created_at DESC
+      LIMIT ?
+    `).all(safeLimit) as SqlRow[]
+    return rows.map((row) => this.mapKnowledgeIndexProgress(row))
+  }
+
   getKnowledgeStats(modelVersion: string): KnowledgeStats {
     const scalar = (sql: string, ...params: Array<string | number | null>): number =>
       Number((this.db.prepare(sql).get(...params) as SqlRow).count ?? 0)
@@ -3187,16 +3660,25 @@ export class AppDatabase {
 
   saveKnowledgeIndexProgress(progress: KnowledgeIndexProgress): void {
     const timestamp = nowIso()
+    const elapsedMs = Number.isFinite(progress.elapsedMs)
+      ? Math.max(0, Math.trunc(progress.elapsedMs as number))
+      : 0
+    const throughputPerSecond = Number.isFinite(progress.throughputPerSecond)
+      ? Math.max(0, progress.throughputPerSecond as number)
+      : 0
     this.db.prepare(`
       INSERT INTO knowledge_index_tasks(
-        id, phase, status, current_count, total_count, message, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        id, phase, status, current_count, total_count, message,
+        elapsed_ms, throughput_per_second, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         phase = excluded.phase,
         status = excluded.status,
         current_count = excluded.current_count,
         total_count = excluded.total_count,
         message = excluded.message,
+        elapsed_ms = excluded.elapsed_ms,
+        throughput_per_second = excluded.throughput_per_second,
         updated_at = excluded.updated_at
     `).run(
       progress.taskId,
@@ -3205,6 +3687,8 @@ export class AppDatabase {
       progress.current,
       progress.total,
       progress.message,
+      elapsedMs,
+      throughputPerSecond,
       timestamp,
       timestamp
     )
@@ -5514,6 +5998,7 @@ export class AppDatabase {
     const next = this.getAnalyticsRevision() + 1
     this.setSetting('analytics:data-revision', String(next))
     this.db.prepare('DELETE FROM query_cache WHERE data_revision < ?').run(next)
+    this.statsCache = null
     return next
   }
 
@@ -6126,6 +6611,7 @@ export class AppDatabase {
     lastModifyTime: string
     raw: Record<string, unknown>
   }): void {
+    this.statsCache = null
     this.db
       .prepare(
         `INSERT INTO projects(uid, name, item_id, last_modify_time, raw_json, synced_at)
@@ -6160,17 +6646,92 @@ export class AppDatabase {
     return buildRequirementBusinessText({ name: row.name, raw })
   }
 
+  private getRecordWriteStatements(): NonNullable<AppDatabase['recordWriteStatements']> {
+    if (!this.recordWriteStatements) {
+      this.recordWriteStatements = {
+        conflict: this.db.prepare('SELECT uid FROM records WHERE item_id = ? AND uid <> ? LIMIT 1'),
+        previous: this.db.prepare('SELECT raw_json FROM records WHERE uid = ?'),
+        deleteImageRefs: this.db.prepare('DELETE FROM record_image_refs WHERE record_uid = ?'),
+        upsert: this.db.prepare(`
+          INSERT INTO records(
+             uid, project_id, node_type, item_id, parent_id, name,
+             last_modify_time, raw_json, normalized_text, content_hash, semantic_hash, synced_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(uid) DO UPDATE SET
+             project_id=excluded.project_id,
+             node_type=excluded.node_type,
+             item_id=excluded.item_id,
+             parent_id=excluded.parent_id,
+             name=excluded.name,
+             last_modify_time=excluded.last_modify_time,
+             raw_json=excluded.raw_json,
+             normalized_text=excluded.normalized_text,
+             content_hash=excluded.content_hash,
+             semantic_hash=excluded.semantic_hash,
+             push_status=CASE
+               WHEN records.content_hash <> excluded.content_hash THEN 'pending'
+               ELSE records.push_status
+             END,
+             push_message=CASE
+               WHEN records.content_hash <> excluded.content_hash THEN ''
+               ELSE records.push_message
+             END,
+             pushed_at=CASE
+               WHEN records.content_hash <> excluded.content_hash THEN ''
+               ELSE records.pushed_at
+             END,
+             pushed_uid=CASE
+               WHEN records.content_hash <> excluded.content_hash THEN ''
+               ELSE records.pushed_uid
+             END,
+             synced_at=excluded.synced_at`
+        )
+      }
+    }
+    return this.recordWriteStatements
+  }
+
+  private getRequirementSearchStatements(): NonNullable<AppDatabase['requirementSearchStatements']> {
+    if (!this.requirementSearchStatements) {
+      this.requirementSearchStatements = {
+        delete: this.db.prepare('DELETE FROM requirement_records_fts WHERE record_uid = ?'),
+        select: this.db.prepare('SELECT uid, name, raw_json FROM records WHERE uid = ?'),
+        insert: this.db.prepare(
+          'INSERT INTO requirement_records_fts(record_uid, business_text) VALUES (?, ?)'
+        )
+      }
+    }
+    return this.requirementSearchStatements
+  }
+
+  private getMaintenanceWriteStatements(): NonNullable<AppDatabase['maintenanceWriteStatements']> {
+    if (!this.maintenanceWriteStatements) {
+      this.maintenanceWriteStatements = {
+        ensure: this.db.prepare(`
+          INSERT OR IGNORE INTO record_maintenance_states(record_uid, updated_at)
+          VALUES (?, ?)
+        `),
+        update: this.db.prepare(`
+          UPDATE record_maintenance_states
+          SET clean_status = 'ready', clean_version = ?, clean_updated_at = ?, clean_error = '',
+              lexical_status = 'ready', lexical_version = ?, lexical_updated_at = ?, lexical_error = '',
+              vector_status = 'pending', vector_version = '', vector_model_version = '',
+              vector_error = '', updated_at = ?
+          WHERE record_uid = ?
+        `)
+      }
+    }
+    return this.maintenanceWriteStatements
+  }
+
   private syncRequirementSearchIndex(recordUid: string): void {
-    this.db.prepare('DELETE FROM requirement_records_fts WHERE record_uid = ?').run(recordUid)
-    const row = this.db.prepare(`
-      SELECT uid, name, raw_json FROM records WHERE uid = ?
-    `).get(recordUid) as SqlRow | undefined
+    const statements = this.getRequirementSearchStatements()
+    statements.delete.run(recordUid)
+    const row = statements.select.get(recordUid) as SqlRow | undefined
     if (!row) return
     const businessText = this.requirementBusinessTextFromRow(row)
     if (businessText) {
-      this.db.prepare(`
-        INSERT INTO requirement_records_fts(record_uid, business_text) VALUES (?, ?)
-      `).run(recordUid, businessText)
+      statements.insert.run(recordUid, businessText)
     }
   }
 
@@ -6186,16 +6747,40 @@ export class AppDatabase {
     }
   }
 
+  /** Persist a batch with one SQLite transaction and reusable write statements. */
+  upsertRecords(inputs: readonly RecordInput[]): number {
+    if (!inputs.length) return 0
+    this.runInTransaction(() => {
+      for (const input of inputs) this.upsertRecord(input)
+    })
+    return inputs.length
+  }
+
   upsertRecord(input: RecordInput): void {
+    this.statsCache = null
     const itemId = input.itemId.trim()
     if (!itemId) throw new Error('记录缺少 _valm_ItemID，不能写入本地数据')
-    const conflict = this.db
-      .prepare('SELECT uid FROM records WHERE item_id = ? AND uid <> ? LIMIT 1')
-      .get(itemId, input.uid) as SqlRow | undefined
+    const statements = this.getRecordWriteStatements()
+    const conflict = statements.conflict.get(itemId, input.uid) as SqlRow | undefined
     if (conflict) {
       throw new Error(`_valm_ItemID ${itemId} 已存在，不能直接覆盖`)
     }
     const rawJson = JSON.stringify(input.raw)
+    const previous = statements.previous.get(input.uid) as SqlRow | undefined
+    if (previous) {
+      let previousRaw: Record<string, unknown> = {}
+      try {
+        const parsed = JSON.parse(String(previous.raw_json ?? '{}')) as unknown
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          previousRaw = parsed as Record<string, unknown>
+        }
+      } catch {
+        previousRaw = {}
+      }
+      if (JSON.stringify(previousRaw._valm_Description) !== JSON.stringify(input.raw._valm_Description)) {
+        statements.deleteImageRefs.run(input.uid)
+      }
+    }
     const contentHash = createHash('sha256').update(rawJson).digest('hex')
     const semanticHash = requirementSemanticSourceHash({
       name: input.name,
@@ -6203,42 +6788,7 @@ export class AppDatabase {
       rawJson,
       normalizedText: input.normalizedText
     })
-    this.db
-      .prepare(
-        `INSERT INTO records(
-           uid, project_id, node_type, item_id, parent_id, name,
-           last_modify_time, raw_json, normalized_text, content_hash, semantic_hash, synced_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(uid) DO UPDATE SET
-           project_id=excluded.project_id,
-           node_type=excluded.node_type,
-           item_id=excluded.item_id,
-           parent_id=excluded.parent_id,
-           name=excluded.name,
-           last_modify_time=excluded.last_modify_time,
-           raw_json=excluded.raw_json,
-           normalized_text=excluded.normalized_text,
-           content_hash=excluded.content_hash,
-           semantic_hash=excluded.semantic_hash,
-           push_status=CASE
-             WHEN records.content_hash <> excluded.content_hash THEN 'pending'
-             ELSE records.push_status
-           END,
-           push_message=CASE
-             WHEN records.content_hash <> excluded.content_hash THEN ''
-             ELSE records.push_message
-           END,
-           pushed_at=CASE
-             WHEN records.content_hash <> excluded.content_hash THEN ''
-             ELSE records.pushed_at
-           END,
-           pushed_uid=CASE
-             WHEN records.content_hash <> excluded.content_hash THEN ''
-             ELSE records.pushed_uid
-           END,
-           synced_at=excluded.synced_at`
-      )
-      .run(
+    statements.upsert.run(
         input.uid,
         input.projectId,
         input.nodeType,
@@ -6463,34 +7013,316 @@ export class AppDatabase {
     } finally {
       this.db.exec('DELETE FROM sync_record_keep')
     }
+    this.cleanupOrphanAssetBlobs()
+  }
+
+  private cleanupOrphanAssetBlobs(): void {
+    const rows = this.db.prepare(`
+      SELECT b.sha256, b.binary_path
+      FROM asset_blobs b
+      LEFT JOIN images i ON i.sha256 = b.sha256
+      LEFT JOIN record_image_refs r ON r.asset_sha256 = b.sha256
+      WHERE i.sha256 IS NULL AND r.asset_sha256 IS NULL
+    `).all() as SqlRow[]
+    for (const row of rows) {
+      const sha256 = String(row.sha256 ?? '')
+      this.db.prepare('DELETE FROM asset_blobs WHERE sha256 = ?').run(sha256)
+      const filePath = String(row.binary_path ?? '')
+      if (filePath) {
+        try { unlinkSync(filePath) } catch { /* best-effort orphan cleanup */ }
+      }
+    }
+  }
+
+  private binaryPathForSha(sha256: string): string {
+    const normalized = sha256.trim().toLowerCase()
+    if (!/^[a-f0-9]{64}$/.test(normalized)) throw new Error('图片 SHA-256 无效')
+    return join(this.binaryAssetDir, normalized.slice(0, 2), normalized)
+  }
+
+  private migrateLegacyImageFiles(): void {
+    const rows = this.db.prepare(`
+      SELECT id, sha256, mime_type, byte_size, source_url, base64_path, binary_path
+      FROM images
+      WHERE COALESCE(base64_path, '') <> '' OR COALESCE(binary_path, '') = ''
+    `).all() as SqlRow[]
+    if (!rows.length) return
+    const legacyPaths = new Set(
+      rows.map((row) => String(row.base64_path ?? '').trim()).filter(Boolean)
+    )
+    const insertBlob = this.db.prepare(`
+      INSERT INTO asset_blobs(sha256, mime_type, byte_size, binary_path, created_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(sha256) DO UPDATE SET
+        mime_type = excluded.mime_type,
+        byte_size = excluded.byte_size,
+        binary_path = excluded.binary_path
+    `)
+    for (const row of rows) {
+      const sha256 = String(row.sha256 ?? '').trim().toLowerCase()
+      const legacyPath = String(row.base64_path ?? '').trim()
+      let decodedTempPath = ''
+      try {
+        if (!/^[a-f0-9]{64}$/.test(sha256)) continue
+        const existingBinary = String(row.binary_path ?? '').trim()
+        let bytes: Buffer | null = null
+        let byteSize = 0
+        if (existingBinary && existsSync(existingBinary)) {
+          const candidate = readFileSync(existingBinary)
+          if (createHash('sha256').update(candidate).digest('hex') === sha256) {
+            bytes = candidate
+            byteSize = candidate.byteLength
+          }
+        }
+        if (!bytes && legacyPath && existsSync(legacyPath)) {
+          const binaryPath = this.binaryPathForSha(sha256)
+          decodedTempPath = `${binaryPath}.${randomUUID()}.decode.tmp`
+          const decoded = decodeLegacyBase64File(legacyPath, decodedTempPath)
+          if (decoded?.sha256 === sha256) byteSize = decoded.byteSize
+        }
+        if (!bytes && !byteSize) continue
+        const binaryPath = this.binaryPathForSha(sha256)
+        mkdirSync(join(this.binaryAssetDir, sha256.slice(0, 2)), { recursive: true })
+        let binaryIsValid = false
+        if (existsSync(binaryPath)) {
+          try {
+            const existing = readFileSync(binaryPath)
+            binaryIsValid = existing.byteLength === byteSize &&
+              createHash('sha256').update(existing).digest('hex') === sha256
+          } catch {
+            binaryIsValid = false
+          }
+        }
+        if (!binaryIsValid) {
+          if (decodedTempPath && existsSync(decodedTempPath)) {
+            renameSync(decodedTempPath, binaryPath)
+            decodedTempPath = ''
+          } else if (bytes) {
+            const temporaryPath = `${binaryPath}.${randomUUID()}.tmp`
+            writeFileSync(temporaryPath, bytes)
+            renameSync(temporaryPath, binaryPath)
+          }
+        } else if (decodedTempPath) {
+          try { unlinkSync(decodedTempPath) } catch {}
+          decodedTempPath = ''
+        }
+        const mimeType = normalizeMimeType(row.mime_type)
+        insertBlob.run(sha256, mimeType, byteSize, binaryPath, nowIso())
+        this.db.prepare('UPDATE images SET binary_path = ?, base64_path = \'\', byte_size = ?, source_url = ? WHERE id = ?')
+          .run(binaryPath, byteSize, compactImageSource(row.source_url, sha256), String(row.id))
+      } catch {
+        // One damaged legacy image must not make the database unusable.  It
+        // remains available for a later repair/import operation.
+      } finally {
+        if (decodedTempPath) {
+          try { unlinkSync(decodedTempPath) } catch {}
+        }
+      }
+    }
+    for (const legacyPath of legacyPaths) {
+      const pending = this.db.prepare(`
+        SELECT 1 FROM images WHERE base64_path = ? LIMIT 1
+      `).get(legacyPath)
+      if (!pending) {
+        try { unlinkSync(legacyPath) } catch { /* best-effort cleanup */ }
+      }
+    }
+  }
+
+  /** Upgrade already-collected descriptions to lossless binary asset tokens. */
+  private migrateRichTextAssetTokens(): void {
+    const rows = this.db.prepare(`
+      SELECT uid, node_type, raw_json, normalized_text FROM records
+      WHERE raw_json LIKE '%_valm_Description%'
+        AND raw_json LIKE '%<img%'
+        AND NOT EXISTS (
+          SELECT 1 FROM record_image_refs refs
+          WHERE refs.record_uid = records.uid
+            AND refs.field_path = '_valm_Description'
+        )
+    `).all() as SqlRow[]
+    for (const row of rows) {
+      let raw: Record<string, unknown>
+      try {
+        const parsed = JSON.parse(String(row.raw_json)) as unknown
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue
+        raw = parsed as Record<string, unknown>
+      } catch {
+        continue
+      }
+      const description = typeof raw._valm_Description === 'string' ? raw._valm_Description : ''
+      if (!description || !findRichTextImageSources(description).length) continue
+      const images = this.db.prepare(`
+        SELECT id, name, source_url, sha256, mime_type
+        FROM images WHERE record_uid = ? ORDER BY created_at, id
+      `).all(String(row.uid)) as SqlRow[]
+      const findImage = (source: string, sha256?: string): SqlRow | undefined => images.find((image) => {
+        if (sha256 && String(image.sha256).toLowerCase() === sha256.toLowerCase()) return true
+        const sourceUrl = String(image.source_url ?? '')
+        return sourceUrl === source || sourceUrl.includes(source) ||
+          (/^data:image\//i.test(source) && sourceUrl.startsWith('inline:data-uri'))
+      })
+      const tokenized = replaceRichTextImageSources(description, (source) => {
+        const parsed = parseAssetToken(source.source)
+        const image = findImage(source.source, parsed?.sha256)
+        const sha256 = parsed?.sha256 || String(image?.sha256 ?? '').toLowerCase()
+        if (!/^[a-f0-9]{64}$/.test(sha256) || !this.getAssetBlob(sha256)) return undefined
+        const referenceId = parsed?.referenceId || randomUUID()
+        this.saveRecordImageReference({
+          id: referenceId,
+          recordUid: String(row.uid),
+          fieldPath: '_valm_Description',
+          ordinal: source.occurrence,
+          assetSha256: sha256,
+          sourceType: parsed ? 'token' : 'legacy',
+          sourceName: String(image?.name ?? ''),
+          originalSource: source.source
+        })
+        return parsed ? source.source : `visslm-asset://${sha256}/${referenceId}`
+      })
+      if (!tokenized.replacements.length || tokenized.html === description) continue
+      const nextRaw = { ...raw, _valm_Description: tokenized.html }
+      const normalizedText = String(row.normalized_text ?? '')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+      this.updateRecordRawAndNormalizedText(String(row.uid), nextRaw, normalizedText)
+      if (String(row.node_type ?? '') === 'Project') {
+        this.db.prepare('UPDATE projects SET raw_json = ? WHERE uid = ?')
+          .run(JSON.stringify(nextRaw), String(row.uid))
+      }
+    }
+  }
+
+  private ensureAssetBlob(input: {
+    sha256: string
+    mimeType: string
+    bytes: Buffer
+  }): AssetBlob {
+    const sha256 = input.sha256.trim().toLowerCase()
+    const expected = createHash('sha256').update(input.bytes).digest('hex')
+    if (expected !== sha256) throw new Error('图片内容 SHA-256 校验失败')
+    const filePath = this.binaryPathForSha(sha256)
+    mkdirSync(join(this.binaryAssetDir, sha256.slice(0, 2)), { recursive: true })
+    let fileIsValid = false
+    if (existsSync(filePath)) {
+      try {
+        const existing = readFileSync(filePath)
+        fileIsValid = existing.byteLength === input.bytes.byteLength &&
+          createHash('sha256').update(existing).digest('hex') === sha256
+      } catch {
+        fileIsValid = false
+      }
+    }
+    if (!fileIsValid) {
+      const temporaryPath = `${filePath}.${randomUUID()}.tmp`
+      writeFileSync(temporaryPath, input.bytes)
+      renameSync(temporaryPath, filePath)
+    }
+    const mimeType = normalizeMimeType(input.mimeType)
+    this.db.prepare(`
+      INSERT INTO asset_blobs(sha256, mime_type, byte_size, binary_path, created_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(sha256) DO UPDATE SET
+        mime_type = CASE WHEN asset_blobs.mime_type = 'application/octet-stream'
+          THEN excluded.mime_type ELSE asset_blobs.mime_type END,
+        byte_size = excluded.byte_size,
+        binary_path = excluded.binary_path
+    `).run(sha256, mimeType, input.bytes.byteLength, filePath, nowIso())
+    return { sha256, mimeType, byteSize: input.bytes.byteLength, filePath }
+  }
+
+  /** Store a content-addressed blob without associating it with a record yet. */
+  saveAssetBlob(input: {
+    sha256: string
+    mimeType: string
+    bytes: Buffer
+  }): AssetBlob {
+    const sha256 = input.sha256.trim().toLowerCase()
+    return this.ensureAssetBlob({ sha256, mimeType: input.mimeType, bytes: input.bytes })
+  }
+
+  runInTransaction<T>(action: () => T): T {
+    // Importing a resource pack already runs the whole apply phase inside one
+    // transaction.  Keep nested callers in that same SQLite transaction
+    // instead of issuing a second BEGIN, while the outermost caller retains
+    // the commit/rollback boundary.
+    if (this.transactionDepth > 0) return action()
+    this.db.exec('BEGIN IMMEDIATE')
+    this.transactionDepth = 1
+    try {
+      const result = action()
+      this.db.exec('COMMIT')
+      return result
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    } finally {
+      this.transactionDepth = 0
+    }
+  }
+
+  removeAssetBlob(sha256: string): void {
+    const normalized = sha256.trim().toLowerCase()
+    if (!/^[a-f0-9]{64}$/.test(normalized)) return
+    const hasImage = this.db.prepare('SELECT 1 FROM images WHERE sha256 = ? LIMIT 1').get(normalized)
+    const hasReference = this.db.prepare('SELECT 1 FROM record_image_refs WHERE asset_sha256 = ? LIMIT 1').get(normalized)
+    if (hasImage || hasReference) return
+    const blob = this.db.prepare('SELECT binary_path FROM asset_blobs WHERE sha256 = ?').get(normalized) as SqlRow | undefined
+    this.db.prepare('DELETE FROM asset_blobs WHERE sha256 = ?').run(normalized)
+    const filePath = String(blob?.binary_path ?? '')
+    if (filePath) {
+      try { unlinkSync(filePath) } catch { /* best-effort cleanup */ }
+    }
   }
 
   saveImage(input: ImageInput): ImageAsset {
+    this.statsCache = null
     const sha256 = createHash('sha256').update(input.bytes).digest('hex')
+    const unresolvedMarker = unresolvedImageMarker(input.recordUid, input.name, input.sourceUrl)
+    this.db.prepare('DELETE FROM images WHERE record_uid = ? AND sha256 = ? AND state = \'unresolved\'')
+      .run(input.recordUid, unresolvedMarker)
     const existing = this.db
       .prepare('SELECT * FROM images WHERE record_uid = ? AND sha256 = ?')
       .get(input.recordUid, sha256) as SqlRow | undefined
-    if (existing) return this.mapImage(existing)
+    if (existing) {
+      if (!this.getAssetBlob(sha256)) {
+        const blob = this.ensureAssetBlob({
+          sha256,
+          mimeType: input.mimeType,
+          bytes: input.bytes
+        })
+        this.db.prepare('UPDATE images SET binary_path = ?, byte_size = ? WHERE id = ?')
+          .run(blob.filePath, blob.byteSize, String(existing.id))
+        existing.binary_path = blob.filePath
+        existing.byte_size = blob.byteSize
+      }
+      return this.mapImage(existing)
+    }
 
     const id = randomUUID()
-    const base64Path = join(this.assetDir, `${sha256}.b64`)
-    writeFileSync(base64Path, input.bytes.toString('base64'), 'utf8')
+    const blob = this.ensureAssetBlob({
+      sha256,
+      mimeType: input.mimeType,
+      bytes: input.bytes
+    })
     const createdAt = nowIso()
+    const sourceUrl = compactImageSource(input.sourceUrl, sha256)
     this.db
       .prepare(
         `INSERT INTO images(
            id, record_uid, name, mime_type, source_url, sha256,
-           base64_path, byte_size, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           base64_path, binary_path, byte_size, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?)`
       )
       .run(
         id,
         input.recordUid,
         input.name,
-        input.mimeType,
-        input.sourceUrl,
+        normalizeMimeType(input.mimeType),
+        sourceUrl,
         sha256,
-        base64Path,
+        blob.filePath,
         input.bytes.byteLength,
         createdAt
       )
@@ -6498,32 +7330,313 @@ export class AppDatabase {
       id,
       recordUid: input.recordUid,
       name: input.name,
-      mimeType: input.mimeType,
-      sourceUrl: input.sourceUrl,
+      mimeType: normalizeMimeType(input.mimeType),
+      sourceUrl,
       sha256,
-      byteSize: input.bytes.byteLength
+      byteSize: input.bytes.byteLength,
+      assetUrl: `visslm-asset://${sha256}/${id}`,
+      state: 'ready'
+    } as ImageAsset
+  }
+
+  attachImageAsset(input: {
+    recordUid: string
+    name: string
+    mimeType: string
+    sourceUrl: string
+    sha256: string
+  }): ImageAsset {
+    this.statsCache = null
+    const sha256 = input.sha256.trim().toLowerCase()
+    const blob = this.getAssetBlob(sha256)
+    if (!blob || !this.readAssetBytes(sha256)) throw new Error('图片资源不存在或已损坏')
+    const existing = this.db.prepare(
+      'SELECT * FROM images WHERE record_uid = ? AND sha256 = ?'
+    ).get(input.recordUid, sha256) as SqlRow | undefined
+    if (existing) return this.mapImage(existing)
+    const id = randomUUID()
+    const sourceUrl = compactImageSource(input.sourceUrl, sha256)
+    this.db.prepare(`
+      INSERT INTO images(
+        id, record_uid, name, mime_type, source_url, sha256,
+        base64_path, binary_path, byte_size, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?)
+    `).run(
+      id,
+      input.recordUid,
+      input.name,
+      normalizeMimeType(input.mimeType || blob.mimeType),
+      sourceUrl,
+      sha256,
+      blob.filePath,
+      blob.byteSize,
+      nowIso()
+    )
+    return {
+      id,
+      recordUid: input.recordUid,
+      name: input.name,
+      mimeType: normalizeMimeType(input.mimeType || blob.mimeType),
+      sourceUrl,
+      sha256,
+      byteSize: blob.byteSize,
+      assetUrl: `visslm-asset://${sha256}/${id}`,
+      state: 'ready'
+    } as ImageAsset
+  }
+
+  saveUnresolvedImage(input: {
+    recordUid: string
+    name: string
+    mimeType?: string
+    sourceUrl: string
+    errorMessage: string
+  }): ImageAsset {
+    const marker = unresolvedImageMarker(input.recordUid, input.name, input.sourceUrl)
+    const sourceUrl = compactImageSource(input.sourceUrl, marker)
+    const existing = this.db.prepare(
+      'SELECT * FROM images WHERE record_uid = ? AND sha256 = ?'
+    ).get(input.recordUid, marker) as SqlRow | undefined
+    if (existing) {
+      this.db.prepare('UPDATE images SET state = \'unresolved\', error_message = ?, source_url = ? WHERE id = ?')
+        .run(input.errorMessage, sourceUrl, String(existing.id))
+      existing.state = 'unresolved'
+      existing.error_message = input.errorMessage
+      existing.source_url = sourceUrl
+      return this.mapImage(existing)
+    }
+    const id = randomUUID()
+    this.db.prepare(`
+      INSERT INTO images(
+        id, record_uid, name, mime_type, source_url, sha256,
+        base64_path, binary_path, byte_size, state, error_message, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, '', '', 0, 'unresolved', ?, ?)
+    `).run(
+      id,
+      input.recordUid,
+      input.name,
+      normalizeMimeType(input.mimeType),
+      sourceUrl,
+      marker,
+      input.errorMessage,
+      nowIso()
+    )
+    return {
+      id,
+      recordUid: input.recordUid,
+      name: input.name,
+      mimeType: normalizeMimeType(input.mimeType),
+      sourceUrl,
+      sha256: marker,
+      byteSize: 0,
+      state: 'unresolved',
+      errorMessage: input.errorMessage
     }
   }
 
-  private mapImage(row: SqlRow, includeData = false): ImageAsset {
-    const mimeType = String(row.mime_type)
-    let dataUri: string | undefined
-    if (includeData) {
-      try {
-        dataUri = `data:${mimeType};base64,${readFileSync(String(row.base64_path), 'utf8')}`
-      } catch {
-        dataUri = undefined
+  private mapImage(row: SqlRow): ImageAsset {
+    const mimeType = normalizeMimeType(row.mime_type)
+    const sha256 = String(row.sha256)
+    const sourceUrl = compactImageSource(row.source_url, sha256)
+    const storedState = String(row.state ?? 'ready')
+    // Verify the content-addressed file before exposing a local URL.  This
+    // keeps corrupted or partially copied files in the explicit `missing`
+    // state instead of letting the renderer receive a broken image stream.
+    if (storedState === 'unresolved') {
+      return {
+        id: String(row.id),
+        recordUid: String(row.record_uid),
+        name: String(row.name),
+        mimeType,
+        sourceUrl,
+        sha256,
+        byteSize: Number(row.byte_size ?? 0),
+        state: 'unresolved',
+        errorMessage: String(row.error_message ?? '图片资源未解析')
       }
     }
+    const assetReady = Boolean(this.readAssetBytes(sha256))
     return {
       id: String(row.id),
       recordUid: String(row.record_uid),
       name: String(row.name),
       mimeType,
-      sourceUrl: String(row.source_url),
-      sha256: String(row.sha256),
+      sourceUrl,
+      sha256,
       byteSize: Number(row.byte_size),
-      dataUri
+      ...(assetReady
+        ? { assetUrl: `visslm-asset://${sha256}/${String(row.id)}`, state: 'ready' as const }
+        : { state: 'missing' as const, errorMessage: String(row.error_message ?? '') || '本地图片二进制资源不存在或校验失败' })
+    } as ImageAsset
+  }
+
+  getAssetBlob(sha256: string): AssetBlob | null {
+    const normalized = sha256.trim().toLowerCase()
+    if (!/^[a-f0-9]{64}$/.test(normalized)) return null
+    const row = this.db.prepare(`
+      SELECT sha256, mime_type, byte_size, binary_path
+      FROM asset_blobs WHERE sha256 = ?
+    `).get(normalized) as SqlRow | undefined
+    if (!row) return null
+    const filePath = String(row.binary_path ?? '')
+    if (!filePath || !existsSync(filePath)) return null
+    return {
+      sha256: normalized,
+      mimeType: normalizeMimeType(row.mime_type),
+      byteSize: Number(row.byte_size ?? 0),
+      filePath
+    }
+  }
+
+  readAssetBytes(sha256: string): Buffer | null {
+    const blob = this.getAssetBlob(sha256)
+    if (!blob) return null
+    try {
+      const bytes = readFileSync(blob.filePath)
+      if (createHash('sha256').update(bytes).digest('hex') !== blob.sha256) return null
+      return bytes
+    } catch {
+      return null
+    }
+  }
+
+  listAssetBlobs(recordUids?: string[]): Array<AssetBlob & { bytes: Buffer }> {
+    const selected = [...new Set((recordUids ?? []).map((uid) => uid.trim()).filter(Boolean))]
+    const rows = selected.length
+      ? this.db.prepare(`
+          SELECT DISTINCT b.* FROM asset_blobs b
+          JOIN images i ON i.sha256 = b.sha256
+          WHERE i.record_uid IN (${selected.map(() => '?').join(',')})
+          ORDER BY b.sha256
+        `).all(...selected)
+      : this.db.prepare('SELECT * FROM asset_blobs ORDER BY sha256').all()
+    const assets: Array<AssetBlob & { bytes: Buffer }> = []
+    for (const row of rows as SqlRow[]) {
+      const blob = this.getAssetBlob(String(row.sha256 ?? ''))
+      const bytes = blob ? this.readAssetBytes(blob.sha256) : null
+      if (blob && bytes) assets.push({ ...blob, bytes })
+    }
+    return assets
+  }
+
+  listRecordImageReferences(recordUid: string, fieldPath?: string): RecordImageReference[] {
+    const rows = fieldPath === undefined
+      ? this.db.prepare(`
+          SELECT * FROM record_image_refs
+          WHERE record_uid = ? ORDER BY field_path, ordinal
+        `).all(recordUid)
+      : this.db.prepare(`
+          SELECT * FROM record_image_refs
+          WHERE record_uid = ? AND field_path = ? ORDER BY ordinal
+        `).all(recordUid, fieldPath)
+    return (rows as SqlRow[]).map((row) => ({
+      id: String(row.id),
+      recordUid: String(row.record_uid),
+      fieldPath: String(row.field_path),
+      occurrence: Number(row.ordinal),
+      ordinal: Number(row.ordinal),
+      assetSha256: String(row.asset_sha256),
+      sourceType: String(row.source_type),
+      sourceName: String(row.source_name),
+      originalSource: String(row.original_source),
+      createdAt: String(row.created_at)
+    }))
+  }
+
+  saveRecordImageReference(input: {
+    id?: string
+    recordUid: string
+    fieldPath: string
+    ordinal: number
+    assetSha256: string
+    sourceType?: string
+    sourceName?: string
+    originalSource?: string
+  }): RecordImageReference {
+    const id = input.id?.trim() || randomUUID()
+    const fieldPath = input.fieldPath.trim() || '_valm_Description'
+    const ordinal = Math.max(0, Math.floor(input.ordinal))
+    const assetSha256 = input.assetSha256.trim().toLowerCase()
+    if (!this.getAssetBlob(assetSha256)) throw new Error('图片资源不存在或已损坏')
+    const createdAt = nowIso()
+    this.db.prepare(`
+      INSERT INTO record_image_refs(
+        id, record_uid, field_path, ordinal, asset_sha256,
+        source_type, source_name, original_source, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(record_uid, field_path, ordinal) DO UPDATE SET
+        id = excluded.id,
+        asset_sha256 = excluded.asset_sha256,
+        source_type = excluded.source_type,
+        source_name = excluded.source_name,
+        original_source = excluded.original_source
+    `).run(
+      id,
+      input.recordUid,
+      fieldPath,
+      ordinal,
+      assetSha256,
+      input.sourceType?.trim() || 'rich-text',
+      input.sourceName?.trim() || '',
+      compactImageSource(input.originalSource, assetSha256),
+      createdAt
+    )
+    const row = this.db.prepare(`
+      SELECT * FROM record_image_refs
+      WHERE record_uid = ? AND field_path = ? AND ordinal = ?
+    `).get(input.recordUid, fieldPath, ordinal) as SqlRow
+    return {
+      id: String(row.id),
+      recordUid: String(row.record_uid),
+      fieldPath: String(row.field_path),
+      occurrence: Number(row.ordinal),
+      ordinal: Number(row.ordinal),
+      assetSha256: String(row.asset_sha256),
+      sourceType: String(row.source_type),
+      sourceName: String(row.source_name),
+      originalSource: String(row.original_source),
+      createdAt: String(row.created_at)
+    }
+  }
+
+  getPushAssetUpload(baseUrl: string, projectId: string, sha256: string): PushAssetUpload | null {
+    const key = `${baseUrl.replace(/\/+$/, '')}\u0000${projectId.trim()}\u0000${sha256.trim().toLowerCase()}`
+    const row = this.db.prepare('SELECT * FROM push_asset_uploads WHERE cache_key = ?').get(key) as SqlRow | undefined
+    if (!row) return null
+    return {
+      cacheKey: String(row.cache_key),
+      baseUrl: String(row.base_url),
+      projectId: String(row.project_id),
+      sha256: String(row.sha256),
+      remotePath: String(row.remote_path),
+      createdAt: String(row.created_at)
+    }
+  }
+
+  savePushAssetUpload(input: {
+    baseUrl: string
+    projectId: string
+    sha256: string
+    remotePath: string
+  }): PushAssetUpload {
+    const baseUrl = input.baseUrl.replace(/\/+$/, '')
+    const projectId = input.projectId.trim()
+    const sha256 = input.sha256.trim().toLowerCase()
+    const cacheKey = `${baseUrl}\u0000${projectId}\u0000${sha256}`
+    const createdAt = nowIso()
+    this.db.prepare(`
+      INSERT INTO push_asset_uploads(
+        cache_key, base_url, project_id, sha256, remote_path, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(cache_key) DO UPDATE SET remote_path = excluded.remote_path
+    `).run(cacheKey, baseUrl, projectId, sha256, input.remotePath, createdAt)
+    return {
+      cacheKey,
+      baseUrl,
+      projectId,
+      sha256,
+      remotePath: input.remotePath,
+      createdAt
     }
   }
 
@@ -6555,6 +7668,56 @@ export class AppDatabase {
     ).map((row) => String(row.node_type))
   }
 
+  listRecordReleaseValues(): RecordReleaseValue[] {
+    const counts = new Map<string, number>()
+    try {
+      const valueSql = releaseTextSql('r')
+      const rows = this.db
+        .prepare(
+          `WITH release_values AS (
+             SELECT r.uid, ${valueSql} AS value
+             FROM records r
+           )
+           SELECT value, COUNT(DISTINCT uid) AS count
+           FROM release_values
+           WHERE value IS NOT NULL AND value <> ''
+           GROUP BY value
+           ORDER BY count DESC, value COLLATE NOCASE ASC`
+        )
+        .all() as SqlRow[]
+      return rows.map((row) => ({
+        value: String(row.value),
+        count: Number(row.count ?? 0)
+      }))
+    } catch {
+      // Keep compatibility with SQLite builds without JSON1.  The normal
+      // application build has JSON1, but legacy environments can still
+      // enumerate release values by parsing the stored payloads.
+      const rows = this.db.prepare('SELECT raw_json FROM records').all() as SqlRow[]
+      for (const row of rows) {
+        let raw: Record<string, unknown> = {}
+        try {
+          const parsed = JSON.parse(String(row.raw_json)) as unknown
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            raw = parsed as Record<string, unknown>
+          }
+        } catch {
+          // Corrupt legacy raw JSON has no release text value.
+        }
+        const value = releaseTextFromRaw(raw)
+        if (value) counts.set(value, (counts.get(value) ?? 0) + 1)
+      }
+      return [...counts.entries()]
+        .map(([value, count]) => ({ value, count }))
+        .sort(
+          (left, right) =>
+            right.count - left.count ||
+            left.value.localeCompare(right.value, undefined, { sensitivity: 'base' }) ||
+            left.value.localeCompare(right.value)
+        )
+    }
+  }
+
   private recordFilters(query: RecordQuery, semanticContext?: RequirementSemanticizationContext): {
     join: string
     where: string
@@ -6581,6 +7744,10 @@ export class AppDatabase {
     if (query.nodeType) {
       clauses.push('r.node_type = ?')
       params.push(query.nodeType)
+    }
+    if (query.releaseText !== undefined) {
+      clauses.push(`${releaseTextSql('r')} = ?`)
+      params.push(String(query.releaseText).trim())
     }
     if (query.excludeProjectAssetProjectId) {
       clauses.push(`NOT EXISTS (
@@ -6639,6 +7806,24 @@ export class AppDatabase {
     }
   }
 
+  listRecordUids(
+    query: Omit<RecordQuery, 'page' | 'pageSize'>,
+    semanticContext?: RequirementSemanticizationContext
+  ): string[] {
+    const filters = this.recordFilters({ page: 1, pageSize: 1, ...query }, semanticContext)
+    const rows = this.db
+      .prepare(
+        `SELECT r.uid
+         FROM records r
+         ${filters.join}
+         ${filters.where}
+         GROUP BY r.uid
+         ORDER BY r.last_modify_time DESC, r.uid DESC`
+      )
+      .all(...filters.params) as SqlRow[]
+    return rows.map((row) => String(row.uid))
+  }
+
   getRecord(
     uid: string,
     includeImages = true,
@@ -6681,7 +7866,7 @@ export class AppDatabase {
           this.db
             .prepare('SELECT * FROM images WHERE record_uid = ? ORDER BY created_at')
             .all(uid) as SqlRow[]
-        ).map((image) => this.mapImage(image, true))
+        ).map((image) => this.mapImage(image))
       : []
     let semanticAnalysisTrace: RequirementSemanticizationAnalysisTrace | undefined
     try {
@@ -6711,6 +7896,7 @@ export class AppDatabase {
     message = '',
     pushedUid = ''
   ): void {
+    this.statsCache = null
     this.db
       .prepare(
         `UPDATE records
@@ -6733,9 +7919,28 @@ export class AppDatabase {
     params: Record<string, string>
     body: Record<string, unknown>
   }): number {
-    const loggedBody = Object.fromEntries(
-      Object.entries(input.body).filter(([key]) => key !== '_valm_Description')
-    )
+    const redact = (value: unknown, key = ''): unknown => {
+      if (typeof value === 'string') {
+        if (
+          /description/i.test(key) ||
+          /(?:data:image\/[^;,\s]+;base64,|visslm-asset:\/\/)/i.test(value)
+        ) return '[富文本图片内容已省略]'
+        return value.length > 100_000 ? `${value.slice(0, 100_000)}…` : value
+      }
+      if (Array.isArray(value)) return value.map((item) => redact(item, key))
+      if (value && typeof value === 'object') {
+        return Object.fromEntries(
+          Object.entries(value as Record<string, unknown>).map(([childKey, child]) => [
+            childKey,
+            redact(child, childKey)
+          ])
+        )
+      }
+      return value
+    }
+    const loggedBody = redact(input.body) as Record<string, unknown>
+    // Keep diagnostics useful without persisting the complete rich-text body.
+    delete loggedBody._valm_Description
     const result = this.db
       .prepare(
         `INSERT INTO push_logs(
@@ -6764,6 +7969,15 @@ export class AppDatabase {
       remoteUid?: string
     }
   ): void {
+    const safeResponse = input.response === undefined
+      ? ''
+      : JSON.stringify(input.response, (key, value) => {
+          if (typeof value === 'string' && (
+            /description|base64|token|cookie|authorization/i.test(key) ||
+            /(?:data:image\/[^;\s]+;base64,|visslm-asset:\/\/)/i.test(value)
+          )) return '[敏感内容已省略]'
+          return value
+        })
     this.db
       .prepare(
         `UPDATE push_logs
@@ -6774,7 +7988,7 @@ export class AppDatabase {
       .run(
         status,
         input.httpStatus ?? 0,
-        input.response === undefined ? '' : JSON.stringify(input.response),
+        safeResponse,
         input.errorMessage ?? '',
         input.remoteUid ?? '',
         nowIso(),
@@ -6988,6 +8202,7 @@ export class AppDatabase {
         raw._valm_Description === undefined || raw._valm_Description === null
           ? ''
           : String(raw._valm_Description),
+      releaseText: releaseTextFromRaw(raw),
       lastModifyTime: String(row.last_modify_time),
       syncedAt: String(row.synced_at),
       imageCount: Number(row.image_count ?? 0),
@@ -7038,6 +8253,11 @@ export class AppDatabase {
   }
 
   getStats(): DashboardStats {
+    const revision = this.getAnalyticsRevision()
+    if (
+      this.statsCache?.revision === revision &&
+      Date.now() - this.statsCache.createdAt < 1_000
+    ) return this.statsCache.value
     const scalar = (sql: string): number => {
       const row = this.db.prepare(sql).get() as SqlRow
       return Number(Object.values(row)[0] ?? 0)
@@ -7080,31 +8300,57 @@ export class AppDatabase {
       imageCount: scalar('SELECT COUNT(*) FROM images')
     }
     const releaseCounts = new Map<string, number>()
-    const releaseRows = this.db.prepare('SELECT raw_json FROM records').all() as SqlRow[]
-    for (const row of releaseRows) {
-      let raw: Record<string, unknown>
-      try {
-        const parsed = JSON.parse(String(row.raw_json)) as unknown
-        raw = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-          ? parsed as Record<string, unknown>
-          : {}
-      } catch {
-        raw = {}
+    try {
+      // JSON1 keeps the dashboard aggregation in SQLite instead of
+      // materializing and parsing every raw record in the main process.
+      const releaseRows = this.db.prepare(`
+        WITH release_values AS (
+          SELECT CASE
+            WHEN json_valid(raw_json)
+              AND NULLIF(TRIM(CAST(json_extract(raw_json, '$._valm_Release_text') AS TEXT)), '') IS NOT NULL
+              THEN CASE json_type(raw_json, '$._valm_Release_text')
+                WHEN 'true' THEN 'true'
+                WHEN 'false' THEN 'false'
+                ELSE CAST(json_extract(raw_json, '$._valm_Release_text') AS TEXT)
+              END
+            WHEN json_valid(raw_json)
+              AND NULLIF(TRIM(CAST(json_extract(raw_json, '$._valm_Release') AS TEXT)), '') IS NOT NULL
+              THEN CASE json_type(raw_json, '$._valm_Release')
+                WHEN 'true' THEN 'true'
+                WHEN 'false' THEN 'false'
+                ELSE CAST(json_extract(raw_json, '$._valm_Release') AS TEXT)
+              END
+            ELSE '未设置'
+          END AS name
+          FROM records
+        )
+        SELECT name, COUNT(*) AS value
+        FROM release_values
+        GROUP BY name
+        ORDER BY value DESC, name COLLATE NOCASE ASC
+      `).all() as SqlRow[]
+      for (const row of releaseRows) {
+        releaseCounts.set(String(row.name), Number(row.value ?? 0))
       }
-      const displayValue = raw._valm_Release_text
-      const releaseValue =
-        displayValue !== undefined && displayValue !== null && String(displayValue).trim() !== ''
-          ? displayValue
-          : raw._valm_Release
-      const name =
-        releaseValue === undefined || releaseValue === null || String(releaseValue).trim() === ''
-          ? '未设置'
-          : typeof releaseValue === 'object'
-            ? JSON.stringify(releaseValue)
-            : String(releaseValue)
-      releaseCounts.set(name, (releaseCounts.get(name) ?? 0) + 1)
+    } catch {
+      // Keep compatibility with a SQLite build without JSON1.  This fallback
+      // is intentionally isolated to the dashboard release chart.
+      const releaseRows = this.db.prepare('SELECT raw_json FROM records').all() as SqlRow[]
+      for (const row of releaseRows) {
+        let raw: Record<string, unknown> = {}
+        try {
+          const parsed = JSON.parse(String(row.raw_json)) as unknown
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            raw = parsed as Record<string, unknown>
+          }
+        } catch {
+          // Corrupt legacy raw JSON is grouped under the empty release.
+        }
+        const name = releaseNameFromRaw(raw)
+        releaseCounts.set(name, (releaseCounts.get(name) ?? 0) + 1)
+      }
     }
-    return {
+    const value: DashboardStats = {
       projectCount: scalar('SELECT COUNT(*) FROM projects'),
       recordCount: scalar('SELECT COUNT(*) FROM records'),
       collectedCount: scalar('SELECT COUNT(*) FROM records'),
@@ -7121,6 +8367,8 @@ export class AppDatabase {
       projectManagement,
       assetCenter
     }
+    this.statsCache = { revision, createdAt: Date.now(), value }
+    return value
   }
 
   aggregate(metric: string, projectId?: string): unknown {
@@ -7434,6 +8682,60 @@ export class AppDatabase {
     return Number(result.lastInsertRowid)
   }
 
+  /**
+   * A renderer/process crash can leave external request rows in an active
+   * state forever.  Mark them failed on the next database open so the UI and
+   * diagnostics describe the interruption accurately.  This is intentionally
+   * a status repair only; replaying POST writes still requires an explicit
+   * user action and a platform idempotency contract.
+   */
+  reconcileInterruptedExternalRuns(): {
+    syncRuns: number
+    pushLogs: number
+    collectionRequests: number
+  } {
+    const timestamp = nowIso()
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const syncRuns = this.db.prepare(`
+        UPDATE sync_runs
+        SET status = 'failed', finished_at = ?,
+            error_message = CASE
+              WHEN error_message = '' THEN '应用在同步任务中断，可重新执行同步'
+              ELSE error_message || '（应用重启中断）'
+            END
+        WHERE status = 'running'
+      `).run(timestamp)
+      const pushLogs = this.db.prepare(`
+        UPDATE push_logs
+        SET status = 'failed', finished_at = ?,
+            error_message = CASE
+              WHEN error_message = '' THEN '应用在推送请求中断，可根据日志手动重试'
+              ELSE error_message || '（应用重启中断）'
+            END
+        WHERE status = 'sending'
+      `).run(timestamp)
+      const collectionRequests = this.db.prepare(`
+        UPDATE collection_request_logs
+        SET status = 'failed', finished_at = ?,
+            error_message = CASE
+              WHEN error_message = '' THEN '应用在采集请求中断，可重新执行采集'
+              ELSE error_message || '（应用重启中断）'
+            END
+        WHERE status = 'running'
+      `).run(timestamp)
+      this.db.exec('COMMIT')
+      return {
+        syncRuns: Number(syncRuns.changes ?? 0),
+        pushLogs: Number(pushLogs.changes ?? 0),
+        collectionRequests: Number(collectionRequests.changes ?? 0)
+      }
+    } catch (error) {
+      try { this.db.exec('ROLLBACK') } catch { /* best effort */ }
+      throw error
+    }
+  }
+
   finishSync(
     id: number,
     status: 'success' | 'failed',
@@ -7473,23 +8775,32 @@ export class AppDatabase {
     }))
   }
 
-  private mapExportRow(row: SqlRow): Record<string, unknown> {
+  private mapExportRow(row: SqlRow, includeBinary = true): Record<string, unknown> {
     const images = (
       this.db.prepare('SELECT * FROM images WHERE record_uid=?').all(String(row.uid)) as SqlRow[]
     ).map((image) => {
+      const sha256 = String(image.sha256)
+      const bytes = this.readAssetBytes(sha256)
+      const storedState = String(image.state ?? 'ready')
+      const state = storedState === 'unresolved' ? 'unresolved' : bytes ? 'ready' : 'missing'
       let base64 = ''
-      try {
-        base64 = readFileSync(String(image.base64_path), 'utf8')
-      } catch {
-        // A missing image file should not prevent the remaining records from exporting.
+      if (includeBinary) {
+        if (bytes) base64 = bytes.toString('base64')
+        if (!base64) {
+          try { base64 = readFileSync(String(image.base64_path), 'utf8').replace(/\s+/g, '') } catch { /* legacy file absent */ }
+        }
       }
-        return {
+      return {
         id: String(image.id),
         name: String(image.name),
-        mimeType: String(image.mime_type),
+        mimeType: normalizeMimeType(image.mime_type),
         sourceUrl: String(image.source_url),
-        sha256: String(image.sha256),
-        base64
+        sha256,
+        byteSize: Number(image.byte_size ?? 0),
+        ...(bytes && state === 'ready' ? { assetUrl: `visslm-asset://${sha256}/${String(image.id)}` } : {}),
+        state,
+        ...(String(image.error_message ?? '') ? { errorMessage: String(image.error_message) } : {}),
+        ...(includeBinary ? { base64 } : {})
       }
     })
     return {
@@ -7514,7 +8825,8 @@ export class AppDatabase {
           return {}
         }
       })(),
-      images
+      images,
+      imageReferences: this.listRecordImageReferences(String(row.uid))
     }
   }
 
@@ -7527,8 +8839,178 @@ export class AppDatabase {
     }
   }
 
+  *iterateExportRowsWithoutBinary(): Generator<Record<string, unknown>> {
+    const rows = this.db
+      .prepare('SELECT * FROM records ORDER BY project_id, node_type, uid')
+      .iterate() as Iterable<SqlRow>
+    for (const row of rows) yield this.mapExportRow(row, false)
+  }
+
   exportRows(): Array<Record<string, unknown>> {
     return [...this.iterateExportRows()]
+  }
+
+  private mapDataImportRun(row: SqlRow): DataImportRunSnapshot {
+    const rawStatus = String(row.status ?? '')
+    const status: DataImportRunStatus = rawStatus === 'running' || rawStatus === 'success' || rawStatus === 'failed'
+      ? rawStatus
+      : 'failed'
+    return {
+      id: String(row.id),
+      path: String(row.path ?? ''),
+      format: String(row.format) === 'json' ? 'json' : 'jsonl',
+      fileSize: Math.max(0, Number(row.file_size ?? 0)),
+      fileMtimeMs: Math.max(0, Number(row.file_mtime_ms ?? 0)),
+      status,
+      batchCount: Number(row.batch_count ?? 0),
+      sourceRowCount: Number(row.source_row_count ?? 0),
+      importedRecordCount: Number(row.imported_record_count ?? 0),
+      skippedCount: Number(row.skipped_count ?? 0),
+      parseErrorCount: Number(row.parse_error_count ?? 0),
+      reviewBatchId: String(row.review_batch_id ?? ''),
+      errorMessage: String(row.error_message ?? ''),
+      startedAt: String(row.started_at ?? ''),
+      updatedAt: String(row.updated_at ?? ''),
+      finishedAt: String(row.finished_at ?? '')
+    }
+  }
+
+  startDataImportRun(
+    path: string,
+    format: 'json' | 'jsonl',
+    fileSize = 0,
+    fileMtimeMs = 0
+  ): string {
+    const id = randomUUID()
+    const timestamp = nowIso()
+    this.db.prepare(`
+      INSERT INTO data_import_runs(
+        id, path, format, file_size, file_mtime_ms, status, started_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, 'running', ?, ?)
+    `).run(
+      id,
+      path.trim(),
+      format,
+      Math.max(0, Math.trunc(Number(fileSize) || 0)),
+      Math.max(0, Math.trunc(Number(fileMtimeMs) || 0)),
+      timestamp,
+      timestamp
+    )
+    return id
+  }
+
+  updateDataImportRun(
+    id: string,
+    patch: Partial<Pick<DataImportRunSnapshot,
+      'batchCount' | 'sourceRowCount' | 'importedRecordCount' | 'skippedCount' |
+      'parseErrorCount' | 'reviewBatchId' | 'errorMessage'>>
+  ): void {
+    const fields: string[] = []
+    const values: Array<string | number> = []
+    const add = (column: string, value: string | number | undefined): void => {
+      if (value === undefined) return
+      fields.push(`${column} = ?`)
+      values.push(value)
+    }
+    add('batch_count', patch.batchCount)
+    add('source_row_count', patch.sourceRowCount)
+    add('imported_record_count', patch.importedRecordCount)
+    add('skipped_count', patch.skippedCount)
+    add('parse_error_count', patch.parseErrorCount)
+    add('review_batch_id', patch.reviewBatchId)
+    add('error_message', patch.errorMessage)
+    if (!fields.length) return
+    fields.push('updated_at = ?')
+    values.push(nowIso(), id.trim())
+    this.db.prepare(`
+      UPDATE data_import_runs SET ${fields.join(', ')} WHERE id = ? AND status = 'running'
+    `).run(...values)
+  }
+
+  finishDataImportRun(
+    id: string,
+    status: Exclude<DataImportRunStatus, 'running'>,
+    patch: Partial<Pick<DataImportRunSnapshot,
+      'batchCount' | 'sourceRowCount' | 'importedRecordCount' | 'skippedCount' |
+      'parseErrorCount' | 'reviewBatchId' | 'errorMessage'>> = {}
+  ): void {
+    const timestamp = nowIso()
+    const fields: string[] = ['status = ?', 'updated_at = ?', 'finished_at = ?']
+    const values: Array<string | number> = [status, timestamp, timestamp]
+    const add = (column: string, value: string | number | undefined): void => {
+      if (value === undefined) return
+      fields.push(`${column} = ?`)
+      values.push(value)
+    }
+    add('batch_count', patch.batchCount)
+    add('source_row_count', patch.sourceRowCount)
+    add('imported_record_count', patch.importedRecordCount)
+    add('skipped_count', patch.skippedCount)
+    add('parse_error_count', patch.parseErrorCount)
+    add('review_batch_id', patch.reviewBatchId)
+    add('error_message', patch.errorMessage)
+    values.push(id.trim())
+    this.db.prepare(`
+      UPDATE data_import_runs SET ${fields.join(', ')} WHERE id = ? AND status = 'running'
+    `).run(...values)
+  }
+
+  /** Re-open an interrupted legacy import while retaining its last checkpoint. */
+  resumeDataImportRun(id: string): DataImportRunSnapshot | null {
+    const normalizedId = id.trim()
+    if (!normalizedId) return null
+    this.db.prepare(`
+      UPDATE data_import_runs
+      SET status = 'running',
+          error_message = '',
+          finished_at = '',
+          updated_at = ?
+      WHERE id = ? AND status = 'failed'
+    `).run(nowIso(), normalizedId)
+    return this.getDataImportRun(normalizedId)
+  }
+
+  getDataImportRun(id: string): DataImportRunSnapshot | null {
+    const row = this.db.prepare('SELECT * FROM data_import_runs WHERE id = ? LIMIT 1').get(id.trim()) as SqlRow | undefined
+    return row ? this.mapDataImportRun(row) : null
+  }
+
+  listDataImportRuns(limit = 50): DataImportRunSnapshot[] {
+    const safeLimit = Math.min(200, Math.max(1, Math.trunc(limit || 50)))
+    const rows = this.db.prepare(`
+      SELECT * FROM data_import_runs
+      ORDER BY updated_at DESC, started_at DESC
+      LIMIT ?
+    `).all(safeLimit) as SqlRow[]
+    return rows.map((row) => this.mapDataImportRun(row))
+  }
+
+  /** Mark streamed imports interrupted by a process exit and retain bounded diagnostics. */
+  reconcileInterruptedDataImports(): number {
+    const timestamp = nowIso()
+    const cutoff = new Date(Date.now() - TASK_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString()
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const result = this.db.prepare(`
+        UPDATE data_import_runs
+        SET status = 'failed',
+            error_message = CASE
+              WHEN error_message = '' THEN '应用在数据导入中断，已提交批次保留并可据运行记录诊断'
+              ELSE error_message || '（应用重启中断）'
+            END,
+            updated_at = ?, finished_at = ?
+        WHERE status = 'running'
+      `).run(timestamp, timestamp)
+      this.db.prepare(`
+        DELETE FROM data_import_runs
+        WHERE status IN ('success', 'failed') AND updated_at < ?
+      `).run(cutoff)
+      this.db.exec('COMMIT')
+      return Number(result.changes ?? 0)
+    } catch (error) {
+      try { this.db.exec('ROLLBACK') } catch { /* best effort */ }
+      throw error
+    }
   }
 
   importRows(
@@ -7536,6 +9018,13 @@ export class AppDatabase {
     options: {
       overwriteExisting?: boolean
       targetUidByItemId?: ReadonlyMap<string, string>
+      /** Reuse one review batch when a streaming import commits multiple chunks. */
+      reviewBatchId?: string
+      /** Atomically advance a persisted streaming import checkpoint. */
+      importRunId?: string
+      batchNumber?: number
+      sourceRowCount?: number
+      parseErrorCount?: number
     } = {}
   ): DataImportResult {
     let recordCount = 0
@@ -7543,7 +9032,7 @@ export class AppDatabase {
     let skippedCount = 0
     const errors: string[] = []
     const duplicates: DataReviewItem[] = []
-    let reviewBatchId: string | undefined
+    let reviewBatchId: string | undefined = options.reviewBatchId
     const asObject = (input: unknown): Record<string, unknown> | null =>
       input && typeof input === 'object' && !Array.isArray(input)
         ? input as Record<string, unknown>
@@ -7573,7 +9062,8 @@ export class AppDatabase {
       }))
     }
 
-    rows.forEach((input, index) => {
+    this.runInTransaction(() => {
+      rows.forEach((input, index) => {
       try {
         const row = asObject(input)
         if (!row) throw new Error('记录不是 JSON 对象')
@@ -7628,7 +9118,7 @@ export class AppDatabase {
           return
         }
         const targetUid = options.targetUidByItemId?.get(itemId) || uid
-        const normalizedRaw = {
+        let normalizedRaw: Record<string, unknown> = {
           ...raw,
           _valm_Uid: targetUid,
           _valm_NodeType: text(raw._valm_NodeType) || nodeType,
@@ -7670,27 +9160,148 @@ export class AppDatabase {
         const images = Array.isArray(row.images) ? row.images : []
         for (const imageInput of images) {
           const image = asObject(imageInput)
-          const base64 = text(image?.base64).replace(/\s+/g, '')
-          if (!image || !base64) continue
+          if (!image) continue
+          const assetUrl = text(image.assetUrl)
+          const assetToken = /^visslm-asset:\/\/([a-f0-9]{64})\/[A-Za-z0-9_-]{1,128}$/i.exec(assetUrl)
+          if (assetToken) {
+            const blob = this.getAssetBlob(assetToken[1])
+            if (blob) {
+              this.attachImageAsset({
+                recordUid: targetUid,
+                name: text(image.name),
+                mimeType: text(image.mimeType) || blob.mimeType,
+                sourceUrl: text(image.sourceUrl) || 'imported:asset',
+                sha256: assetToken[1]
+              })
+              imageCount += 1
+              continue
+            }
+            // A .visslmpack importer may provide the binary as a transient
+            // legacy base64 field before this database receives the blob.
+            // Fall through to the compatibility decoder below.
+          }
+          const dataUri = text(image.dataUri)
+          const legacyEncoded = text(image.base64)
+          const dataUriMatch = /^data:([^;,\s]+);base64,([A-Za-z0-9+/]*={0,2})$/is.exec(dataUri)
+          const encodedDataMatch = /^data:([^;,\s]+);base64,([A-Za-z0-9+/]*={0,2})$/is.exec(legacyEncoded)
+          const base64 = (encodedDataMatch?.[2] || legacyEncoded || dataUriMatch?.[2] || '').replace(/\s+/g, '')
+          if (!base64) continue
+          if (!/^[A-Za-z0-9+/]*={0,2}$/.test(base64) || base64.length % 4 === 1) {
+            skippedCount += 1
+            continue
+          }
           const bytes = Buffer.from(base64, 'base64')
           if (!bytes.length) {
+            skippedCount += 1
+            continue
+          }
+          const declaredSha = text(image.sha256).trim().toLowerCase()
+          if (/^[a-f0-9]{64}$/.test(declaredSha) && createHash('sha256').update(bytes).digest('hex') !== declaredSha) {
+            skippedCount += 1
+            continue
+          }
+          if (assetToken && createHash('sha256').update(bytes).digest('hex') !== assetToken[1].toLowerCase()) {
             skippedCount += 1
             continue
           }
           this.saveImage({
             recordUid: targetUid,
             name: text(image.name),
-            mimeType: text(image.mimeType) || 'application/octet-stream',
+            mimeType: text(image.mimeType) || encodedDataMatch?.[1] || dataUriMatch?.[1] || 'application/octet-stream',
             sourceUrl: text(image.sourceUrl) || 'imported:data',
             bytes
           })
           imageCount += 1
+        }
+        const references = Array.isArray(row.imageReferences) ? row.imageReferences : []
+        for (const referenceInput of references) {
+          const reference = asObject(referenceInput)
+          if (!reference) continue
+          const sha256 = text(reference.assetSha256).trim().toLowerCase()
+          if (!/^[a-f0-9]{64}$/.test(sha256) || !this.getAssetBlob(sha256)) continue
+          this.saveRecordImageReference({
+            id: text(reference.id) || undefined,
+            recordUid: targetUid,
+            fieldPath: text(reference.fieldPath) || '_valm_Description',
+            ordinal: Number(reference.ordinal ?? 0),
+            assetSha256: sha256,
+            sourceType: text(reference.sourceType) || 'rich-text',
+            sourceName: text(reference.sourceName),
+            originalSource: text(reference.originalSource)
+          })
+        }
+        const importedDescription = text(normalizedRaw._valm_Description)
+        if (importedDescription) {
+          const importedImages = this.db.prepare(
+            'SELECT id, name, sha256, source_url FROM images WHERE record_uid = ?'
+          ).all(targetUid) as SqlRow[]
+          const tokenized = replaceRichTextImageSources(importedDescription, (source) => {
+            const token = parseAssetToken(source.source)
+            const image = token
+              ? importedImages.find((candidate) => String(candidate.sha256 ?? '').toLowerCase() === token.sha256)
+              : importedImages.find((candidate) => {
+                  const sourceUrl = String(candidate.source_url ?? '')
+                  return sourceUrl === source.source || sourceUrl.includes(source.source) ||
+                    (/^data:image\//i.test(source.source) && sourceUrl.startsWith('inline:data-uri'))
+                })
+            const sha256 = token?.sha256 || String(image?.sha256 ?? '').trim().toLowerCase()
+            if (!image || !/^[a-f0-9]{64}$/.test(sha256) || !this.getAssetBlob(sha256)) return undefined
+            const reference = this.saveRecordImageReference({
+              id: token?.referenceId,
+              recordUid: targetUid,
+              fieldPath: '_valm_Description',
+              ordinal: source.occurrence,
+              assetSha256: sha256,
+              sourceType: token ? 'token' : 'legacy-import',
+              sourceName: String(image.name ?? ''),
+              originalSource: source.source
+            })
+            return token ? source.source : `visslm-asset://${sha256}/${reference.id}`
+          })
+          if (tokenized.html !== importedDescription) {
+            normalizedRaw = { ...normalizedRaw, _valm_Description: tokenized.html }
+            this.updateRecordRawAndNormalizedText(targetUid, normalizedRaw, text(row.content))
+            if (nodeType === 'Project') {
+              this.upsertProject({
+                uid: targetUid,
+                name,
+                itemId,
+                lastModifyTime,
+                raw: normalizedRaw
+              })
+            }
+          }
         }
       } catch (error) {
         skippedCount += 1
         if (errors.length < 50) {
           errors.push(`第 ${index + 1} 条：${error instanceof Error ? error.message : String(error)}`)
         }
+      }
+      })
+      if (options.importRunId) {
+        const timestamp = nowIso()
+        this.db.prepare(`
+          UPDATE data_import_runs
+          SET batch_count = ?,
+              source_row_count = ?,
+              imported_record_count = imported_record_count + ?,
+              skipped_count = skipped_count + ? + MAX(0, ? - parse_error_count),
+              parse_error_count = ?,
+              review_batch_id = ?,
+              updated_at = ?
+          WHERE id = ? AND status = 'running'
+        `).run(
+          Math.max(0, Math.trunc(options.batchNumber ?? 0)),
+          Math.max(0, Math.trunc(options.sourceRowCount ?? 0)),
+          recordCount,
+          skippedCount,
+          Math.max(0, Math.trunc(options.parseErrorCount ?? 0)),
+          Math.max(0, Math.trunc(options.parseErrorCount ?? 0)),
+          reviewBatchId ?? '',
+          timestamp,
+          options.importRunId.trim()
+        )
       }
     })
 
@@ -7753,9 +9364,8 @@ export class AppDatabase {
     const placeholders = selected.map(() => '?').join(',')
     const where = deleteAll ? '' : `WHERE record_uid IN (${placeholders})`
     const imageRows = this.db
-      .prepare(`SELECT base64_path FROM images ${where}`)
+      .prepare(`SELECT DISTINCT sha256, binary_path, base64_path FROM images ${where}`)
       .all(...selected) as SqlRow[]
-    const paths = [...new Set(imageRows.map((row) => String(row.base64_path)))]
 
     this.db.exec('BEGIN IMMEDIATE')
     let recordCount = 0
@@ -7788,17 +9398,29 @@ export class AppDatabase {
       throw error
     }
 
-    for (const path of paths) {
+    for (const row of imageRows) {
+      const sha256 = String(row.sha256 ?? '').trim().toLowerCase()
       const remaining = this.db
-        .prepare('SELECT 1 FROM images WHERE base64_path = ? LIMIT 1')
-        .get(path)
+        .prepare('SELECT 1 FROM images WHERE sha256 = ? LIMIT 1')
+        .get(sha256)
       if (remaining) continue
+      const referenced = this.db
+        .prepare('SELECT 1 FROM record_image_refs WHERE asset_sha256 = ? LIMIT 1')
+        .get(sha256)
+      if (referenced) continue
+      this.db.prepare('DELETE FROM asset_blobs WHERE sha256 = ?').run(sha256)
+      const binaryPath = String(row.binary_path ?? '')
+      const legacyPath = String(row.base64_path ?? '')
       try {
-        unlinkSync(path)
+        if (binaryPath) unlinkSync(binaryPath)
       } catch {
-        // A missing Base64 file is already effectively deleted.
+        // A missing binary file is already effectively deleted.
+      }
+      if (legacyPath && legacyPath !== binaryPath) {
+        try { unlinkSync(legacyPath) } catch { /* best-effort legacy cleanup */ }
       }
     }
+    this.cleanupOrphanAssetBlobs()
 
     if (recordCount > 0) this.bumpAnalyticsRevision()
 
