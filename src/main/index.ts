@@ -22,6 +22,12 @@ import type {
   ChatDataView,
   ChatSessionDeleteResult,
   ChatSessionSaveInput,
+  AssistantArtifactInput,
+  AssistantArtifactPreview,
+  AssistantRunHistory,
+  AssistantArtifactExportRequest,
+  AssistantArtifactExportResult,
+  AssistantPlanPatch,
   DataImportResult,
   DataImportRunSnapshot,
   DataReviewApplyInput,
@@ -72,7 +78,7 @@ import type {
   DashboardSpec,
   VisualizationRunInput
 } from '../shared/dashboard'
-import type { AgentEvent } from '../shared/expert-types'
+import type { AgentEvent, AssistantExecutionSummary } from '../shared/expert-types'
 import { compareDashboardSpecValues } from '../shared/dashboard'
 import { QueryEngine } from './analytics/query-engine'
 import { AppDatabase } from './database'
@@ -91,6 +97,21 @@ import {
   traceContextFromDecision,
   type AssistantTraceContext
 } from './assistant/task-trace'
+import {
+  AssistantRunRegistry,
+  isAssistantRunCancellation,
+  runWithAssistantRunContext
+} from './assistant/run-controller'
+import { AnswerStream } from './assistant/answer-stream'
+import { AssistantPlanConfirmationController } from './assistant/plan-confirmation'
+import type { AssistantPlanValidationMetadata, ConfirmedAssistantPlan } from './assistant/execution-plan'
+import { buildSafeQueryRecoverySuggestions } from './assistant/recovery-suggestions'
+import { buildEvidenceBlocks } from './assistant/evidence-block'
+import {
+  createAssistantArtifactPreview,
+  verifyAssistantArtifactPreview
+} from './assistant/artifact-service'
+import { renderAssistantArtifact } from './assistant/artifact-exporter'
 import { RequirementAnalysisAgent } from './experts/requirement-analysis-agent'
 import { RequirementSemanticizationService } from './requirements/semanticization-service'
 import { VisualizationAgent } from './experts/visualization-agent'
@@ -159,6 +180,71 @@ const execFileAsync = promisify(execFile)
 const previewUrlTtlMs = 5 * 60 * 1000
 const maxPreviewUrls = 32
 const previewFiles = new Map<string, { filePath: string; byteSize: number; mimeType: string; expiresAt: number }>()
+const assistantRunRegistry = new AssistantRunRegistry()
+const assistantPlanConfirmation = new AssistantPlanConfirmationController()
+
+const planValidationMetadata = (
+  summary: AssistantExecutionSummary,
+  dataScope?: DataScope
+): AssistantPlanValidationMetadata => {
+  if (summary.sourceMode !== 'records' && summary.sourceMode !== 'mixed') return {}
+
+  const projectIds = db.listProjects()
+    .map((project) => project.uid.trim())
+    .filter(Boolean)
+  const nodeTypes = db.listNodeTypes()
+    .map((nodeType) => nodeType.trim())
+    .filter(Boolean)
+  const scopedNodeTypes = dataScope?.nodeTypes ?? summary.scope.nodeTypes
+  // Confirmation metadata must come from the trusted field-definition catalog,
+  // not from scanning record JSON or reading evidence before approval.
+  const definitions = db.getFieldDefinitions(nodeTypes)
+  const fields = new Map<string, {
+    field: string
+    displayName?: string
+    allowed: boolean
+    types: string[]
+  }>()
+  const addField = (field: string, displayName?: string, types: string[] = []): void => {
+    const normalized = field.trim()
+    if (!normalized) return
+    const existing = fields.get(normalized)
+    fields.set(normalized, {
+      field: normalized,
+      ...(displayName?.trim() || existing?.displayName
+        ? { displayName: displayName?.trim() || existing?.displayName }
+        : {}),
+      allowed: existing?.allowed ?? true,
+      types: [...new Set([...(existing?.types ?? []), ...types.map((value) => value.trim()).filter(Boolean)])]
+    })
+  }
+  for (const definition of definitions) {
+    addField(
+      definition.field,
+      definition.displayName,
+      [definition.nodeType]
+    )
+  }
+  // Existing planner output is already produced from the trusted catalog. If
+  // a legacy installation has no persisted field-definition rows, retain only
+  // those exact fields for an unedited plan; newly supplied fields still fail
+  // closed because they are not added here.
+  const fallbackFields = [
+    ...(summary.fields ?? []),
+    ...(summary.filters ?? []).map((filter) => filter.field),
+    ...(summary.scope.baseFilters ?? []).map((filter) => filter.field),
+    ...(summary.groupByField ? [summary.groupByField] : []),
+    ...(summary.sort?.field ? [summary.sort.field] : [])
+  ]
+  for (const field of fallbackFields) {
+    addField(field, undefined, scopedNodeTypes.length ? scopedNodeTypes : [])
+  }
+  return {
+    projectIds,
+    nodeTypes,
+    fields: [...fields.values()]
+  }
+}
 
 const prunePreviewFiles = (): void => {
   const now = Date.now()
@@ -757,9 +843,14 @@ const registerIpc = (): void => {
     async (_event, input?: PlatformSettingsInput) =>
       new VisslmClient(settings.getPlatformCredentials(input)).test()
   )
-  ipcMain.handle('connections:test-model', async (_event, input?: ModelSettings, probeChat = false) => {
+  ipcMain.handle('connections:test-model', async (
+    _event,
+    input?: ModelSettings,
+    probeChat = false,
+    probeCapabilities = false
+  ) => {
     const model = settings.getModelCredentials(input)
-    return new OllamaAgent(db, model).test(probeChat)
+    return new OllamaAgent(db, model).test(probeChat, probeCapabilities)
   })
 
   ipcMain.handle('data:projects', () => db.listProjects())
@@ -856,7 +947,168 @@ const registerIpc = (): void => {
   ipcMain.handle('chat:delete-session', (_event, id: string): ChatSessionDeleteResult =>
     db.deleteChatSession(id)
   )
+  ipcMain.handle('assistant-artifacts:preview', (_event, input: AssistantArtifactInput) =>
+    createAssistantArtifactPreview(input)
+  )
+  ipcMain.handle('assistant-artifacts:commit', (_event, preview: AssistantArtifactPreview) =>
+    db.saveAssistantArtifact(verifyAssistantArtifactPreview(preview))
+  )
+  ipcMain.handle('assistant-artifacts:list', (_event, limit?: number) =>
+    db.listAssistantArtifacts(limit)
+  )
+  ipcMain.handle('assistant-artifacts:revert', (_event, id: string) =>
+    db.revertAssistantArtifact(id)
+  )
+  ipcMain.handle('assistant-runs:list', (_event, limit?: number) =>
+    db.listAssistantRunHistory(limit)
+  )
+  ipcMain.handle('assistant-runs:stats', () => db.getAssistantRunHistoryStats())
+  ipcMain.handle(
+    'assistant-artifacts:export',
+    async (ipcEvent, input: AssistantArtifactExportRequest): Promise<AssistantArtifactExportResult> => {
+      const artifact = db.getAssistantArtifact(input.artifactId.trim())
+      if (!artifact) throw new Error('交付物不存在')
+      if (artifact.status !== 'active') throw new Error('交付物已撤销，不能导出')
+      const rendered = await renderAssistantArtifact(artifact, input.format, input.instructions)
+      const owner = BrowserWindow.fromWebContents(ipcEvent.sender)
+      const saveOptions = {
+        title: '导出 AI 交付物',
+        defaultPath: rendered.fileName,
+        filters: [{ name: input.format.toUpperCase(), extensions: [input.format] }]
+      }
+      const selection = owner
+        ? await dialog.showSaveDialog(owner, saveOptions)
+        : await dialog.showSaveDialog(saveOptions)
+      if (selection.canceled || !selection.filePath) {
+        return { ok: false, canceled: true, format: input.format, message: '已取消导出' }
+      }
+      writeFileSync(selection.filePath, rendered.bytes)
+      return {
+        ok: true,
+        format: input.format,
+        filePath: selection.filePath,
+        fileName: rendered.fileName,
+        mimeType: rendered.mimeType,
+        byteSize: rendered.byteSize,
+        sha256: rendered.sha256,
+        manifest: rendered.manifest,
+        message: `已导出 ${rendered.fileName}`
+      }
+    }
+  )
+  ipcMain.handle('agent:cancel', (ipcEvent, runId: unknown) =>
+    assistantRunRegistry.cancel(ipcEvent.sender, runId)
+  )
+  ipcMain.handle('agent:confirm-plan', (ipcEvent, runId: unknown, patch: unknown) =>
+    assistantPlanConfirmation.confirm(
+      ipcEvent.sender,
+      runId,
+      patch as AssistantPlanPatch | undefined
+    )
+  )
   ipcMain.handle('agent:ask', async (ipcEvent, request: ChatRequest) => {
+    const registration = assistantRunRegistry.register(ipcEvent.sender, request?.runId)
+    const runStartedAt = new Date().toISOString()
+    const runStages: AssistantRunHistory['stages'] = []
+    let completedResponse: ChatResponse | undefined
+    request = { ...request, runId: registration.runId }
+    const fallbackTraceContext: AssistantTraceContext = {
+      taskType: 'conversation',
+      sourceMode: 'conversation',
+      resultMode: 'answer',
+      primaryAgent: 'conversation',
+      invokedAgents: []
+    }
+    const cancelledResponse = (response?: ChatResponse): ChatResponse => {
+      answerStream?.abandon()
+      let context = fallbackTraceContext
+      if (response?.taskTrace) {
+        context = {
+          taskType: response.taskTrace.taskType,
+          sourceMode: response.taskTrace.sourceMode,
+          resultMode: response.taskTrace.resultMode,
+          primaryAgent: response.taskTrace.primaryAgent,
+          invokedAgents: response.taskTrace.invokedAgents
+        }
+      } else if (response?.assistantIntent) {
+        try {
+          context = traceContextFromDecision(response.assistantIntent)
+        } catch {
+          // Keep the conversation fallback for an invalid or partial response.
+        }
+      }
+      return {
+        answer: '本次助手任务已取消，未保留未完成的证据或产物。',
+        sources: [],
+        dataViews: [],
+        cancelled: true,
+        ...(response?.expertId ? { expertId: response.expertId } : {}),
+        ...(response?.assistantIntent ? { assistantIntent: response.assistantIntent } : {}),
+        taskTrace: createAssistantTaskTrace(context, {
+          runId: registration.runId,
+          startedAt: runStartedAt,
+          status: 'cancelled',
+          invokedAgents: response?.taskTrace?.invokedAgents ?? [],
+          error: {
+            code: 'AGENT_RUN_CANCELLED',
+            message: '助手任务已取消'
+          }
+        }),
+        events: [{
+          type: 'error' as const,
+          code: 'AGENT_RUN_CANCELLED',
+          message: '助手任务已取消',
+          recoverable: true,
+          stage: 'cancelled'
+        }]
+      }
+    }
+    let runFinished = false
+    const sendAgentEvent = (event: AgentEvent): void => {
+      if (runFinished || registration.signal.aborted || ipcEvent.sender.isDestroyed()) return
+      if (event.type === 'status') {
+        runStages.push({ stage: event.stage, message: event.message, at: new Date().toISOString() })
+      }
+      try {
+        ipcEvent.sender.send('agent:event', {
+          runId: registration.runId,
+          conversationId: request.conversationId,
+          event
+        })
+      } catch {
+        // A renderer can disappear between the destroyed check and send.
+      }
+    }
+    const answerStream = new AnswerStream({
+      emit: (event) => sendAgentEvent(event),
+      signal: registration.signal
+    })
+    let confirmedExecutionSummary: AssistantExecutionSummary | undefined
+    const confirmExecutionSummary = async (
+      summary: AssistantExecutionSummary,
+      dataScope?: DataScope
+    ): Promise<ConfirmedAssistantPlan> => {
+      const confirmationInput = {
+        summary,
+        dataScope: dataScope ?? request.dataScope,
+        metadata: planValidationMetadata(summary, dataScope ?? request.dataScope)
+      }
+      const confirmation = assistantPlanConfirmation.wait(
+        ipcEvent.sender,
+        registration.runId,
+        registration.signal,
+        confirmationInput
+      )
+      sendAgentEvent({ type: 'plan', summary, requiresConfirmation: true })
+      const approved = await confirmation
+      if (!approved) throw new Error('执行计划确认未完成')
+      confirmedExecutionSummary = approved.effectiveSummary
+      request = { ...request, dataScope: approved.effectiveDataScope }
+      return approved
+    }
+    return runWithAssistantRunContext(registration.context, async () => {
+      try {
+        const response = await (async (): Promise<ChatResponse> => {
     const isAutoChat = request.chatMode === 'auto' && request.entrypoint !== 'dashboard'
     let assistantIntent: AssistantIntentDecision | undefined
     const traceStartedAt = new Date().toISOString()
@@ -885,9 +1137,32 @@ const registerIpc = (): void => {
       options: Parameters<typeof createAssistantTaskTrace>[1] = {},
       contextOverride?: AssistantTraceContext
     ): ChatResponse => {
-      const enriched = assistantIntent
-        ? { ...response, assistantIntent }
+      const withSummary = confirmedExecutionSummary && !response.executionSummary
+        ? { ...response, executionSummary: confirmedExecutionSummary }
         : response
+      const hasRecoverableError = withSummary.events?.some(
+        (event) => event.type === 'error' && event.recoverable
+      ) === true
+      const withRecovery = hasRecoverableError && confirmedExecutionSummary &&
+          !withSummary.recoverySuggestions?.length
+        ? {
+            ...withSummary,
+            recoverySuggestions: buildSafeQueryRecoverySuggestions(confirmedExecutionSummary)
+          }
+        : withSummary
+      const evidenceBlocks = withRecovery.evidenceBlocks?.length
+        ? withRecovery.evidenceBlocks
+        : buildEvidenceBlocks(
+            withRecovery.sources,
+            withRecovery.dataViews,
+            withRecovery.executionSummary ?? confirmedExecutionSummary
+          )
+      const withEvidence = evidenceBlocks.length
+        ? { ...withRecovery, evidenceBlocks }
+        : withRecovery
+      const enriched = assistantIntent
+        ? { ...withEvidence, assistantIntent }
+        : withEvidence
       if (enriched.taskTrace) return enriched
       return {
         ...enriched,
@@ -918,10 +1193,7 @@ const registerIpc = (): void => {
         message: string,
         metadata?: Extract<AgentEvent, { type: 'status' }>['metadata']
       ): void => {
-        ipcEvent.sender.send('agent:event', {
-          conversationId: request.conversationId,
-          event: { type: 'status' as const, stage, message, ...(metadata ? { metadata } : {}) }
-        })
+        sendAgentEvent({ type: 'status' as const, stage, message, ...(metadata ? { metadata } : {}) })
       }
       emitIntentStatus('classify', '正在理解目标、上下文与任务类型')
       try {
@@ -999,12 +1271,15 @@ const registerIpc = (): void => {
         knowledge_qa: '知识库问答',
         mixed_analysis: '混合分析',
         visualization: '可视化交付',
-        requirement_matching: '需求匹配'
+        requirement_matching: '需求匹配',
+        artifact_generation: '交付物生成'
       }
       const skillLabels: Record<AssistantIntentDecision['skillId'], string> = {
         general: '通用数据助手',
+        'knowledge-base': '知识库专家',
         visualization: '数据可视化专家',
-        'requirement-analysis': '需求分析专家'
+        'requirement-analysis': '需求分析专家',
+        artifact: '交付物专家'
       }
       emitIntentStatus(
         'skill',
@@ -1071,11 +1346,95 @@ const registerIpc = (): void => {
               primaryAgent: 'requirement-analysis',
               invokedAgents: []
             }
+          : route.expert.id === 'knowledge-base'
+            ? {
+                taskType: 'knowledge_qa',
+                sourceMode: 'knowledge',
+                resultMode: 'answer',
+                primaryAgent: 'knowledge-base',
+                invokedAgents: []
+              }
+            : route.expert.id === 'artifact'
+              ? {
+                  taskType: 'artifact_generation',
+                  sourceMode: 'mixed',
+                  resultMode: 'artifact',
+                  primaryAgent: 'artifact',
+                  invokedAgents: []
+                }
           : route.expert.id === 'general'
             ? fallbackTraceContext
             : fallbackTraceContext
+    if (assistantIntent?.taskType === 'artifact_generation' || route.expert.id === 'artifact') {
+      const source = request.artifactSource
+      if (!source?.evidenceBlocks.length) {
+        return attachAssistantIntent({
+          answer: '请先选择一条包含可核验证据的已完成回答，再生成交付物。',
+          sources: [],
+          dataViews: [],
+          needsClarification: true,
+          clarificationQuestion: '请先选择一条包含可核验证据的已完成回答。',
+          expertId: 'artifact'
+        }, { status: 'clarification', invokedAgents: [] })
+      }
+      const artifactPreview = createAssistantArtifactPreview({
+        ...source,
+        type: source.type ?? 'delivery_draft',
+        title: source.title || `交付物草稿 · ${source.question}`
+      })
+      return attachAssistantIntent({
+        answer: '已基于所选回答的 EvidenceBlock 生成交付物预览。确认影响范围和回滚点后才能保存；当前未写入任何原始数据。',
+        sources: source.sources ?? [],
+        dataViews: source.dataViews,
+        evidenceBlocks: source.evidenceBlocks,
+        artifactPreview,
+        expertId: 'artifact'
+      }, { invokedAgents: ['artifact'] })
+    }
+    if (
+      request.entrypoint !== 'dashboard' &&
+      (route.expert.id === 'visualization' || route.expert.id === 'requirement-analysis')
+    ) {
+      const scope = request.dataScope
+      const requirementIds = autoRequirementIds(request.question, request.history) ?? []
+      const stringValue = (value: unknown): string | undefined => value === undefined
+        ? undefined
+        : typeof value === 'string'
+          ? value.slice(0, 240)
+          : JSON.stringify(value).slice(0, 240)
+      const summaryProjectIds = scope?.projectIds !== undefined
+        ? [...new Set(scope.projectIds)]
+        : request.projectId ? [request.projectId] : []
+      await confirmExecutionSummary({
+        question: request.question,
+        taskType: route.expert.id === 'visualization' ? 'visualization' : 'requirement_matching',
+        sourceMode: 'records',
+        resultMode: route.expert.id === 'visualization' ? 'dashboard' : 'answer',
+        intent: route.expert.id === 'visualization' ? 'visualize_records' : 'match_requirements',
+        searchTerms: requirementIds.length ? requirementIds : assistantIntent?.groupEntities ?? [],
+        fields: [],
+        filters: [],
+        limit: scope?.recordUids?.length ?? 50,
+        scope: {
+          projectIds: [...new Set(summaryProjectIds)],
+          nodeTypes: [...new Set(scope?.nodeTypes ?? [])],
+          ...(scope?.recordUids ? { recordCount: scope.recordUids.length } : {}),
+          baseFilters: (scope?.baseFilters ?? []).map((filter) => ({
+            field: filter.field,
+            operator: filter.operator,
+            ...(filter.value === undefined ? {} : { value: stringValue(filter.value) })
+          })),
+          ...(scope?.snapshotAt ? { snapshotAt: scope.snapshotAt } : {})
+        }
+      }, scope)
+    }
     if (autoRequirementIdsForRequest?.length) {
-      const agent = new DirectRequirementDataAnalysisAgent(db, settings.getModelCredentials())
+      const agent = new DirectRequirementDataAnalysisAgent(
+        db,
+        settings.getModelCredentials(),
+        undefined,
+        (content) => answerStream.push(content)
+      )
       return agent.ask({
         ...request,
         question: request.question,
@@ -1106,7 +1465,11 @@ const registerIpc = (): void => {
       })
     }
     if (request.entrypoint !== 'dashboard' && request.chatMode === 'plain') {
-      const agent = new PlainChatAgent(settings.getModelCredentials())
+      const agent = new PlainChatAgent(
+        settings.getModelCredentials(),
+        undefined,
+        (content) => answerStream.push(content)
+      )
       return agent.ask({ ...request, question: route.question }).then((response) => attachAssistantIntent(response, {
         invokedAgents: ['conversation']
       })).catch((error: unknown) => {
@@ -1213,12 +1576,9 @@ const registerIpc = (): void => {
         settings.getModelCredentials(),
         (run) => {
           latestVisualizationRun = run
-          db.recordVisualizationRun(run)
+          if (!registration.signal.aborted) db.recordVisualizationRun(run)
         },
-        (event) => ipcEvent.sender.send('agent:event', {
-          conversationId: request.conversationId,
-          event
-        })
+        (event) => sendAgentEvent(event)
       )
       const task = activeArtifact && isPatchRequest
         ? agent.patch(
@@ -1343,10 +1703,7 @@ const registerIpc = (): void => {
         db,
         knowledgeService,
         settings.getModelCredentials(),
-        (event: Extract<AgentEvent, { type: 'status' }>) => ipcEvent.sender.send('agent:event', {
-          conversationId: request.conversationId,
-          event
-        })
+        (event: Extract<AgentEvent, { type: 'status' }>) => sendAgentEvent(event)
       )
       return agent.ask({ ...request, question: route.question }).then((response) => attachAssistantIntent({
         ...response,
@@ -1378,16 +1735,30 @@ const registerIpc = (): void => {
         })
       })
     }
+    const executionRequest = route.expert.id === 'knowledge-base' && !request.assistantIntent
+      ? {
+          ...request,
+          assistantIntent: {
+            taskType: 'knowledge_qa' as const,
+            skillId: 'knowledge-base' as const,
+            sourceMode: 'knowledge' as const,
+            resolvedQuestion: route.question,
+            resultMode: 'answer' as const,
+            groupEntities: [],
+            needsClarification: false,
+            reason: 'explicit-knowledge-base-skill'
+          }
+        }
+      : request
     const agent = new OllamaAgent(
       db,
       settings.getModelCredentials(),
       knowledgeService,
-      (event: Extract<AgentEvent, { type: 'status' }>) => ipcEvent.sender.send('agent:event', {
-        conversationId: request.conversationId,
-        event
-      })
+      (event: Extract<AgentEvent, { type: 'status' }>) => sendAgentEvent(event),
+      (content) => answerStream.push(content),
+      confirmExecutionSummary
     )
-    return agent.ask({ ...request, question: route.question }).then((response) => attachAssistantIntent({
+    return agent.ask({ ...executionRequest, question: route.question }).then((response) => attachAssistantIntent({
       ...response,
       contextRefs: response.contextRefs ?? contextRefsFromResponse(response),
       expertId: route.expert.id
@@ -1417,6 +1788,68 @@ const registerIpc = (): void => {
           message: errorMessage
         }
       }, failure.traceContext)
+        })
+        })()
+        if (registration.signal.aborted) {
+          completedResponse = cancelledResponse(response)
+          return completedResponse
+        }
+        const hasErrorEvent = response.events?.some((event) => event.type === 'error') ?? false
+        const failedTrace = response.taskTrace?.status === 'failed' || response.taskTrace?.status === 'cancelled'
+        if (response.needsClarification || response.cancelled || hasErrorEvent || failedTrace) {
+          answerStream.abandon()
+        } else {
+          answerStream.complete(response.answer)
+        }
+        completedResponse = response
+        return response
+      } catch (error) {
+        if (registration.signal.aborted || isAssistantRunCancellation(error)) {
+          completedResponse = cancelledResponse()
+          return completedResponse
+        }
+        answerStream.abandon()
+        throw error
+      } finally {
+        runFinished = true
+        answerStream.abandon()
+        const completedAt = new Date().toISOString()
+        const trace = completedResponse?.taskTrace
+        const errorEvent = completedResponse?.events?.find((event) => event.type === 'error')
+        const taskContext = trace ?? {
+          runId: registration.runId,
+          status: 'failed' as const,
+          ...fallbackTraceContext,
+          startedAt: runStartedAt,
+          completedAt,
+          error: { code: 'AGENT_RUN_FAILED', message: '助手任务在返回响应前失败' }
+        }
+        const toolStageNames = new Set(['inspect', 'scan', 'retrieve', 'query', 'tool', 'execute'])
+        const history: AssistantRunHistory = {
+          runId: registration.runId,
+          ...(request.conversationId ? { conversationId: request.conversationId } : {}),
+          status: taskContext.status,
+          taskType: taskContext.taskType,
+          sourceMode: taskContext.sourceMode,
+          resultMode: taskContext.resultMode,
+          primaryAgent: taskContext.primaryAgent,
+          invokedAgents: [...taskContext.invokedAgents],
+          startedAt: runStartedAt,
+          completedAt,
+          durationMs: Math.max(0, Date.parse(completedAt) - Date.parse(runStartedAt)),
+          stages: runStages.slice(0, 100),
+          toolCallCount: runStages.filter((stage) => toolStageNames.has(stage.stage.trim().toLocaleLowerCase())).length,
+          matchedCount: completedResponse?.dataViews.reduce((sum, view) => sum + view.total, 0) ?? 0,
+          recordEvidenceCount: completedResponse?.sources.filter((source) => source.sourceType !== 'document').length ?? 0,
+          documentEvidenceCount: completedResponse?.sources.filter((source) => source.sourceType === 'document').length ?? 0,
+          ...((taskContext.status === 'failed' || taskContext.status === 'cancelled')
+            ? { failedStage: errorEvent?.type === 'error' ? errorEvent.stage : runStages.at(-1)?.stage ?? 'unknown' }
+            : {}),
+          ...(taskContext.error ? { error: taskContext.error } : {})
+        }
+        db.saveAssistantRunHistory(history)
+        assistantRunRegistry.finish(ipcEvent.sender, registration.runId)
+      }
     })
   })
   ipcMain.handle('analytics:field-profiles', (_event, scope?: DataScope) =>
@@ -2355,6 +2788,8 @@ if (!hasSingleInstanceLock) {
 
   app.on('before-quit', () => {
     isQuitting = true
+    assistantRunRegistry.abortAll()
+    assistantPlanConfirmation.clearAll()
     cancelKnowledgeInitialization()
     knowledgeService?.cancelAllTasks()
     previewFiles.clear()

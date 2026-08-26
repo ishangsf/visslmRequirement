@@ -44,7 +44,7 @@ React 页面 -> window.visslm -> preload/index.ts -> ipcRenderer.invoke(channel)
 | API-IPC-008 | `settings:save-features` / `saveFeatureSettings` | `FeatureModuleSettings` | `AppSettings`；键由固定 feature key 集合写入 | `SettingsPage`；`index.ts:139-141` / `SettingsService.saveFeatures`；`settings` |
 | API-IPC-009 | `settings:save-navigation-order` / `saveNavigationOrder` | `FeatureNavigationOrder` | `AppSettings`；未知/重复键被归一化，版本不匹配回默认 | `SettingsPage`；`index.ts:142-144` / `SettingsService.saveNavigationOrder`；`settings` |
 | API-IPC-010 | `connections:test-platform` / `testPlatform` | 可选 `PlatformSettingsInput`，允许测试未保存值 | `ConnectionResult {ok,message,details?}`；VISSLM HTTP/业务错误转为 `ok:false` | `SettingsPage`；`index.ts:146-150` / `VisslmClient.test`；外部 VISSLM |
-| API-IPC-011 | `connections:test-model` / `testModel` | 可选 `ModelSettings`，允许测试未保存值 | `ConnectionResult`；缺 API Key、模型不存在、HTTP 错误为 `ok:false` | `SettingsPage`、`AppShell`；`index.ts:151-154` / `OllamaAgent.test -> ModelClient.test`；外部模型服务 |
+| API-IPC-011 | `connections:test-model` / `testModel` | 可选 `ModelSettings`、`probeChat?`、`probeCapabilities?`，允许测试未保存值。启动轻探测使用 `false, true`，手动完整能力测试使用 `true, true` | `ConnectionResult {ok,message,details?,capabilityReport?}`。能力报告固定返回连接、最小问答、结构化输出、工具调用、上下文窗口、思考模式六项及证据来源；本地轻探测只调用 `/api/tags`、`/api/show`，不生成内容；单项能力失败不伪装为连接失败 | `SettingsPage`、`AppShell`；`index.ts` / `OllamaAgent.test -> ModelClient.test`；外部模型服务 |
 
 ### 2.2 数据中心、采集、同步和数据传输
 
@@ -58,7 +58,7 @@ React 页面 -> window.visslm -> preload/index.ts -> ipcRenderer.invoke(channel)
 | API-IPC-017 | `sync:get-config` / `getSyncConfig` | 无 | `SyncScopeConfig|null`；版本/JSON 损坏返回 null | `SyncPage`：`App.tsx:2084`；`index.ts:161` / `SettingsService.getSyncConfig`；`settings` |
 | API-IPC-018 | `sync:save-config` / `saveSyncConfig` | `SyncScopeConfig {selectedTypes,rules}` | `Promise<void>`；至少选择一种类型否则 rejection | `SyncPage`：`App.tsx:2256`；`index.ts:162-164` / `SettingsService.saveSyncConfig`；`settings` |
 | API-IPC-019 | `sync:preview` / `previewSync` | 可选 `SyncScopeConfig` | `SyncPreviewResult`，含扫描数、匹配数、样例和脱敏请求；连接/字段非法 rejection | `SyncPage`：`App.tsx:2272`；`index.ts:165-169` / `VisslmClient.previewScope`；外部 VISSLM、`settings` |
-| API-IPC-020 | `sync:start` / `startSync` | 可选 `SyncScopeConfig` | `SyncResult {ok,projectCount,recordCount,updatedCount,imageCount,message}`；`recordCount` 为新增数，`updatedCount` 为实际发生属性/描述更新的已有记录数；按 `_valm_ItemID` 命中已有记录时自动刷新本次返回的属性值，保留本地 UID 和关联；运行中、连接失败或平台错误可能返回 `ok:false`，配置错误可 rejection | `AppShell`/`SyncPage`：`App.tsx:2290,3941`；`index.ts:170-177` / `SyncService.run`；`sync_runs`,`projects`,`records`,`images` |
+| API-IPC-020 | `sync:start` / `startSync` | 可选 `SyncScopeConfig` | `SyncResult {ok,projectCount,recordCount,updatedCount,imageCount,message}`；每种节点类型先以网页登录会话 POST `/Admin/Virtualization_ReadMember`（`nodeType`、`proId=0`）刷新字段定义，失败保留最近成功目录并继续采集；`recordCount` 为新增数，`updatedCount` 为实际发生属性/描述更新的已有记录数；按 `_valm_ItemID` 命中已有记录时自动刷新本次返回的属性值，保留本地 UID 和关联；运行中、连接失败或平台错误可能返回 `ok:false`，配置错误可 rejection | `AppShell`/`SyncPage`；`index.ts` / `SyncService.run`；`sync_runs`,`projects`,`records`,`images`,`field_definitions` |
 | API-IPC-021 | `sync:request-logs` / `listCollectionRequestLogs` | `page?: number,pageSize?: number` | `CollectionRequestLogPage`；分页参数由 DB clamp | `SyncPage`：`App.tsx:2104`；`index.ts:179-181` / DB；`collection_request_logs` |
 | API-IPC-022 | `data:import` / `importData` | 无；handler 弹出文件选择框，接受 `.visslmpack`（最大 1 GB）及旧 `.jsonl/.json`（最大 512 MB） | `DataImportResult`；资源包先流式解包、校验路径/哈希/MIME/总量，再在事务中导入；旧 JSON/JSONL 使用 256 条受控批处理（JSON 数组按元素流式切分），Base64 图片转换为二进制资源；返回 `importRunId` 及 `batchCount/sourceRowCount/parseErrorCount/durationMs` 便于观测，运行状态持久化到 `data_import_runs`；批次完成后重建记录索引并标记项目匹配 stale；大文件导入批次之间不保证单一全局事务 | `DataPage`：`App.tsx:532`；`index.ts` / `data-import-stream.ts` / `transfer-pack.ts` + DB + KnowledgeService + ProjectManagementService；`records`,`images`,`asset_blobs`,`record_image_refs`,`data_import_runs` |
 | API-IPC-022A | `data:import-runs` / `listDataImportRuns`、`data:import-run` / `getDataImportRun`、`data:import-resume` / `resumeDataImportRun` | `limit?: number`（最多 200）、`id: string` | `DataImportRunSnapshot[]` / `DataImportRunSnapshot|null` / `DataImportResult`；带源文件指纹的失败旧 JSON/JSONL 先校验文件大小/修改时间，再从已提交源行/解析错误检查点继续，已提交批次不会重复进入数据库；缺少指纹或文件已变化时要求重新导入 | `DataPage` 导入运行记录抽屉：`App.tsx`；`index.ts` / `AppDatabase.listDataImportRuns/getDataImportRun/resumeDataImportRun` + 流式解析器；`data_import_runs` |
@@ -69,7 +69,8 @@ React 页面 -> window.visslm -> preload/index.ts -> ipcRenderer.invoke(channel)
 
 | 编号 | IPC channel / preload 方法 | 请求参数 | 响应与错误 | 调用页面；Handler / Service / 表 |
 | --- | --- | --- | --- | --- |
-| API-IPC-025 | `agent:ask` / `askAgent` | `ChatRequest {question,projectId?,conversationId?,expertId?,chatMode?,entrypoint?,dataScope?,activeArtifact?,history?}` | `ChatResponse {answer,sources,dataViews,expertId?,dashboard?,events?}`；`chatMode='auto'` 时按当前问题自动选择普通对话、通用数据或需求分析能力；`chatMode='plain'` 时只执行普通模型对话；明确 `@` 或 `chatMode='expert'` 时进入对应专家；可视化无数据时返回 event code `NO_ANALYTICS_DATA`，模型/查询校验失败 rejection | `ChatPage`：`App.tsx:1407`；`index.ts:190-265` / `ExpertRouter`、`PlainChatAgent`、`VisualizationAgent`、`RequirementAnalysisAgent` 或 `OllamaAgent`；`records`,`knowledge_*`,`visualization_runs` |
+| API-IPC-025 | `agent:ask` / `askAgent` | `ChatRequest {question,runId?,projectId?,conversationId?,expertId?,chatMode?,entrypoint?,dataScope?,activeArtifact?,history?}` | `ChatResponse {answer,sources,dataViews,executionSummary?,taskTrace?,expertId?,dashboard?,events?}`；非普通对话任务先通过 `agent:event` 发送 `type='plan'` 的结构化摘要并暂停，收到同窗口同 `runId` 的确认后才执行证据工具；自动路由、失败关闭和取消语义保持不变 | `ChatPage`；`index.ts` / `ExpertRouter`、专业 Agent、`AssistantPlanConfirmationController`；`records`,`knowledge_*`,`visualization_runs` |
+| API-IPC-025A | `agent:confirm-plan` / `confirmAgentPlan` | `runId:string` | `ConfirmAgentPlanResult {status:'approved'|'not_found',runId}`；仅发起该运行的 renderer 可确认，取消、过期或跨窗口请求返回 `not_found` | `ChatPage`；`index.ts` / `AssistantPlanConfirmationController`；内存等待控制器 |
 | API-IPC-026 | `chat:sessions` / `listChatSessions` | `limit?: number` | `ChatSessionSummary[]` | `ChatPage`：`App.tsx` 会话历史；`index.ts:182` / DB；`chat_sessions` |
 | API-IPC-027 | `chat:session` / `getChatSession` | `id: string` | `ChatSession|null` | `ChatPage` 加载历史；`index.ts:183` / DB；`chat_sessions` |
 | API-IPC-028 | `chat:save-session` / `saveChatSession` | `ChatSessionSaveInput {id,title?,messages}` | `ChatSession`；消息结构会被清洗/截断 | `ChatPage`；`index.ts:184-186` / DB；`chat_sessions` |
@@ -113,8 +114,8 @@ React 页面 -> window.visslm -> preload/index.ts -> ipcRenderer.invoke(channel)
 | API-IPC-051 | `knowledge:retry` / `retryKnowledgeDocument` | `id:string` | `KnowledgeDocument|null`；不存在返回 null，处理失败返回 failed 文档 | `KnowledgeBasePage`：`App.tsx:922`；`index.ts:666` / `KnowledgeService.retryDocument`；知识库四表 |
 | API-IPC-052 | `knowledge:tags` / `updateKnowledgeDocumentTags` | `id:string,tags:string[]` | `KnowledgeDocument|null`；标签 trim、去重、最多 20 个 | `KnowledgeBasePage`：`App.tsx:961`；`index.ts:667-669` / Service + DB；`knowledge_documents` |
 | API-IPC-053 | `knowledge:delete` / `deleteKnowledgeDocument` | `id:string` | `{ok:boolean,message:string}`；不存在返回 `ok:false` | `KnowledgeBasePage`：`App.tsx:938`；`index.ts:670` / Service + DB/fs；文档、分块、向量、项目文档关联 |
-| API-IPC-054 | `knowledge:rebuild` / `rebuildKnowledgeIndex` | 无 | `KnowledgeRebuildResult`；embedding 资源不可用 rejection | `KnowledgeBasePage`：`App.tsx:949`；`index.ts:671` / `KnowledgeService.rebuildIndex`；`knowledge_chunks`,`knowledge_vectors` |
-| API-IPC-055 | `knowledge:stats` / `getKnowledgeStats` | 无 | `KnowledgeStats` | `KnowledgeBasePage`：`App.tsx:870`；`index.ts:672` / DB；`knowledge_documents`,`knowledge_chunks`,`knowledge_vectors` |
+| API-IPC-054 | `knowledge:rebuild` / `rebuildKnowledgeIndex` | 无 | `KnowledgeRebuildResult`；先同步采集记录分块，再重建文档与记录向量；embedding 资源不可用或生成失败 rejection，并持久化 error 终止任务 | `KnowledgeBasePage`、`ChatPage`；`index.ts` / `KnowledgeService.rebuildIndex`；`records`,`knowledge_chunks`,`knowledge_vectors`,`knowledge_index_tasks` |
+| API-IPC-055 | `knowledge:stats` / `getKnowledgeStats` | 无 | `KnowledgeStats`，包含文档/分块/向量统计和可选 `latestTask: KnowledgeIndexProgress`；应用重启中断的 running 任务返回 retryable failed | `KnowledgeBasePage`、`ChatPage`；`index.ts` / DB；`knowledge_documents`,`knowledge_chunks`,`knowledge_vectors`,`knowledge_index_tasks` |
 | API-IPC-055A | `knowledge:cancel` / `cancelKnowledgeTask` | `taskId:string` | `boolean`；只请求 cooperative checkpoint 停止，已进入单次 embedding/OCR/模型调用的操作会在返回后停止 | `KnowledgeBasePage`；`index.ts` / preload + `KnowledgeService.cancelTask`；内存任务控制器 |
 
 ### 2.7 项目管理、需求、匹配、成本和资产
@@ -335,3 +336,11 @@ const preview = await window.visslm.previewPush({
 - `src/main/model-client.ts:31-387`：Ollama、OpenAI 兼容和 Anthropic 外部模型协议。
 - `src/main/knowledge.ts:480-984`：知识库上传、解析、embedding、索引和搜索。
 - `src/main/project-management.ts:99-1198`：项目管理服务、协议分析、审核、发布和匹配。
+# AI 助手新增 IPC（2026-08）
+
+- `analytics:field-profiles` / `analytics:field-profile-semantics`：读取和保存字段语义。
+- `assistant-artifacts:preview`：规范化交付物输入，返回影响范围、回滚点和预览哈希。
+- `assistant-artifacts:commit`：校验预览哈希后保存版本。
+- `assistant-artifacts:list` / `assistant-artifacts:revert`：查询和撤销交付物。
+- `assistant-artifacts:export`：从有效交付物生成 DOCX、XLSX、PPTX 或 ZIP，并返回证据清单与哈希。
+- `assistant-runs:list` / `assistant-runs:stats`：返回运行历史和聚合质量指标。

@@ -12,7 +12,8 @@ import type {
   RequirementSemanticizationTraceEvent,
   RequirementSemanticizationTraceField,
   RequirementSemanticizationAnalysisStage,
-  RequirementSemanticizationModelUsage
+  RequirementSemanticizationModelUsage,
+  RequirementSemanticizationQualityMode
 } from '../../shared/types'
 import { AppDatabase, type RequirementSemanticizationCandidate } from '../database'
 import { ModelClient, type ModelChatInput } from '../model-client'
@@ -29,6 +30,8 @@ import {
 } from './semantic-card'
 
 export const REQUIREMENT_SEMANTIC_ANALYZER_VERSION = 'requirement-semantic-card-v2'
+export const REQUIREMENT_SEMANTIC_POLICY_VERSION = 'requirement-semantic-routing-v1'
+const REQUIREMENT_SEMANTIC_SCHEMA_VERSION = 'requirement-semantic-output-v2'
 
 type SemanticAnalysisOutput = {
   recordUid: string
@@ -42,17 +45,25 @@ export interface RequirementSemanticizationModelClient {
 
 const activeTaskStatuses = new Set(['queued', 'running', 'pausing', 'paused', 'stopping'])
 const recentItemLimit = 12
+/** One model request may still run for at most fifteen minutes. */
 export const REQUIREMENT_SEMANTIC_MODEL_TIMEOUT_MS = 15 * 60 * 1000
 
 const semanticStagePredictBudget: Record<'initial' | 'independent' | 'adjudication', { deep: number; standard: number }> = {
-  initial: { deep: 4800, standard: 2600 },
-  independent: { deep: 4200, standard: 2200 },
-  adjudication: { deep: 3200, standard: 1800 }
+  // Structured extraction should finish within a small visible-output budget;
+  // strict mode gets more room, while standard mode stays deliberately cheap.
+  initial: { deep: 2400, standard: 1200 },
+  independent: { deep: 2200, standard: 1200 },
+  adjudication: { deep: 2000, standard: 1200 }
 }
 
-const semanticStageRetryBudget = (base: number): number => Math.min(8_000, Math.ceil(base * 1.5 / 200) * 200)
+const semanticStageRetryBudget = (base: number, fieldCount = 1): number => {
+  const scaled = Math.ceil(Math.max(1, fieldCount) * 320 / 160) * 160
+  return Math.min(2_400, Math.max(640, Math.ceil(Math.min(base * 1.25, scaled) / 160) * 160))
+}
 
 const knownSemanticFields: RequirementSemanticFieldName[] = ['requirementType', 'productDomain', 'module']
+const modelSemanticFields: RequirementSemanticFieldName[] = REQUIREMENT_SEMANTIC_FIELDS
+  .filter((field) => !knownSemanticFields.includes(field))
 const confidenceForAdjudication = 0.78
 
 const semanticStageLabels: Record<RequirementSemanticizationAnalysisStage, string> = {
@@ -105,7 +116,9 @@ class SemanticOutputValidationError extends Error {
   }
 }
 
-const semanticValidationMaxAttempts = 4
+// A malformed/invalid initial response gets one targeted repair, never a
+// cascade of full-card retries. The final card still has to pass validation.
+const semanticValidationMaxAttempts = 2
 
 const coreSemanticFields = new Set<RequirementSemanticFieldName>(['functionalObject', 'behavior'])
 
@@ -176,17 +189,12 @@ const responseSchemaFor = (fields: readonly RequirementSemanticFieldName[]) => (
 interface SemanticCallOptions {
   responseFields?: readonly RequirementSemanticFieldName[]
   fallbackFields?: Partial<Record<RequirementSemanticFieldName, RequirementSemanticFieldAssessment>>
+  maxAttempts?: number
 }
 
 const normalizedEvidence = (value: string): string => value
   .replace(/[\s\u00a0]+/g, ' ')
   .trim()
-
-const sourceEvidenceSegments = (sourceText: string): string[] => sourceText
-  .split(/\r?\n/)
-  .map((line) => line.trim())
-  .filter(Boolean)
-  .slice(0, 120)
 
 const modelPromptChars = (messages: ModelChatInput['messages']): number => messages
   .reduce((total, message) => total + message.content.length, 0)
@@ -199,7 +207,7 @@ const dynamicModelContext = (
   // while avoiding a 32K KV cache for ordinary short requirements.
   const estimatedPromptTokens = Math.ceil(modelPromptChars(messages) / 1.5)
   const required = estimatedPromptTokens + numPredict + 1_024
-  return Math.min(32_768, Math.max(8_192, Math.ceil(required / 1_024) * 1_024))
+  return Math.min(24_576, Math.max(4_096, Math.ceil(required / 1_024) * 1_024))
 }
 
 const mergeModelUsage = (
@@ -225,12 +233,17 @@ const mergeModelUsage = (
 
 export const requirementSemanticModelSignature = (settings: ModelSettings): string => createHash('sha256')
   .update(JSON.stringify({
+    analyzerVersion: REQUIREMENT_SEMANTIC_ANALYZER_VERSION,
+    policyVersion: REQUIREMENT_SEMANTIC_POLICY_VERSION,
+    schemaVersion: REQUIREMENT_SEMANTIC_SCHEMA_VERSION,
     source: settings.source,
     provider: settings.provider,
     baseUrl: settings.baseUrl.replace(/\/+$/, ''),
     model: settings.model,
-    thinking: true,
-    forceThinking: true
+    // The task-level deepThinking switch is a route, not a global cache
+    // identity. The persisted card must be reusable by either route.
+    configuredThinking: settings.thinking,
+    structuredOutput: 'json-schema'
   }))
   .digest('hex')
 
@@ -263,7 +276,9 @@ export class RequirementSemanticizationService {
       throw new Error('未知的 AI 语义化任务范围')
     }
     const settings = this.getSettings()
-    const deepThinking = input.deepThinking !== false
+    const qualityMode: RequirementSemanticizationQualityMode = input.qualityMode ??
+      (input.deepThinking === true ? 'strict' : 'standard')
+    const deepThinking = qualityMode === 'strict'
     const context = {
       analyzerVersion: REQUIREMENT_SEMANTIC_ANALYZER_VERSION,
       modelSignature: requirementSemanticModelSignature(settings)
@@ -307,7 +322,8 @@ export class RequirementSemanticizationService {
         updatedAt: timestamp,
         message: available > 0 ? `没有新任务，已跳过 ${available} 条记录` : '当前没有需要生成或更新的 AI 语义卡片',
         recentItems: [],
-        deepThinking
+        deepThinking,
+        qualityMode
       }
       this.emit()
       return { jobId, accepted: 0, skipped: available, available }
@@ -328,10 +344,11 @@ export class RequirementSemanticizationService {
       updatedAt: timestamp,
       message: `已创建任务，将逐条处理 ${candidates.length} 条记录`,
       recentItems: [],
-      deepThinking
+      deepThinking,
+      qualityMode
     }
     this.emit()
-    void this.runJob(settings, deepThinking).catch((error) => {
+    void this.runJob(settings, qualityMode).catch((error) => {
       if (!this.task || this.task.status === 'stopped') return
       this.finishStopped(`任务异常结束：${error instanceof Error ? error.message : String(error)}`)
     })
@@ -378,7 +395,8 @@ export class RequirementSemanticizationService {
     return this.getTask()
   }
 
-  private async runJob(settings: ModelSettings, deepThinking: boolean): Promise<void> {
+  private async runJob(settings: ModelSettings, qualityMode: RequirementSemanticizationQualityMode): Promise<void> {
+    const deepThinking = qualityMode === 'strict'
     if (!this.task) return
     if (this.task.status === 'stopping' || this.task.status === 'stopped') {
       this.finishStopped()
@@ -421,7 +439,7 @@ export class RequirementSemanticizationService {
       this.task.status = 'running'
       this.task.currentStage = 'initial'
       this.task.message = `正在分析 ${candidate.itemId || candidate.name}`
-      this.currentTrace = this.createTrace(candidate.recordUid, settings, deepThinking)
+      this.currentTrace = this.createTrace(candidate.recordUid, settings, deepThinking, qualityMode)
       this.startTraceStage('initial')
       this.touch()
       this.emit(candidate.recordUid, 'processing')
@@ -430,28 +448,77 @@ export class RequirementSemanticizationService {
         if (!record) throw new Error('数据中心记录不存在或已被删除')
         const source = buildRequirementSemanticCard(record)
         if (!source.evidence.trim()) throw new Error('记录没有可供 AI 分析的文本内容')
-        const initial = this.enforceKnownFields(source, await this.analyze(client, candidate.recordUid, source, 'initial'))
-        this.updateTraceStageOutput('initial', initial)
-        await this.checkpoint()
-        this.setStage('independent', '正在执行独立语义复核')
-        const independent = this.enforceKnownFields(source, await this.analyze(client, candidate.recordUid, source, 'independent'))
-        this.updateTraceStageOutput('independent', independent)
-        await this.checkpoint()
-        this.setStage('adjudication', '正在裁决两轮分析结果')
-        const divergence = this.compareDivergence(initial, independent)
-        const adjudicationFields = this.adjudicationFields(initial, independent, divergence)
-        // Adjudication is always a real third model stage. Even when the first
-        // two analyses agree, the final pass must return to the source and
-        // confirm that the agreement is evidence-backed before persistence.
-        const adjudicated = this.enforceKnownFields(
-          source,
-          await this.adjudicate(client, candidate.recordUid, source, initial, independent, adjudicationFields)
-        )
-        this.updateTraceStageOutput('adjudication', adjudicated)
+        let finalOutput: SemanticAnalysisOutput
+        if (!deepThinking) {
+          // Standard mode is a cheap, fully validated fast path. A second
+          // request is made only when the deterministic result identifies a
+          // low-confidence core field or the initial response needs repair.
+          const initial = this.enforceKnownFields(source, await this.analyze(client, candidate.recordUid, source, 'initial'))
+          this.updateTraceStageOutput('initial', initial)
+          await this.checkpoint()
+          const lowConfidenceFields = this.lowConfidenceCoreFields(initial)
+          if (lowConfidenceFields.length) {
+            this.setStage('initial', `正在定向修复低置信核心字段：${lowConfidenceFields.join('、')}`)
+            finalOutput = this.enforceKnownFields(
+              source,
+              await this.repairFields(client, candidate.recordUid, source, initial, lowConfidenceFields)
+            )
+            this.updateTraceStageOutput('initial', finalOutput)
+          } else {
+            finalOutput = initial
+          }
+        } else {
+          // Strict mode keeps the independent quality signal, but the two
+          // source-only analyses are independent and safe to run concurrently.
+          this.task.message = '正在并行执行初步分析与独立语义复核'
+          this.touch()
+          this.emit(candidate.recordUid, 'processing')
+          this.startTraceStage('independent')
+          // Wait for both in-flight requests even if one fails. Otherwise a
+          // fast rejection could advance the job and let the other promise
+          // mutate the next record's trace after the current card is failed.
+          const parallelResults = await Promise.allSettled([
+            this.analyze(client, candidate.recordUid, source, 'initial'),
+            this.analyze(client, candidate.recordUid, source, 'independent')
+          ])
+          const rejected = parallelResults.find((result): result is PromiseRejectedResult => result.status === 'rejected')
+          if (rejected) throw rejected.reason
+          const initialResult = (parallelResults[0] as PromiseFulfilledResult<SemanticAnalysisOutput>).value
+          const independentResult = (parallelResults[1] as PromiseFulfilledResult<SemanticAnalysisOutput>).value
+          const initial = this.enforceKnownFields(source, initialResult)
+          const independent = this.enforceKnownFields(source, independentResult)
+          this.updateTraceStageOutput('initial', initial)
+          this.updateTraceStageOutput('independent', independent)
+          await this.checkpoint()
+          const divergence = this.compareDivergence(initial, independent)
+          const lowConfidenceFields = this.lowConfidenceCoreFields(initial, independent)
+          const adjudicationFields = this.adjudicationFields(initial, independent, divergence)
+          if (divergence.hasDivergence || lowConfidenceFields.length) {
+            this.setStage('adjudication', '正在裁决存在分歧或低置信核心字段')
+            finalOutput = this.enforceKnownFields(
+              source,
+              await this.adjudicate(
+                client,
+                candidate.recordUid,
+                source,
+                initial,
+                independent,
+                adjudicationFields,
+                divergence
+              )
+            )
+            this.updateTraceStageOutput('adjudication', finalOutput)
+          } else {
+            // Agreement plus strong core fields is already a validated result;
+            // choose the higher-confidence field without an unconditional
+            // third model call.
+            finalOutput = this.mergeAgreeingOutputs(initial, independent)
+          }
+        }
         await this.checkpoint()
         this.setStage('persisting', '正在校验并保存语义卡片')
-        const card = this.toCard(source, adjudicated)
-        this.completeTraceStage('persisting', adjudicated, '结构化字段、置信度和原文证据校验通过，正在写入语义资产')
+        const card = this.toCard(source, finalOutput)
+        this.completeTraceStage('persisting', finalOutput, '结构化字段、置信度和原文证据校验通过，正在写入语义资产')
         this.db.completeRequirementSemanticCard(candidate.recordUid, card, this.finishTrace('completed'))
         this.addResult(candidate, 'ready', Date.now() - startedAt)
         this.emit(candidate.recordUid, 'ready')
@@ -578,12 +645,12 @@ export class RequirementSemanticizationService {
           content: [
             role,
             '只能依据给定原文分析，禁止补充原文不存在的业务事实。',
-            ...knownSemanticFields.flatMap((field) => source[field]
-              ? [`${field} 已由数据中心明确提供，必须原样保留为 value：${source[field]}；不要重新推断或改写。`]
-              : []),
+            ...knownSemanticFields.map((field) => source[field]
+              ? `${field} 已由数据中心明确提供，服务端会原样注入 value：${source[field]}；不要在 fields 中生成该字段。`
+              : `${field} 没有数据中心明确值，服务端会注入空值；不要在 fields 中生成该字段。`),
             'value 是归一化后的语义结论，不要求在原文中逐字出现；evidence 是支撑该结论的原文证据，必须从 sourceText 复制一个逐字连续片段，禁止改写、概括或翻译。',
-            '例如 action.value 可以是 add_capability，但 action.evidence 应复制原文中的“新增”“支持”或对应目标表述；requirementType/productDomain 等字段也必须复制 sourceText 中实际出现的值或标签片段。',
-            '每个字段必须给出 value、0-1 confidence 和 evidence；找不到可逐字复制的证据时，该字段 value/evidence 置空且 confidence 为 0。',
+            '例如 action.value 可以是 add_capability，但 action.evidence 应复制原文中的“新增”“支持”或对应目标表述。',
+            `每个可推断字段（${modelSemanticFields.join('、')}）必须给出 value、0-1 confidence 和 evidence；找不到可逐字复制的证据时，该字段 value/evidence 置空且 confidence 为 0。`,
             'action 是唯一例外：找不到可逐字复制的动作证据时，返回 action.value="unknown"、action.evidence=""、action.confidence=0，不得为满足枚举约束编造动作。',
             'functionalObject 和 behavior 是核心字段，不能留空。正文缺失或只有图片时，必须深度理解“名称：”行：functionalObject 提炼名称中真正被操作或出现异常的业务对象，behavior 归一化名称表达的用户可观察需求或问题；两者的 evidence 都可以直接复制完整名称文本。',
             `action 只能是：${REQUIREMENT_ACTIONS.join('、')}。`,
@@ -602,10 +669,10 @@ export class RequirementSemanticizationService {
     source: RequirementSemanticCard,
     initial: SemanticAnalysisOutput,
     independent: SemanticAnalysisOutput,
-    focusFields: RequirementSemanticFieldName[]
+    focusFields: RequirementSemanticFieldName[],
+    divergence?: RequirementSemanticizationDivergence
   ): Promise<SemanticAnalysisOutput> {
-    const divergence = this.compareDivergence(initial, independent)
-    if (divergence.hasDivergence) this.recordTraceEvent({
+    if (divergence?.hasDivergence) this.recordTraceEvent({
       stage: 'adjudication',
       kind: 'divergence',
       message: '初步分析与独立复核存在字段分歧，已交由最终裁决',
@@ -656,12 +723,11 @@ export class RequirementSemanticizationService {
     const fields = { ...output.fields }
     knownSemanticFields.forEach((field) => {
       const value = source[field].trim()
-      if (!value) return
       const sourceAssessment = source.fieldAssessments[field]
       fields[field] = {
         value,
-        confidence: sourceAssessment?.confidence ?? 1,
-        evidence: sourceAssessment?.evidence || value
+        confidence: sourceAssessment?.confidence ?? (value ? 1 : 0),
+        evidence: value ? (sourceAssessment?.evidence || value) : ''
       }
     })
     return { ...output, fields }
@@ -683,8 +749,10 @@ export class RequirementSemanticizationService {
     independent: SemanticAnalysisOutput,
     divergence: RequirementSemanticizationDivergence
   ): RequirementSemanticFieldName[] {
-    const fields = new Set<RequirementSemanticFieldName>(divergence.fields.map((item) => item.field as RequirementSemanticFieldName))
-    REQUIREMENT_SEMANTIC_FIELDS.forEach((field) => {
+    const fields = new Set<RequirementSemanticFieldName>(divergence.fields
+      .map((item) => item.field as RequirementSemanticFieldName)
+      .filter((field) => modelSemanticFields.includes(field)))
+    modelSemanticFields.forEach((field) => {
       const left = initial.fields[field]
       const right = independent.fields[field]
       const hasSemanticValue = Boolean(left.value || right.value)
@@ -697,6 +765,75 @@ export class RequirementSemanticizationService {
       }
     })
     return REQUIREMENT_SEMANTIC_FIELDS.filter((field) => fields.has(field))
+  }
+
+  private lowConfidenceCoreFields(
+    ...outputs: SemanticAnalysisOutput[]
+  ): RequirementSemanticFieldName[] {
+    return modelSemanticFields.filter((field) => coreSemanticFields.has(field) && outputs.some((output) => {
+      const assessment = output.fields[field]
+      return !assessment.value || assessment.confidence < confidenceForAdjudication
+    }))
+  }
+
+  private mergeAgreeingOutputs(
+    initial: SemanticAnalysisOutput,
+    independent: SemanticAnalysisOutput
+  ): SemanticAnalysisOutput {
+    const fields = Object.fromEntries(REQUIREMENT_SEMANTIC_FIELDS.map((field) => {
+      const left = initial.fields[field]
+      const right = independent.fields[field]
+      return [field, right.confidence > left.confidence ? right : left]
+    })) as Record<RequirementSemanticFieldName, RequirementSemanticFieldAssessment>
+    return {
+      recordUid: initial.recordUid,
+      fields,
+      analysisSummary: initial.analysisSummary || independent.analysisSummary
+    }
+  }
+
+  private async repairFields(
+    client: RequirementSemanticizationModelClient,
+    recordUid: string,
+    source: RequirementSemanticCard,
+    previous: SemanticAnalysisOutput,
+    fields: readonly RequirementSemanticFieldName[]
+  ): Promise<SemanticAnalysisOutput> {
+    const responseFields = fields.filter((field) => modelSemanticFields.includes(field))
+    if (!responseFields.length) return previous
+    const lockedFields = Object.fromEntries(REQUIREMENT_SEMANTIC_FIELDS
+      .filter((field) => !responseFields.includes(field))
+      .map((field) => [field, previous.fields[field]])) as Partial<Record<RequirementSemanticFieldName, RequirementSemanticFieldAssessment>>
+    return this.callAndValidate(client, recordUid, source.evidence, 'initial', {
+      messages: [
+        {
+          role: 'system',
+          content: [
+            '你是需求语义卡片的定向修复专家，只重新分析指定的低置信核心字段。',
+            '只能依据 sourceText，不得引入原文之外的事实；只输出严格 JSON，不要输出解释或 Markdown。',
+            `只输出字段：${responseFields.join('、')}；其他字段由服务端锁定，不要生成。`,
+            'value 是归一化语义结论；evidence 必须从 sourceText 复制逐字连续片段。',
+            'functionalObject 和 behavior 必须表达具体、可观察的业务语义，不能只写模块名。'
+          ].join('\n')
+        },
+        {
+          role: 'user',
+          content: JSON.stringify({
+            task: 'repair_low_confidence_semantic_fields',
+            recordUid,
+            sourceText: source.evidence,
+            fields: Object.fromEntries(responseFields.map((field) => [field, previous.fields[field]])),
+            lockedFields
+          })
+        }
+      ]
+    }, source, {
+      responseFields,
+      fallbackFields: lockedFields,
+      // This is already the one allowed low-confidence escalation. If its
+      // output is invalid, fail closed instead of starting another model call.
+      maxAttempts: 1
+    })
   }
 
   private async callAndValidate(
@@ -713,8 +850,9 @@ export class RequirementSemanticizationService {
     let lockedFields: Partial<Record<RequirementSemanticFieldName, RequirementSemanticFieldAssessment>> = {
       ...(options.fallbackFields ?? {})
     }
-    let responseFields = options.responseFields ?? REQUIREMENT_SEMANTIC_FIELDS
-    for (let attempt = 0; attempt < semanticValidationMaxAttempts; attempt += 1) {
+    let responseFields = options.responseFields ?? modelSemanticFields
+    const maxAttempts = Math.max(1, Math.min(semanticValidationMaxAttempts, options.maxAttempts ?? semanticValidationMaxAttempts))
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       const traceStage = this.currentTrace?.stages[stage]
       if (traceStage) {
         traceStage.attempts = Math.max(traceStage.attempts, attempt + 1)
@@ -724,15 +862,17 @@ export class RequirementSemanticizationService {
       let usedNumPredict = 0
       try {
         const stageBudget = semanticStagePredictBudget[stage === 'persisting' ? 'adjudication' : stage]
-        const baseNumPredict = this.task?.deepThinking === false ? stageBudget.standard : stageBudget.deep
-        const numPredict = attempt === 0 ? baseNumPredict : semanticStageRetryBudget(baseNumPredict)
+        const baseNumPredict = this.task?.qualityMode === 'strict' ? stageBudget.deep : stageBudget.standard
+        const numPredict = attempt === 0
+          ? baseNumPredict
+          : semanticStageRetryBudget(baseNumPredict, responseFields.length)
         usedNumPredict = numPredict
         response = await client.chat({
           messages,
-          think: this.task?.deepThinking !== false,
-          forceThinking: this.task?.deepThinking !== false,
-          stream: true,
-          temperature: 0.05,
+          think: this.task?.qualityMode === 'strict',
+          forceThinking: this.task?.qualityMode === 'strict',
+          stream: false,
+          temperature: 0,
           numPredict,
           numCtx: dynamicModelContext(messages, numPredict),
           timeoutMs: REQUIREMENT_SEMANTIC_MODEL_TIMEOUT_MS,
@@ -757,7 +897,7 @@ export class RequirementSemanticizationService {
           kind: 'model_error',
           message: message.slice(0, 500),
           attempt: attempt + 1,
-          maxAttempts: semanticValidationMaxAttempts
+          maxAttempts
         })
         throw new Error(message)
       }
@@ -776,7 +916,7 @@ export class RequirementSemanticizationService {
           kind: 'validation_passed',
           message: `${stage} 阶段第 ${attempt + 1} 次输出已通过 JSON 结构、字段、置信度和原文证据校验`,
           attempt: attempt + 1,
-          maxAttempts: semanticValidationMaxAttempts
+          maxAttempts
         })
         this.completeTraceStage(stage, output)
         return output
@@ -787,59 +927,32 @@ export class RequirementSemanticizationService {
           kind: 'validation_failed',
           message: `${stage} 阶段第 ${attempt + 1} 次输出未通过校验：${error instanceof Error ? error.message : String(error)}`.slice(0, 500),
           attempt: attempt + 1,
-          maxAttempts: semanticValidationMaxAttempts
+          maxAttempts
         })
-        if (attempt === 0) {
+        if (attempt + 1 < maxAttempts) {
           await this.checkpoint()
           const validationError = error instanceof Error ? error.message : String(error)
-          const previousContent = response.message?.content?.trim() ?? ''
-          messages = [
-            ...input.messages,
-            ...(previousContent ? [{ role: 'assistant' as const, content: previousContent }] : []),
-            {
-              role: 'user' as const,
-              content: JSON.stringify({
-                task: 'repair_semantic_output',
-                recordUid,
-                sourceText,
-                analysisPass: stage,
-                validationError,
-                instructions: [
-                  '只修复校验错误并重新输出完整 JSON 对象，不要输出解释或 Markdown。',
-                  'value 是归一化语义结论，可以不在原文逐字出现。',
-                  '每个 evidence 必须直接复制 sourceText 中的一个逐字连续片段，禁止改写、概括、翻译或拼接多个不连续片段。',
-                  '如果 sourceText 中找不到能支撑某字段的逐字证据，将该字段 value 和 evidence 置空，confidence 设为 0。',
-                  `action.value 仍只能是：${REQUIREMENT_ACTIONS.join('、')}；有动作依据时 action.evidence 复制原文中的动作或目标表述，没有动作依据时必须返回 action.value="unknown"、action.evidence=""、action.confidence=0。`,
-                  'functionalObject 和 behavior 是核心字段，不能置空；正文没有可用文字时，回到“名称：”行深度分析，value 可归一化，evidence 直接复制名称文本。'
-                ]
-              })
-            }
-          ]
-          this.recordTraceEvent({
-            stage,
-            kind: 'retry',
-            message: `${stage} 阶段将携带具体校验错误和原文证据规则进行第 2 次修复调用`,
-            attempt: 2,
-            maxAttempts: semanticValidationMaxAttempts
-          })
-        } else if (attempt === 1 && error instanceof SemanticOutputValidationError && error.fields.length > 0) {
-          await this.checkpoint()
+          const validationFields = error instanceof SemanticOutputValidationError && error.fields.length
+            ? error.fields
+            : responseFields
           lockedFields = {
             ...lockedFields,
-            ...error.validFields
+            ...(error instanceof SemanticOutputValidationError ? error.validFields : {})
           }
-          responseFields = error.fields
+          responseFields = validationFields.filter((field) => modelSemanticFields.includes(field))
+          if (!responseFields.length) responseFields = modelSemanticFields
           const previousContent = response.message?.content?.trim() ?? ''
-          const currentInvalidFields = this.modelFieldsFromContent(previousContent, error.fields)
+          const previousFields = this.modelFieldsFromContent(previousContent, responseFields)
           messages = [{
             role: 'system' as const,
             content: [
-              '你是需求语义卡片的最终纠错专家。只依据 sourceText 深度分析指定失败字段。',
-              '不得使用规则猜测、常识补充或原文之外的业务事实；必须由你重新理解原文后输出语义字段。',
+              '你是需求语义卡片的定向纠错专家，只重新分析校验失败的字段。',
+              '只能依据 sourceText，不得使用规则猜测或原文之外的业务事实。',
+              `只输出字段：${responseFields.join('、')}；其他字段由服务端锁定，不要生成。`,
               '只输出严格符合 JSON Schema 的 JSON，不要输出解释或 Markdown。',
-              'value 是归一化语义结论；evidence 必须直接复制 sourceText 中一个逐字连续片段，不得改写、概括、翻译或拼接。',
-              '如果普通字段没有原文支持，value/evidence 置空且 confidence 为 0；action 没有原文动作依据时必须返回 unknown、空 evidence 和 0 置信度。',
-              'functionalObject 和 behavior 是核心字段，必须回到名称与描述中识别最直接、最具体的原文依据；正文缺失或只有图片时，深度理解名称并直接复制名称文本作为 evidence。'
+              '每个非空 value 必须附 sourceText 中逐字连续复制的 evidence；找不到证据时置空并将 confidence 设为 0。',
+              `action.value 只能是：${REQUIREMENT_ACTIONS.join('、')}。`,
+              'functionalObject 和 behavior 是核心字段，必须保持具体且可观察。'
             ].join('\n')
           }, {
             role: 'user' as const,
@@ -848,65 +961,23 @@ export class RequirementSemanticizationService {
               recordUid,
               analysisPass: stage,
               sourceText,
-              sourceEvidenceSegments: sourceEvidenceSegments(sourceText),
-              invalidFields: error.fields,
-              validationIssues: error.issues,
-              previousInvalidFields: currentInvalidFields,
+              invalidFields: responseFields,
+              validationError,
+              previousFields,
               lockedValidFields: lockedFields,
-              instructions: error.fields.map((field) => semanticFieldRepairGuidance[field] ??
+              instructions: responseFields.map((field) => semanticFieldRepairGuidance[field] ??
                 `${field} 必须准确表达 sourceText 中对应语义；非空 value 必须附逐字连续原文 evidence。`)
             })
           }]
           this.recordTraceEvent({
             stage,
             kind: 'retry',
-            message: `${stage} 阶段只重新分析失败字段 ${error.fields.join('、')}，其余已验证字段保持锁定`,
-            attempt: 3,
-            maxAttempts: semanticValidationMaxAttempts
+            message: `${stage} 阶段只重新分析校验失败字段，最多进行 1 次定向修复`,
+            attempt: 2,
+            maxAttempts
           })
-        } else if (attempt === 2 && error instanceof SemanticOutputValidationError && error.fields.length > 0) {
-          await this.checkpoint()
-          lockedFields = {
-            ...lockedFields,
-            ...error.validFields
-          }
-          responseFields = error.fields
-          const previousContent = response.message?.content?.trim() ?? ''
-          messages = [{
-            role: 'system' as const,
-            content: [
-              '你是需求语义卡片的最终证据校准专家。前三次输出仍有少数字段不合法，请对失败字段重新独立分析。',
-              '只输出失败字段，禁止重复或修改 lockedValidFields。不要解释，不要 Markdown。',
-              '每个 evidence 必须从 sourceEvidenceSegments 中选择一个字符串并逐字复制；不得改写、截断、拼接或创造新句子。',
-              'functionalObject 和 behavior 必须非空：可以根据名称文本形成归一化 value，并把完整“名称：...”行或其中连续出现的名称文本作为 evidence。',
-              'action 没有明确动作证据时，必须输出 value="unknown"、confidence=0、evidence=""；不得输出无证据的其他枚举。'
-            ].join('\n')
-          }, {
-            role: 'user' as const,
-            content: JSON.stringify({
-              task: 'final_repair_invalid_semantic_fields',
-              recordUid,
-              analysisPass: stage,
-              invalidFields: error.fields,
-              validationIssues: error.issues,
-              previousInvalidFields: this.modelFieldsFromContent(previousContent, error.fields),
-              lockedValidFields: lockedFields,
-              sourceText,
-              sourceEvidenceSegments: sourceEvidenceSegments(sourceText),
-              instructions: error.fields.map((field) => semanticFieldRepairGuidance[field] ??
-                `${field} 必须准确表达 sourceText 中对应语义；非空 value 必须附逐字连续原文 evidence。`)
-            })
-          }]
-          this.recordTraceEvent({
-            stage,
-            kind: 'retry',
-            message: `${stage} 阶段对仍失败的字段 ${error.fields.join('、')} 进行最终证据校准`,
-            attempt: 4,
-            maxAttempts: semanticValidationMaxAttempts
-          })
-        } else if (attempt >= 1) {
-          // Malformed JSON and request-level errors do not identify a field that a
-          // targeted repair can safely correct; avoid sending a duplicate call.
+        } else {
+          // Do not replay a second repair request after the bounded attempt.
           break
         }
       }
@@ -917,7 +988,8 @@ export class RequirementSemanticizationService {
   private createTrace(
     recordUid: string,
     settings: ModelSettings,
-    deepThinking = this.task?.deepThinking !== false
+    deepThinking = this.task?.qualityMode === 'strict',
+    qualityMode: RequirementSemanticizationQualityMode = deepThinking ? 'strict' : 'standard'
   ): RequirementSemanticizationAnalysisTrace {
     return {
       version: 1,
@@ -925,6 +997,7 @@ export class RequirementSemanticizationService {
       analyzerVersion: REQUIREMENT_SEMANTIC_ANALYZER_VERSION,
       modelSignature: requirementSemanticModelSignature(settings),
       deepThinking,
+      qualityMode,
       events: [],
       stages: {}
     }
@@ -984,17 +1057,20 @@ export class RequirementSemanticizationService {
     const trace = this.currentTrace ?? this.createTrace(
       this.task?.currentRecord?.uid ?? '',
       this.getSettings(),
-      this.task?.deepThinking !== false
+      this.task?.qualityMode === 'strict',
+      this.task?.qualityMode ?? (this.task?.deepThinking ? 'strict' : 'standard')
     )
     trace.outcome = outcome
     trace.completedAt = new Date().toISOString()
     if (outcome === 'completed') {
-      const adjudication = trace.stages.adjudication
-      if (adjudication?.fields) {
+      // Keep the existing renderer contract (`finalAdjudication`) even when
+      // standard mode finishes on the validated initial extraction.
+      const finalStage = trace.stages.adjudication ?? trace.stages.initial
+      if (finalStage?.fields) {
         trace.finalAdjudication = {
-          completedAt: adjudication.completedAt ?? trace.completedAt,
-          summary: adjudication.summary ?? '',
-          fields: adjudication.fields
+          completedAt: finalStage.completedAt ?? trace.completedAt,
+          summary: finalStage.summary ?? '',
+          fields: finalStage.fields
         }
       }
     }
@@ -1014,7 +1090,13 @@ export class RequirementSemanticizationService {
     const stage = this.currentTrace.stages[input.stage]
     if (stage && input.kind === 'retry') stage.attempts = Math.max(stage.attempts, input.attempt ?? 0)
     if (this.task) this.task.analysisTrace = structuredClone(this.currentTrace)
-    this.db.updateRequirementSemanticCardTrace(this.currentTrace.recordUid, this.currentTrace)
+    // Keep every event in the in-memory/IPC audit stream, but only rewrite the
+    // durable full trace at meaningful boundaries. Terminal paths always flush
+    // through complete/fail/releaseRequirementSemanticCard.
+    if (input.kind === 'stage_started' || input.kind === 'stage_completed' ||
+      input.kind === 'model_error' || input.kind === 'divergence') {
+      this.db.updateRequirementSemanticCardTrace(this.currentTrace.recordUid, this.currentTrace)
+    }
     this.touch()
     this.emit(this.task?.currentRecord?.uid, 'processing')
   }
@@ -1034,12 +1116,11 @@ export class RequirementSemanticizationService {
     const fields = { ...(candidate.fields as Record<string, unknown>) }
     knownSemanticFields.forEach((field) => {
       const valueText = source[field].trim()
-      if (!valueText) return
       const assessment = source.fieldAssessments[field]
       fields[field] = {
         value: valueText,
-        confidence: assessment?.confidence ?? 1,
-        evidence: assessment?.evidence || valueText
+        confidence: assessment?.confidence ?? (valueText ? 1 : 0),
+        evidence: valueText ? (assessment?.evidence || valueText) : ''
       }
     })
     return { ...candidate, fields }
@@ -1080,7 +1161,7 @@ export class RequirementSemanticizationService {
   }
 
   private compareDivergence(initial: SemanticAnalysisOutput, independent: SemanticAnalysisOutput): RequirementSemanticizationDivergence {
-    const fields = REQUIREMENT_SEMANTIC_FIELDS.flatMap((field) => {
+    const fields = modelSemanticFields.flatMap((field) => {
       const left = initial.fields[field]
       const right = independent.fields[field]
       const leftTrace = { value: left.value, confidence: left.confidence, evidence: left.evidence }

@@ -27,6 +27,8 @@ interface DirectDataAnalysisClient {
     messages: ModelMessage[]
     think?: boolean
     forceThinking?: boolean
+    stream?: boolean
+    onTextDelta?: (content: string) => void
     temperature?: number
     numPredict?: number
     numCtx?: number
@@ -225,7 +227,8 @@ export class DirectRequirementDataAnalysisAgent {
   constructor(
     private readonly db: AppDatabase,
     settings: ModelSettings,
-    client?: DirectDataAnalysisClient
+    client?: DirectDataAnalysisClient,
+    private readonly onTextDelta?: (content: string) => void
   ) {
     this.client = client ?? new ModelClient(settings)
   }
@@ -320,6 +323,9 @@ export class DirectRequirementDataAnalysisAgent {
       ],
       think: true,
       forceThinking: undefined,
+      ...(this.onTextDelta
+        ? { stream: true, onTextDelta: this.onTextDelta }
+        : {}),
       temperature: 0.2,
       numPredict: 2400,
       numCtx: 32_768

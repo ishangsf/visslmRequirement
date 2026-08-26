@@ -10,6 +10,7 @@ import type {
   ChatResponse
 } from '../../shared/types'
 import { resolveAssistantExecutionRoute } from './agent-registry'
+import { getAssistantRunContext } from './run-controller'
 
 export interface AssistantTraceContext {
   taskType: AssistantIntentTaskType
@@ -45,7 +46,7 @@ export const createAssistantTaskTrace = (
     runId?: string
   } = {}
 ): AssistantTaskTrace => ({
-  runId: options.runId ?? randomUUID(),
+  runId: options.runId ?? getAssistantRunContext()?.runId ?? randomUUID(),
   status: options.status ?? 'completed',
   primaryAgent: context.primaryAgent,
   invokedAgents: options.status === 'clarification'

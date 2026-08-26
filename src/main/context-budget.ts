@@ -335,7 +335,11 @@ export const compactChatMessageForPersistence = (message: ChatMessage): ChatMess
 export const chatHistoryFromMessages = (
   messages: readonly ChatMessage[]
 ): ChatHistoryTurn[] => messages
-  .filter((message) => message.contextOutcome !== 'failed' && message.contextOutcome !== 'undone')
+  .filter((message) => (
+    message.contextOutcome !== 'failed' &&
+    message.contextOutcome !== 'undone' &&
+    message.taskTrace?.status !== 'cancelled'
+  ))
   .slice(-16)
   .map((message) => ({
     role: message.role,

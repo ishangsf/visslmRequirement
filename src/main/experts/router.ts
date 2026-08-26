@@ -17,6 +17,16 @@ export const expertRegistry: readonly ExpertDefinition[] = [
     systemPromptVersion: 'general-v1'
   },
   {
+    id: 'knowledge-base',
+    name: '知识库专家',
+    mention: '@知识库专家',
+    description: '仅基于已索引知识库文档检索、归纳和回答',
+    icon: 'read',
+    capabilities: ['document-only-retrieval', 'knowledge-question-answering', 'document-provenance'],
+    allowedTools: ['search_document_chunks'],
+    systemPromptVersion: 'knowledge-base-v1'
+  },
+  {
     id: 'visualization',
     name: '数据可视化专家',
     mention: '@数据可视化专家',
@@ -35,6 +45,16 @@ export const expertRegistry: readonly ExpertDefinition[] = [
     capabilities: ['requirement-lookup', 'hybrid-retrieval', 'cross-encoder-rerank', 'deterministic-scoring', 'batch-explanation', 'match-cache'],
     allowedTools: ['locate_requirement', 'hybrid_requirement_retrieval', 'cross_encoder_rerank', 'score_requirement_matches', 'explain_requirement_matches'],
     systemPromptVersion: 'requirement-analysis-v2'
+  },
+  {
+    id: 'artifact',
+    name: '交付物专家',
+    mention: '@交付物专家',
+    description: '把已验证证据生成报告、表格、PPT 或统一导出包',
+    icon: 'file-done',
+    capabilities: ['artifact-spec', 'docx', 'xlsx', 'pptx', 'export-bundle'],
+    allowedTools: ['render_docx', 'render_xlsx', 'render_pptx', 'render_bundle'],
+    systemPromptVersion: 'artifact-v1'
   }
 ] as const
 
@@ -46,10 +66,14 @@ export class ExpertRouter {
   route(input: ExpertRouteInput): ExpertRouteResult {
     const visualization = byId.get('visualization')!
     const general = byId.get('general')!
+    const knowledgeBase = byId.get('knowledge-base')!
     const requirementAnalysis = byId.get('requirement-analysis')!
+    const artifact = byId.get('artifact')!
     const explicitVisualization = /@数据可视化专家(?:\s|$)/.test(input.question)
     const explicitGeneral = /@通用数据助手(?:\s|$)/.test(input.question)
+    const explicitKnowledgeBase = /@知识库专家(?:\s|$)/.test(input.question)
     const explicitRequirementAnalysis = /@需求分析专家(?:\s|$)/.test(input.question)
+    const explicitArtifact = /@交付物专家(?:\s|$)/.test(input.question)
     let result: ExpertRouteResult
     if (explicitVisualization) {
       result = {
@@ -63,11 +87,23 @@ export class ExpertRouter {
         reason: 'explicit-mention',
         question: input.question.replace(/@通用数据助手\s*/g, '').trim()
       }
+    } else if (explicitKnowledgeBase) {
+      result = {
+        expert: knowledgeBase,
+        reason: 'explicit-mention',
+        question: input.question.replace(/@知识库专家\s*/g, '').trim()
+      }
     } else if (explicitRequirementAnalysis) {
       result = {
         expert: requirementAnalysis,
         reason: 'explicit-mention',
         question: input.question.replace(/@需求分析专家\s*/g, '').trim()
+      }
+    } else if (explicitArtifact) {
+      result = {
+        expert: artifact,
+        reason: 'explicit-mention',
+        question: input.question.replace(/@交付物专家\s*/g, '').trim()
       }
     } else if (input.entrypoint === 'dashboard') {
       result = { expert: visualization, reason: 'entrypoint', question: input.question.trim() }

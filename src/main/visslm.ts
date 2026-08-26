@@ -3,6 +3,7 @@ import type {
   ConnectionResult,
   DataReviewApplyResult,
   FieldDefinition,
+  FieldDefinitionNormalizedType,
   PushConfig,
   PushRequestTrace,
   PushResult,
@@ -443,6 +444,59 @@ const readTextCandidate = (object: JsonObject, keys: string[]): string => {
   return ''
 }
 
+const readCaseInsensitiveValue = (object: JsonObject, key: string): unknown => {
+  if (Object.prototype.hasOwnProperty.call(object, key)) return object[key]
+  const normalizedKey = key.toLocaleLowerCase()
+  const actualKey = Object.keys(object).find((candidate) =>
+    candidate.toLocaleLowerCase() === normalizedKey
+  )
+  return actualKey === undefined ? undefined : object[actualKey]
+}
+
+const hasCaseInsensitiveKey = (object: JsonObject, key: string): boolean => {
+  const normalizedKey = key.toLocaleLowerCase()
+  return Object.keys(object).some((candidate) => candidate.toLocaleLowerCase() === normalizedKey)
+}
+
+const readFieldDefinitionText = (object: JsonObject, key: string): string => {
+  const current = readCaseInsensitiveValue(object, key)
+  if (typeof current !== 'string' && typeof current !== 'number') return ''
+  return String(current).trim()
+}
+
+const readFieldDefinitionBoolean = (input: unknown): boolean => {
+  if (typeof input === 'boolean') return input
+  if (typeof input === 'number') return Number.isFinite(input) && input !== 0
+  if (typeof input !== 'string') return false
+  const normalized = input.trim().toLocaleLowerCase()
+  return ['true', '1', 'yes', 'y', 'on', 't', '是', '真'].includes(normalized)
+}
+
+const fieldDefinitionTypeMap: Readonly<Record<string, FieldDefinitionNormalizedType>> = {
+  SINGLELINETEXT: 'string',
+  MULTILINETEXT: 'string',
+  RICH: 'rich_text',
+  LOG: 'log',
+  INTEGER: 'integer',
+  FLOAT: 'number',
+  BOOL: 'boolean',
+  DATE: 'date',
+  DATETIME: 'datetime',
+  DATAENUM: 'enum',
+  SYSTEMENUM: 'system_enum',
+  REFERENCE: 'reference',
+  RELATION: 'relation',
+  URL: 'url',
+  SPECIALTYPE: 'special'
+}
+
+export const normalizeFieldDefinitionType = (
+  sourceType: unknown
+): FieldDefinitionNormalizedType => {
+  const normalized = String(sourceType ?? '').trim().toLocaleUpperCase()
+  return fieldDefinitionTypeMap[normalized] ?? 'unknown'
+}
+
 const parseJsonPayload = (input: unknown): unknown => {
   let current = input
   for (let attempt = 0; attempt < 2 && typeof current === 'string'; attempt += 1) {
@@ -760,21 +814,124 @@ export const parseRichImageUploadCallback = (body: string): string => {
   throw new Error('图片上传响应未返回合法的 CKEditor 图片路径')
 }
 
-const validFieldKey = (field: string): boolean =>
-  field.length > 0 && field.length <= 240 && field !== '_valm_NodeType' &&
-  !FIELD_COLLECTION_KEYS.has(field.toLocaleLowerCase())
+const validFieldKey = (
+  field: string,
+  allowNodeTypeField = false,
+  allowCollectionField = false
+): boolean =>
+  field.length > 0 && field.length <= 240 &&
+  (allowNodeTypeField || field !== '_valm_NodeType') &&
+  (allowCollectionField || !FIELD_COLLECTION_KEYS.has(field.toLocaleLowerCase()))
+
+type FieldDefinitionMetadata = Pick<
+  FieldDefinition,
+  'sourceType' | 'normalizedType' | 'attrType' | 'sourceUid' |
+  'internalMember' | 'conditionUid' | 'isSystem' | 'isEditable' | 'isRemovable'
+>
+
+const emptyFieldDefinitionMetadata = (): FieldDefinitionMetadata => ({
+  sourceType: '',
+  normalizedType: 'unknown',
+  attrType: '',
+  sourceUid: '',
+  internalMember: '',
+  conditionUid: '',
+  isSystem: false,
+  isEditable: false,
+  isRemovable: false
+})
+
+const fieldDefinitionMetadataFromRow = (row: JsonObject): FieldDefinitionMetadata => {
+  const sourceType = readFieldDefinitionText(row, 'MemberType')
+  return {
+    sourceType,
+    normalizedType: normalizeFieldDefinitionType(sourceType),
+    attrType: readFieldDefinitionText(row, 'AttrType'),
+    sourceUid: readFieldDefinitionText(row, 'Uid'),
+    internalMember: readFieldDefinitionText(row, 'Member'),
+    conditionUid: readFieldDefinitionText(row, 'MemberConditionUid'),
+    isSystem: readFieldDefinitionBoolean(readCaseInsensitiveValue(row, 'IsSystem')),
+    isEditable: readFieldDefinitionBoolean(readCaseInsensitiveValue(row, 'IsEdit')),
+    isRemovable: readFieldDefinitionBoolean(readCaseInsensitiveValue(row, 'IsRemove'))
+  }
+}
+
+const fieldDefinitionRowsPayload = (input: unknown): unknown[] | null => {
+  let current = parseJsonPayload(input)
+  for (let depth = 0; depth <= 3; depth += 1) {
+    if (!current || typeof current !== 'object' || Array.isArray(current)) return null
+    const object = current as JsonObject
+    const rowsValue = readCaseInsensitiveValue(object, 'rows')
+    if (hasCaseInsensitiveKey(object, 'rows')) {
+      const rows = parseJsonPayload(rowsValue)
+      return Array.isArray(rows) ? rows : []
+    }
+    // An envelope without rows is a failed/empty member response.  Do not let
+    // the legacy recursive parser treat `total` or `Extend` as a business
+    // field and accidentally replace a known-good catalog.
+    if (hasCaseInsensitiveKey(object, 'total') || hasCaseInsensitiveKey(object, 'extend')) {
+      return []
+    }
+    const next = readCaseInsensitiveValue(object, 'Data')
+    if (next === undefined || next === current) return null
+    current = parseJsonPayload(next)
+  }
+  return null
+}
+
+const parseDeterministicFieldDefinitionRows = (
+  rows: unknown[],
+  fallbackNodeType: string
+): FieldDefinition[] => {
+  const definitions = new Map<string, FieldDefinition>()
+  const fallback = fallbackNodeType.trim()
+  for (const rawRow of rows) {
+    const row = parseJsonPayload(rawRow)
+    if (!row || typeof row !== 'object' || Array.isArray(row)) continue
+    const rowObject = row as JsonObject
+    const nodeType = readFieldDefinitionText(rowObject, 'NodeType') || fallback
+    const field = readFieldDefinitionText(rowObject, 'HideMember')
+    const displayName = stripHtml(readFieldDefinitionText(rowObject, 'MemberName')).trim()
+    if (!nodeType || nodeType.length > 240 || !validFieldKey(field, true, true) ||
+        !displayName || displayName.length > 200) continue
+    definitions.set(`${nodeType}\u0000${field}`, {
+      nodeType,
+      field,
+      displayName,
+      ...fieldDefinitionMetadataFromRow(rowObject)
+    })
+  }
+  return [...definitions.values()]
+}
 
 export const parseFieldDefinitions = (
   input: unknown,
   fallbackNodeType = ''
 ): FieldDefinition[] => {
+  const deterministicRows = fieldDefinitionRowsPayload(input)
+  if (deterministicRows) {
+    return parseDeterministicFieldDefinitionRows(deterministicRows, fallbackNodeType)
+  }
+
   const definitions = new Map<string, FieldDefinition>()
-  const add = (nodeTypeInput: string, fieldInput: string, displayInput: string): void => {
+  const add = (
+    nodeTypeInput: string,
+    fieldInput: string,
+    displayInput: string,
+    metadata: Partial<FieldDefinitionMetadata> = {}
+  ): void => {
     const nodeType = nodeTypeInput.trim() || fallbackNodeType.trim()
     const field = fieldInput.trim()
     const displayName = stripHtml(displayInput).trim()
     if (!nodeType || !validFieldKey(field) || !displayName || displayName.length > 200) return
-    definitions.set(`${nodeType}\u0000${field}`, { nodeType, field, displayName })
+    definitions.set(`${nodeType}\u0000${field}`, {
+      nodeType,
+      field,
+      displayName,
+      ...emptyFieldDefinitionMetadata(),
+      ...metadata,
+      normalizedType: metadata.normalizedType ?? normalizeFieldDefinitionType(metadata.sourceType)
+    })
   }
 
   const visit = (
@@ -793,7 +950,7 @@ export const parseFieldDefinitions = (
     const nodeType = readTextCandidate(object, FIELD_NODE_TYPE_KEYS) || inheritedNodeType
     const field = readTextCandidate(object, FIELD_KEY_KEYS)
     const displayName = readTextCandidate(object, FIELD_DISPLAY_KEYS)
-    if (field && displayName) add(nodeType, field, displayName)
+    if (field && displayName) add(nodeType, field, displayName, fieldDefinitionMetadataFromRow(object))
 
     const dynamicCollection = collectionContext || (depth === 0 && Boolean(nodeType) && !field)
     for (const [key, child] of Object.entries(object)) {
@@ -818,7 +975,9 @@ export const parseFieldDefinitions = (
       if (!child || typeof child !== 'object' || Array.isArray(child)) continue
       const childObject = child as JsonObject
       const childDisplayName = readTextCandidate(childObject, FIELD_DISPLAY_KEYS)
-      if (childDisplayName) add(nodeType, key, childDisplayName)
+      if (childDisplayName) {
+        add(nodeType, key, childDisplayName, fieldDefinitionMetadataFromRow(childObject))
+      }
     }
   }
 
@@ -1003,6 +1162,14 @@ export class VisslmClient {
 
   private richImageAuthenticated = false
 
+  /**
+   * A client instance owns one immutable credential set.  Remember a failed
+   * web login for the lifetime of that instance so optional field-catalog
+   * enrichment cannot immediately submit the same invalid credentials again
+   * when the sync proceeds to user display-name resolution.
+   */
+  private richImageLoginError: unknown
+
   constructor(private readonly credentials: Credentials) {
     if (!credentials.baseUrl || !credentials.username || !credentials.token) {
       throw new Error('请先完整配置 VISSLM 地址、用户名和 API Token')
@@ -1176,13 +1343,35 @@ export class VisslmClient {
 
   private async ensureRichImageLogin(): Promise<void> {
     if (this.richImageAuthenticated && this.hasSessionCookie('JSESSIONID')) return
+    if (this.richImageLoginError) throw this.richImageLoginError
     if (!this.richImageLoginPromise) {
-      this.richImageLoginPromise = this.loginForRichImage()
+      this.richImageLoginPromise = this.loginForRichImage().catch((error) => {
+        this.richImageLoginError = error
+        throw error
+      })
     }
     try {
       await this.richImageLoginPromise
     } finally {
       this.richImageLoginPromise = undefined
+    }
+  }
+
+  private async ensureFieldDefinitionLogin(): Promise<void> {
+    try {
+      // The member catalog and rich-image upload use the same VISSLM web
+      // session.  Reuse that login flow so the platform password never needs
+      // to be sent as part of the catalog request itself.
+      await this.ensureRichImageLogin()
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (message.includes('图片上传密码')) {
+        throw new Error('未配置 VISSLM 平台登录密码，无法读取字段定义')
+      }
+      if (message.includes('图片上传')) {
+        throw new Error(message.replaceAll('图片上传', '平台网页'))
+      }
+      throw error
     }
   }
 
@@ -1303,6 +1492,80 @@ export class VisslmClient {
       }
     }
     return data
+  }
+
+  /**
+   * Read a form-backed JSON endpoint through the browser session.  This
+   * helper is intentionally private and only used by the read-only member
+   * catalog endpoint below: unlike ordinary POST calls, replaying this
+   * request is safe because it only reads metadata.
+   */
+  private async postJsonWithSessionReadOnly(
+    path: string,
+    body: Record<string, string>
+  ): Promise<AlmResponse | unknown> {
+    const form = new URLSearchParams(body)
+    const response = await this.requestWithRetry(
+      this.sessionUrl(path),
+      {
+        method: 'POST',
+        headers: {
+          accept: 'application/json,text/plain,*/*',
+          'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
+          cookie: this.sessionCookieHeader(),
+          origin: new URL(this.baseUrl).origin,
+          referer: this.endpoint('/admin/index').toString(),
+          'x-requested-with': 'XMLHttpRequest'
+        },
+        body: form.toString()
+      },
+      true
+    )
+    this.updateSessionCookies(response)
+    const responseText = await response.text()
+    const loginPage = response.status === 999 || isRichImageLoginResponse(responseText)
+    if (loginPage) {
+      throw new VisslmRequestError(
+        `VISSLM 字段定义会话已过期（HTTP ${response.status}）`,
+        response.status,
+        { ErrorCode: 999 }
+      )
+    }
+    if (!response.ok) {
+      throw new VisslmRequestError(`VISSLM HTTP ${response.status}`, response.status)
+    }
+    let data: AlmResponse | unknown = null
+    try {
+      data = responseText.trim() ? JSON.parse(responseText) as AlmResponse | unknown : null
+    } catch {
+      throw new VisslmInvalidJsonResponseError(
+        describeInvalidJsonResponse(response, responseText),
+        response.status,
+        false
+      )
+    }
+    if (data && typeof data === 'object' && 'ErrorCode' in data) {
+      const result = data as AlmResponse
+      const errorCode = Number(result.ErrorCode)
+      const errorMessage = result.ErrorMessage || result.ErrorMsg || `VISSLM 错误 ${result.ErrorCode}`
+      if (errorCode !== 0) {
+        throw new VisslmRequestError(
+          errorMessage,
+          response.status,
+          data
+        )
+      }
+    }
+    return data
+  }
+
+  private isFieldDefinitionSessionExpired(error: unknown): boolean {
+    if (error instanceof VisslmInvalidJsonResponseError) return error.loginPage
+    if (!(error instanceof VisslmRequestError)) return false
+    if (error.httpStatus === 999) return true
+    if (!error.response || typeof error.response !== 'object') return false
+    const response = error.response as JsonObject
+    return Number(response.ErrorCode ?? response.errorCode) === 999
   }
 
   private async postJson(
@@ -1506,11 +1769,22 @@ export class VisslmClient {
   async getFieldDefinitions(nodeType: string): Promise<FieldDefinition[]> {
     const normalizedNodeType = nodeType.trim()
     if (!normalizedNodeType) return []
-    const response = await this.getJson('/Admin/Virtualization_ReadMember', {
-      nodeType: normalizedNodeType,
-      name: `${this.credentials.username},user`
-    })
-    return parseFieldDefinitions(response, normalizedNodeType)
+    await this.ensureFieldDefinitionLogin()
+    const request = (): Promise<AlmResponse | unknown> => this.postJsonWithSessionReadOnly(
+      '/Admin/Virtualization_ReadMember',
+      { nodeType: normalizedNodeType, proId: '0' }
+    )
+    try {
+      return parseFieldDefinitions(await request(), normalizedNodeType)
+    } catch (error) {
+      if (!this.isFieldDefinitionSessionExpired(error)) throw error
+      // HTTP 999 and an explicit LogOn page are the only conditions that
+      // authorize replaying this otherwise read-only POST.  Generic 4xx/5xx,
+      // malformed JSON, and network failures are not replayed here.
+      this.clearRichImageSession()
+      await this.ensureFieldDefinitionLogin()
+      return parseFieldDefinitions(await request(), normalizedNodeType)
+    }
   }
 
   async getAttachments(id: string): Promise<JsonObject[]> {

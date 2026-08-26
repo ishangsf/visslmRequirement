@@ -1,9 +1,13 @@
 import type {
   ChatDataRow,
   ChatDataView,
-  ChatSource
+  ChatSource,
+  FieldDefinitionNormalizedType,
+  AssistantPlanFilter
 } from '../../../shared/types'
-import { AppDatabase, type FieldQueryResult } from '../../database'
+import type { DataScope, FilterSpec } from '../../../shared/query-spec'
+import { AppDatabase, type FieldQueryFilter, type FieldQueryResult } from '../../database'
+import { QueryEngine } from '../../analytics/query-engine'
 import {
   compactContextValue,
   compactEvidenceJson,
@@ -58,11 +62,19 @@ export interface DataCenterQueryPlan {
   metric?: 'record_count' | 'image_count' | 'count_by_type' | 'count_by_project'
   sort?: { field: string; direction: 'asc' | 'desc' }
   limit: number
+  /** Effective scope after plan confirmation.  Omitted for legacy callers. */
+  scope?: DataScope
 }
 
 export interface DataCenterFieldCatalogEntry {
   field: string
+  displayName?: string
+  role?: 'dimension' | 'measure' | 'time' | 'identifier'
+  synonyms: string[]
   kind: 'technical' | 'business'
+  declaredType?: FieldDefinitionNormalizedType
+  sourceType?: string
+  attrType?: string
   types: string[]
   coverageRate: number
   samples: string[]
@@ -71,6 +83,41 @@ export interface DataCenterFieldCatalogEntry {
 export interface DataCenterFieldCatalog {
   nodeTypes: string[]
   fields: DataCenterFieldCatalogEntry[]
+}
+
+export interface AmbiguousSemanticAlias {
+  alias: string
+  fields: string[]
+}
+
+const normalizeSemanticAlias = (value: string): string => value
+  .normalize('NFKC')
+  .trim()
+  .toLocaleLowerCase()
+
+/**
+ * Resolve only user-maintained aliases. When one mentioned alias points to
+ * multiple real fields the planner must stop instead of choosing a field.
+ */
+export const findAmbiguousSemanticAliases = (
+  question: string,
+  catalog: DataCenterFieldCatalogEntry[]
+): AmbiguousSemanticAlias[] => {
+  const normalizedQuestion = normalizeSemanticAlias(question)
+  const fieldsByAlias = new Map<string, Set<string>>()
+  for (const field of catalog) {
+    for (const synonym of field.synonyms) {
+      const alias = normalizeSemanticAlias(synonym)
+      if (!alias) continue
+      const fields = fieldsByAlias.get(alias) ?? new Set<string>()
+      fields.add(field.field)
+      fieldsByAlias.set(alias, fields)
+    }
+  }
+  return [...fieldsByAlias.entries()]
+    .filter(([alias, fields]) => fields.size > 1 && normalizedQuestion.includes(alias))
+    .map(([alias, fields]) => ({ alias, fields: [...fields].sort() }))
+    .sort((left, right) => left.alias.localeCompare(right.alias))
 }
 
 export interface DataCenterExecution {
@@ -102,6 +149,39 @@ const compactModelToolFieldValue = (value: string | string[]): string | string[]
   return String(compacted ?? '')
 }
 
+const scopeFilterToDatabaseFilter = (filter: FilterSpec | AssistantPlanFilter): {
+  field: string
+  operator:
+    | 'equals'
+    | 'not_equals'
+    | 'contains'
+    | 'not_contains'
+    | 'is_empty'
+    | 'not_empty'
+    | 'gt'
+    | 'gte'
+    | 'lt'
+    | 'lte'
+  value?: string
+} => ({
+  field: String(filter.field ?? '').trim(),
+  operator: filter.operator === 'notEquals'
+    ? 'not_equals'
+    : filter.operator === 'notContains'
+      ? 'not_contains'
+      : filter.operator === 'empty'
+        ? 'is_empty'
+        : filter.operator === 'notEmpty'
+          ? 'not_empty'
+          : filter.operator as ReturnType<typeof scopeFilterToDatabaseFilter>['operator'],
+  ...(filter.value === undefined ? {} : { value: String(filter.value) })
+})
+
+const normalizedStringArray = (value: unknown): string[] | undefined => {
+  if (!Array.isArray(value)) return undefined
+  return [...new Set(value.map((item) => String(item ?? '').trim()).filter(Boolean))]
+}
+
 const normalizeGroupValue = (value: string): string => value
   .normalize('NFKC')
   .toLocaleLowerCase()
@@ -119,17 +199,36 @@ export class DataCenterAgent {
   inspectCatalog(projectId?: string): DataCenterFieldCatalog {
     assertAssistantAgentToolAllowed('data-center', 'inspect_fields')
     const profile = this.db.inspectFields({ projectId, limit: 100 })
+    const semanticProfiles = (() => {
+      try {
+        return new QueryEngine(this.db).profile(projectId ? { projectIds: [projectId] } : {})
+      } catch {
+        return []
+      }
+    })()
+    const semanticsByField = new Map(semanticProfiles.map((field) => [field.field, field]))
     return {
       nodeTypes: this.db.listNodeTypes(),
-      fields: profile.fields.map((field) => ({
-        field: field.field,
-        kind: /^_valm_|^(Record|uid|parentId|projectId|nodeType)$/i.test(field.field)
-          ? 'technical' as const
-          : 'business' as const,
-        types: field.types,
-        coverageRate: field.coverageRate,
-        samples: field.samples.slice(0, 3)
-      }))
+      fields: profile.fields.map((field) => {
+        const semantics = semanticsByField.get(field.field)
+        return {
+          field: field.field,
+          ...(semantics?.displayName || field.displayName
+            ? { displayName: semantics?.displayName || field.displayName }
+            : {}),
+          ...(semantics?.role ? { role: semantics.role } : {}),
+          synonyms: [...new Set(semantics?.synonyms ?? [])],
+          kind: /^_valm_|^(Record|uid|parentId|projectId|nodeType)$/i.test(field.field)
+            ? 'technical' as const
+            : 'business' as const,
+          ...(field.declaredType ? { declaredType: field.declaredType } : {}),
+          ...(field.sourceType ? { sourceType: field.sourceType } : {}),
+          ...(field.attrType ? { attrType: field.attrType } : {}),
+          types: field.types,
+          coverageRate: field.coverageRate,
+          samples: field.samples.slice(0, 3)
+        }
+      })
     }
   }
 
@@ -137,19 +236,35 @@ export class DataCenterAgent {
     let toolName: string
     let args: Record<string, unknown>
     let result: unknown
+    const scope = plan.scope
+    const scopeProjectIds = scope?.projectIds
+    const scopeNodeTypes = scope?.nodeTypes
+    const scopeRecordUids = scope?.recordUids
+    const scopeBaseFilters = scope?.baseFilters?.map(scopeFilterToDatabaseFilter)
+    const scopeArguments = {
+      ...(scopeProjectIds === undefined ? {} : { project_ids: scopeProjectIds }),
+      ...(scopeNodeTypes === undefined ? {} : { node_types: scopeNodeTypes }),
+      ...(scopeRecordUids === undefined ? {} : { record_uids: scopeRecordUids }),
+      ...(scopeBaseFilters === undefined ? {} : { base_filters: scopeBaseFilters }),
+      ...(scopeProjectIds !== undefined && scopeProjectIds.length === 0 ? { scope_all_projects: true } : {}),
+      ...(scopeNodeTypes !== undefined && scopeNodeTypes.length === 0 ? { scope_all_node_types: true } : {})
+    }
     if (plan.intent === 'schema_inspection') {
       toolName = 'inspect_fields'
       args = {
         project_id: projectId,
         node_type: plan.nodeType,
-        limit: plan.limit
+        limit: plan.limit,
+        ...scopeArguments
       }
       result = this.executeTool(toolName, args, projectId)
     } else if (plan.intent === 'total') {
       toolName = 'aggregate_records'
       args = {
         metric: plan.metric ?? 'record_count',
-        project_id: projectId
+        project_id: projectId,
+        filters: plan.filters,
+        ...scopeArguments
       }
       result = this.executeTool(toolName, args, projectId)
     } else if (plan.intent === 'field_aggregate') {
@@ -159,7 +274,9 @@ export class DataCenterAgent {
         project_id: projectId,
         node_type: plan.nodeType,
         limit: plan.limit,
-        split_multi_value: true
+        split_multi_value: true,
+        filters: plan.filters,
+        ...scopeArguments
       }
       result = this.executeTool(toolName, args, projectId)
     } else {
@@ -177,6 +294,7 @@ export class DataCenterAgent {
       args = {
         project_id: projectId,
         node_type: plan.nodeType,
+        ...scopeArguments,
         search_terms: effectiveSearchTerms,
         search_mode: plan.searchMode,
         filters: plan.filters,
@@ -187,10 +305,16 @@ export class DataCenterAgent {
         group_entities: plan.groupEntities
       }
       result = this.db.queryRecordsByFields({
-        projectId,
-        nodeType: plan.nodeType,
+        ...(scopeProjectIds === undefined
+          ? { projectId }
+          : scopeProjectIds.length ? { projectIds: scopeProjectIds } : {}),
+        ...(scopeNodeTypes === undefined
+          ? { nodeType: plan.nodeType }
+          : scopeNodeTypes.length ? { nodeTypes: scopeNodeTypes } : {}),
+        ...(scopeRecordUids === undefined ? {} : { recordUids: scopeRecordUids }),
         searchTerms: effectiveSearchTerms,
         searchMode: plan.searchMode,
+        baseFilters: scopeBaseFilters,
         filters: plan.filters,
         fields: plan.fields,
         sort: plan.sort,
@@ -226,10 +350,16 @@ export class DataCenterAgent {
     selectedProjectId?: string
   ): unknown {
     assertAssistantAgentToolAllowed('data-center', name)
+    const projectIds = normalizedStringArray(args.project_ids)
+    const nodeTypes = normalizedStringArray(args.node_types)
+    const recordUids = normalizedStringArray(args.record_uids)
+    const fallbackProjectId = args.scope_all_projects === true
+      ? undefined
+      : String(args.project_id ?? selectedProjectId ?? '') || undefined
     if (name === 'search_records') {
       const results = this.db.searchForAgent(
         String(args.query ?? ''),
-        String(args.project_id ?? selectedProjectId ?? '') || undefined,
+        fallbackProjectId,
         Math.min(20, Math.max(1, Number(args.limit ?? 8)))
       )
       return results.map((item) => ({
@@ -240,8 +370,15 @@ export class DataCenterAgent {
     }
     if (name === 'inspect_fields') {
       const result = this.db.inspectFields({
-        projectId: String(args.project_id ?? selectedProjectId ?? '') || undefined,
-        nodeType: String(args.node_type ?? '') || undefined,
+        ...(projectIds === undefined
+          ? { projectId: fallbackProjectId }
+          : { projectIds: args.scope_all_projects === true ? undefined : projectIds }),
+        ...(nodeTypes === undefined
+          ? { nodeType: String(args.node_type ?? '') || undefined }
+          : { nodeTypes: args.scope_all_node_types === true ? undefined : nodeTypes }),
+        ...(recordUids === undefined
+          ? {}
+          : { recordUids }),
         search: String(args.search ?? '') || undefined,
         limit: Math.min(100, Math.max(1, Number(args.limit ?? 40)))
       })
@@ -285,11 +422,27 @@ export class DataCenterAgent {
           ? args.sort as Record<string, unknown>
           : null
       const result = this.db.queryRecordsByFields({
-        projectId: String(args.project_id ?? selectedProjectId ?? '') || undefined,
-        nodeType: String(args.node_type ?? '') || undefined,
+        ...(projectIds === undefined
+          ? { projectId: fallbackProjectId }
+          : { projectIds: args.scope_all_projects === true ? undefined : projectIds }),
+        ...(nodeTypes === undefined
+          ? { nodeType: String(args.node_type ?? '') || undefined }
+          : { nodeTypes: args.scope_all_node_types === true ? undefined : nodeTypes }),
+        ...(recordUids === undefined
+          ? {}
+          : { recordUids }),
         search: String(args.search ?? '') || undefined,
         searchTerms,
         searchMode: args.search_mode === 'all' ? 'all' : 'any',
+        baseFilters: Array.isArray(args.base_filters)
+          ? args.base_filters
+              .filter((filter): filter is Record<string, unknown> => Boolean(filter) && typeof filter === 'object' && !Array.isArray(filter))
+              .map((filter) => ({
+                field: String(filter.field ?? ''),
+                operator: String(filter.operator ?? 'equals') as FieldQueryFilter['operator'],
+                value: filter.value === undefined ? undefined : String(filter.value)
+              }))
+          : [],
         filters,
         fields,
         sort: sortInput?.field
@@ -341,14 +494,82 @@ export class DataCenterAgent {
     if (name === 'aggregate_records') {
       return this.db.aggregate(
         String(args.metric ?? 'count_by_type'),
-        String(args.project_id ?? selectedProjectId ?? '') || undefined
+        fallbackProjectId,
+        {
+          ...(projectIds === undefined || args.scope_all_projects === true ? {} : { projectIds }),
+          ...(nodeTypes === undefined || args.scope_all_node_types === true ? {} : { nodeTypes }),
+          ...(recordUids === undefined ? {} : { recordUids }),
+          filters: Array.isArray(args.filters)
+            ? args.filters
+                .filter((filter): filter is Record<string, unknown> => Boolean(filter) && typeof filter === 'object' && !Array.isArray(filter))
+                .map((filter) => ({
+                  field: String(filter.field ?? ''),
+                  operator: String(filter.operator ?? 'equals') as FieldQueryFilter['operator'],
+                  value: filter.value === undefined ? undefined : String(filter.value)
+                }))
+            : [],
+          baseFilters: Array.isArray(args.base_filters)
+            ? args.base_filters
+                .filter((filter): filter is Record<string, unknown> => Boolean(filter) && typeof filter === 'object' && !Array.isArray(filter))
+                .map((filter) => ({
+                  field: String(filter.field ?? ''),
+                  operator: String(filter.operator ?? 'equals') as FieldQueryFilter['operator'],
+                  value: filter.value === undefined ? undefined : String(filter.value)
+                }))
+            : []
+        }
       )
     }
     if (name === 'aggregate_by_field') {
       return this.db.aggregateByField({
         field: String(args.field ?? ''),
-        projectId: String(args.project_id ?? selectedProjectId ?? '') || undefined,
-        nodeType: String(args.node_type ?? '') || undefined,
+        ...(projectIds === undefined
+          ? { projectId: fallbackProjectId }
+          : { projectIds: args.scope_all_projects === true ? undefined : projectIds }),
+        ...(nodeTypes === undefined
+          ? { nodeType: String(args.node_type ?? '') || undefined }
+          : { nodeTypes: args.scope_all_node_types === true ? undefined : nodeTypes }),
+        ...(recordUids === undefined
+          ? {}
+          : { recordUids }),
+        filters: Array.isArray(args.filters)
+          ? args.filters
+              .filter((filter): filter is Record<string, unknown> => Boolean(filter) && typeof filter === 'object' && !Array.isArray(filter))
+              .map((filter) => ({
+                field: String(filter.field ?? ''),
+                operator: String(filter.operator ?? 'equals') as
+                  | 'equals'
+                  | 'not_equals'
+                  | 'contains'
+                  | 'not_contains'
+                  | 'is_empty'
+                  | 'not_empty'
+                  | 'gt'
+                  | 'gte'
+                  | 'lt'
+                  | 'lte',
+                value: filter.value === undefined ? undefined : String(filter.value)
+              }))
+          : [],
+        baseFilters: Array.isArray(args.base_filters)
+          ? args.base_filters
+              .filter((filter): filter is Record<string, unknown> => Boolean(filter) && typeof filter === 'object' && !Array.isArray(filter))
+              .map((filter) => ({
+                field: String(filter.field ?? ''),
+                operator: String(filter.operator ?? 'equals') as
+                  | 'equals'
+                  | 'not_equals'
+                  | 'contains'
+                  | 'not_contains'
+                  | 'is_empty'
+                  | 'not_empty'
+                  | 'gt'
+                  | 'gte'
+                  | 'lt'
+                  | 'lte',
+                value: filter.value === undefined ? undefined : String(filter.value)
+              }))
+          : [],
         limit: Math.min(50, Math.max(1, Number(args.limit ?? 10))),
         splitMultiValue: args.split_multi_value !== false
       })
@@ -385,16 +606,33 @@ export class DataCenterAgent {
       }
       const field = String(aggregate.field ?? args.field ?? '').trim()
       if (!field || !aggregate.items?.length) return null
+      const projectIds = normalizedStringArray(args.project_ids)
+      const nodeTypes = normalizedStringArray(args.node_types)
+      const recordUids = normalizedStringArray(args.record_uids)
+      const baseFilters: FieldQueryFilter[] = Array.isArray(args.base_filters)
+        ? args.base_filters
+            .filter((filter): filter is Record<string, unknown> => Boolean(filter) && typeof filter === 'object' && !Array.isArray(filter))
+            .map((filter) => ({
+              field: String(filter.field ?? ''),
+              operator: String(filter.operator ?? 'equals') as FieldQueryFilter['operator'],
+              value: filter.value === undefined ? undefined : String(filter.value)
+            }))
+        : []
       const fieldLabels = this.db.getFieldDisplayNames(
-        String(args.node_type ?? '').trim(),
+        nodeTypes?.length ? nodeTypes : String(args.node_type ?? '').trim(),
         [field]
       )
       const groups = aggregate.items.slice(0, 5).map((item) => {
         const groupName = String(item.name ?? '')
         const query = this.db.queryRecordsByFields({
-          projectId: String(args.project_id ?? selectedProjectId ?? '') || undefined,
-          nodeType: String(args.node_type ?? '') || undefined,
-          filters: [{ field, operator: 'contains', value: groupName }],
+          ...(projectIds === undefined
+            ? { projectId: args.scope_all_projects === true ? undefined : String(args.project_id ?? selectedProjectId ?? '') || undefined }
+            : { projectIds: args.scope_all_projects === true ? undefined : projectIds }),
+          ...(nodeTypes === undefined
+            ? { nodeType: String(args.node_type ?? '') || undefined }
+            : { nodeTypes: args.scope_all_node_types === true ? undefined : nodeTypes }),
+          ...(recordUids === undefined ? {} : { recordUids }),
+          filters: [...baseFilters, { field, operator: 'contains', value: groupName }],
           fields: [field],
           limit: 100
         })

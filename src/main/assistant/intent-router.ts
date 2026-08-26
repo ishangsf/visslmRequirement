@@ -23,7 +23,8 @@ const taskTypes: readonly AssistantIntentTaskType[] = [
   'knowledge_qa',
   'mixed_analysis',
   'visualization',
-  'requirement_matching'
+  'requirement_matching',
+  'artifact_generation'
 ]
 
 const sourceModes: readonly AssistantIntentSourceMode[] = [
@@ -38,10 +39,14 @@ const resultModes: readonly AssistantIntentResultMode[] = [
   'list',
   'grouped_list',
   'table',
-  'dashboard'
+  'dashboard',
+  'artifact'
 ]
 
-const skillIds = new Set(['general', 'visualization', 'requirement-analysis'])
+const skillIds = new Set(['general', 'knowledge-base', 'visualization', 'requirement-analysis', 'artifact'])
+
+const intentInitialOutputBudget = 900
+const intentRetryOutputBudget = 1_800
 
 export const assistantIntentDecisionFormat = {
   type: 'object',
@@ -58,7 +63,7 @@ export const assistantIntentDecisionFormat = {
   ],
   properties: {
     taskType: { type: 'string', enum: taskTypes },
-    skillId: { type: 'string', enum: ['general', 'visualization', 'requirement-analysis'] },
+    skillId: { type: 'string', enum: ['general', 'knowledge-base', 'visualization', 'requirement-analysis', 'artifact'] },
     sourceMode: { type: 'string', enum: sourceModes },
     resolvedQuestion: { type: 'string' },
     resultMode: { type: 'string', enum: resultModes },
@@ -76,10 +81,12 @@ export const assistantIntentDecisionFormat = {
 const mentionPatterns = {
   visualization: /@数据可视化专家(?=$|[\s，,。！？!?：:；;])/u,
   requirement: /@需求分析专家(?=$|[\s，,。！？!?：:；;])/u,
+  knowledge: /@知识库专家(?=$|[\s，,。！？!?：:；;])/u,
+  artifact: /@交付物专家(?=$|[\s，,。！？!?：:；;])/u,
   general: /@通用数据助手(?=$|[\s，,。！？!?：:；;])/u
 } as const
 
-const allMentionPattern = /@(?:数据可视化专家|需求分析专家|通用数据助手)\s*/gu
+const allMentionPattern = /@(?:数据可视化专家|需求分析专家|知识库专家|交付物专家|通用数据助手)\s*/gu
 
 const normalizedGrounding = (value: string): string => (
   value
@@ -132,6 +139,15 @@ const parseModelJson = (response: ModelResponse): Record<string, unknown> => {
   return parsed as Record<string, unknown>
 }
 
+const hasEmptyVisibleContent = (response: ModelResponse): boolean => (
+  !(response.message?.content?.trim() ?? '')
+)
+
+const isLengthTruncated = (response: ModelResponse): boolean => {
+  const reason = response.done_reason?.trim().toLocaleLowerCase()
+  return reason === 'length' || reason === 'max_tokens' || reason === 'max_output_tokens'
+}
+
 const enumValue = <T extends string>(values: readonly T[], value: unknown): T | undefined => {
   const candidate = typeof value === 'string' ? value.trim() : ''
   return values.includes(candidate as T) ? candidate as T : undefined
@@ -141,17 +157,23 @@ const canonicalSourceForTask = (taskType: AssistantIntentTaskType): AssistantInt
   if (taskType === 'conversation') return 'conversation'
   if (taskType === 'knowledge_qa') return 'knowledge'
   if (taskType === 'mixed_analysis') return 'mixed'
+  if (taskType === 'artifact_generation') return 'mixed'
   return 'records'
 }
 
-const canonicalSkillForTask = (taskType: AssistantIntentTaskType): 'general' | 'visualization' | 'requirement-analysis' => {
+const canonicalSkillForTask = (
+  taskType: AssistantIntentTaskType
+): 'general' | 'knowledge-base' | 'visualization' | 'requirement-analysis' | 'artifact' => {
+  if (taskType === 'knowledge_qa') return 'knowledge-base'
   if (taskType === 'visualization') return 'visualization'
   if (taskType === 'requirement_matching') return 'requirement-analysis'
+  if (taskType === 'artifact_generation') return 'artifact'
   return 'general'
 }
 
 const defaultResultForTask = (taskType: AssistantIntentTaskType): AssistantIntentResultMode => {
   if (taskType === 'visualization') return 'dashboard'
+  if (taskType === 'artifact_generation') return 'artifact'
   return taskType === 'record_query' ? 'list' : 'answer'
 }
 
@@ -191,7 +213,17 @@ const validatedGroupEntities = (
 const clarificationFor = (taskType: AssistantIntentTaskType | undefined): string => {
   if (taskType === 'visualization') return '请说明要生成或修改的大屏主题、数据范围或组件。'
   if (taskType === 'requirement_matching') return '请提供要分析的需求编号或明确的需求范围。'
+  if (taskType === 'artifact_generation') return '请先选择一条包含可核验证据的已完成回答，再生成交付物。'
   return '请明确要查询的数据范围、资料来源或希望得到的结果形式。'
+}
+
+const artifactSourceModeOf = (
+  source: ChatRequest['artifactSource']
+): Exclude<AssistantIntentSourceMode, 'conversation'> => {
+  const hasDocument = source?.evidenceBlocks.some((block) => block.kind === 'document') === true
+  const hasRecords = source?.evidenceBlocks.some((block) => block.kind !== 'document') === true
+  if (hasDocument && hasRecords) return 'mixed'
+  return hasDocument ? 'knowledge' : 'records'
 }
 
 const capabilitySummary = expertRegistry.map((expert) => ({
@@ -212,7 +244,7 @@ export class AssistantIntentRouter {
   }
 
   async resolve(
-    request: Pick<ChatRequest, 'question' | 'history' | 'entrypoint' | 'expertId' | 'chatMode'>
+    request: Pick<ChatRequest, 'question' | 'history' | 'entrypoint' | 'expertId' | 'chatMode' | 'artifactSource'>
   ): Promise<AssistantIntentDecision> {
     const question = String(request.question ?? '').trim()
     const cleanedQuestion = stripMentions(question)
@@ -258,6 +290,34 @@ export class AssistantIntentRouter {
         reason: 'explicit-requirement-skill'
       }
     }
+    if (mentionPatterns.knowledge.test(question)) {
+      return {
+        taskType: 'knowledge_qa',
+        skillId: 'knowledge-base',
+        sourceMode: 'knowledge',
+        resolvedQuestion: cleanedQuestion,
+        resultMode: 'answer',
+        groupEntities: [],
+        needsClarification: false,
+        reason: 'explicit-knowledge-base-skill'
+      }
+    }
+    if (mentionPatterns.artifact.test(question)) {
+      const hasEvidence = Boolean(request.artifactSource?.evidenceBlocks.length)
+      return {
+        taskType: 'artifact_generation',
+        skillId: 'artifact',
+        sourceMode: artifactSourceModeOf(request.artifactSource),
+        resolvedQuestion: cleanedQuestion,
+        resultMode: 'artifact',
+        groupEntities: [],
+        needsClarification: !hasEvidence,
+        ...(!hasEvidence
+          ? { clarificationQuestion: '请先选择一条包含可核验证据的已完成回答，再调用 @交付物专家。' }
+          : {}),
+        reason: 'explicit-artifact-skill'
+      }
+    }
 
     const forcedSkill = mentionPatterns.general.test(question) ? 'general' : undefined
     const exactIds = forcedSkill ? [] : extractExplicitRequirementIds(cleanedQuestion)
@@ -274,48 +334,53 @@ export class AssistantIntentRouter {
       }
     }
 
-    const response = await this.client.chat({
-      messages: [
-        {
-          role: 'system',
-          content: [
-            '你是 VISSLM Auto 助手的统一意图路由器，只输出一个严格 JSON 决策，不回答用户问题。',
-            '这是模型优先的分类阶段：不得访问、猜测或依赖数据库字段、向量索引、知识库内容或工具结果。',
-            'taskType 必须是 conversation、record_query、knowledge_qa、mixed_analysis、visualization、requirement_matching 之一。',
-            'sourceMode 必须分别表示普通对话、数据中心记录、上传文档知识库或两种来源；不要把记录向量当作文档知识。',
-            'visualization 只用于明确的大屏/看板/图表交付，requirement_matching 只用于需求编号或需求相似匹配；普通数据列表、筛选、统计和分析使用 record_query。',
-            'resultMode 表示 answer、list、grouped_list、table 或 dashboard。用户要求按多个已提及实体分别列出时使用 grouped_list。',
-            'groupEntities 只能填写当前问题或用户历史中实际出现、且与 grouped_list 直接相关的实体；不得创造、补全或猜测名称。',
-            '当前句子省略实体时，可以从用户历史恢复明确实体；不要把助手上一轮的推测当作用户实体。',
-            '来源、范围、字段或交付形式不能安全确定时，设置 needsClarification=true，给出具体 clarificationQuestion，并且不要猜测查询。',
-            '不要宣称支持未列出的文件格式或交付物。',
-            ...(forcedSkill ? [`用户显式选择了 general 技能，skillId 必须保持 general；只在该技能能力范围内选择任务。`] : []),
-            `已注册技能能力：${JSON.stringify(capabilitySummary)}`,
-            '输出严格 JSON，不要 Markdown。'
-          ].join('\n')
-        },
-        {
-          role: 'user',
-          content: JSON.stringify({
-            currentQuestion: question,
-            conversationHistory: history.map((message) => ({
-              role: message.role,
-              content: message.content
-            })),
-            ...(forcedSkill ? { forcedSkill } : {})
-          })
-        }
-      ],
-      think: true,
-      forceThinking: true,
+    const messages: ModelChatInput['messages'] = [
+      {
+        role: 'system',
+        content: [
+          '你是 VISSLM Auto 助手的统一意图路由器，只输出一个严格 JSON 决策，不回答用户问题。',
+          '这是模型优先的分类阶段：不得访问、猜测或依赖数据库字段、向量索引、知识库内容或工具结果。',
+          'taskType 必须是 conversation、record_query、knowledge_qa、mixed_analysis、visualization、requirement_matching、artifact_generation 之一。',
+          'sourceMode 必须分别表示普通对话、数据中心记录、上传文档知识库或两种来源；不要把记录向量当作文档知识。',
+          'visualization 只用于明确的大屏/看板/图表交付，requirement_matching 只用于需求编号或需求相似匹配，artifact_generation 只用于把已验证证据生成 DOCX/XLSX/PPTX/ZIP；普通数据列表、筛选、统计和分析使用 record_query。',
+          'resultMode 表示 answer、list、grouped_list、table 或 dashboard。用户要求按多个已提及实体分别列出时使用 grouped_list。',
+          'groupEntities 只能填写当前问题或用户历史中实际出现、且与 grouped_list 直接相关的实体；不得创造、补全或猜测名称。',
+          '当前句子省略实体时，可以从用户历史恢复明确实体；不要把助手上一轮的推测当作用户实体。',
+          '来源、范围、字段或交付形式不能安全确定时，设置 needsClarification=true，给出具体 clarificationQuestion，并且不要猜测查询。',
+          '不要宣称支持未列出的文件格式或交付物。',
+          ...(forcedSkill ? [`用户显式选择了 general 技能，skillId 必须保持 general；只在该技能能力范围内选择任务。`] : []),
+          `已注册技能能力：${JSON.stringify(capabilitySummary)}`,
+          '输出严格 JSON，不要 Markdown。'
+        ].join('\n')
+      },
+      {
+        role: 'user',
+        content: JSON.stringify({
+          currentQuestion: question,
+          conversationHistory: history.map((message) => ({
+            role: message.role,
+            content: message.content
+          })),
+          ...(forcedSkill ? { forcedSkill } : {})
+        })
+      }
+    ]
+    const classify = (numPredict: number): Promise<ModelResponse> => this.client.chat({
+      messages,
+      think: false,
+      forceThinking: false,
       format: assistantIntentDecisionFormat,
       temperature: 0,
-      numPredict: 900
+      numPredict
     })
+    let response = await classify(intentInitialOutputBudget)
+    if (hasEmptyVisibleContent(response) || isLengthTruncated(response)) {
+      response = await classify(intentRetryOutputBudget)
+    }
     const raw = parseModelJson(response)
     const taskType = enumValue(taskTypes, raw.taskType)
     const modelSkill = typeof raw.skillId === 'string' && skillIds.has(raw.skillId.trim())
-      ? raw.skillId.trim() as 'general' | 'visualization' | 'requirement-analysis'
+      ? raw.skillId.trim() as 'general' | 'knowledge-base' | 'visualization' | 'requirement-analysis' | 'artifact'
       : undefined
     const rawSourceMode = enumValue(sourceModes, raw.sourceMode)
     const rawResultMode = enumValue(resultModes, raw.resultMode)
@@ -347,9 +412,11 @@ export class AssistantIntentRouter {
     ].filter(Boolean).join('\n')
     const modelNeedsClarification = raw.needsClarification === true
     const groupedWithoutGroundedEntities = resultMode === 'grouped_list' && entities.length === 0
+    const artifactWithoutEvidence = resolvedTask === 'artifact_generation' &&
+      !request.artifactSource?.evidenceBlocks.length
     const sourceMismatch = rawSourceMode !== undefined && rawSourceMode !== sourceMode
     const taskSkillMismatch = modelSkill !== undefined && modelSkill !== canonicalSkillForTask(resolvedTask)
-    const needsClarification = modelNeedsClarification || groupedWithoutGroundedEntities ||
+    const needsClarification = modelNeedsClarification || groupedWithoutGroundedEntities || artifactWithoutEvidence ||
       hasUngroundedGroupEntity || invalidDecisionShape || sourceMismatch || taskSkillMismatch
     const clarificationQuestion = typeof raw.clarificationQuestion === 'string'
       ? sanitizeContextText(raw.clarificationQuestion, 240).trim()
@@ -361,7 +428,7 @@ export class AssistantIntentRouter {
     // A forced general mention can still classify conversation, records,
     // knowledge or mixed work. It cannot silently escalate to a specialist.
     const normalizedTask = forcedSkill === 'general' && (
-      resolvedTask === 'visualization' || resolvedTask === 'requirement_matching'
+      resolvedTask === 'visualization' || resolvedTask === 'requirement_matching' || resolvedTask === 'artifact_generation'
     ) ? 'record_query' : resolvedTask
     const normalizedSource = canonicalSourceForTask(normalizedTask)
     const normalizedResult = normalizedTask === 'record_query' && resultMode === 'dashboard'
@@ -382,6 +449,8 @@ export class AssistantIntentRouter {
             clarificationQuestion: clarificationQuestion || (
                 hasUngroundedGroupEntity
                 ? '分组实体必须来自当前问题或用户历史，请确认要分别列出的实体。'
+                : artifactWithoutEvidence
+                  ? '请先选择一条包含可核验证据的已完成回答，再生成交付物。'
                 : invalidDecisionShape || sourceMismatch || taskSkillMismatch
                   ? '统一意图决策不完整或来源不一致，请明确任务类型、数据来源和结果形式。'
                 : clarificationFor(normalizedTask)
@@ -396,7 +465,7 @@ export class AssistantIntentRouter {
 }
 
 export const resolveAssistantIntent = (
-  request: Pick<ChatRequest, 'question' | 'history' | 'entrypoint' | 'expertId' | 'chatMode'>,
+  request: Pick<ChatRequest, 'question' | 'history' | 'entrypoint' | 'expertId' | 'chatMode' | 'artifactSource'>,
   settings: ModelSettings,
   client?: AssistantIntentModelClient
 ): Promise<AssistantIntentDecision> => new AssistantIntentRouter(settings, client).resolve(request)

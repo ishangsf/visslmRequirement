@@ -75,19 +75,44 @@ const checks = await evaluate(`(async () => {
 })()`)
 
 await call('Page.enable')
-const shot = await call('Page.captureScreenshot', { format: 'png', fromSurface: true })
-const screenshot = join(process.env.TEMP, 'visslm-chat-redesign.png')
-writeFileSync(screenshot, Buffer.from(shot.result.data, 'base64'))
 const themeSetup = await evaluate(`(async () => {
   const originalTheme = document.documentElement.dataset.theme || 'dark';
-  if (originalTheme !== 'light') {
+  if (originalTheme !== 'dark') {
     document.querySelector('.window-theme-toggle')?.click();
     await new Promise((resolve) => setTimeout(resolve, 240));
   }
   return {
     originalTheme,
-    lightApplied: document.documentElement.dataset.theme === 'light'
+    darkApplied: document.documentElement.dataset.theme === 'dark'
   };
+})()`)
+const darkThemeChecks = await evaluate(`(() => {
+  const surfaces = [
+    document.querySelector('.chat-history-panel'),
+    document.querySelector('.chat-card'),
+    document.querySelector('.composer-input')
+  ].filter(Boolean);
+  const surfaceColors = surfaces.map((element) => getComputedStyle(element).backgroundColor);
+  const textColor = getComputedStyle(
+    document.querySelector('.chat-session-title') || document.body
+  ).color;
+  return {
+    darkThemeApplied: document.documentElement.dataset.theme === 'dark',
+    darkThemeSurfaces: surfaces.length === 3 && surfaceColors.every(
+      (color) => color && color !== 'transparent' && color !== 'rgba(0, 0, 0, 0)'
+    ),
+    darkThemeSurfaceColors: surfaceColors,
+    darkThemeTextColor: textColor
+  };
+})()`)
+const shot = await call('Page.captureScreenshot', { format: 'png', fromSurface: true })
+const screenshot = join(process.env.TEMP, 'visslm-chat-redesign.png')
+writeFileSync(screenshot, Buffer.from(shot.result.data, 'base64'))
+await evaluate(`(async () => {
+  if (document.documentElement.dataset.theme !== 'light') {
+    document.querySelector('.window-theme-toggle')?.click();
+    await new Promise((resolve) => setTimeout(resolve, 240));
+  }
 })()`)
 const lightThemeChecks = await evaluate(`(() => {
   const surfaces = [
@@ -175,6 +200,24 @@ const historyUiChecks = await evaluate(`(async () => {
   }
   const historyItems = [...(panel?.querySelectorAll('.chat-history-item') ?? [])]
   const historyItemCount = historyItems.length
+  const historyBody = panel?.querySelector('.chat-history-panel-body')
+  const historyList = panel?.querySelector('.chat-history-list')
+  const historyBodyStyle = historyBody ? getComputedStyle(historyBody) : null
+  const historyListStyle = historyList ? getComputedStyle(historyList) : null
+  const historyHintRemoved = !panel?.querySelector('.chat-history-hint')
+  const historyRowsCompact = historyItems.length === 0 || historyItems.every(
+    (item) => item.getBoundingClientRect().height <= 64
+  )
+  const inactiveHistoryItems = historyItems.filter((item) => !item.classList.contains('active'))
+  const isTransparent = (color) => !color || color === 'transparent' || color === 'rgba(0, 0, 0, 0)'
+  const historyRowsFlattened = inactiveHistoryItems.length === 0 || inactiveHistoryItems.every((item) => {
+    const style = getComputedStyle(item)
+    return isTransparent(style.backgroundColor) && isTransparent(style.borderTopColor)
+  })
+  const historyListOwnsScroll = !historyList || Boolean(
+    historyBodyStyle?.overflowY === 'hidden' &&
+    ['auto', 'scroll'].includes(historyListStyle?.overflowY ?? '')
+  )
   const itemDetails = historyItems.map((item) => ({
     title: item.querySelector('.chat-history-item-main strong')?.textContent?.trim() ?? '',
     preview: item.querySelector('.chat-history-item-main small')?.textContent?.trim() ?? ''
@@ -322,6 +365,10 @@ const historyUiChecks = await evaluate(`(async () => {
     historySearchTitleSkipped: titleSearchSkipped,
     historySearchPreviewSkipped: previewSearchSkipped,
     historyItemCount,
+    historyHintRemoved,
+    historyRowsCompact,
+    historyRowsFlattened,
+    historyListOwnsScroll,
     historyToggle: Boolean(historyToggle),
     historyPanelCollapseObserved: collapseObserved,
     historyPanelRestoreObserved: restoreObserved,
@@ -432,6 +479,101 @@ const taskDetailChecks = await evaluate(`(async () => {
     completedTaskDetailsRestoreObserved: restoreObserved
   }
 })()`)
+
+const messagePresentationChecks = await evaluate(`(() => {
+  const assistantRow = document.querySelector('.message-row.assistant:not(:has(.message-bubble.thinking))')
+  const userRow = document.querySelector('.message-row.user')
+  const assistantBubble = assistantRow?.querySelector('.message-bubble')
+  const userBubble = userRow?.querySelector('.message-bubble')
+  const assistantAvatar = assistantRow?.querySelector('.message-avatar')
+  const userAvatar = userRow?.querySelector('.message-avatar')
+  const assistantMeta = assistantRow?.querySelector('.message-meta')
+  const userMeta = userRow?.querySelector('.message-meta')
+  const assistantMarkdown = assistantRow?.querySelector('.chat-markdown')
+  const assistantRect = assistantRow?.getBoundingClientRect()
+  const userRect = userRow?.getBoundingClientRect()
+  const assistantBubbleRect = assistantBubble?.getBoundingClientRect()
+  const userBubbleRect = userBubble?.getBoundingClientRect()
+  const assistantAvatarRect = assistantAvatar?.getBoundingClientRect()
+  const userAvatarRect = userAvatar?.getBoundingClientRect()
+  const assistantMetaRect = assistantMeta?.getBoundingClientRect()
+  const userMetaRect = userMeta?.getBoundingClientRect()
+  const rolesPresent = Boolean(assistantRow && userRow && assistantBubble && userBubble)
+  const roleAlignmentSeparated = !rolesPresent || Boolean(
+    assistantRect && userRect && assistantBubbleRect && userBubbleRect &&
+    assistantAvatarRect && userAvatarRect && assistantMetaRect && userMetaRect &&
+    assistantBubbleRect.left < userBubbleRect.left &&
+    assistantAvatarRect.left < userAvatarRect.left &&
+    assistantMetaRect.left < userMetaRect.left
+  )
+  const visibleInlineHeadingMarker = /(?:^|\\s)#{2,4}\\s+\\S/.test(
+    assistantMarkdown?.textContent ?? ''
+  )
+  const structuredMarkdownPresent = Boolean(
+    assistantMarkdown?.querySelector('h1, h2, h3, h4, ol, ul, blockquote, table, pre')
+  )
+
+  return {
+    messageRolesPresent: rolesPresent,
+    messageRoleAlignmentSkipped: !rolesPresent,
+    messageRoleAlignmentSeparated: roleAlignmentSeparated,
+    assistantRowLeft: assistantRect?.left ?? null,
+    assistantRowRight: assistantRect?.right ?? null,
+    userRowLeft: userRect?.left ?? null,
+    userRowRight: userRect?.right ?? null,
+    assistantBubbleLeft: assistantBubbleRect?.left ?? null,
+    userBubbleLeft: userBubbleRect?.left ?? null,
+    assistantAvatarLeft: assistantAvatarRect?.left ?? null,
+    userAvatarLeft: userAvatarRect?.left ?? null,
+    legacyMarkdownMarkerHidden: !visibleInlineHeadingMarker,
+    structuredMarkdownPresent
+  }
+})()`)
+await evaluate(`(() => {
+  const list = document.querySelector('.message-list')
+  if (list) list.scrollTop = 0
+})()`)
+await new Promise((resolve) => setTimeout(resolve, 100))
+const messageShot = await call('Page.captureScreenshot', { format: 'png', fromSurface: true })
+const messageScreenshot = join(process.env.TEMP, 'visslm-chat-message-layout.png')
+writeFileSync(messageScreenshot, Buffer.from(messageShot.result.data, 'base64'))
+
+await call('Emulation.setDeviceMetricsOverride', {
+  width: 1920,
+  height: 1080,
+  deviceScaleFactor: 1,
+  mobile: false,
+  screenWidth: 1920,
+  screenHeight: 1080
+})
+let wideTrackChecks
+let wideScreenshot
+try {
+  wideTrackChecks = await evaluate(`(() => {
+    const heading = document.querySelector('.content-page-heading')
+    const chat = document.querySelector('.chat-page')
+    const headingRect = heading?.getBoundingClientRect()
+    const chatRect = chat?.getBoundingClientRect()
+    const tolerance = 1
+    return {
+      wideViewportWidth: window.innerWidth,
+      wideHeadingWidth: headingRect?.width ?? null,
+      wideChatWidth: chatRect?.width ?? null,
+      chatTrackMatchesPageTrack: Boolean(
+        headingRect && chatRect &&
+        Math.abs(headingRect.left - chatRect.left) <= tolerance &&
+        Math.abs(headingRect.right - chatRect.right) <= tolerance &&
+        Math.abs(headingRect.width - chatRect.width) <= tolerance
+      )
+    }
+  })()`)
+  const wideShot = await call('Page.captureScreenshot', { format: 'png', fromSurface: true })
+  wideScreenshot = join(process.env.TEMP, 'visslm-chat-wide-layout.png')
+  writeFileSync(wideScreenshot, Buffer.from(wideShot.result.data, 'base64'))
+} finally {
+  await call('Emulation.clearDeviceMetricsOverride')
+  await new Promise((resolve) => setTimeout(resolve, 180))
+}
 
 await call('Emulation.setDeviceMetricsOverride', {
   width: 680,
@@ -579,10 +721,26 @@ const focusChecks = await evaluate(`(() => {
   const input = document.querySelector('.composer textarea');
   input?.focus();
   const style = input ? getComputedStyle(input) : null;
+  const focusOwner = input?.closest('.composer-input');
+  const focusOwnerStyle = focusOwner ? getComputedStyle(focusOwner) : null;
+  const borderWidths = style
+    ? [style.borderTopWidth, style.borderRightWidth, style.borderBottomWidth, style.borderLeftWidth]
+    : [];
+  const inputFocusBorderRemoved = borderWidths.length === 4 && borderWidths.every(
+    (width) => Number.parseFloat(width) === 0
+  );
   return {
     inputFocused: document.activeElement === input,
     inputFocusShadowRemoved: style?.boxShadow === 'none',
-    inputFocusOutlineRemoved: style?.outlineStyle === 'none'
+    inputFocusOutlineRemoved: style?.outlineStyle === 'none',
+    inputFocusBorderRemoved,
+    composerOwnsFocusBoundary: Boolean(
+      focusOwner?.matches(':focus-within') &&
+      focusOwnerStyle?.borderTopStyle !== 'none' &&
+      inputFocusBorderRemoved &&
+      style?.boxShadow === 'none' &&
+      style?.outlineStyle === 'none'
+    )
   };
 })()`)
 const focusShot = await call('Page.captureScreenshot', { format: 'png', fromSurface: true })
@@ -664,6 +822,11 @@ const runningTaskChecks = await evaluate(`(() => {
   })
   const currentStatus = [...document.querySelectorAll('.agent-run-current')]
     .find((element) => isVisible(element) && Boolean(element.textContent?.trim()))
+  const streamingAnswerVisible = [...document.querySelectorAll('.streaming-answer-row')].some(isVisible)
+  const runningPanelVisible = [...document.querySelectorAll('.message-bubble.thinking')].some(isVisible)
+  const runningSummaryVisible = [...document.querySelectorAll('.agent-run-task-summary')].some(isVisible)
+  const streamingReplacesProgress = !(streamingAnswerVisible && runningPanelVisible)
+  const runningSummaryNotDuplicated = !runningSummaryVisible
   if (!largeFlows.length) {
     return {
       runningControlFlowPresent: flows.length > 0,
@@ -672,7 +835,11 @@ const runningTaskChecks = await evaluate(`(() => {
       runningControlFlowCollapsed: true,
       runningControlFlowEntry: true,
       runningCurrentStatusVisible: true,
-      runningCurrentStatusObserved: Boolean(currentStatus)
+      runningCurrentStatusObserved: Boolean(currentStatus),
+      streamingAnswerVisible,
+      runningPanelVisible,
+      streamingReplacesProgress,
+      runningSummaryNotDuplicated
     }
   }
 
@@ -690,7 +857,11 @@ const runningTaskChecks = await evaluate(`(() => {
     runningControlFlowCollapsed: collapsed,
     runningControlFlowEntry: entry,
     runningCurrentStatusVisible: Boolean(currentStatus),
-    runningCurrentStatusObserved: Boolean(currentStatus)
+    runningCurrentStatusObserved: Boolean(currentStatus),
+    streamingAnswerVisible,
+    runningPanelVisible,
+    streamingReplacesProgress,
+    runningSummaryNotDuplicated
   }
 })()`)
 const latestChecks = await evaluate(`(async () => {
@@ -764,6 +935,10 @@ const requiredChecks = {
   // interaction and accessibility gates for the redesign.
   historySearchControl: historyUiChecks.historySearchControl,
   historySearchFiltering: historyUiChecks.historySearchFiltering,
+  historyHintRemoved: historyUiChecks.historyHintRemoved,
+  historyRowsCompact: historyUiChecks.historyRowsCompact,
+  historyRowsFlattened: historyUiChecks.historyRowsFlattened,
+  historyListOwnsScroll: historyUiChecks.historyListOwnsScroll,
   historyToggle: historyUiChecks.historyToggle,
   historyPanelCollapseObserved: historyUiChecks.historyPanelCollapseObserved,
   historyPanelRestoreObserved: historyUiChecks.historyPanelRestoreObserved,
@@ -774,11 +949,19 @@ const requiredChecks = {
   completedTaskDetailsCollapsed: taskDetailChecks.completedTaskDetailsCollapsed,
   completedTaskDetailsEntry: taskDetailChecks.completedTaskDetailsEntry,
   completedTaskDetailsExpandable: taskDetailChecks.completedTaskDetailsExpandable,
+  messageRoleAlignmentSeparated: messagePresentationChecks.messageRoleAlignmentSeparated,
+  legacyMarkdownMarkerHidden: messagePresentationChecks.legacyMarkdownMarkerHidden,
+  chatTrackMatchesPageTrack: wideTrackChecks.chatTrackMatchesPageTrack,
   oldEmptyStateClassesRemoved: simplificationChecks.oldEmptyStateClassesRemoved,
   promptCompact: simplificationChecks.promptCompact,
   topDataStatusBadgeNotDuplicated: simplificationChecks.topDataStatusBadgeNotDuplicated,
   onlineModelExplanationCompact: simplificationChecks.onlineModelExplanationCompact,
+  streamingReplacesProgress: runningTaskChecks.streamingReplacesProgress,
+  runningSummaryNotDuplicated: runningTaskChecks.runningSummaryNotDuplicated,
+  composerOwnsFocusBoundary: focusChecks.composerOwnsFocusBoundary,
   narrowHistoryEntry: narrowHistoryChecks?.narrowHistoryEntry === true,
+  darkThemeApplied: darkThemeChecks.darkThemeApplied,
+  darkThemeSurfaces: darkThemeChecks.darkThemeSurfaces,
   lightThemeApplied: lightThemeChecks.lightThemeApplied,
   lightThemeSurfaces: lightThemeChecks.lightThemeSurfaces,
   ...(latestChecks.latestControlExpected || latestChecks.latestControlPresent ? {
@@ -807,6 +990,9 @@ console.log(JSON.stringify({
   ...conversationChecks,
   ...runningTaskChecks,
   ...latestChecks,
+  ...messagePresentationChecks,
+  ...wideTrackChecks,
+  ...darkThemeChecks,
   ...lightThemeChecks,
   requiredChecks,
   ok: failedChecks.length === 0,
@@ -814,6 +1000,8 @@ console.log(JSON.stringify({
   lightScreenshot,
   focusScreenshot,
   conversationScreenshot,
+  messageScreenshot,
+  wideScreenshot,
   failedChecks
 }, null, 2))
 socket.close()

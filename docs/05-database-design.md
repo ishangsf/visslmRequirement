@@ -59,6 +59,7 @@
 | DB-28 | `pm_requirement_matches` | 表 | 需求与数据中心记录的向量/AI 匹配结果 | `replaceRequirementMatches/listProjectRequirementMatches` |
 | DB-29 | `pm_analysis_runs` | 表 | 技术协议解析和匹配任务进度 | `saveProjectAnalysisProgress/reconcileInterruptedProjectAnalysis` |
 | DB-30 | `records_fts` | FTS5 虚表 | 为 `records` 的名称、编号、类型和规范化正文提供全文搜索 | `records_ai/records_ad/records_au` 触发器；`searchForAgent/listRecords` |
+| DB-31 | `field_definitions` | 表 | 按数据类型保存平台字段显示名、声明类型和字段属性 | `replaceFieldDefinitions/getFieldDefinitions/getFieldDisplayNames` |
 
 ## 3. 字段定义
 
@@ -275,6 +276,26 @@
 | `data_revision` | `INTEGER NOT NULL` | 与 `settings` 中的 `analytics:data-revision` 对应 |
 
 主键为 `(scope_key, field)`；保存新 revision 时会删除同范围旧 revision 的画像。
+
+#### `field_definitions`
+
+| 字段 | 类型/约束 | 业务含义 |
+| --- | --- | --- |
+| `node_type` | `TEXT NOT NULL` | 字段所属数据类型；接口返回空 `NodeType` 时使用请求的节点类型 |
+| `field` | `TEXT NOT NULL` | 记录原始 JSON 属性 Key，对应平台 `HideMember` |
+| `display_name` | `TEXT NOT NULL` | 平台字段显示名，对应 `MemberName` |
+| `source_type` | `TEXT NOT NULL DEFAULT ''` | 平台原始 `MemberType` |
+| `normalized_type` | `TEXT NOT NULL DEFAULT 'unknown'` | 应用声明类型，例如 `string/number/date/datetime/enum/reference` |
+| `attr_type` | `TEXT NOT NULL DEFAULT ''` | 平台本地化 `AttrType` 文案 |
+| `source_uid` | `TEXT NOT NULL DEFAULT ''` | 字段定义行 `Uid` |
+| `internal_member` | `TEXT NOT NULL DEFAULT ''` | 平台内部 `Member` 标识，不作为采集属性 Key |
+| `condition_uid` | `TEXT NOT NULL DEFAULT ''` | 平台 `MemberConditionUid` |
+| `is_system` | `INTEGER NOT NULL DEFAULT 0` | 平台 `IsSystem` 布尔标志 |
+| `is_editable` | `INTEGER NOT NULL DEFAULT 0` | 平台 `IsEdit` 布尔标志 |
+| `is_removable` | `INTEGER NOT NULL DEFAULT 0` | 平台 `IsRemove` 能力标志，不表示字段已经删除 |
+| `updated_at` | `TEXT NOT NULL` | 最近一次成功刷新时间 |
+
+主键为 `(node_type, field)`。刷新某个节点类型时在事务内替换该类型的完整有效目录；空或无法解析的响应不进入替换流程，因此保留最近一次成功结果。`field_profiles.inferred_type` 继续保存实际采集值观察类型，不能被 `normalized_type` 覆盖。
 
 #### `query_cache`
 
@@ -668,3 +689,8 @@ erDiagram
 - `src/main/database.ts:4325-4525`：推送/采集日志。
 - `src/main/database.ts:4936-5200`：同步运行、导入、导出和删除。
 - `src/shared/types.ts`、`src/shared/project-types.ts`、`src/shared/query-spec.ts`、`src/shared/dashboard.ts`：对外返回对象和枚举契约。
+# AI 助手新增本地表（2026-08）
+
+- `assistant_artifacts`：保存交付物类型、状态、版本、会话/消息关联、标题和完整证据载荷。撤销通过状态与版本递增表达，不物理删除审计内容。
+- `assistant_run_history`：以 `run_id` 为主键保存运行状态、起止时间与结构化指标 JSON；用于运行历史和质量统计。
+- `field_profiles` 的人工语义字段继续作为字段词典事实来源，按查询范围键隔离。

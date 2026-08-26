@@ -140,9 +140,11 @@ VISSLM Agent 将 VISSLM 平台数据复制到本地，提供本地检索、文�
 
 #### FR-CONFIG-003 连接测试
 
-- 平台测试调用 VISSLM API；本地模型检查 `/api/tags`；在线模型检查 `/models`，RawChat Codex 随后使用 `/responses` 做最小问答探测。
-- 结果：`ConnectionResult { ok, message, details? }`。
-- 依据：`main/index.ts:146-154`、`model-client.ts:23-76`。
+- 平台测试调用 VISSLM API。模型测试支持两档：应用启动时执行轻量能力探测，手动点击“完整能力测试”时执行主动探测。
+- 本地轻量探测仅调用 `/api/tags` 与 `/api/show`，不得触发模型生成；完整探测使用不含业务数据、低输出预算的请求验证最小问答、JSON Schema 和工具调用。在线模型无法从元数据确认的能力必须显示“未验证”，不得根据提供商名称推断为支持。
+- 结果：`ConnectionResult { ok, message, details?, capabilityReport? }`。`capabilityReport` 固定包含连接、最小问答、结构化输出、工具调用、上下文窗口、思考模式六项，并区分“支持、有限支持、不支持、未验证、检测失败”及证据来源。
+- 连接成功但某项能力探测失败时，连接结果仍为成功，失败只记录到对应能力项；错误摘要必须清除 API Key、Bearer Token 等敏感信息。
+- 依据：`shared/types.ts`、`main/index.ts`、`model-client.ts`、`renderer/src/App.tsx`。
 
 #### FR-CONFIG-004 功能开关
 
@@ -214,6 +216,15 @@ VISSLM Agent 将 VISSLM 平台数据复制到本地，提供本地检索、文�
 - 导入支持 JSON 数组和 JSONL，文件上限 512 MB；单行 JSON 错误会被跳过并报告最多 50 条错误。
 - 导出生成 JSONL，由用户选择路径。
 - 依据：`main/index.ts:517-615`。
+
+#### FR-SYNC-010 数据类型字段定义
+
+- 每种配置的节点类型在采集记录前调用只读元数据接口 `POST /Admin/Virtualization_ReadMember`，表单固定包含 `nodeType` 和 `proId=0`。
+- 接口通过平台网页登录会话访问；仅在明确返回 HTTP 999、ErrorCode 999 或登录页时重新登录并安全重放一次。
+- 以 `rows` 为准，不依赖不准确的 `total`；`HideMember` 为原始字段 Key，`MemberName` 为显示名，`MemberType` 为平台机器类型，空 `NodeType` 继承当前请求类型。
+- 字段目录按 `(node_type, field)` 保存显示名、声明类型、平台原始类型、内部标识及字段标志；`IsRemove` 作为字段能力标志保留，不代表删除状态。
+- 空、损坏或未授权响应不会清除最近一次成功目录，也不阻断正常记录采集。规范化文本、分析字段画像和 AI 字段目录消费最近成功定义；实际值观察类型与平台声明类型分别保留。
+- 依据：`visslm.ts` 的 `getFieldDefinitions/parseFieldDefinitions`、`database.ts` 的 `field_definitions`、`scripts/smoke-field-definitions.ts`。
 
 ### 6.4 资产中心
 
@@ -311,7 +322,8 @@ VISSLM Agent 将 VISSLM 平台数据复制到本地，提供本地检索、文�
 #### FR-KB-010 进度和统计
 
 - 通过 `knowledge:progress` 发送 parsing/embedding/records/done/error；统计文档、ready/processing/failed、分块、已索引分块、记录数和模型版本。
-- 依据：`shared/types.ts:515-544`、`database.ts:1504-1549`。
+- 最近一次索引任务随统计结果持久化返回；应用重启时把中断任务恢复为可重试失败，不能永久显示“索引中”。重建索引必须先同步采集记录分块，再重建全部文档和记录向量。
+- 依据：`shared/types.ts`、`database.ts`、`knowledge.ts`。
 
 ### 6.6 AI 助手
 
@@ -372,6 +384,20 @@ VISSLM Agent 将 VISSLM 平台数据复制到本地，提供本地检索、文�
 - 自动判断只使用当前问题的确定性数据意图；不会因为上一轮选择过专家而隐式沿用。用户也可以明确指定 `@通用数据助手`、`@需求分析专家` 或 `@数据可视化专家`。
 - 普通对话不返回本地来源或查询数据视图；自动数据模式必须使用本地工具或匹配流程取得证据，模型不得把记忆内容冒充为本地数据事实。
 - 无 `@` 的需求编号分析仅精确读取编号对应记录并把原文/字段交给模型，不执行内置需求匹配、召回、重排或评分；需要这些内置能力时必须使用 `@需求分析专家`。
+
+#### FR-AI-011 工作区就绪与恢复
+
+- AI 助手必须区分状态读取中、状态不可用、无数据、索引中、索引失败、索引未建立和就绪，不能把这些状态统一显示为“知识库待准备”。
+- 无数据时提供数据中心和知识库入口；索引中显示当前任务进度并允许刷新；失败或未建立时提供重建索引，失败状态同时允许打开知识库处理失败文档。
+- 状态刷新不得触发模型调用，重建失败必须保留原始数据并记录终止任务；失败任务内容不进入有效对话上下文。
+- 依据：`shared/assistant-readiness.ts`、`main/knowledge.ts`、`renderer/src/App.tsx`。
+
+#### FR-AI-012 执行计划确认与会话范围
+
+- 数据、知识、混合、可视化和需求匹配任务在读取证据前必须生成结构化 `AssistantExecutionSummary`；普通对话不要求确认。
+- 摘要至少包含检索词、读取字段、筛选条件、来源、交付形式、项目范围、数据类型、指定记录数和结果上限。主进程按发送窗口和 `runId` 等待 `agent:confirm-plan`，其他窗口不得代为确认。
+- 用户确认后才执行证据工具；停止任务通过同一 `AbortSignal` 释放等待且不执行工具。确认后的摘要随回答消息保存，作为本轮实际生效范围；会话消息同时保存会话级 `dataScope`，加载历史会话时恢复，开始新会话时清除。
+- 依据：`assistant/plan-confirmation.ts`、`ollama.ts`、`main/index.ts`、`renderer/src/App.tsx`。
 
 ### 6.7 本地分析查询
 
@@ -657,3 +683,11 @@ VISSLM Agent 将 VISSLM 平台数据复制到本地，提供本地检索、文�
 ## 10. 代码依据索引
 
 参见 `docs/00-project-scan.md` 和 `docs/01-code-mapping.md` 的索引；需求细节主要依据：`src/main/index.ts`、`src/main/database.ts`、`src/main/settings.ts`、`src/main/visslm.ts`、`src/main/knowledge.ts`、`src/main/ollama.ts`、`src/main/model-client.ts`、`src/main/analytics/query-engine.ts`、`src/main/project-management.ts`、`src/shared/types.ts`、`src/shared/project-types.ts`、`src/shared/query-spec.ts`、`src/shared/dashboard.ts`、`src/renderer/src/App.tsx`、`src/renderer/src/dashboard/DashboardStudio.tsx`、`src/renderer/src/project-management/ProjectManagementPage.tsx`、`README.md`。
+# AI 助手证据与交付闭环（2026-08）
+
+- 数据中心提供按项目范围维护的字段显示名、角色、业务别名和敏感级别；Agent 规划优先使用人工语义，同一别名对应多个字段时必须澄清。
+- 数据回答保存统一 `EvidenceBlock`，分别表达记录、文档、聚合和查询明细，并显示命中数、载入数与截断状态。
+- 查询失败只允许根据已确认计划生成字段确认、缩小范围或正文检索建议，不得引入计划之外的字段和实体。
+- 分析快照、筛选视图、报告草稿和文件交付草稿必须先预览影响与回滚点，再由用户确认保存；没有 EvidenceBlock 时拒绝创建。
+- 交付物支持 DOCX、XLSX、PPTX、ZIP，导出清单记录证据计数、文件大小和 SHA-256。
+- 每次 Agent 运行保存状态、耗时、阶段、工具阶段数、命中数、依据数和失败阶段；运行历史可在 AI 助手中查看。

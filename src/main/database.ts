@@ -22,6 +22,10 @@ import type {
   ChatSessionSaveInput,
   ChatSessionSummary,
   ChatSource,
+  AssistantArtifact,
+  AssistantArtifactInput,
+  AssistantRunHistory,
+  AssistantRunHistoryStats,
   CollectionRequestLogPage,
   CollectionRequestLogRow,
   CollectionRequestLogStatus,
@@ -35,6 +39,7 @@ import type {
   DataImportRunStatus,
   DashboardStats,
   FieldDefinition,
+  FieldDefinitionNormalizedType,
   ImageAsset,
   KnowledgeChunk,
   KnowledgeDocument,
@@ -74,6 +79,7 @@ import {
   compactRecordUids,
   sanitizeContextText
 } from './context-budget'
+import { sanitizeChatMessageContent } from '../shared/chat-message-format'
 import {
   buildRequirementBusinessText,
   isAiRequirementSemanticCard,
@@ -645,10 +651,87 @@ const mapFieldProfileRow = (row: SqlRow): FieldProfile => {
   }
 }
 
+const fieldDefinitionNormalizedTypes = new Set<FieldDefinitionNormalizedType>([
+  'string',
+  'rich_text',
+  'log',
+  'integer',
+  'number',
+  'boolean',
+  'date',
+  'datetime',
+  'enum',
+  'system_enum',
+  'reference',
+  'relation',
+  'url',
+  'special',
+  'unknown'
+])
+
+const fieldDefinitionSourceTypeMap: Readonly<Record<string, FieldDefinitionNormalizedType>> = {
+  SINGLELINETEXT: 'string',
+  MULTILINETEXT: 'string',
+  RICH: 'rich_text',
+  LOG: 'log',
+  INTEGER: 'integer',
+  FLOAT: 'number',
+  BOOL: 'boolean',
+  DATE: 'date',
+  DATETIME: 'datetime',
+  DATAENUM: 'enum',
+  SYSTEMENUM: 'system_enum',
+  REFERENCE: 'reference',
+  RELATION: 'relation',
+  URL: 'url',
+  SPECIALTYPE: 'special'
+}
+
+const normalizeStoredFieldDefinitionType = (
+  sourceType: unknown,
+  declaredType: unknown
+): FieldDefinitionNormalizedType => {
+  const normalized = String(declaredType ?? '').trim().toLocaleLowerCase() as FieldDefinitionNormalizedType
+  if (fieldDefinitionNormalizedTypes.has(normalized)) return normalized
+  return fieldDefinitionSourceTypeMap[String(sourceType ?? '').trim().toLocaleUpperCase()] ?? 'unknown'
+}
+
+const storedFieldDefinitionBoolean = (input: unknown): boolean => {
+  if (typeof input === 'boolean') return input
+  if (typeof input === 'number') return Number.isFinite(input) && input !== 0
+  if (typeof input !== 'string') return false
+  return ['1', 'true', 'yes', 'y', 'on', 't', '是', '真']
+    .includes(input.trim().toLocaleLowerCase())
+}
+
+const mapFieldDefinitionRow = (row: SqlRow): FieldDefinition => {
+  const sourceType = String(row.source_type ?? '').trim()
+  return {
+    nodeType: String(row.node_type ?? '').trim(),
+    field: String(row.field ?? '').trim(),
+    displayName: String(row.display_name ?? '').trim(),
+    sourceType,
+    normalizedType: normalizeStoredFieldDefinitionType(sourceType, row.normalized_type),
+    attrType: String(row.attr_type ?? '').trim(),
+    sourceUid: String(row.source_uid ?? '').trim(),
+    internalMember: String(row.internal_member ?? '').trim(),
+    conditionUid: String(row.condition_uid ?? '').trim(),
+    isSystem: storedFieldDefinitionBoolean(row.is_system),
+    isEditable: storedFieldDefinitionBoolean(row.is_editable),
+    isRemovable: storedFieldDefinitionBoolean(row.is_removable),
+    updatedAt: String(row.updated_at ?? '').trim()
+  }
+}
+
 export interface FieldAggregateOptions {
   field: string
   projectId?: string
+  projectIds?: string[]
   nodeType?: string
+  nodeTypes?: string[]
+  recordUids?: string[]
+  baseFilters?: FieldQueryFilter[]
+  filters?: FieldQueryFilter[]
   limit?: number
   splitMultiValue?: boolean
 }
@@ -669,7 +752,10 @@ export interface FieldAggregateResult {
 
 export interface FieldInspectionOptions {
   projectId?: string
+  projectIds?: string[]
   nodeType?: string
+  nodeTypes?: string[]
+  recordUids?: string[]
   search?: string
   limit?: number
 }
@@ -679,6 +765,12 @@ export interface FieldInspectionResult {
   fields: Array<{
     field: string
     displayName?: string
+    /** Declared application type from the VISSLM member catalog. */
+    declaredType?: FieldDefinitionNormalizedType
+    /** Original VISSLM MemberType from the member catalog. */
+    sourceType?: string
+    /** Original localized VISSLM AttrType from the member catalog. */
+    attrType?: string
     nonEmptyRecords: number
     coverageRate: number
     types: string[]
@@ -706,10 +798,18 @@ export interface FieldQueryFilter {
 
 export interface FieldQueryOptions {
   projectId?: string
+  /** Multi-project scope; when present it takes precedence over projectId. */
+  projectIds?: string[]
   nodeType?: string
+  /** Multi-type scope; when present it takes precedence over nodeType. */
+  nodeTypes?: string[]
+  /** Immutable record scope; an explicitly empty list matches no rows. */
+  recordUids?: string[]
   search?: string
   searchTerms?: string[]
   searchMode?: 'any' | 'all'
+  /** Inherited filters applied together with filters using AND. */
+  baseFilters?: FieldQueryFilter[]
   filters?: FieldQueryFilter[]
   fields?: string[]
   sort?: { field: string; direction: 'asc' | 'desc' }
@@ -994,6 +1094,33 @@ export class AppDatabase {
       CREATE INDEX IF NOT EXISTS idx_chat_sessions_updated
         ON chat_sessions(updated_at DESC);
 
+      CREATE TABLE IF NOT EXISTS assistant_artifacts (
+        id TEXT PRIMARY KEY,
+        type TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active',
+        version INTEGER NOT NULL DEFAULT 1,
+        conversation_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_assistant_artifacts_updated
+        ON assistant_artifacts(updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS assistant_run_history (
+        run_id TEXT PRIMARY KEY,
+        status TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        completed_at TEXT NOT NULL,
+        payload_json TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_assistant_run_history_completed
+        ON assistant_run_history(completed_at DESC);
+
       CREATE TABLE IF NOT EXISTS projects (
         uid TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -1232,6 +1359,15 @@ export class AppDatabase {
         node_type TEXT NOT NULL,
         field TEXT NOT NULL,
         display_name TEXT NOT NULL,
+        source_type TEXT NOT NULL DEFAULT '',
+        normalized_type TEXT NOT NULL DEFAULT 'unknown',
+        attr_type TEXT NOT NULL DEFAULT '',
+        source_uid TEXT NOT NULL DEFAULT '',
+        internal_member TEXT NOT NULL DEFAULT '',
+        condition_uid TEXT NOT NULL DEFAULT '',
+        is_system INTEGER NOT NULL DEFAULT 0,
+        is_editable INTEGER NOT NULL DEFAULT 0,
+        is_removable INTEGER NOT NULL DEFAULT 0,
         updated_at TEXT NOT NULL,
         PRIMARY KEY(node_type, field)
       );
@@ -1834,6 +1970,15 @@ export class AppDatabase {
       "ALTER TABLE records ADD COLUMN pushed_uid TEXT NOT NULL DEFAULT ''",
       "ALTER TABLE records ADD COLUMN semantic_hash TEXT NOT NULL DEFAULT ''",
       "ALTER TABLE field_profiles ADD COLUMN sensitivity TEXT NOT NULL DEFAULT 'normal'",
+      "ALTER TABLE field_definitions ADD COLUMN source_type TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE field_definitions ADD COLUMN normalized_type TEXT NOT NULL DEFAULT 'unknown'",
+      "ALTER TABLE field_definitions ADD COLUMN attr_type TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE field_definitions ADD COLUMN source_uid TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE field_definitions ADD COLUMN internal_member TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE field_definitions ADD COLUMN condition_uid TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE field_definitions ADD COLUMN is_system INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE field_definitions ADD COLUMN is_editable INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE field_definitions ADD COLUMN is_removable INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE visualization_runs ADD COLUMN mode TEXT NOT NULL DEFAULT 'generate'",
       "ALTER TABLE visualization_runs ADD COLUMN tool_calls_json TEXT NOT NULL DEFAULT '[]'",
       "ALTER TABLE pm_requirements ADD COLUMN key_info_terms_json TEXT NOT NULL DEFAULT '[]'",
@@ -2611,7 +2756,7 @@ export class AppDatabase {
       )
     }).map((message) => ({
       ...message,
-      content: sanitizeContextText(message.content, 8_000),
+      content: sanitizeChatMessageContent(message.content, 8_000),
       ...(message.contextRefs?.length
         ? { contextRefs: compactChatContextRefs(message.contextRefs) }
         : {}),
@@ -2698,6 +2843,114 @@ export class AppDatabase {
     return Number(result.changes) > 0
       ? { ok: true, message: '历史会话已删除' }
       : { ok: false, message: '历史会话不存在' }
+  }
+
+  private mapAssistantArtifact(row: SqlRow): AssistantArtifact {
+    const payload = JSON.parse(String(row.payload_json)) as AssistantArtifactInput
+    return {
+      id: String(row.id),
+      type: String(row.type) as AssistantArtifact['type'],
+      status: String(row.status) === 'reverted' ? 'reverted' : 'active',
+      version: Number(row.version),
+      conversationId: String(row.conversation_id),
+      messageId: String(row.message_id),
+      title: String(row.title),
+      payload,
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at)
+    }
+  }
+
+  saveAssistantArtifact(input: AssistantArtifactInput): AssistantArtifact {
+    const id = randomUUID()
+    const timestamp = nowIso()
+    this.db.prepare(`
+      INSERT INTO assistant_artifacts(
+        id, type, status, version, conversation_id, message_id,
+        title, payload_json, created_at, updated_at
+      ) VALUES (?, ?, 'active', 1, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      input.type,
+      input.conversationId,
+      input.messageId,
+      input.title,
+      JSON.stringify(input),
+      timestamp,
+      timestamp
+    )
+    return this.getAssistantArtifact(id)!
+  }
+
+  getAssistantArtifact(id: string): AssistantArtifact | null {
+    const row = this.db.prepare('SELECT * FROM assistant_artifacts WHERE id = ?').get(id) as SqlRow | undefined
+    return row ? this.mapAssistantArtifact(row) : null
+  }
+
+  listAssistantArtifacts(limit = 50): AssistantArtifact[] {
+    const safeLimit = Math.min(200, Math.max(1, Math.trunc(limit)))
+    return (this.db.prepare(`
+      SELECT * FROM assistant_artifacts ORDER BY updated_at DESC LIMIT ?
+    `).all(safeLimit) as SqlRow[]).map((row) => this.mapAssistantArtifact(row))
+  }
+
+  revertAssistantArtifact(id: string): AssistantArtifact {
+    const current = this.getAssistantArtifact(id)
+    if (!current) throw new Error('交付物不存在')
+    if (current.status === 'reverted') return current
+    this.db.prepare(`
+      UPDATE assistant_artifacts
+      SET status = 'reverted', version = version + 1, updated_at = ?
+      WHERE id = ?
+    `).run(nowIso(), id)
+    return this.getAssistantArtifact(id)!
+  }
+
+  saveAssistantRunHistory(history: AssistantRunHistory): AssistantRunHistory {
+    this.db.prepare(`
+      INSERT INTO assistant_run_history(run_id, status, started_at, completed_at, payload_json)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(run_id) DO UPDATE SET
+        status = excluded.status,
+        completed_at = excluded.completed_at,
+        payload_json = excluded.payload_json
+    `).run(
+      history.runId,
+      history.status,
+      history.startedAt,
+      history.completedAt,
+      JSON.stringify(history)
+    )
+    return history
+  }
+
+  listAssistantRunHistory(limit = 100): AssistantRunHistory[] {
+    const safeLimit = Math.min(500, Math.max(1, Math.trunc(limit)))
+    return (this.db.prepare(`
+      SELECT payload_json FROM assistant_run_history
+      ORDER BY completed_at DESC LIMIT ?
+    `).all(safeLimit) as SqlRow[]).flatMap((row) => {
+      try {
+        return [JSON.parse(String(row.payload_json)) as AssistantRunHistory]
+      } catch {
+        return []
+      }
+    })
+  }
+
+  getAssistantRunHistoryStats(): AssistantRunHistoryStats {
+    const runs = this.listAssistantRunHistory(500)
+    const totalDuration = runs.reduce((sum, run) => sum + run.durationMs, 0)
+    return {
+      total: runs.length,
+      completed: runs.filter((run) => run.status === 'completed').length,
+      failed: runs.filter((run) => run.status === 'failed').length,
+      cancelled: runs.filter((run) => run.status === 'cancelled').length,
+      clarification: runs.filter((run) => run.status === 'clarification').length,
+      averageDurationMs: runs.length ? Math.round(totalDuration / runs.length) : 0,
+      totalToolCalls: runs.reduce((sum, run) => sum + run.toolCallCount, 0),
+      totalMatchedCount: runs.reduce((sum, run) => sum + run.matchedCount, 0)
+    }
   }
 
   private mapKnowledgeDocument(row: SqlRow): KnowledgeDocument {
@@ -3688,7 +3941,8 @@ export class AppDatabase {
       chunkCount: scalar('SELECT COUNT(*) AS count FROM knowledge_chunks'),
       indexedChunkCount: scalar('SELECT COUNT(*) AS count FROM knowledge_vectors WHERE model_version = ?', modelVersion),
       recordCount: scalar("SELECT COUNT(*) AS count FROM knowledge_chunks WHERE source_type = 'record'"),
-      modelVersion
+      modelVersion,
+      latestTask: this.listKnowledgeIndexProgress(1)[0]
     }
   }
 
@@ -6036,18 +6290,64 @@ export class AppDatabase {
     return next
   }
 
-  replaceFieldDefinitions(definitions: FieldDefinition[]): void {
-    const grouped = new Map<string, Map<string, string>>()
+  replaceFieldDefinitions(definitions: FieldDefinition[]): boolean {
+    const grouped = new Map<string, Map<string, FieldDefinition>>()
     for (const definition of definitions) {
       const nodeType = String(definition.nodeType ?? '').trim()
       const field = String(definition.field ?? '').trim()
       const displayName = String(definition.displayName ?? '').trim()
       if (!nodeType || !field || !displayName) continue
-      const fields = grouped.get(nodeType) ?? new Map<string, string>()
-      fields.set(field, displayName.slice(0, 200))
+      const fields = grouped.get(nodeType) ?? new Map<string, FieldDefinition>()
+      const sourceType = String(definition.sourceType ?? '').trim().slice(0, 120)
+      fields.set(field, {
+        nodeType,
+        field,
+        displayName: displayName.slice(0, 200),
+        sourceType,
+        normalizedType: normalizeStoredFieldDefinitionType(sourceType, definition.normalizedType),
+        attrType: String(definition.attrType ?? '').trim().slice(0, 200),
+        sourceUid: String(definition.sourceUid ?? '').trim().slice(0, 240),
+        internalMember: String(definition.internalMember ?? '').trim().slice(0, 240),
+        conditionUid: String(definition.conditionUid ?? '').trim().slice(0, 240),
+        isSystem: storedFieldDefinitionBoolean(definition.isSystem),
+        isEditable: storedFieldDefinitionBoolean(definition.isEditable),
+        isRemovable: storedFieldDefinitionBoolean(definition.isRemovable)
+      })
       grouped.set(nodeType, fields)
     }
-    if (!grouped.size) return
+    if (!grouped.size) return false
+
+    const existing = new Map(
+      this.getFieldDefinitions([...grouped.keys()]).map((definition) => [
+        `${definition.nodeType}\u0000${definition.field}`,
+        definition
+      ])
+    )
+    const comparable = (definition: FieldDefinition): string => JSON.stringify([
+      definition.nodeType,
+      definition.field,
+      definition.displayName,
+      definition.sourceType,
+      definition.normalizedType,
+      definition.attrType,
+      definition.sourceUid,
+      definition.internalMember,
+      definition.conditionUid,
+      definition.isSystem,
+      definition.isEditable,
+      definition.isRemovable
+    ])
+    const incoming = new Map(
+      [...grouped.values()].flatMap((fields) => [...fields.values()]).map((definition) => [
+        `${definition.nodeType}\u0000${definition.field}`,
+        definition
+      ])
+    )
+    const changed = incoming.size !== existing.size || [...incoming].some(([key, definition]) => {
+      const previous = existing.get(key)
+      return !previous || comparable(previous) !== comparable(definition)
+    })
+    if (!changed) return false
 
     this.db.exec('BEGIN IMMEDIATE')
     try {
@@ -6055,21 +6355,75 @@ export class AppDatabase {
         'DELETE FROM field_definitions WHERE node_type = ?'
       )
       const insertDefinition = this.db.prepare(`
-        INSERT INTO field_definitions(node_type, field, display_name, updated_at)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO field_definitions(
+          node_type, field, display_name, source_type, normalized_type, attr_type,
+          source_uid, internal_member, condition_uid, is_system, is_editable,
+          is_removable, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
       const updatedAt = nowIso()
       for (const [nodeType, fields] of grouped) {
         deleteDefinitions.run(nodeType)
-        for (const [field, displayName] of fields) {
-          insertDefinition.run(nodeType, field, displayName, updatedAt)
+        for (const definition of fields.values()) {
+          insertDefinition.run(
+            nodeType,
+            definition.field,
+            definition.displayName,
+            definition.sourceType,
+            definition.normalizedType,
+            definition.attrType,
+            definition.sourceUid,
+            definition.internalMember,
+            definition.conditionUid,
+            definition.isSystem ? 1 : 0,
+            definition.isEditable ? 1 : 0,
+            definition.isRemovable ? 1 : 0,
+            updatedAt
+          )
         }
       }
       this.db.exec('COMMIT')
+      return true
     } catch (error) {
       this.db.exec('ROLLBACK')
       throw error
     }
+  }
+
+  getFieldDefinitions(
+    nodeType: string | string[],
+    fields?: string[]
+  ): FieldDefinition[] {
+    const nodeTypes = [...new Set(
+      (Array.isArray(nodeType) ? nodeType : [nodeType])
+        .map((value) => String(value ?? '').trim())
+        .filter(Boolean)
+    )]
+    const requestedFields = [...new Set(
+      (fields ?? [])
+        .map((value) => String(value ?? '').trim())
+        .filter(Boolean)
+    )]
+    const conditions: string[] = []
+    const params: string[] = []
+    if (nodeTypes.length) {
+      conditions.push(`node_type IN (${nodeTypes.map(() => '?').join(', ')})`)
+      params.push(...nodeTypes)
+    }
+    if (requestedFields.length) {
+      conditions.push(`field IN (${requestedFields.map(() => '?').join(', ')})`)
+      params.push(...requestedFields)
+    }
+    const rows = this.db.prepare(`
+      SELECT node_type, field, display_name, source_type, normalized_type, attr_type,
+             source_uid, internal_member, condition_uid, is_system, is_editable,
+             is_removable, updated_at
+      FROM field_definitions
+      WHERE ${conditions.length ? conditions.join(' AND ') : '1 = 1'}
+      ORDER BY node_type ASC, field ASC
+    `).all(...params) as SqlRow[]
+    return rows.map(mapFieldDefinitionRow)
   }
 
   getFieldDisplayNames(
@@ -8478,9 +8832,83 @@ export class AppDatabase {
     return value
   }
 
-  aggregate(metric: string, projectId?: string): unknown {
-    const where = projectId ? ' WHERE project_id = ?' : ''
-    const params = projectId ? [projectId] : []
+  aggregate(
+    metric: string,
+    projectId?: string,
+    scope: Pick<FieldQueryOptions, 'projectIds' | 'nodeTypes' | 'recordUids' | 'baseFilters' | 'filters'> = {}
+  ): unknown {
+    const projectIds = scope.projectIds
+      ? [...new Set(scope.projectIds.map((value) => value.trim()).filter(Boolean))]
+      : undefined
+    const nodeTypes = scope.nodeTypes
+      ? [...new Set(scope.nodeTypes.map((value) => value.trim()).filter(Boolean))]
+      : undefined
+    const clauses: string[] = []
+    const params: string[] = []
+    if (projectIds !== undefined) {
+      if (!projectIds.length) clauses.push('1 = 0')
+      else {
+        clauses.push(`project_id IN (${projectIds.map(() => '?').join(', ')})`)
+        params.push(...projectIds)
+      }
+    } else if (projectId?.trim()) {
+      clauses.push('project_id = ?')
+      params.push(projectId.trim())
+    }
+    if (nodeTypes !== undefined) {
+      if (!nodeTypes.length) clauses.push('1 = 0')
+      else {
+        clauses.push(`node_type IN (${nodeTypes.map(() => '?').join(', ')})`)
+        params.push(...nodeTypes)
+      }
+    }
+    if (scope.recordUids !== undefined) {
+      const recordUids = [...new Set(scope.recordUids.map((value) => value.trim()).filter(Boolean))]
+      if (!recordUids.length) clauses.push('1 = 0')
+      else {
+        clauses.push(`uid IN (${recordUids.map(() => '?').join(', ')})`)
+        params.push(...recordUids)
+      }
+    }
+    const where = clauses.length ? ` WHERE ${clauses.join(' AND ')}` : ''
+    const scopeFilters = [...(scope.baseFilters ?? []), ...(scope.filters ?? [])]
+      .filter((filter) => filter.field?.trim())
+    if (scopeFilters.length) {
+      const rows = this.db
+        .prepare(`SELECT uid, project_id, node_type, raw_json FROM records${where}`)
+        .all(...params) as SqlRow[]
+      const matchedRows = rows.filter((row) => {
+        let raw: Record<string, unknown>
+        try {
+          raw = JSON.parse(String(row.raw_json)) as Record<string, unknown>
+        } catch {
+          return false
+        }
+        return scopeFilters.every((filter) => matchesFieldFilter(
+          normalizedFieldValues(fieldValuesAtPath(raw, filter.field.trim()), false),
+          filter
+        ))
+      })
+      if (metric === 'record_count') return { metric, value: matchedRows.length }
+      if (metric === 'image_count') {
+        const recordUids = matchedRows.map((row) => String(row.uid)).filter(Boolean)
+        if (!recordUids.length) return { metric, value: 0 }
+        const placeholders = recordUids.map(() => '?').join(', ')
+        const row = this.db
+          .prepare(`SELECT COUNT(*) AS value FROM images WHERE record_uid IN (${placeholders})`)
+          .get(...recordUids) as SqlRow
+        return { metric, value: Number(row.value ?? 0) }
+      }
+      const grouped = new Map<string, number>()
+      const keyName = metric === 'count_by_project' ? 'project_id' : 'node_type'
+      for (const row of matchedRows) {
+        const name = String(row[keyName] ?? '')
+        grouped.set(name, (grouped.get(name) ?? 0) + 1)
+      }
+      return [...grouped.entries()]
+        .map(([name, value]) => ({ name, value }))
+        .sort((left, right) => right.value - left.value || left.name.localeCompare(right.name))
+    }
     if (metric === 'record_count') {
       const row = this.db
         .prepare(`SELECT COUNT(*) AS value FROM records${where}`)
@@ -8488,15 +8916,31 @@ export class AppDatabase {
       return { metric, value: Number(row.value) }
     }
     if (metric === 'image_count') {
-      const sql = projectId
+      const imageClauses = clauses.map((clause) => clause
+        .replace(/\bproject_id\b/g, 'r.project_id')
+        .replace(/\bnode_type\b/g, 'r.node_type')
+        .replace(/\buid\b/g, 'r.uid'))
+      const imageWhere = imageClauses.length ? ` WHERE ${imageClauses.join(' AND ')}` : ''
+      const sql = imageClauses.length
         ? `SELECT COUNT(*) AS value FROM images i
-           JOIN records r ON r.uid=i.record_uid WHERE r.project_id=?`
+           JOIN records r ON r.uid=i.record_uid${imageWhere}`
         : 'SELECT COUNT(*) AS value FROM images'
       const row = this.db.prepare(sql).get(...params) as SqlRow
       return { metric, value: Number(row.value) }
     }
     if (metric === 'count_by_project') {
-      return this.getStats().byProject
+      // Keep the cached dashboard path for an unscoped request, but execute a
+      // real grouped query whenever the confirmation scope narrows projects,
+      // types, or records.  This prevents a confirmed patch from changing
+      // only the displayed summary while the aggregate still reads all data.
+      if (!clauses.length) return this.getStats().byProject
+      const rows = this.db
+        .prepare(
+          `SELECT project_id AS name, COUNT(*) AS value FROM records${where}
+           GROUP BY project_id ORDER BY value DESC, name COLLATE NOCASE ASC`
+        )
+        .all(...params) as SqlRow[]
+      return rows.map((row) => ({ name: String(row.name), value: Number(row.value ?? 0) }))
     }
     const rows = this.db
       .prepare(
@@ -8511,15 +8955,41 @@ export class AppDatabase {
     const field = options.field.trim()
     if (!field || field.length > 160) throw new Error('统计字段不能为空且不能超过 160 个字符')
 
+    const projectIds = options.projectIds
+      ? [...new Set(options.projectIds.map((value) => value.trim()).filter(Boolean))]
+      : undefined
+    const nodeTypes = options.nodeTypes
+      ? [...new Set(options.nodeTypes.map((value) => value.trim()).filter(Boolean))]
+      : undefined
     const clauses: string[] = []
     const params: string[] = []
-    if (options.projectId?.trim()) {
+    if (projectIds !== undefined) {
+      if (!projectIds.length) clauses.push('1 = 0')
+      else {
+        clauses.push(`project_id IN (${projectIds.map(() => '?').join(', ')})`)
+        params.push(...projectIds)
+      }
+    } else if (options.projectId?.trim()) {
       clauses.push('project_id = ?')
       params.push(options.projectId.trim())
     }
-    if (options.nodeType?.trim()) {
+    if (nodeTypes !== undefined) {
+      if (!nodeTypes.length) clauses.push('1 = 0')
+      else {
+        clauses.push(`node_type IN (${nodeTypes.map(() => '?').join(', ')})`)
+        params.push(...nodeTypes)
+      }
+    } else if (options.nodeType?.trim()) {
       clauses.push('node_type = ?')
       params.push(options.nodeType.trim())
+    }
+    if (options.recordUids !== undefined) {
+      const recordUids = [...new Set(options.recordUids.map((value) => value.trim()).filter(Boolean))]
+      if (!recordUids.length) clauses.push('1 = 0')
+      else {
+        clauses.push(`uid IN (${recordUids.map(() => '?').join(', ')})`)
+        params.push(...recordUids)
+      }
     }
     const where = clauses.length ? ` WHERE ${clauses.join(' AND ')}` : ''
     const rows = this.db
@@ -8527,7 +8997,7 @@ export class AppDatabase {
         `SELECT uid, name, node_type, item_id, raw_json
          FROM records${where}`
       )
-      .all(...params) as SqlRow[]
+       .all(...params) as SqlRow[]
 
     const splitMultiValue = options.splitMultiValue !== false
     const counts = new Map<string, {
@@ -8545,6 +9015,11 @@ export class AppDatabase {
       } catch {
         continue
       }
+      const inheritedFilters = [...(options.baseFilters ?? []), ...(options.filters ?? [])]
+      if (!inheritedFilters.every((filter) => matchesFieldFilter(
+        normalizedFieldValues(fieldValuesAtPath(raw, filter.field.trim()), false),
+        filter
+      ))) continue
       const values = normalizedFieldValues(fieldValuesAtPath(raw, field), splitMultiValue)
       if (!values.length) continue
       matchedRecords += 1
@@ -8591,13 +9066,39 @@ export class AppDatabase {
   inspectFields(options: FieldInspectionOptions = {}): FieldInspectionResult {
     const clauses: string[] = []
     const params: string[] = []
-    if (options.projectId?.trim()) {
+    const projectIds = options.projectIds === undefined
+      ? undefined
+      : [...new Set(options.projectIds.map((value) => value.trim()).filter(Boolean))]
+    if (projectIds !== undefined) {
+      if (!projectIds.length) clauses.push('1 = 0')
+      else {
+        clauses.push(`project_id IN (${projectIds.map(() => '?').join(', ')})`)
+        params.push(...projectIds)
+      }
+    } else if (options.projectId?.trim()) {
       clauses.push('project_id = ?')
       params.push(options.projectId.trim())
     }
-    if (options.nodeType?.trim()) {
+    const nodeTypes = options.nodeTypes === undefined
+      ? undefined
+      : [...new Set(options.nodeTypes.map((value) => value.trim()).filter(Boolean))]
+    if (nodeTypes !== undefined) {
+      if (!nodeTypes.length) clauses.push('1 = 0')
+      else {
+        clauses.push(`node_type IN (${nodeTypes.map(() => '?').join(', ')})`)
+        params.push(...nodeTypes)
+      }
+    } else if (options.nodeType?.trim()) {
       clauses.push('node_type = ?')
       params.push(options.nodeType.trim())
+    }
+    if (options.recordUids !== undefined) {
+      const recordUids = [...new Set(options.recordUids.map((value) => value.trim()).filter(Boolean))]
+      if (!recordUids.length) clauses.push('1 = 0')
+      else {
+        clauses.push(`uid IN (${recordUids.map(() => '?').join(', ')})`)
+        params.push(...recordUids)
+      }
     }
     const where = clauses.length ? ` WHERE ${clauses.join(' AND ')}` : ''
     const rows = this.db.prepare(`SELECT node_type, raw_json FROM records${where}`).all(...params) as SqlRow[]
@@ -8646,6 +9147,13 @@ export class AppDatabase {
       options.nodeType?.trim() || [...new Set(rows.map((row) => String(row.node_type ?? '').trim()))],
       [...profiles.keys()]
     )
+    const declaredDefinitions = new Map<string, FieldDefinition>()
+    const definitionNodeTypes = options.nodeType?.trim()
+      ? options.nodeType.trim()
+      : [...new Set(rows.map((row) => String(row.node_type ?? '').trim()).filter(Boolean))]
+    for (const definition of this.getFieldDefinitions(definitionNodeTypes, [...profiles.keys()])) {
+      if (!declaredDefinitions.has(definition.field)) declaredDefinitions.set(definition.field, definition)
+    }
     const fields = [...profiles.entries()]
       .filter(([field]) =>
         !searchTerms.length ||
@@ -8659,16 +9167,24 @@ export class AppDatabase {
         left[0].localeCompare(right[0], 'zh-CN')
       )
       .slice(0, limit)
-      .map(([field, profile]) => ({
-        field,
-        ...(displayNames[field] ? { displayName: displayNames[field] } : {}),
-        nonEmptyRecords: profile.nonEmptyRecords,
-        coverageRate: rows.length
-          ? Number(((profile.nonEmptyRecords / rows.length) * 100).toFixed(2))
-          : 0,
-        types: [...profile.types].sort(),
-        samples: profile.samples
-      }))
+      .map(([field, profile]) => {
+        const definition = declaredDefinitions.get(field)
+        return {
+          field,
+          ...(displayNames[field] ? { displayName: displayNames[field] } : {}),
+          ...(definition ? {
+            declaredType: definition.normalizedType,
+            ...(definition.sourceType ? { sourceType: definition.sourceType } : {}),
+            ...(definition.attrType ? { attrType: definition.attrType } : {})
+          } : {}),
+          nonEmptyRecords: profile.nonEmptyRecords,
+          coverageRate: rows.length
+            ? Number(((profile.nonEmptyRecords / rows.length) * 100).toFixed(2))
+            : 0,
+          types: [...profile.types].sort(),
+          samples: profile.samples
+        }
+      })
 
     return { totalRecords: rows.length, fields }
   }
@@ -8676,13 +9192,39 @@ export class AppDatabase {
   queryRecordsByFields(options: FieldQueryOptions): FieldQueryResult {
     const clauses: string[] = []
     const params: string[] = []
-    if (options.projectId?.trim()) {
+    const projectIds = options.projectIds === undefined
+      ? undefined
+      : [...new Set(options.projectIds.map((value) => value.trim()).filter(Boolean))]
+    if (projectIds !== undefined) {
+      if (!projectIds.length) clauses.push('1 = 0')
+      else {
+        clauses.push(`project_id IN (${projectIds.map(() => '?').join(', ')})`)
+        params.push(...projectIds)
+      }
+    } else if (options.projectId?.trim()) {
       clauses.push('project_id = ?')
       params.push(options.projectId.trim())
     }
-    if (options.nodeType?.trim()) {
+    const nodeTypes = options.nodeTypes === undefined
+      ? undefined
+      : [...new Set(options.nodeTypes.map((value) => value.trim()).filter(Boolean))]
+    if (nodeTypes !== undefined) {
+      if (!nodeTypes.length) clauses.push('1 = 0')
+      else {
+        clauses.push(`node_type IN (${nodeTypes.map(() => '?').join(', ')})`)
+        params.push(...nodeTypes)
+      }
+    } else if (options.nodeType?.trim()) {
       clauses.push('node_type = ?')
       params.push(options.nodeType.trim())
+    }
+    if (options.recordUids !== undefined) {
+      const recordUids = [...new Set(options.recordUids.map((value) => value.trim()).filter(Boolean))]
+      if (!recordUids.length) clauses.push('1 = 0')
+      else {
+        clauses.push(`uid IN (${recordUids.map(() => '?').join(', ')})`)
+        params.push(...recordUids)
+      }
     }
     const where = clauses.length ? ` WHERE ${clauses.join(' AND ')}` : ''
     const rows = this.db
@@ -8693,7 +9235,7 @@ export class AppDatabase {
       .all(...params) as SqlRow[]
     const fields = [...new Set((options.fields ?? []).map((field) => field.trim()).filter(Boolean))]
       .slice(0, 20)
-    const filters = (options.filters ?? [])
+    const filters = [...(options.baseFilters ?? []), ...(options.filters ?? [])]
       .filter((filter) => filter.field?.trim())
       .slice(0, 10)
     const normalizeSearchTerm = (value: unknown): string => String(value ?? '')
@@ -8797,7 +9339,9 @@ export class AppDatabase {
       ])
     )
     const fieldLabels = this.getFieldDisplayNames(
-      options.nodeType?.trim() || [...new Set(matched.map((item) => item.source.nodeType))],
+      nodeTypes?.length
+        ? nodeTypes
+        : options.nodeType?.trim() || [...new Set(matched.map((item) => item.source.nodeType))],
       fields
     )
     return {

@@ -187,8 +187,8 @@ flowchart LR
 
 ### 8.1 外部认证
 
-- VISSLM REST 接口使用用户名 + API Token；采集配置了用户属性 Key 时，对非空属性值先调用 `/ssf/user/getUserByName` 查询用户显示名。部分平台会对该 API Token 请求以 HTTP 200 返回 `Login/LogOn` HTML；只有明确识别为登录页时，才使用平台登录密码通过 `/User/LogOn` + `/User/UPLogOn` 建立 `JSESSIONID`，再以 Cookie 重试相同查询。富文本图片上传也使用这套网页登录会话，并携带配对的 `ckCsrfToken`；
-- 相同登录名的显示名请求在客户端内去重并缓存；合法 JSON 未返回显示名时缓存为空。HTTP 500、损坏 JSON 或普通 HTML 不触发会话兜底；缺少/错误密码或会话建立失败会使采集失败，并返回不包含凭据和上游正文的可操作错误，不静默成功。API Token 与平台登录密码均由操作系统安全存储加密，界面只返回是否已配置，不回显秘密值；
+- VISSLM REST 接口使用用户名 + API Token；字段定义读取、用户显示名查询的部分部署兼容路径以及富文本图片上传使用平台网页登录密码，通过 `/User/LogOn` + `/User/UPLogOn` 建立 `JSESSIONID`。字段定义以只读表单 POST 调用 `/Admin/Virtualization_ReadMember`，只在明确的 HTTP/ErrorCode 999 或登录页时重新登录并重放一次；富文本图片上传还携带配对的 `ckCsrfToken`；
+- 相同登录名的显示名请求在客户端内去重并缓存；合法 JSON 未返回显示名时缓存为空。HTTP 500、损坏 JSON 或普通 HTML 不触发用户显示名查询的会话兜底；配置了用户属性解析时，缺少/错误密码或会话建立失败会使采集失败。字段定义读取则记录脱敏进度、保留最近成功目录并继续采集。API Token 与平台登录密码均由操作系统安全存储加密，界面只返回是否已配置，不回显秘密值；
 - Ollama 本地服务不需要 API Key；
 - 在线模型使用 Bearer 或 Anthropic `x-api-key` 头；
 - Token、平台登录密码和 API Key 在 settings 表保存为 safeStorage 密文，应用仅返回 `hasToken/hasUploadPassword/hasApiKey`。
@@ -247,6 +247,8 @@ sequenceDiagram
 `VisslmClient` 对平台查询、附件下载、范围预览和 `/alm/rest/items` POST 做封装。响应解析、正文规范化、图片 URL 扫描、过滤器比较、分页递归和请求日志由 `visslm.ts` 完成。查询、下载和预览等幂等 GET 现在对超时、网络失败及 408/425/429/5xx 使用有限次数的指数退避重试；创建记录和图片上传仍不自动重试，因为平台正式接口尚未声明幂等键契约。
 
 `system.userPropertyKeys` 会在采集查询中强制并入 `ReturnProperty`。同步解析每个非空用户属性时，先使用 API Token 查询 `/ssf/user/getUserByName`，必要时按 8.1 的网页登录会话规则重试；成功得到的显示名可在重新采集时回填 `${key}_text`，对象属性回填对象内的 `key_text`。
+
+每个配置节点类型在读取记录前使用同一网页登录会话调用 `/Admin/Virtualization_ReadMember`，固定 `proId=0`。响应中的公共字段以请求节点类型为作用域落入 `field_definitions`；显示名进入记录规范化文本和字段展示，平台声明类型与采集值观察类型分别进入 AI/分析字段目录。目录请求失败时继续使用最近一次成功缓存，不能用空响应覆盖本地定义。
 
 ### 11.2 模型服务
 
@@ -359,3 +361,8 @@ flowchart LR
 ## 17. 代码依据索引
 
 核心依据：`src/main/index.ts`（生命周期/IPC/安全窗口/导出）、`src/preload/index.ts`（隔离边界）、`src/main/database.ts`（SQLite/迁移/缓存/表）、`src/main/visslm.ts`（外部集成）、`src/main/knowledge.ts`（知识处理）、`src/main/ollama.ts` 和 `src/main/model-client.ts`（AI）、`src/main/project-management.ts`（项目工作流）、`src/main/analytics/query-engine.ts`（查询）、`src/main/experts/*` 与 `src/main/dashboards/*`（可视化）、`src/renderer/src/main.tsx`、`src/renderer/src/App.tsx`、`package.json`、`electron.vite.config.ts`、`README.md`。
+# AI 助手证据与受控交付层（2026-08）
+
+`Assistant Orchestrator → 专业 Agent → EvidenceBlock → Artifact Preview → 用户确认 → Artifact Version/Export`
+
+字段语义由 `QueryEngine` 持久化并合并进入 `DataCenterAgent` 字段目录。`EvidenceBlock` 在主进程响应边界统一构造。交付物预览由主进程规范化并签名，提交时重新校验哈希；导出器只读取已确认且未撤销的本地交付物。`assistant_run_history` 独立保存运行质量指标，不从回答文本反推状态。

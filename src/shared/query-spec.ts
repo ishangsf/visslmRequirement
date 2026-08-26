@@ -1,3 +1,5 @@
+import type { FieldDefinitionNormalizedType } from './types'
+
 export type QueryFieldType = 'string' | 'number' | 'boolean' | 'date' | 'enum' | 'array' | 'object'
 
 export type FieldSensitivity = 'normal' | 'internal' | 'sensitive'
@@ -73,6 +75,12 @@ export interface QuerySpec {
 export interface FieldProfile {
   field: string
   inferredType: QueryFieldType
+  /** Authoritative type declared by the VISSLM data-type member catalog. */
+  declaredType?: FieldDefinitionNormalizedType
+  /** Original VISSLM MemberType retained alongside the normalized declared type. */
+  sourceType?: string
+  /** Localized VISSLM AttrType label. */
+  attrType?: string
   sensitivity: FieldSensitivity
   nonNullRate: number
   distinctCount: number

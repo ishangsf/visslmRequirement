@@ -7,6 +7,8 @@ export interface PlainChatClient {
     messages: ModelMessage[]
     think?: boolean
     forceThinking?: boolean
+    stream?: boolean
+    onTextDelta?: (content: string) => void
     temperature?: number
     numPredict?: number
     timeoutMs?: number
@@ -37,7 +39,8 @@ export class PlainChatAgent {
 
   constructor(
     settings: ModelSettings,
-    client?: PlainChatClient
+    client?: PlainChatClient,
+    private readonly onTextDelta?: (content: string) => void
   ) {
     this.client = client ?? new ModelClient(settings)
   }
@@ -51,6 +54,9 @@ export class PlainChatAgent {
       ],
       think: false,
       forceThinking: false,
+      ...(this.onTextDelta
+        ? { stream: true, onTextDelta: this.onTextDelta }
+        : {}),
       temperature: 0.2,
       numPredict: 1600
     })

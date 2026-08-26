@@ -881,7 +881,10 @@ export class KnowledgeService {
   }
 
   async rebuildIndex(): Promise<KnowledgeRebuildResult> {
-    return this.recordIndexLock.runExclusive(() => this.rebuildIndexInternal())
+    return this.recordIndexLock.runExclusive(async () => {
+      await this.syncRecordIndexInternal()
+      return this.rebuildIndexInternal()
+    })
   }
 
   async rebuildIndexInLock(): Promise<KnowledgeRebuildResult> {
@@ -889,12 +892,12 @@ export class KnowledgeService {
   }
 
   private async rebuildIndexInternal(): Promise<KnowledgeRebuildResult> {
-    await this.embeddings.prepare()
-    if (!this.embeddings.available) throw new Error(this.embeddings.unavailableReason)
-    this.clearVectorCaches()
     const taskId = randomUUID()
     const task = this.taskRunner.begin(taskId)
     try {
+      await this.embeddings.prepare()
+      if (!this.embeddings.available) throw new Error(this.embeddings.unavailableReason)
+      this.clearVectorCaches()
       const chunks = this.db.listKnowledgeChunksForRebuild()
       this.db.deleteKnowledgeVectors()
       const vectors: KnowledgeVectorInput[] = []
@@ -937,6 +940,17 @@ export class KnowledgeService {
         chunkCount: chunks.length,
         message: '知识库向量索引已重建'
       }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.emit({
+        taskId,
+        phase: 'error',
+        message: `索引重建失败：${message}`,
+        current: 0,
+        total: 0,
+        status: 'failed'
+      })
+      throw error
     } finally {
       task.dispose()
     }
@@ -1355,8 +1369,11 @@ export class KnowledgeService {
     this.clearVectorCaches()
     const taskId = randomUUID()
     const task = this.taskRunner.begin(taskId)
+    let current = 0
+    let total = 0
     try {
       const rows = this.db.listKnowledgeRecordIndexRows()
+      total = rows.length
       const known = new Set(rows.map((row) => row.uid))
       for (const uid of this.db.listKnowledgeIndexedRecordUids()) {
         await task.checkpoint()
@@ -1414,6 +1431,7 @@ export class KnowledgeService {
           total: rows.length,
           status: 'running'
         })
+        current = index + 1
       }
       this.emit({
         taskId,
@@ -1423,6 +1441,17 @@ export class KnowledgeService {
         total: rows.length,
         status: 'success'
       })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.emit({
+        taskId,
+        phase: 'error',
+        message: `采集记录索引失败：${message}`,
+        current,
+        total,
+        status: 'failed'
+      })
+      throw error
     } finally {
       task.dispose()
     }

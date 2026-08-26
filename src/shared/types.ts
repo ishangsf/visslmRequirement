@@ -10,7 +10,7 @@ import type {
   DashboardVersion,
   VisualizationRun
 } from './dashboard'
-import type { AgentEvent, AgentProgressUpdate, ExpertId } from './expert-types'
+import type { AgentEvent, AgentProgressUpdate, AssistantExecutionSummary, ExpertId } from './expert-types'
 import type {
   DataScope,
   FieldProfile,
@@ -168,10 +168,38 @@ export interface AppSettings {
   navigationOrder: FeatureNavigationOrder
 }
 
+export type ModelCapabilityStatus = 'supported' | 'limited' | 'unsupported' | 'unknown' | 'error'
+
+export type ModelCapabilityEvidence = 'metadata' | 'active-probe' | 'provider-contract'
+
+export interface ModelCapabilityItem {
+  status: ModelCapabilityStatus
+  summary: string
+  evidence: ModelCapabilityEvidence
+  value?: number | boolean | string
+}
+
+export interface ModelCapabilityReport {
+  checkedAt: string
+  probeMode: 'metadata' | 'active'
+  source: ModelSource
+  provider: ModelProvider
+  model: string
+  checks: {
+    connection: ModelCapabilityItem
+    minimalChat: ModelCapabilityItem
+    structuredOutput: ModelCapabilityItem
+    toolCalling: ModelCapabilityItem
+    contextWindow: ModelCapabilityItem
+    thinking: ModelCapabilityItem
+  }
+}
+
 export interface ConnectionResult {
   ok: boolean
   message: string
   details?: Record<string, unknown>
+  capabilityReport?: ModelCapabilityReport
 }
 
 export type UpdateStatusPhase =
@@ -235,10 +263,42 @@ export interface RecordReleaseValue {
   count: number
 }
 
+export type FieldDefinitionNormalizedType =
+  | 'string'
+  | 'rich_text'
+  | 'log'
+  | 'integer'
+  | 'number'
+  | 'boolean'
+  | 'date'
+  | 'datetime'
+  | 'enum'
+  | 'system_enum'
+  | 'reference'
+  | 'relation'
+  | 'url'
+  | 'special'
+  | 'unknown'
+
 export interface FieldDefinition {
   nodeType: string
   field: string
   displayName: string
+  /** Original VISSLM MemberType, retained for round-tripping and diagnostics. */
+  sourceType: string
+  /** Stable application-level type derived from sourceType. */
+  normalizedType: FieldDefinitionNormalizedType
+  /** Original localized VISSLM AttrType label. */
+  attrType: string
+  /** VISSLM field-definition row Uid. */
+  sourceUid: string
+  /** VISSLM internal Member identifier. */
+  internalMember: string
+  /** VISSLM MemberConditionUid identifier. */
+  conditionUid: string
+  isSystem: boolean
+  isEditable: boolean
+  isRemovable: boolean
   updatedAt?: string
 }
 
@@ -411,6 +471,9 @@ export type RequirementSemanticizationStatusReason =
 
 export type RequirementSemanticizationScope = 'selected' | 'all_unready'
 
+/** Internal quality route for record-level semanticization. */
+export type RequirementSemanticizationQualityMode = 'standard' | 'strict'
+
 export type RequirementSemanticizationTaskStatus =
   | 'queued'
   | 'running'
@@ -499,6 +562,8 @@ export interface RequirementSemanticizationAnalysisTrace {
   modelSignature: string
   /** Whether this task requested the model's deep-thinking mode. */
   deepThinking?: boolean
+  /** Quality route used by this task; omitted for traces written by older builds. */
+  qualityMode?: RequirementSemanticizationQualityMode
   outcome?: 'completed' | 'failed' | 'stopped'
   events: RequirementSemanticizationTraceEvent[]
   stages: Partial<Record<RequirementSemanticizationAnalysisStage, RequirementSemanticizationTraceStage>>
@@ -516,6 +581,8 @@ export interface RequirementSemanticizationStartInput {
   scope?: RequirementSemanticizationScope
   force?: boolean
   deepThinking?: boolean
+  /** Defaults to standard; deepThinking=true remains a backwards-compatible strict alias. */
+  qualityMode?: RequirementSemanticizationQualityMode
 }
 
 export interface RequirementSemanticizationStartResult {
@@ -558,6 +625,7 @@ export interface RequirementSemanticizationTaskSnapshot {
   recentItems: RequirementSemanticizationRecentItem[]
   /** Defaults to true for snapshots created before this field existed. */
   deepThinking?: boolean
+  qualityMode?: RequirementSemanticizationQualityMode
   /** Structured audit result only; model hidden reasoning is never included. */
   analysisTrace?: RequirementSemanticizationAnalysisTrace
 }
@@ -900,6 +968,14 @@ export interface ChatMessage {
   assistantIntent?: AssistantIntentDecision
   /** Persisted structured execution facts for this assistant turn. */
   taskTrace?: AssistantTaskTrace
+  /** Confirmed plan and actual source scope used for this assistant turn. */
+  executionSummary?: AssistantExecutionSummary
+  /** Session-level scope carried forward explicitly and restored with history. */
+  dataScope?: DataScope
+  dataScopeSummary?: string
+  recoverySuggestions?: ChatRecoverySuggestion[]
+  /** Fixed, source-aware evidence ledger for this completed turn. */
+  evidenceBlocks?: EvidenceBlock[]
   contextOutcome?: 'success' | 'failed' | 'undone'
 }
 
@@ -1075,6 +1151,8 @@ export interface KnowledgeStats {
   indexedChunkCount: number
   recordCount: number
   modelVersion: string
+  /** Most recent persisted indexing task, including failures recovered after restart. */
+  latestTask?: KnowledgeIndexProgress
 }
 
 export interface KnowledgeRebuildResult {
@@ -1137,6 +1215,7 @@ export type AssistantIntentTaskType =
   | 'mixed_analysis'
   | 'visualization'
   | 'requirement_matching'
+  | 'artifact_generation'
 
 export type AssistantIntentSourceMode = 'conversation' | 'records' | 'knowledge' | 'mixed'
 
@@ -1146,6 +1225,7 @@ export type AssistantIntentResultMode =
   | 'grouped_list'
   | 'table'
   | 'dashboard'
+  | 'artifact'
 
 export interface AssistantIntentDecision {
   taskType: AssistantIntentTaskType
@@ -1167,8 +1247,9 @@ export type AssistantExecutionAgentId =
   | 'knowledge-base'
   | 'requirement-analysis'
   | 'visualization'
+  | 'artifact'
 
-export type AssistantTaskTraceStatus = 'completed' | 'clarification' | 'failed'
+export type AssistantTaskTraceStatus = 'completed' | 'clarification' | 'failed' | 'cancelled'
 
 export interface AssistantTaskTrace {
   runId: string
@@ -1189,6 +1270,8 @@ export interface AssistantTaskTrace {
 
 export interface ChatRequest {
   question: string
+  /** Main process validated run identifier used for cancellation and tracing. */
+  runId?: string
   projectId?: string
   conversationId?: string
   expertId?: ExpertId
@@ -1208,6 +1291,8 @@ export interface ChatRequest {
     version?: number
     dashboard: DashboardSpec
   }
+  /** Verified assistant turn selected as the only source for artifact generation. */
+  artifactSource?: AssistantArtifactInput
   history?: ChatHistoryTurn[]
   /** Validated Auto-mode intent; direct Ollama callers may omit it. */
   assistantIntent?: AssistantIntentDecision
@@ -1217,12 +1302,17 @@ export interface ChatResponse {
   answer: string
   sources: ChatSource[]
   dataViews: ChatDataView[]
+  /** True when the active run was cancelled before a usable answer completed. */
+  cancelled?: boolean
   /** The planner stopped safely and is asking the user to disambiguate scope/source/fields. */
   needsClarification?: boolean
   clarificationQuestion?: string
   /** Validated control decision selected before any Auto-mode evidence access. */
   assistantIntent?: AssistantIntentDecision
   taskTrace?: AssistantTaskTrace
+  executionSummary?: AssistantExecutionSummary
+  recoverySuggestions?: ChatRecoverySuggestion[]
+  evidenceBlocks?: EvidenceBlock[]
   contextRefs?: ChatContextRef[]
   /**
    * Optional diagnostics for bounded/compacted model context.  The field is
@@ -1234,7 +1324,224 @@ export interface ChatResponse {
   expertId?: ExpertId
   dashboard?: DashboardSpec
   dashboardChange?: DashboardAiChangeSummary
+  /** Fail-closed preview returned by the artifact skill before local file creation. */
+  artifactPreview?: AssistantArtifactPreview
   events?: AgentEvent[]
+}
+
+export interface ChatRecoverySuggestion {
+  id: 'confirm_fields' | 'narrow_scope' | 'search_content'
+  label: string
+  prompt: string
+  reason: string
+}
+
+export type EvidenceBlockKind = 'record' | 'document' | 'aggregate' | 'query_detail'
+
+export interface EvidenceBlock {
+  id: string
+  kind: EvidenceBlockKind
+  title: string
+  summary: string
+  count: number
+  /** Indexes into ChatResponse.sources; keeps the block lightweight and auditable. */
+  sourceIndexes?: number[]
+  /** Stable ChatDataView entry for full result inspection and pagination. */
+  dataViewId?: string
+  matchedCount?: number
+  returnedCount?: number
+  truncated?: boolean
+}
+
+export type AssistantArtifactType =
+  | 'analysis_snapshot'
+  | 'saved_filter'
+  | 'report_draft'
+  | 'delivery_draft'
+export type AssistantArtifactStatus = 'active' | 'reverted'
+export type AssistantArtifactOutputFormat = 'docx' | 'xlsx' | 'pptx' | 'zip'
+
+export interface AssistantArtifactInput {
+  type: AssistantArtifactType
+  conversationId: string
+  messageId: string
+  title: string
+  question: string
+  answer: string
+  executionSummary?: AssistantExecutionSummary
+  evidenceBlocks: EvidenceBlock[]
+  dataViews: ChatDataView[]
+  /** Sources referenced by EvidenceBlock.sourceIndexes; optional for legacy saved artifacts. */
+  sources?: ChatSource[]
+  outputFormat?: AssistantArtifactOutputFormat
+  instructions?: string
+}
+
+export interface AssistantArtifactPreview {
+  previewId: string
+  type: AssistantArtifactType
+  title: string
+  contentPreview: string
+  impact: {
+    recordEvidenceCount: number
+    documentEvidenceCount: number
+    queryMatchedCount: number
+    sourceWriteCount: 0
+  }
+  rollbackPoint: string
+  input: AssistantArtifactInput
+  payloadHash: string
+}
+
+export interface AssistantArtifact {
+  id: string
+  type: AssistantArtifactType
+  status: AssistantArtifactStatus
+  version: number
+  conversationId: string
+  messageId: string
+  title: string
+  payload: AssistantArtifactInput
+  createdAt: string
+  updatedAt: string
+}
+
+export interface AssistantArtifactExportFile {
+  name: string
+  mimeType: string
+  byteSize: number
+  sha256: string
+}
+
+export interface AssistantArtifactExportManifest {
+  schemaVersion: '1.0'
+  artifactId: string
+  title: string
+  format: AssistantArtifactOutputFormat
+  conversationId: string
+  messageId: string
+  generatedAt: string
+  evidence: {
+    blockCount: number
+    recordCount: number
+    documentCount: number
+    queryMatchedCount: number
+    dataViewCount: number
+    sourceCount: number
+  }
+  files: AssistantArtifactExportFile[]
+}
+
+export interface AssistantArtifactExportRequest {
+  artifactId: string
+  format: AssistantArtifactOutputFormat
+  instructions?: string
+}
+
+export interface AssistantArtifactExportResult {
+  ok: boolean
+  canceled?: boolean
+  format: AssistantArtifactOutputFormat
+  filePath?: string
+  fileName?: string
+  mimeType?: string
+  byteSize?: number
+  sha256?: string
+  manifest?: AssistantArtifactExportManifest
+  message: string
+}
+
+export interface AssistantRunHistory {
+  runId: string
+  conversationId?: string
+  status: AssistantTaskTraceStatus
+  taskType: AssistantIntentTaskType
+  sourceMode: AssistantIntentSourceMode
+  resultMode: AssistantIntentResultMode
+  primaryAgent: AssistantExecutionAgentId
+  invokedAgents: AssistantExecutionAgentId[]
+  startedAt: string
+  completedAt: string
+  durationMs: number
+  stages: Array<{ stage: string; message: string; at: string }>
+  toolCallCount: number
+  matchedCount: number
+  recordEvidenceCount: number
+  documentEvidenceCount: number
+  failedStage?: string
+  error?: { code: string; message: string }
+}
+
+export interface AssistantRunHistoryStats {
+  total: number
+  completed: number
+  failed: number
+  cancelled: number
+  clarification: number
+  averageDurationMs: number
+  totalToolCalls: number
+  totalMatchedCount: number
+}
+
+export type AssistantPlanFilterOperator =
+  | 'equals'
+  | 'not_equals'
+  | 'contains'
+  | 'not_contains'
+  | 'is_empty'
+  | 'not_empty'
+  | 'gt'
+  | 'gte'
+  | 'lt'
+  | 'lte'
+
+export interface AssistantPlanFilter {
+  field: string
+  operator: AssistantPlanFilterOperator
+  value?: string
+}
+
+/** Renderer-owned edits accepted by the main-process plan confirmation boundary. */
+export interface AssistantPlanPatch {
+  searchTerms?: string[]
+  fields?: string[]
+  scope?: {
+    projectIds?: string[]
+    nodeTypes?: string[]
+    baseFilters?: AssistantPlanFilter[]
+  }
+  filters?: AssistantPlanFilter[]
+  limit?: number
+  resultMode?: AssistantIntentResultMode
+}
+
+export interface ConfirmAgentPlanError {
+  field: string
+  code: string
+  message: string
+}
+
+export interface ConfirmAgentPlanWarning {
+  field: string
+  code: string
+  message: string
+}
+
+export interface ConfirmAgentPlanResult {
+  status: 'approved' | 'invalid' | 'not_found'
+  runId: string
+  effectiveSummary?: AssistantExecutionSummary
+  errors?: ConfirmAgentPlanError[]
+  warnings?: ConfirmAgentPlanWarning[]
+}
+
+export type CancelAgentRunStatus = 'cancel_requested' | 'not_found' | 'invalid'
+
+export interface CancelAgentRunResult {
+  ok: boolean
+  runId: string
+  status: CancelAgentRunStatus
+  message?: string
 }
 
 export interface AppApi {
@@ -1256,7 +1563,7 @@ export interface AppApi {
   saveFeatureSettings(input: FeatureModuleSettings): Promise<AppSettings>
   saveNavigationOrder(input: FeatureNavigationOrder): Promise<AppSettings>
   testPlatform(input?: PlatformSettingsInput): Promise<ConnectionResult>
-  testModel(input?: ModelSettings, probeChat?: boolean): Promise<ConnectionResult>
+  testModel(input?: ModelSettings, probeChat?: boolean, probeCapabilities?: boolean): Promise<ConnectionResult>
   listProjects(): Promise<ProjectRow[]>
   listNodeTypes(): Promise<string[]>
   listRecords(query: RecordQuery): Promise<RecordPage>
@@ -1293,6 +1600,15 @@ export interface AppApi {
   applyDataReview(input: DataReviewApplyInput): Promise<DataReviewApplyResult>
   listCollectionRequestLogs(page?: number, pageSize?: number): Promise<CollectionRequestLogPage>
   askAgent(request: ChatRequest): Promise<ChatResponse>
+  cancelAgentRun(runId: string): Promise<CancelAgentRunResult>
+  confirmAgentPlan(runId: string, patch?: AssistantPlanPatch): Promise<ConfirmAgentPlanResult>
+  previewAssistantArtifact(input: AssistantArtifactInput): Promise<AssistantArtifactPreview>
+  commitAssistantArtifact(preview: AssistantArtifactPreview): Promise<AssistantArtifact>
+  listAssistantArtifacts(limit?: number): Promise<AssistantArtifact[]>
+  revertAssistantArtifact(id: string): Promise<AssistantArtifact>
+  exportAssistantArtifact(input: AssistantArtifactExportRequest): Promise<AssistantArtifactExportResult>
+  listAssistantRunHistory(limit?: number): Promise<AssistantRunHistory[]>
+  getAssistantRunHistoryStats(): Promise<AssistantRunHistoryStats>
   listChatSessions(limit?: number): Promise<ChatSessionSummary[]>
   getChatSession(id: string): Promise<ChatSession | null>
   saveChatSession(input: ChatSessionSaveInput): Promise<ChatSession>

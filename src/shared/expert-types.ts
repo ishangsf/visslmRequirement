@@ -1,7 +1,12 @@
 import type { DashboardSpec } from './dashboard'
 import type { DataScope } from './query-spec'
 
-export type ExpertId = 'general' | 'visualization' | 'requirement-analysis'
+export type ExpertId =
+  | 'general'
+  | 'knowledge-base'
+  | 'visualization'
+  | 'requirement-analysis'
+  | 'artifact'
 
 export interface ExpertDefinition {
   id: ExpertId
@@ -37,6 +42,30 @@ export interface AgentProgress {
   match?: AgentMatchProgress
 }
 
+export interface AssistantExecutionSummary {
+  question: string
+  taskType: string
+  sourceMode: 'conversation' | 'records' | 'knowledge' | 'mixed'
+  resultMode: 'answer' | 'list' | 'grouped_list' | 'table' | 'dashboard'
+  intent: string
+  searchTerms: string[]
+  fields: string[]
+  filters: Array<{ field: string; operator: string; value?: string }>
+  /** Fixed execution semantics retained for plan confirmation and audit. */
+  groupEntities?: string[]
+  searchMode?: 'any' | 'all'
+  groupByField?: string
+  sort?: { field: string; direction: 'asc' | 'desc' }
+  limit: number
+  scope: {
+    projectIds: string[]
+    nodeTypes: string[]
+    recordCount?: number
+    baseFilters: Array<{ field: string; operator: string; value?: string }>
+    snapshotAt?: string
+  }
+}
+
 export type AgentEvent =
   | {
       type: 'status'
@@ -53,7 +82,22 @@ export type AgentEvent =
         clarificationQuestion?: string
       }
     }
-  | { type: 'text'; content: string }
+  | {
+      type: 'text'
+      /** A visible answer delta.  Legacy producers may omit sequencing fields. */
+      content: string
+      sequence?: number
+      done?: boolean
+      /** Replace the currently buffered answer with content. */
+      replace?: boolean
+      /** Alias for clients that call replacement a reset. */
+      reset?: boolean
+    }
+  | {
+      type: 'plan'
+      summary: AssistantExecutionSummary
+      requiresConfirmation: true
+    }
   | { type: 'artifact'; artifactId: string; version: number; dashboard: DashboardSpec }
   | {
       type: 'error'
@@ -65,6 +109,8 @@ export type AgentEvent =
     }
 
 export interface AgentProgressUpdate {
+  /** The assistant run that emitted this update; stale events can be ignored. */
+  runId: string
   conversationId?: string
   event: AgentEvent
 }

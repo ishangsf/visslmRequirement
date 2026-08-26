@@ -5,18 +5,24 @@ import type {
   AssistantIntentResultMode,
   AssistantExecutionAgentId,
   ConnectionResult,
+  FieldDefinitionNormalizedType,
   ModelSettings
 } from '../shared/types'
 import { AppDatabase } from './database'
 import { ModelClient } from './model-client'
 import type { ModelMessage, ModelResponse } from './model-client'
 import { KnowledgeService } from './knowledge'
-import type { AgentEvent } from '../shared/expert-types'
-import { DataCenterAgent } from './assistant/agents/data-center-agent'
+import type { AgentEvent, AssistantExecutionSummary } from '../shared/expert-types'
+import {
+  DataCenterAgent,
+  findAmbiguousSemanticAliases
+} from './assistant/agents/data-center-agent'
 import type {
   DataCenterExecution,
   DataCenterQueryPlan
 } from './assistant/agents/data-center-agent'
+import type { DataScope } from '../shared/query-spec'
+import type { ConfirmedAssistantPlan } from './assistant/execution-plan'
 import { KnowledgeBaseAgent } from './assistant/agents/knowledge-base-agent'
 import {
   attachAssistantTaskTrace,
@@ -211,7 +217,12 @@ export class OllamaAgent {
     private readonly db: AppDatabase,
     private readonly settings: ModelSettings,
     private readonly knowledge?: KnowledgeService,
-    private readonly onProgress?: (event: AgentStatusEvent) => void
+    private readonly onProgress?: (event: AgentStatusEvent) => void,
+    private readonly onTextDelta?: (content: string) => void,
+    private readonly onPlanConfirmation?: (
+      summary: AssistantExecutionSummary,
+      dataScope?: DataScope
+    ) => Promise<ConfirmedAssistantPlan | void>
   ) {
     this.dataCenterAgent = new DataCenterAgent(db)
     this.knowledgeBaseAgent = new KnowledgeBaseAgent(db, knowledge, {
@@ -219,8 +230,8 @@ export class OllamaAgent {
     })
   }
 
-  async test(probeChat = false): Promise<ConnectionResult> {
-    return new ModelClient(this.settings).test(probeChat)
+  async test(probeChat = false, probeCapabilities = false): Promise<ConnectionResult> {
+    return new ModelClient(this.settings).test(probeChat, probeCapabilities)
   }
 
   async ask(request: ChatRequest): Promise<ChatResponse> {
@@ -283,7 +294,7 @@ export class OllamaAgent {
         })
       }
     }
-    const effectiveRequest = request.assistantIntent?.resolvedQuestion
+    let effectiveRequest = request.assistantIntent?.resolvedQuestion
       ? { ...request, question: request.assistantIntent.resolvedQuestion }
       : request
     this.progress('route', '正在形成统一任务计划')
@@ -330,6 +341,37 @@ export class OllamaAgent {
         })
       }
     }
+    let executionSummary = this.executionSummaryFor(effectiveRequest, plan)
+    if (plan.sourceMode !== 'conversation' && this.onPlanConfirmation) {
+      this.progress('scope', '执行计划已生成，等待用户确认范围')
+      const confirmed = await this.onPlanConfirmation(executionSummary, effectiveRequest.dataScope)
+      if (confirmed?.effectiveSummary) {
+        const effective = confirmed.effectiveSummary
+        plan = {
+          ...plan,
+          searchTerms: [...effective.searchTerms],
+          fields: [...effective.fields],
+          filters: effective.filters.map((filter) => ({
+            field: filter.field,
+            operator: filter.operator as QuestionPlan['filters'][number]['operator'],
+            ...(filter.value === undefined ? {} : { value: filter.value })
+          })),
+          limit: effective.limit,
+          ...(plan.sourceMode === 'knowledge'
+            ? { evidenceLimit: Math.min(20, Math.max(1, Math.trunc(effective.limit))) }
+            : {}),
+          resultMode: effective.resultMode,
+          ...(effective.groupEntities
+            ? { groupEntities: [...effective.groupEntities] }
+            : {}),
+          ...(effective.searchMode ? { searchMode: effective.searchMode } : {}),
+          scope: confirmed.effectiveDataScope
+        }
+        effectiveRequest = { ...effectiveRequest, dataScope: confirmed.effectiveDataScope }
+        executionSummary = effective
+      }
+      this.progress('scope', '执行范围已确认')
+    }
     if (process.env.VISSLM_AGENT_DEBUG === '1') {
       console.info('[Agent] 结构化计划：', JSON.stringify(plan))
     }
@@ -337,7 +379,7 @@ export class OllamaAgent {
       this.progress('query', '正在执行本地查询并获取证据')
       const execution = await this.executePlanAndAnswer(effectiveRequest, plan)
       const context = this.traceContextForPlan(plan)
-      return attachAssistantTaskTrace(execution.response, context, {
+      return attachAssistantTaskTrace({ ...execution.response, executionSummary }, context, {
         startedAt,
         invokedAgents: execution.invokedAgents
       })
@@ -357,6 +399,53 @@ export class OllamaAgent {
 
   private progress(stage: string, message: string): void {
     this.onProgress?.({ type: 'status', stage, message })
+  }
+
+  private executionSummaryFor(request: ChatRequest, plan: QuestionPlan): AssistantExecutionSummary {
+    const scope = request.dataScope
+    const projectIds = [...new Set(
+      (scope?.projectIds !== undefined
+        ? scope.projectIds
+        : request.projectId ? [request.projectId] : [])
+        .map((value) => value.trim())
+        .filter(Boolean)
+    )]
+    const valueText = (value: unknown): string | undefined => {
+      if (value === undefined) return undefined
+      if (typeof value === 'string') return sanitizeContextText(value, 240)
+      if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+      return sanitizeContextText(JSON.stringify(value), 240)
+    }
+    return {
+      question: request.question,
+      taskType: this.traceContextForPlan(plan).taskType,
+      sourceMode: plan.sourceMode,
+      resultMode: plan.resultMode,
+      intent: plan.intent,
+      searchTerms: [...plan.searchTerms],
+      fields: [...plan.fields],
+      filters: plan.filters.map((filter) => ({
+        field: filter.field,
+        operator: filter.operator,
+        ...(filter.value === undefined ? {} : { value: filter.value })
+      })),
+      ...(plan.groupEntities.length ? { groupEntities: [...plan.groupEntities] } : {}),
+      ...(plan.searchMode ? { searchMode: plan.searchMode } : {}),
+      ...(plan.groupByField ? { groupByField: plan.groupByField } : {}),
+      ...(plan.sort ? { sort: { ...plan.sort } } : {}),
+      limit: plan.limit,
+      scope: {
+        projectIds,
+        nodeTypes: [...new Set((scope?.nodeTypes ?? []).map((value) => value.trim()).filter(Boolean))],
+        ...(scope?.recordUids ? { recordCount: scope.recordUids.length } : {}),
+        baseFilters: (scope?.baseFilters ?? []).map((filter) => ({
+          field: filter.field,
+          operator: filter.operator,
+          ...(filter.value === undefined ? {} : { value: valueText(filter.value) })
+        })),
+        ...(scope?.snapshotAt ? { snapshotAt: scope.snapshotAt } : {})
+      }
+    }
   }
 
   private traceContextForPlan(plan: QuestionPlan): AssistantTraceContext {
@@ -480,7 +569,13 @@ export class OllamaAgent {
     let nodeTypes: string[] = []
     let catalog: Array<{
       field: string
+      displayName?: string
+      role?: 'dimension' | 'measure' | 'time' | 'identifier'
+      synonyms: string[]
       kind: 'technical' | 'business'
+      declaredType?: FieldDefinitionNormalizedType
+      sourceType?: string
+      attrType?: string
       types: string[]
       coverageRate: number
       samples: string[]
@@ -524,6 +619,10 @@ export class OllamaAgent {
               '只要问题包含主题、属性、时间、状态、对象类别等限定条件，就不能使用 total。',
               '业务类别应优先映射到目录中真实存在的字段过滤；无法映射为字段的主题概念使用 searchTerms。',
               '字段目录中的 kind=technical 表示同步或存储技术字段，kind=business 表示用户可理解的业务属性。',
+              '字段目录中的 displayName 是平台字段显示名；理解用户问题时优先匹配 displayName，但查询计划必须输出对应的 field 原始 key。',
+              '字段目录中的 synonyms 是用户人工维护的业务别名，优先级高于模型自行联想；别名命中多个字段时必须 needsClarification=true，禁止任选一个。',
+              '字段目录中的 role 表示 dimension、measure、time 或 identifier；聚合、时间筛选和唯一记录定位必须选择匹配角色的字段。',
+              'declaredType 是平台声明类型，types 是采集值观察类型；选择日期比较、数值比较、枚举分组等操作时优先参考 declaredType，并在二者冲突时采用保守查询。',
               '当用户表达业务类别、状态、优先级等条件时，必须优先选择语义匹配的 business 字段，不能用 _valm_NodeType 等 technical 字段替代。',
               'searchTerms 只能使用当前问题或用户历史中明确出现的词或短语；除非用户明确要求同义扩展，否则禁止自行增加近义词、关联词。',
               '同义词、近义词和主题扩展词之间使用 searchMode=any；只有用户明确要求多个不同概念必须同时满足时才使用 all。',
@@ -658,16 +757,18 @@ export class OllamaAgent {
         ? raw.sort as Record<string, unknown>
         : null
     const sortField = resolveField(sortInput?.field)
-    const resultModeValues: AssistantIntentResultMode[] = [
+    const resultModeValues: QuestionPlan['resultMode'][] = [
       'answer',
       'list',
       'grouped_list',
       'table',
       'dashboard'
     ]
-    const resultMode = resultModeValues.includes(raw.resultMode as AssistantIntentResultMode)
-      ? raw.resultMode as AssistantIntentResultMode
-      : providedDecision?.resultMode ?? (
+    const resultMode = resultModeValues.includes(raw.resultMode as QuestionPlan['resultMode'])
+      ? raw.resultMode as QuestionPlan['resultMode']
+      : (providedDecision && resultModeValues.includes(providedDecision.resultMode as QuestionPlan['resultMode'])
+          ? providedDecision.resultMode as QuestionPlan['resultMode']
+          : undefined) ?? (
           ['filter_records', 'record_lookup', 'search_content'].includes(intent)
             ? 'list'
             : intent === 'field_aggregate' || intent === 'schema_inspection'
@@ -710,6 +811,14 @@ export class OllamaAgent {
         ? { field: sortField, direction: sortInput?.direction === 'asc' ? 'asc' : 'desc' }
         : undefined,
       limit: effectiveLimit
+    }
+    const ambiguousSemanticAliases = findAmbiguousSemanticAliases(groundingQuestion, catalog)
+    if (ambiguousSemanticAliases.length) {
+      const details = ambiguousSemanticAliases
+        .map(({ alias, fields }) => `“${alias}”可能对应 ${fields.join('、')}`)
+        .join('；')
+      plan.needsClarification = true
+      plan.clarificationQuestion = `字段语义词典存在歧义：${details}。请明确要使用哪个字段。`
     }
     if (plan.sourceMode !== 'knowledge' && plan.intent === 'total' && (plan.searchTerms.length || plan.filters.length)) {
       plan.intent = 'count_matching'
@@ -780,7 +889,8 @@ export class OllamaAgent {
         ],
         think: false,
         temperature: 0.3,
-        numPredict: 800
+        numPredict: 800,
+        ...(this.onTextDelta ? { onTextDelta: this.onTextDelta } : {})
       })
       return {
         response: {
@@ -793,16 +903,25 @@ export class OllamaAgent {
     }
 
     let recordExecution: RecordPlanExecution | undefined
+    const selectedProjectId = plan.scope?.projectIds === undefined
+      ? request.projectId
+      : plan.scope.projectIds.length === 1
+        ? plan.scope.projectIds[0]
+        : undefined
     if (plan.sourceMode !== 'knowledge') {
       invokedAgents.push('data-center')
-      recordExecution = this.dataCenterAgent.executePlan(request.projectId, plan)
+      recordExecution = this.dataCenterAgent.executePlan(selectedProjectId, plan)
     }
     let knowledgeExecution: KnowledgePlanExecution | undefined
     if (plan.sourceMode !== 'records') {
       invokedAgents.push('knowledge-base')
+      const knowledgeQuestion = plan.sourceMode === 'knowledge' && plan.evidenceLimit !== undefined && plan.searchTerms.length
+        ? plan.searchTerms.join(' ')
+        : request.question
+      const knowledgeLimit = Math.min(20, Math.max(1, Math.trunc(plan.evidenceLimit ?? 8)))
       knowledgeExecution = await this.knowledgeBaseAgent.search(
-        request.question,
-        plan.evidenceLimit ?? 8
+        knowledgeQuestion,
+        knowledgeLimit
       )
     }
     const sources = new Map<string, ChatSource>()
@@ -819,7 +938,7 @@ export class OllamaAgent {
           recordExecution.toolName,
           recordExecution.args,
           recordExecution.result,
-          request.projectId
+          selectedProjectId
         )
       : null
 
@@ -975,8 +1094,13 @@ export class OllamaAgent {
     format?: 'json' | Record<string, unknown>
     temperature: number
     numPredict: number
+    onTextDelta?: (content: string) => void
   }): Promise<ModelResponse> {
-    return new ModelClient(this.settings).chat({ ...input, forceThinking: true })
+    return new ModelClient(this.settings).chat({
+      ...input,
+      ...(input.onTextDelta ? { stream: true } : {}),
+      forceThinking: true
+    })
   }
 
   private collectSources(input: unknown, sources: Map<string, ChatSource>): void {

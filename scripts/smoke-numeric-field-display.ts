@@ -548,8 +548,11 @@ try {
     const syncResult = await new SyncService(db, () => syncClient, () => undefined).run(config)
     assert.equal(syncResult.ok, false, `${label} must fail synchronization`)
     assertSanitized(syncResult.message)
-    assert.equal(authLogOnCalls, 0, `${label} sync must not open /User/LogOn`)
-    assert.equal(authUpLogOnCalls, 0, `${label} sync must not submit /User/UPLogOn`)
+    // Sync now refreshes the field-definition catalog before querying items,
+    // so one web login is expected even though the later display-value HTTP
+    // failure itself must not trigger an additional relogin.
+    assert.equal(authLogOnCalls, 1, `${label} sync must perform only the field-definition login`)
+    assert.equal(authUpLogOnCalls, 1, `${label} sync must submit only the field-definition login`)
   }
 
   await assertNonLoginFailure(

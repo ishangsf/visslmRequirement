@@ -85,6 +85,14 @@ import appIconLight from './assets/visslm-icon-light.png'
 import { RichDescription } from './RichDescription'
 import { ResizableTable } from './ResizableTable'
 import {
+  ArtifactExportPanel,
+  assistantSkillPresentation
+} from './assistant/ArtifactExportPanel'
+import type {
+  ArtifactExportFormat,
+  ArtifactExportGenerationStatus
+} from './assistant/ArtifactExportPanel'
+import {
   buildDefaultPushFieldMappings,
   isLegacyDefaultPushFieldMappings,
   pushForbiddenSourceFields,
@@ -96,8 +104,15 @@ import {
 import type { PushConfigDraft, PushFormValues } from './push-config-draft'
 import type { AppThemeMode } from './theme'
 import type { DashboardSpec } from '../../shared/dashboard'
-import type { DataScope } from '../../shared/query-spec'
-import type { AgentEvent, AgentMatchProgress, AgentProgress, ExpertId } from '../../shared/expert-types'
+import type {
+  DataScope,
+  FieldProfile,
+  FieldProfileRole,
+  FieldSensitivity
+} from '../../shared/query-spec'
+import { restoreLegacyAssistantMarkdown } from '../../shared/chat-message-format'
+import { deriveAssistantWorkspaceReadiness } from '../../shared/assistant-readiness'
+import type { AgentEvent, AgentMatchProgress, AgentProgress, AssistantExecutionSummary, ExpertId } from '../../shared/expert-types'
 import {
   DEFAULT_PROJECT_MATCHING_SETTINGS,
   DEFAULT_FEATURE_MODULE_SETTINGS,
@@ -105,8 +120,18 @@ import {
 } from '../../shared/types'
 import type {
   AppSettings,
+  AssistantArtifact,
+  AssistantArtifactOutputFormat,
+  AssistantArtifactPreview,
+  AssistantArtifactType,
+  AssistantPlanFilter,
+  AssistantPlanFilterOperator,
+  AssistantPlanPatch,
+  AssistantRunHistory,
+  AssistantRunHistoryStats,
   AssistantExecutionAgentId,
   AssistantTaskTrace,
+  ConfirmAgentPlanResult,
   ChatDataGroup,
   ChatDataRow,
   ChatDataView,
@@ -114,6 +139,7 @@ import type {
   ChatMessage,
   ChatSessionSummary,
   CollectionRequestLogRow,
+  ConnectionResult,
   DataImportResult,
   DataImportRunSnapshot,
   DataReviewApplyResult,
@@ -127,6 +153,10 @@ import type {
   KnowledgeDocumentDetail,
   KnowledgeIndexProgress,
   KnowledgeStats,
+  ModelCapabilityEvidence,
+  ModelCapabilityItem,
+  ModelCapabilityReport,
+  ModelCapabilityStatus,
   ModelSettings,
   ModelProvider,
   ModelSource,
@@ -456,7 +486,7 @@ const isRecordObject = (value: unknown): value is Record<string, unknown> => (
 
 type AgentControlStepKey = 'understand' | 'skill' | 'plan' | 'tool' | 'verify' | 'deliver'
 type AgentControlStepState = 'pending' | 'active' | 'complete'
-type AgentRunStatus = 'idle' | 'running' | 'clarification' | 'failed'
+type AgentRunStatus = 'idle' | 'running' | 'clarification' | 'failed' | 'cancelled'
 
 type AgentRunMetadata = {
   skill?: string
@@ -468,7 +498,32 @@ type AgentRunMetadata = {
   clarificationQuestion?: string
 }
 
-type AssistantTaskStatus = 'pending' | 'running' | 'completed' | 'clarification' | 'failed'
+type AssistantTaskStatus = 'pending' | 'running' | 'completed' | 'clarification' | 'failed' | 'cancelled'
+
+type ActiveChatRun = {
+  runId: string
+  sessionId: string
+  question: string
+  userMessage: ChatMessage
+  baseMessages: ChatMessage[]
+  startedAt: string
+  initialMetadata: AgentRunMetadata
+  cancelRequested: boolean
+}
+
+type AnswerStreamBuffer = {
+  runId: string
+  sessionId: string
+  content: string
+  lastSequence: number | null
+  done: boolean
+}
+
+type StreamingAnswerView = {
+  runId: string
+  sessionId: string
+  content: string
+}
 
 type AssistantTaskView = {
   runId?: AssistantTaskTrace['runId']
@@ -489,7 +544,8 @@ const assistantTaskStatusLabels: Record<AssistantTaskStatus, string> = {
   running: '执行中',
   completed: '已完成',
   clarification: '等待补充',
-  failed: '执行失败'
+  failed: '执行失败',
+  cancelled: '已停止'
 }
 
 const assistantTaskStatusClassOf = (status: AssistantTaskStatus | undefined): string => (
@@ -497,11 +553,13 @@ const assistantTaskStatusClassOf = (status: AssistantTaskStatus | undefined): st
     ? 'failed'
     : status === 'clarification'
       ? 'clarification'
-      : status === 'completed'
-        ? 'completed'
-        : status === 'running'
-          ? 'running'
-          : 'pending'
+      : status === 'cancelled'
+        ? 'cancelled'
+        : status === 'completed'
+          ? 'completed'
+          : status === 'running'
+            ? 'running'
+            : 'pending'
 )
 
 const assistantTaskStatusOf = (
@@ -512,6 +570,7 @@ const assistantTaskStatusOf = (
   const normalized = value.trim().toLocaleLowerCase()
   if (['success', 'succeeded', 'complete', 'completed', 'done'].includes(normalized)) return 'completed'
   if (['clarification', 'needs_clarification', 'paused', 'waiting'].includes(normalized)) return 'clarification'
+  if (['cancelled', 'canceled', 'stopped', 'stop_requested'].includes(normalized)) return 'cancelled'
   if (['failed', 'failure', 'error', 'aborted'].includes(normalized)) return 'failed'
   if (['running', 'in_progress', 'active', 'executing'].includes(normalized)) return 'running'
   if (['pending', 'queued', 'created'].includes(normalized)) return 'pending'
@@ -575,8 +634,10 @@ const agentControlStepLabelsByStage: Record<string, AgentControlStepKey> = {
 
 const agentSkillLabels: Record<string, string> = {
   general: '通用数据助手',
+  'knowledge-base': '知识库专家',
   visualization: '数据可视化专家',
-  'requirement-analysis': '需求分析专家'
+  'requirement-analysis': '需求分析专家',
+  artifact: '交付物专家'
 }
 
 const agentSourceModeLabels: Record<string, string> = {
@@ -601,6 +662,7 @@ const agentTaskTypeLabels: Record<string, string> = {
   count_matching: '条件统计',
   search_content: '知识检索',
   visualization: '可视化交付',
+  artifact_generation: '交付物生成',
   requirement_analysis: '需求分析',
   'requirement-analysis': '需求分析'
 }
@@ -739,6 +801,8 @@ const agentTaskTypeLabelOf = (
 const explicitAgentSkillOf = (question: string): string | undefined => {
   if (/@数据可视化专家(?:\s|$)/.test(question)) return 'visualization'
   if (/@需求分析专家(?:\s|$)/.test(question)) return 'requirement-analysis'
+  if (/@知识库专家(?:\s|$)/.test(question)) return 'knowledge-base'
+  if (/@交付物专家(?:\s|$)/.test(question)) return 'artifact'
   if (/@通用数据助手(?:\s|$)/.test(question)) return 'general'
   return undefined
 }
@@ -752,7 +816,8 @@ const assistantExecutionAgentLabels: Record<AssistantExecutionAgentId, string> =
   'data-center': '数据中心 Agent',
   'knowledge-base': '知识库 Agent',
   'requirement-analysis': '需求分析 Agent',
-  visualization: '可视化 Agent'
+  visualization: '可视化 Agent',
+  artifact: '交付物 Agent'
 }
 
 const assistantTaskTypeLabels: Record<string, string> = {
@@ -761,7 +826,8 @@ const assistantTaskTypeLabels: Record<string, string> = {
   knowledge_qa: '知识库问答',
   mixed_analysis: '混合分析',
   visualization: '可视化交付',
-  requirement_matching: '需求匹配'
+  requirement_matching: '需求匹配',
+  artifact_generation: '交付物生成'
 }
 
 const assistantResultModeLabels: Record<string, string> = {
@@ -769,7 +835,8 @@ const assistantResultModeLabels: Record<string, string> = {
   list: '列表',
   grouped_list: '分组列表',
   table: '数据表',
-  dashboard: '大屏交付'
+  dashboard: '大屏交付',
+  artifact: '文件交付'
 }
 
 const assistantSourceModeLabels: Record<string, string> = {
@@ -801,6 +868,10 @@ const canonicalAssistantExecutionAgentOf = (
     ['visualization', 'visualization-agent', 'visual'].includes(normalized) ||
     /可视化|大屏|visual/.test(normalized)
   ) return 'visualization'
+  if (
+    ['artifact', 'artifact-agent', 'delivery'].includes(normalized) ||
+    /交付物|artifact|delivery/.test(normalized)
+  ) return 'artifact'
   return undefined
 }
 
@@ -815,7 +886,9 @@ const assistantExecutionAgentsFor = (
   skillId?: string
 ): AssistantExecutionAgentId[] => {
   const skillAgent = canonicalAssistantExecutionAgentOf(skillId)
-  if (skillAgent === 'visualization' || skillAgent === 'requirement-analysis') return [skillAgent]
+  if (
+    skillAgent === 'visualization' || skillAgent === 'requirement-analysis' || skillAgent === 'artifact'
+  ) return [skillAgent]
   const normalizedTask = taskType?.trim().toLocaleLowerCase()
   const normalizedSource = sourceMode?.trim().toLocaleLowerCase()
   if (normalizedTask === 'conversation' || normalizedSource === 'conversation') return ['conversation']
@@ -825,6 +898,7 @@ const assistantExecutionAgentsFor = (
   }
   if (normalizedTask === 'visualization') return ['visualization']
   if (normalizedTask === 'requirement_matching') return ['requirement-analysis']
+  if (normalizedTask === 'artifact_generation') return ['artifact']
   if (normalizedTask === 'record_query' || normalizedSource === 'records') return ['data-center']
   return skillAgent ? [skillAgent] : []
 }
@@ -1002,7 +1076,11 @@ const assistantTaskTraceForMessage = (
   message: ChatMessage,
   metadata?: AgentRunMetadata
 ): AssistantTaskView | undefined => {
-  const fallbackStatus: AssistantTaskStatus = message.contextOutcome === 'failed' ? 'failed' : 'completed'
+  const fallbackStatus: AssistantTaskStatus = message.contextOutcome === 'failed'
+    ? 'failed'
+    : message.contextOutcome === 'undone'
+      ? 'cancelled'
+      : 'completed'
   const metadataTaskTrace = metadata && (
     metadata.skill || metadata.taskType || metadata.sourceMode || metadata.resultMode
   )
@@ -1038,7 +1116,7 @@ const assistantTaskTracePayloadOf = (
 ): AssistantTaskTrace | undefined => {
   if (!task?.runId || !task.primaryAgent || !task.taskType || !task.sourceMode || !task.resultMode) return undefined
   const status = task.status ?? fallbackStatus
-  if (!['completed', 'clarification', 'failed'].includes(status)) return undefined
+  if (!['completed', 'clarification', 'failed', 'cancelled'].includes(status)) return undefined
   return {
     runId: task.runId,
     status: status as AssistantTaskTrace['status'],
@@ -1066,19 +1144,22 @@ function AgentTaskSummary({
   const statusLabel = assistantTaskStatusLabels[status]
   const statusClass = assistantTaskStatusClassOf(status)
   const isClarification = status === 'clarification'
+  const isCancelled = status === 'cancelled'
   const primaryLabel = isClarification
     ? '尚未执行'
-    : assistantExecutionAgentLabelOf(task?.primaryAgent) ?? '路由中'
+    : assistantExecutionAgentLabelOf(task?.primaryAgent) ?? (isCancelled ? '未选定' : '路由中')
   const invokedLabels = (task?.invokedAgents ?? [])
     .map((agent) => assistantExecutionAgentLabels[agent])
     .filter((label, index, labels) => labels.indexOf(label) === index)
   const invokedLabel = isClarification
     ? '暂无（等待补充）'
-    : invokedLabels.length
-      ? invokedLabels.join('、')
-      : status === 'running' || status === 'pending'
-        ? '选择中'
-        : '未记录'
+      : invokedLabels.length
+          ? invokedLabels.join('、')
+          : status === 'running' || status === 'pending'
+            ? '选择中'
+            : isCancelled
+              ? '未执行'
+              : '未记录'
   const taskTypeLabel = assistantTaskTraceLabelOf(task?.taskType, assistantTaskTypeLabels)
   const sourceModeLabel = assistantTaskTraceLabelOf(task?.sourceMode, assistantSourceModeLabels)
   const resultModeLabel = assistantTaskTraceLabelOf(task?.resultMode, assistantResultModeLabels)
@@ -1128,6 +1209,658 @@ function AgentTaskSummary({
   )
 }
 
+/**
+ * Keep the local name readable while using the exact shared plan patch
+ * contract. The main process remains the authority for canonicalization and
+ * validation; the renderer deliberately sends only fields the user can edit.
+ */
+type AssistantPlanPatchInput = AssistantPlanPatch
+
+type AssistantPlanDraft = {
+  searchTerms: string[]
+  fields: string[]
+  projectIds: string[]
+  nodeTypes: string[]
+  baseFilters: AssistantPlanFilter[]
+  filters: AssistantPlanFilter[]
+  limit: number | null
+  resultMode: AssistantExecutionSummary['resultMode']
+}
+
+type AssistantPlanValidationIssue = {
+  field: string
+  code: string
+  message: string
+}
+
+type AssistantPlanSummaryExtras = AssistantExecutionSummary & {
+  groupEntities?: string[]
+  groupByField?: string
+  metric?: string
+  searchMode?: string
+}
+
+const assistantPlanFilterOperators: Array<{
+  value: AssistantPlanFilterOperator
+  label: string
+}> = [
+  { value: 'equals', label: '等于' },
+  { value: 'not_equals', label: '不等于' },
+  { value: 'contains', label: '包含' },
+  { value: 'not_contains', label: '不包含' },
+  { value: 'is_empty', label: '为空' },
+  { value: 'not_empty', label: '不为空' },
+  { value: 'gt', label: '大于' },
+  { value: 'gte', label: '大于等于' },
+  { value: 'lt', label: '小于' },
+  { value: 'lte', label: '小于等于' }
+]
+
+const assistantPlanFilterOperatorAliases: Record<string, AssistantPlanFilterOperator> = {
+  equals: 'equals',
+  not_equals: 'not_equals',
+  notEquals: 'not_equals',
+  contains: 'contains',
+  not_contains: 'not_contains',
+  notContains: 'not_contains',
+  is_empty: 'is_empty',
+  empty: 'is_empty',
+  not_empty: 'not_empty',
+  notEmpty: 'not_empty',
+  gt: 'gt',
+  greaterThan: 'gt',
+  gte: 'gte',
+  greaterThanOrEqual: 'gte',
+  lt: 'lt',
+  lessThan: 'lt',
+  lte: 'lte',
+  lessThanOrEqual: 'lte'
+}
+
+const assistantPlanOperatorOf = (value: string): AssistantPlanFilterOperator => (
+  assistantPlanFilterOperatorAliases[value.trim()] ?? 'equals'
+)
+
+const assistantPlanFilterOf = (
+  filter: { field: string; operator: string; value?: unknown }
+): AssistantPlanFilter => {
+  const operator = assistantPlanOperatorOf(filter.operator)
+  if (operator === 'is_empty' || operator === 'not_empty') {
+    return { field: String(filter.field ?? ''), operator }
+  }
+  return {
+    field: String(filter.field ?? ''),
+    operator,
+    value: filter.value === undefined ? '' : String(filter.value)
+  }
+}
+
+const assistantPlanSummaryExtrasOf = (
+  summary: AssistantExecutionSummary
+): AssistantPlanSummaryExtras => summary as AssistantPlanSummaryExtras
+
+const assistantPlanDraftOf = (summary: AssistantExecutionSummary): AssistantPlanDraft => ({
+  searchTerms: [...(summary.searchTerms ?? [])],
+  fields: [...(summary.fields ?? [])],
+  projectIds: [...(summary.scope?.projectIds ?? [])],
+  nodeTypes: [...(summary.scope?.nodeTypes ?? [])],
+  baseFilters: (summary.scope?.baseFilters ?? []).map(assistantPlanFilterOf),
+  filters: (summary.filters ?? []).map(assistantPlanFilterOf),
+  limit: Number.isFinite(summary.limit) ? summary.limit : 1,
+  resultMode: summary.resultMode
+})
+
+const assistantPlanArraysEqual = (left: string[], right: string[]): boolean => (
+  left.length === right.length && left.every((value, index) => value === right[index])
+)
+
+const assistantPlanFiltersEqual = (
+  left: AssistantPlanFilter[],
+  right: AssistantPlanFilter[]
+): boolean => JSON.stringify(left) === JSON.stringify(right)
+
+const assistantPlanCapabilitiesOf = (summary: AssistantExecutionSummary): {
+  searchTerms: boolean
+  fields: boolean
+  scope: boolean
+  filters: boolean
+  limit: boolean
+  resultMode: AssistantExecutionSummary['resultMode'][]
+} => {
+  const extras = assistantPlanSummaryExtrasOf(summary)
+  const isRecordsSource = summary.sourceMode === 'records' || summary.sourceMode === 'mixed'
+  const isKnowledge = summary.sourceMode === 'knowledge' && summary.taskType === 'knowledge_qa'
+  const isRequirementMatching = summary.taskType === 'requirement_matching'
+  const isVisualization = summary.taskType === 'visualization'
+  const resultMode: AssistantExecutionSummary['resultMode'][] = (
+    summary.taskType === 'record_query' && summary.sourceMode === 'records'
+  )
+    ? ['answer', 'list', ...(extras.groupEntities?.length ? ['grouped_list' as const] : []), 'table']
+    : summary.taskType === 'knowledge_qa' && summary.sourceMode === 'knowledge'
+      ? ['answer']
+      : summary.taskType === 'mixed_analysis' && summary.sourceMode === 'mixed'
+        ? ['answer', 'list', ...(extras.groupEntities?.length ? ['grouped_list' as const] : []), 'table']
+        : isVisualization && summary.sourceMode === 'records'
+          ? ['dashboard']
+          : isRequirementMatching && summary.sourceMode === 'records'
+            ? ['answer']
+            : [summary.resultMode]
+  return {
+    // These capabilities mirror the main-process supportedPatchField matrix.
+    // Requirement matching and visualization keep their fixed execution
+    // semantics; only their data scope can be adjusted in this version.
+    searchTerms: (isKnowledge || isRecordsSource) && !isVisualization && !isRequirementMatching,
+    fields: isRecordsSource && !isVisualization && !isRequirementMatching,
+    scope: isRecordsSource,
+    filters: isRecordsSource && !isVisualization && !isRequirementMatching,
+    limit: (isRecordsSource && !isVisualization && !isRequirementMatching) || summary.sourceMode === 'knowledge',
+    resultMode
+  }
+}
+
+const assistantPlanPatchOf = (
+  summary: AssistantExecutionSummary,
+  draft: AssistantPlanDraft,
+  capabilities: ReturnType<typeof assistantPlanCapabilitiesOf>
+): AssistantPlanPatchInput => {
+  const model = assistantPlanDraftOf(summary)
+  const patch: AssistantPlanPatchInput = {}
+  if (capabilities.searchTerms && !assistantPlanArraysEqual(draft.searchTerms, model.searchTerms)) {
+    patch.searchTerms = [...draft.searchTerms]
+  }
+  if (capabilities.fields && !assistantPlanArraysEqual(draft.fields, model.fields)) {
+    patch.fields = [...draft.fields]
+  }
+  if (capabilities.scope) {
+    const scope: NonNullable<AssistantPlanPatchInput['scope']> = {}
+    if (!assistantPlanArraysEqual(draft.projectIds, model.projectIds)) scope.projectIds = [...draft.projectIds]
+    if (!assistantPlanArraysEqual(draft.nodeTypes, model.nodeTypes)) scope.nodeTypes = [...draft.nodeTypes]
+    if (!assistantPlanFiltersEqual(draft.baseFilters, model.baseFilters)) scope.baseFilters = [...draft.baseFilters]
+    if (Object.keys(scope).length) patch.scope = scope
+  }
+  if (capabilities.filters && !assistantPlanFiltersEqual(draft.filters, model.filters)) {
+    patch.filters = [...draft.filters]
+  }
+  if (capabilities.limit && draft.limit !== model.limit) {
+    patch.limit = draft.limit === null ? Number.NaN : draft.limit
+  }
+  if (capabilities.resultMode.includes(draft.resultMode) && draft.resultMode !== model.resultMode) {
+    patch.resultMode = draft.resultMode
+  }
+  return patch
+}
+
+const assistantPlanIssueMatches = (issueField: string, field: string): boolean => {
+  const normalizedIssue = issueField.trim().toLocaleLowerCase()
+  const normalizedField = field.trim().toLocaleLowerCase()
+  return normalizedIssue === normalizedField ||
+    normalizedIssue.startsWith(`${normalizedField}.`) ||
+    normalizedIssue.startsWith(`${normalizedField}[`)
+}
+
+function AssistantExecutionPlanCard({
+  summary,
+  pending,
+  confirming,
+  cancelling,
+  expired = false,
+  projects,
+  nodeTypes,
+  metadataLoading = false,
+  metadataError,
+  errors = [],
+  warnings = [],
+  onConfirm,
+  onCancel,
+  onClearIssues
+}: {
+  summary: AssistantExecutionSummary
+  pending: boolean
+  confirming: boolean
+  cancelling: boolean
+  expired?: boolean
+  projects: ProjectRow[]
+  nodeTypes: string[]
+  metadataLoading?: boolean
+  metadataError?: string
+  errors?: AssistantPlanValidationIssue[]
+  warnings?: AssistantPlanValidationIssue[]
+  onConfirm: (patch: AssistantPlanPatchInput) => void | Promise<void>
+  onCancel: () => void
+  onClearIssues?: () => void
+}): React.JSX.Element {
+  const capabilities = assistantPlanCapabilitiesOf(summary)
+  const modelDraft = useMemo(() => assistantPlanDraftOf(summary), [summary])
+  const [draft, setDraft] = useState<AssistantPlanDraft>(modelDraft)
+  const [editing, setEditing] = useState(pending)
+
+  useEffect(() => {
+    setDraft(modelDraft)
+    setEditing(pending)
+  }, [modelDraft, pending])
+
+  const patch = useMemo(
+    () => assistantPlanPatchOf(summary, draft, capabilities),
+    [capabilities, draft, summary]
+  )
+  const dirty = Object.keys(patch).length > 0
+  const extras = assistantPlanSummaryExtrasOf(summary)
+  const fieldOptions = [...new Set([
+    ...draft.fields,
+    ...draft.filters.map((filter) => filter.field),
+    ...draft.baseFilters.map((filter) => filter.field)
+  ].map((value) => value.trim()).filter(Boolean))]
+  const projectOptions = [
+    ...projects.map((project) => ({ label: `${project.name} · ${project.uid}`, value: project.uid })),
+    ...draft.projectIds
+      .filter((id) => !projects.some((project) => project.uid === id))
+      .map((id) => ({ label: id, value: id, disabled: true }))
+  ]
+  const nodeTypeOptions = [...new Set([...nodeTypes, ...draft.nodeTypes])].map((value) => ({
+    label: value,
+    value,
+    ...(nodeTypes.includes(value) ? {} : { disabled: true })
+  }))
+
+  const updateDraft = (next: Partial<AssistantPlanDraft>): void => {
+    setDraft((current) => ({ ...current, ...next }))
+  }
+  const updateFilter = (
+    group: 'baseFilters' | 'filters',
+    index: number,
+    next: Partial<AssistantPlanFilter>
+  ): void => {
+    setDraft((current) => ({
+      ...current,
+      [group]: current[group].map((filter, filterIndex) => (
+        filterIndex === index ? { ...filter, ...next } : filter
+      ))
+    }))
+  }
+  const removeFilter = (group: 'baseFilters' | 'filters', index: number): void => {
+    setDraft((current) => ({
+      ...current,
+      [group]: current[group].filter((_filter, filterIndex) => filterIndex !== index)
+    }))
+  }
+  const addFilter = (group: 'baseFilters' | 'filters'): void => {
+    if (draft.baseFilters.length + draft.filters.length >= 10) return
+    setDraft((current) => ({
+      ...current,
+      [group]: [
+        ...current[group],
+        { field: fieldOptions[0] ?? '', operator: 'equals', value: '' }
+      ]
+    }))
+  }
+  const issueTextFor = (field: string): string[] => errors
+    .filter((issue) => assistantPlanIssueMatches(issue.field, field))
+    .map((issue) => issue.message)
+  const fixedFact = (label: string, value: string, className = ''): React.JSX.Element => (
+    <div className={`agent-plan-fixed-fact ${className}`.trim()}>
+      <span>{label}</span>
+      <strong title={value}>{value}</strong>
+    </div>
+  )
+  const renderFilterEditor = (
+    group: 'baseFilters' | 'filters',
+    label: string,
+    helper: string
+  ): React.JSX.Element => {
+    const filters = draft[group]
+    const groupIssueField = group === 'baseFilters' ? 'scope.baseFilters' : 'filters'
+    return (
+      <div className="agent-plan-editor-section agent-plan-filter-section">
+        <div className="agent-plan-editor-heading">
+          <div>
+            <strong>{label}</strong>
+            <small>{helper}</small>
+          </div>
+          <Button
+            type="text"
+            size="small"
+            icon={<PlusOutlined aria-hidden="true" />}
+            onClick={() => addFilter(group)}
+            disabled={!editing || confirming || filters.length + draft[group === 'filters' ? 'baseFilters' : 'filters'].length >= 10}
+            aria-label={`添加${label}`}
+          >
+            添加条件
+          </Button>
+        </div>
+        {filters.length === 0 ? (
+          <Text type="secondary">无条件</Text>
+        ) : (
+          <div className="agent-plan-filter-list">
+            {filters.map((filter, index) => {
+              const noValue = filter.operator === 'is_empty' || filter.operator === 'not_empty'
+              const rowField = `${group}[${index}]`
+              const rowErrors = [
+                ...issueTextFor(rowField),
+                ...issueTextFor(`${group}.${index}`),
+                ...issueTextFor(`${groupIssueField}[${index}]`),
+                ...issueTextFor(`${groupIssueField}.${index}`),
+                ...issueTextFor(`${group}[${index}].field`),
+                ...issueTextFor(`${group}[${index}].operator`),
+                ...issueTextFor(`${group}[${index}].value`)
+              ]
+              return (
+                <div className="agent-plan-filter-row" key={`${group}-${index}`}>
+                  <Select
+                    mode="tags"
+                    showSearch
+                    allowClear
+                    value={filter.field ? [filter.field] : []}
+                    options={fieldOptions.map((field) => ({ label: field, value: field }))}
+                    maxCount={1}
+                    tokenSeparators={[',', '，', '、']}
+                    placeholder="选择或输入字段 Key"
+                    optionFilterProp="label"
+                    disabled={!editing || confirming}
+                    aria-label={`${label}第 ${index + 1} 条字段`}
+                    onChange={(values) => updateFilter(group, index, {
+                      field: Array.isArray(values) ? String(values.at(-1) ?? '') : ''
+                    })}
+                  />
+                  <Select
+                    value={filter.operator}
+                    options={assistantPlanFilterOperators}
+                    disabled={!editing || confirming}
+                    aria-label={`${label}第 ${index + 1} 条操作符`}
+                    onChange={(value) => {
+                      const operator = assistantPlanOperatorOf(String(value))
+                      updateFilter(group, index, {
+                        operator,
+                        ...(operator === 'is_empty' || operator === 'not_empty' ? { value: undefined } : { value: filter.value ?? '' })
+                      })
+                    }}
+                  />
+                  <Input
+                    value={noValue ? undefined : filter.value ?? ''}
+                    disabled={!editing || confirming || noValue}
+                    placeholder={noValue ? '无需填写值' : '输入值'}
+                    aria-label={`${label}第 ${index + 1} 条匹配值`}
+                    onChange={(event) => updateFilter(group, index, { value: event.target.value })}
+                  />
+                  <Button
+                    type="text"
+                    danger
+                    size="small"
+                    icon={<DeleteOutlined aria-hidden="true" />}
+                    onClick={() => removeFilter(group, index)}
+                    disabled={!editing || confirming}
+                    aria-label={`删除${label}第 ${index + 1} 条`}
+                  />
+                  {rowErrors.length > 0 && <small className="agent-plan-field-error">{[...new Set(rowErrors)].join('；')}</small>}
+                </div>
+              )
+            })}
+          </div>
+        )}
+        {issueTextFor(groupIssueField).map((text) => (
+          <small className="agent-plan-field-error" key={`${groupIssueField}-${text}`}>{text}</small>
+        ))}
+      </div>
+    )
+  }
+
+  const canEdit = pending && !expired
+  const statusLabel = expired
+    ? '计划已失效'
+    : pending
+      ? (editing ? '编辑中，尚未执行工具' : '等待确认后执行工具')
+      : '范围已确认，正在执行'
+  return (
+    <section
+      className={`agent-execution-summary agent-plan-card ${pending ? 'is-pending' : 'is-confirmed'} ${expired ? 'is-expired' : ''}`.trim()}
+      aria-label="执行计划确认卡片"
+    >
+      <div className="agent-plan-card-heading">
+        <div>
+          <strong>执行计划</strong>
+          <small>{statusLabel}</small>
+        </div>
+        <div className="agent-plan-heading-actions">
+          {canEdit && !editing && (
+            <Button
+              type="text"
+              size="small"
+              onClick={() => {
+                setEditing(true)
+                onClearIssues?.()
+              }}
+              disabled={confirming}
+            >
+              编辑计划
+            </Button>
+          )}
+          {canEdit && editing && (
+            <Button
+              type="text"
+              size="small"
+              onClick={() => {
+                setDraft(modelDraft)
+                setEditing(true)
+                onClearIssues?.()
+              }}
+              disabled={confirming || !dirty}
+            >
+              恢复模型计划
+            </Button>
+          )}
+        </div>
+      </div>
+      <div className="agent-execution-summary-body agent-plan-card-body">
+        <div className="agent-plan-fixed-grid" aria-label="计划固定事实">
+          {fixedFact('用户问题', summary.question, 'is-question')}
+          {fixedFact('来源模式', assistantSourceModeLabels[summary.sourceMode] ?? summary.sourceMode)}
+          {fixedFact('任务类型', assistantTaskTypeLabels[summary.taskType] ?? summary.taskType)}
+          {fixedFact('计划意图', agentIntentLabels[summary.intent] ?? summary.intent)}
+          {summary.scope.snapshotAt ? fixedFact('范围快照', summary.scope.snapshotAt) : null}
+          {extras.groupEntities?.length ? fixedFact('分组实体', extras.groupEntities.join('、')) : null}
+          {extras.groupByField ? fixedFact('分组字段', extras.groupByField) : null}
+          {extras.sort ? fixedFact('排序', `${extras.sort.field} · ${extras.sort.direction === 'asc' ? '升序' : '降序'}`) : null}
+          {extras.metric ? fixedFact('指标', extras.metric) : null}
+          {extras.searchMode ? fixedFact('搜索模式', extras.searchMode === 'all' ? '全部匹配' : '任一匹配') : null}
+          {capabilities.resultMode.length === 1
+            ? fixedFact('交付形式', assistantResultModeLabels[capabilities.resultMode[0]] ?? capabilities.resultMode[0])
+            : null}
+        </div>
+
+        {canEdit && editing ? (
+          <div className="agent-plan-editors" aria-label="可编辑执行计划">
+            {capabilities.searchTerms && (
+              <div className="agent-plan-editor-section">
+                <label htmlFor="agent-plan-search-terms">检索词</label>
+                <Select
+                  id="agent-plan-search-terms"
+                  mode="tags"
+                  value={draft.searchTerms}
+                  options={draft.searchTerms.map((term) => ({ label: term, value: term }))}
+                  tokenSeparators={[',', '，', '、']}
+                  maxCount={10}
+                  placeholder="输入后按 Enter 添加，最多 10 项"
+                  disabled={confirming}
+                  aria-label="检索词"
+                  onChange={(values) => updateDraft({ searchTerms: Array.isArray(values) ? values.map(String).slice(0, 10) : [] })}
+                />
+                {issueTextFor('searchTerms').map((text) => <small className="agent-plan-field-error" key={`searchTerms-${text}`}>{text}</small>)}
+              </div>
+            )}
+            {capabilities.fields && (
+              <div className="agent-plan-editor-section">
+                <label htmlFor="agent-plan-fields">读取字段</label>
+                <Select
+                  id="agent-plan-fields"
+                  mode="tags"
+                  value={draft.fields}
+                  options={fieldOptions.map((field) => ({ label: field, value: field }))}
+                  tokenSeparators={[',', '，', '、']}
+                  maxCount={20}
+                  placeholder="选择或输入字段 Key，最多 20 项"
+                  disabled={confirming}
+                  aria-label="读取字段"
+                  onChange={(values) => updateDraft({ fields: Array.isArray(values) ? values.map(String).slice(0, 20) : [] })}
+                />
+                <small className="agent-plan-editor-hint">字段目录不可用时可输入字段 Key，确认时由主进程校验。</small>
+                {issueTextFor('fields').map((text) => <small className="agent-plan-field-error" key={`fields-${text}`}>{text}</small>)}
+              </div>
+            )}
+            {capabilities.scope && (
+              <div className="agent-plan-scope-grid">
+                <div className="agent-plan-editor-section">
+                  <label htmlFor="agent-plan-projects">项目范围</label>
+                  <Select
+                    id="agent-plan-projects"
+                    mode="multiple"
+                    allowClear
+                    showSearch
+                    value={draft.projectIds}
+                    options={projectOptions}
+                    optionFilterProp="label"
+                    maxTagCount="responsive"
+                    placeholder={metadataLoading ? '正在读取项目目录…' : '全部项目'}
+                    disabled={confirming || metadataLoading}
+                    aria-label="项目范围"
+                    onChange={(values) => updateDraft({ projectIds: Array.isArray(values) ? values.map(String).slice(0, 100) : [] })}
+                  />
+                  {metadataError && <small className="agent-plan-field-error">{metadataError}</small>}
+                  {issueTextFor('scope.projectIds').map((text) => <small className="agent-plan-field-error" key={`projects-${text}`}>{text}</small>)}
+                </div>
+                <div className="agent-plan-editor-section">
+                  <label htmlFor="agent-plan-node-types">数据类型</label>
+                  <Select
+                    id="agent-plan-node-types"
+                    mode="multiple"
+                    allowClear
+                    showSearch
+                    value={draft.nodeTypes}
+                    options={nodeTypeOptions}
+                    optionFilterProp="label"
+                    maxTagCount="responsive"
+                    placeholder={metadataLoading ? '正在读取类型目录…' : '全部类型'}
+                    disabled={confirming || metadataLoading}
+                    aria-label="数据类型"
+                    onChange={(values) => updateDraft({ nodeTypes: Array.isArray(values) ? values.map(String).slice(0, 100) : [] })}
+                  />
+                  {issueTextFor('scope.nodeTypes').map((text) => <small className="agent-plan-field-error" key={`nodeTypes-${text}`}>{text}</small>)}
+                </div>
+              </div>
+            )}
+            {capabilities.filters && (
+              <>
+                {renderFilterEditor('filters', '计划筛选条件', '本轮查询条件；与范围筛选按 AND 合并。')}
+                {renderFilterEditor('baseFilters', '范围筛选条件', '继承范围条件；清空表示不追加该组条件。')}
+              </>
+            )}
+            <div className="agent-plan-scope-grid">
+              {capabilities.limit ? (
+                <div className="agent-plan-editor-section">
+                  <label htmlFor="agent-plan-limit">结果上限</label>
+                  <InputNumber
+                    id="agent-plan-limit"
+                    min={1}
+                    max={50}
+                    precision={0}
+                    value={draft.limit}
+                    disabled={confirming}
+                    aria-label="结果上限"
+                    onChange={(value) => updateDraft({ limit: value })}
+                  />
+                  {issueTextFor('limit').map((text) => <small className="agent-plan-field-error" key={`limit-${text}`}>{text}</small>)}
+                </div>
+              ) : (
+                fixedFact('结果上限', `${summary.limit} 条`)
+              )}
+              {capabilities.resultMode.length > 1 && (
+                <div className="agent-plan-editor-section">
+                  <label htmlFor="agent-plan-result-mode">兼容交付形式</label>
+                  <Select
+                    id="agent-plan-result-mode"
+                    value={draft.resultMode}
+                    options={capabilities.resultMode.map((mode) => ({ label: assistantResultModeLabels[mode] ?? mode, value: mode }))}
+                    disabled={confirming}
+                    aria-label="兼容交付形式"
+                    onChange={(value) => updateDraft({ resultMode: value as AssistantExecutionSummary['resultMode'] })}
+                  />
+                  {issueTextFor('resultMode').map((text) => <small className="agent-plan-field-error" key={`resultMode-${text}`}>{text}</small>)}
+                </div>
+              )}
+            </div>
+            {errors.length > 0 && (
+              <div className="agent-plan-validation-summary" role="alert" aria-live="assertive">
+                <strong>计划校验未通过，请修正后重试。</strong>
+                {errors.map((issue, index) => (
+                  <span key={`${issue.field}-${issue.code}-${index}`}>{issue.field ? `${issue.field}：` : ''}{issue.message}</span>
+                ))}
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="agent-plan-readonly-values" aria-label="计划参数">
+            {capabilities.searchTerms && fixedFact('检索词', summary.searchTerms.join('、') || '无全文检索词')}
+            {capabilities.fields && fixedFact('读取字段', summary.fields.join('、') || '按任务所需字段')}
+            {capabilities.scope && fixedFact('项目范围', summary.scope.projectIds.join('、') || '全部项目')}
+            {capabilities.scope && fixedFact('数据类型', summary.scope.nodeTypes.join('、') || '全部类型')}
+            {capabilities.scope && fixedFact('记录范围', summary.scope.recordCount === undefined ? '当前范围全部记录' : `${summary.scope.recordCount} 条指定记录`)}
+            {fixedFact('结果上限', `${summary.limit} 条`)}
+            {fixedFact('交付形式', assistantResultModeLabels[summary.resultMode] ?? summary.resultMode)}
+            {capabilities.filters && (
+              <div className="agent-plan-readonly-filters">
+                <span>筛选条件</span>
+                <div>
+                  {[...summary.scope.baseFilters, ...summary.filters].length
+                    ? [...summary.scope.baseFilters, ...summary.filters].map((filter, index) => (
+                        <Tag key={`${filter.field}-${filter.operator}-${index}`}>
+                          {filter.field} {assistantPlanFilterOperators.find((option) => option.value === assistantPlanOperatorOf(filter.operator))?.label ?? filter.operator}{filter.value === undefined ? '' : ` ${filter.value}`}
+                        </Tag>
+                      ))
+                    : <Text type="secondary">无额外筛选条件</Text>}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {warnings.length > 0 && (
+          <div className="agent-plan-warning-list" role="status" aria-live="polite">
+            {warnings.map((warning) => <span key={`${warning.field}-${warning.code}`}>{warning.field ? `${warning.field}：` : ''}{warning.message}</span>)}
+          </div>
+        )}
+        <div className="agent-execution-summary-actions agent-plan-actions">
+          {pending && !expired ? (
+            <>
+              <Button
+                type="primary"
+                size="small"
+                loading={confirming}
+                disabled={!editing || confirming}
+                onClick={() => void onConfirm(patch)}
+              >
+                确认并执行
+              </Button>
+              <Button
+                size="small"
+                danger
+                onClick={onCancel}
+                disabled={cancelling}
+              >
+                取消任务
+              </Button>
+            </>
+          ) : expired ? (
+            <>
+              <Tag color="error" icon={<ExclamationCircleOutlined />}>执行计划已失效，请重新提交问题</Tag>
+              <Button size="small" danger onClick={onCancel} disabled={cancelling}>取消任务</Button>
+            </>
+          ) : (
+            <Tag color="success" icon={<CheckCircleOutlined />}>已确认</Tag>
+          )}
+        </div>
+      </div>
+    </section>
+  )
+}
+
 const semanticTaskStatusLabels: Record<SemanticizationTaskStatus, string> = {
   queued: '排队中',
   running: '执行中',
@@ -1147,6 +1880,26 @@ const semanticTaskStageLabels: Record<SemanticizationTaskStage, string> = {
   idle: '空闲'
 }
 
+type SemanticTaskMode = 'standard' | 'strict'
+
+const semanticTaskModeOf = (
+  task: Pick<SemanticizationTaskSnapshot, 'deepThinking' | 'qualityMode'>
+): SemanticTaskMode => {
+  if (task.qualityMode === 'standard' || task.qualityMode === 'strict') return task.qualityMode
+  // Older snapshots only carry deepThinking; retain that IPC/storage meaning.
+  return task.deepThinking === false ? 'standard' : 'strict'
+}
+
+const semanticTaskModeLabelOf = (mode: SemanticTaskMode): string => (
+  mode === 'standard' ? '标准模式' : '严格模式'
+)
+
+const semanticTaskModeDescriptionOf = (mode: SemanticTaskMode): string => (
+  mode === 'standard'
+    ? '标准模式：单次结构化提取，校验失败才定向修复'
+    : '严格模式：独立复核，仅分歧/低置信时裁决'
+)
+
 const semanticTaskActiveStatuses: SemanticizationTaskStatus[] = [
   'queued',
   'running',
@@ -1161,7 +1914,7 @@ const readSemanticDeepThinking = (): boolean => {
   if (typeof window === 'undefined') return true
   try {
     const raw = window.localStorage.getItem(semanticTaskThinkingStorageKey)
-    return raw === null ? true : raw !== 'false'
+    return raw === null ? false : raw !== 'false'
   } catch {
     return true
   }
@@ -1336,9 +2089,9 @@ const semanticAuditStageDefinitions: Array<{
   hint: string
 }> = [
   { key: 'queued', label: '任务排队', hint: '确认任务范围并等待执行' },
-  { key: 'initial', label: '初步分析', hint: '基于原文生成第一份结构化分析' },
-  { key: 'independent', label: '独立复核', hint: '不参考初步结论，重新核对字段' },
-  { key: 'adjudication', label: '结果裁决', hint: '按原文证据逐字段形成终稿' },
+  { key: 'initial', label: '初步分析', hint: '基于原文生成结构化分析结果' },
+  { key: 'independent', label: '独立复核', hint: '严格模式下不参考初步结论，重新核对字段' },
+  { key: 'adjudication', label: '结果裁决', hint: '仅在分歧或低置信时按原文证据形成终稿' },
   { key: 'persisting', label: '校验与保存', hint: '校验字段、置信度和证据引用后保存' }
 ]
 
@@ -1792,6 +2545,7 @@ const persistedSemanticAuditTask = (detail: RecordDetail): SemanticizationTaskSn
     message: completed ? '语义化审计轨迹已完成' : '语义化审计轨迹记录了异常或终止',
     recentItems: [],
     deepThinking: trace.deepThinking !== false,
+    ...(trace.qualityMode ? { qualityMode: trace.qualityMode } : {}),
     analysisTrace: trace
   }
 }
@@ -1806,6 +2560,7 @@ function SemanticAuditPanel({
   history?: SemanticAuditEventView[]
 }): React.JSX.Element {
   const view = buildSemanticAuditView(task, records, history)
+  const taskMode = semanticTaskModeOf(task)
   const adjudicationStage = view.timeline.find((stage) => stage.key === 'adjudication')
   const hasSemanticResult = view.finalFields.length > 0 || Boolean(view.finalSummary)
   const resultIsCompleted = hasSemanticResult
@@ -1832,7 +2587,7 @@ function SemanticAuditPanel({
           <Text type="secondary">展示阶段、校验事件和可追溯证据，不展示模型内部思维链。</Text>
         </div>
         <div className="asset-semantic-audit-badges">
-          <span className="asset-semantic-audit-disclaimer">深度思考：{task.deepThinking === false ? '关闭' : '开启'}</span>
+          <span className="asset-semantic-audit-disclaimer">分析模式：{semanticTaskModeLabelOf(taskMode)}</span>
           <span className="asset-semantic-audit-disclaimer">过程记录 ≠ 内部思维链</span>
         </div>
       </div>
@@ -1843,7 +2598,7 @@ function SemanticAuditPanel({
               {resultIsCompleted ? <CheckCircleOutlined aria-hidden="true" /> : <InfoCircleOutlined aria-hidden="true" />}
               <span>最终语义化结果</span>
             </div>
-            <Text type="secondary">基于最终裁决字段汇总，优先展示已确认内容。</Text>
+            <Text type="secondary">基于已确认字段汇总，优先展示通过校验的内容。</Text>
           </div>
           <span className={`asset-semantic-result-state ${resultStatusClass}`} role="status">
             {resultStatusLabel}
@@ -1867,7 +2622,7 @@ function SemanticAuditPanel({
         ) : hasSemanticResult ? (
           <p className="asset-semantic-result-text">{view.finalSummary}</p>
         ) : (
-          <div className="asset-semantic-result-empty">最终裁决完成后，已确认的核心字段会显示在这里。</div>
+          <div className="asset-semantic-result-empty">生成并通过必要校验后，已确认的核心字段会显示在这里。</div>
         )}
         {view.finalFields.length > 0 && view.finalSummary && <p className="asset-semantic-result-text">{view.finalSummary}</p>}
       </section>
@@ -1915,14 +2670,14 @@ function SemanticAuditPanel({
       </div>
       <div className="asset-semantic-audit-review-grid">
         <section className="asset-semantic-audit-section">
-          <div className="asset-semantic-audit-section-heading"><span>初步 / 独立分歧</span><Text type="secondary">{view.comparisons.length} 项</Text></div>
+          <div className="asset-semantic-audit-section-heading"><span>复核与分歧</span><Text type="secondary">{view.comparisons.length} 项</Text></div>
           {view.comparisons.length ? <div className="asset-semantic-audit-comparison-list">{view.comparisons.map((item) => (
             <div className="asset-semantic-audit-comparison" key={item.field}><strong>{item.label}</strong><div><span>初步</span><p>{item.initial}</p></div><div><span>独立</span><p>{item.independent}</p></div><div><span>裁决</span><p>{item.resolution}</p></div>{item.evidence && <blockquote>依据：{item.evidence}</blockquote>}</div>
-          ))}</div> : <div className="asset-semantic-audit-empty">两轮输出一致，或尚未完成独立复核。</div>}
+          ))}</div> : <div className="asset-semantic-audit-empty">未触发独立复核，或当前尚无需要裁决的分歧。</div>}
         </section>
         <section className="asset-semantic-audit-section">
-          <div className="asset-semantic-audit-section-heading"><span>最终裁决摘要</span><Text type="secondary">可追溯结论</Text></div>
-          <p className="asset-semantic-audit-final-summary">{view.finalSummary || '裁决完成后展示最终摘要。'}</p>
+          <div className="asset-semantic-audit-section-heading"><span>最终结论摘要</span><Text type="secondary">可追溯结论</Text></div>
+          <p className="asset-semantic-audit-final-summary">{view.finalSummary || '必要校验完成后展示最终摘要。'}</p>
           <div className="asset-semantic-audit-evidence"><strong>原文证据</strong><p>{view.evidence || '当前记录尚未提供可引用原文。'}</p></div>
         </section>
       </div>
@@ -2064,12 +2819,14 @@ const chatExperts: Array<{
     mention: '@通用数据助手',
     description: '检索、统计和解释本地数据'
   },
+  assistantSkillPresentation['knowledge-base'],
   {
     id: 'requirement-analysis',
     name: '需求分析专家',
     mention: '@需求分析专家',
     description: '按需求编号匹配数据中心相似需求'
-  }
+  },
+  assistantSkillPresentation.artifact
 ]
 
 const visualizationStages = [
@@ -2955,6 +3712,74 @@ function DataPage({
   const maintenanceDetailUidRef = useRef<string | null>(null)
   const maintenancePreviewRequestRef = useRef(0)
   const [maintenancePreviewRefreshKey, setMaintenancePreviewRefreshKey] = useState(0)
+  const [semanticDictionaryOpen, setSemanticDictionaryOpen] = useState(false)
+  const [semanticProfiles, setSemanticProfiles] = useState<FieldProfile[]>([])
+  const [semanticProfilesLoading, setSemanticProfilesLoading] = useState(false)
+  const [semanticEditing, setSemanticEditing] = useState<FieldProfile | null>(null)
+  const [semanticDisplayName, setSemanticDisplayName] = useState('')
+  const [semanticRole, setSemanticRole] = useState<FieldProfileRole>('dimension')
+  const [semanticSynonyms, setSemanticSynonyms] = useState('')
+  const [semanticSensitivity, setSemanticSensitivity] = useState<FieldSensitivity>('normal')
+  const [semanticSaving, setSemanticSaving] = useState(false)
+
+  const semanticScope = useMemo<DataScope>(
+    () => projectId ? { projectIds: [projectId] } : {},
+    [projectId]
+  )
+
+  const loadSemanticProfiles = useCallback(async (): Promise<void> => {
+    setSemanticProfilesLoading(true)
+    try {
+      setSemanticProfiles(await window.visslm.listFieldProfiles(semanticScope))
+    } catch (error) {
+      message.error(`读取字段语义词典失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setSemanticProfilesLoading(false)
+    }
+  }, [message, semanticScope])
+
+  const openSemanticDictionary = (): void => {
+    setSemanticDictionaryOpen(true)
+    void loadSemanticProfiles()
+  }
+
+  const editSemanticProfile = (profile: FieldProfile): void => {
+    setSemanticEditing(profile)
+    setSemanticDisplayName(profile.displayName ?? '')
+    setSemanticRole(profile.role ?? 'dimension')
+    setSemanticSynonyms((profile.synonyms ?? []).join('、'))
+    setSemanticSensitivity(profile.sensitivity)
+  }
+
+  const saveSemanticProfile = async (): Promise<void> => {
+    if (!semanticEditing) return
+    setSemanticSaving(true)
+    try {
+      const synonyms = [...new Set(semanticSynonyms
+        .split(/[、,，;；\n]+/u)
+        .map((value) => value.trim())
+        .filter(Boolean))]
+      const saved = await window.visslm.saveFieldProfileSemantics(
+        semanticScope,
+        semanticEditing.field,
+        {
+          displayName: semanticDisplayName.trim(),
+          role: semanticRole,
+          synonyms,
+          sensitivity: semanticSensitivity
+        }
+      )
+      setSemanticProfiles((current) => current.map((profile) => (
+        profile.field === saved.field ? saved : profile
+      )))
+      setSemanticEditing(null)
+      message.success('字段语义已保存，后续 Agent 规划将优先采用该配置')
+    } catch (error) {
+      message.error(`保存字段语义失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setSemanticSaving(false)
+    }
+  }
 
   const recordFilters = useMemo<RecordExportQuery>(() => ({
     search,
@@ -3407,6 +4232,9 @@ function DataPage({
             数据维护
             {selectedRowKeys.length ? `（${selectedRowKeys.length}）` : ''}
           </Button>
+          <Button icon={<BulbOutlined />} onClick={openSemanticDictionary}>
+            字段语义词典
+          </Button>
           <Button
             type="primary"
             icon={<FundProjectionScreenOutlined />}
@@ -3605,6 +4433,151 @@ function DataPage({
           ]}
         />
       </Card>
+      <Drawer
+        rootClassName="semantic-dictionary-drawer-shell"
+        className="semantic-dictionary-drawer"
+        title={(
+          <div className="drawer-context-title">
+            <BulbOutlined />
+            <span>字段语义词典</span>
+            <strong>{projectId
+              ? projects.find((project) => project.uid === projectId)?.name ?? projectId
+              : '全部项目'}</strong>
+          </div>
+        )}
+        extra={(
+          <Button
+            size="small"
+            icon={<ReloadOutlined />}
+            loading={semanticProfilesLoading}
+            onClick={() => void loadSemanticProfiles()}
+          >
+            刷新
+          </Button>
+        )}
+        size={960}
+        open={semanticDictionaryOpen}
+        onClose={() => {
+          setSemanticDictionaryOpen(false)
+          setSemanticEditing(null)
+        }}
+      >
+        <div className="semantic-dictionary-panel">
+          <Alert
+            type="info"
+            showIcon
+            message="人工维护的显示名、角色和业务别名会进入 Agent 字段目录；同一别名映射多个字段时，Agent 会先要求澄清。"
+          />
+          <ResizableTable<FieldProfile>
+            tableKey="asset-field-semantics"
+            rowKey="field"
+            loading={semanticProfilesLoading}
+            dataSource={semanticProfiles}
+            pagination={{ pageSize: 20, showSizeChanger: true }}
+            scroll={{ x: 1100, y: 'min(560px, max(260px, calc(100vh - 280px)))' }}
+            locale={{ emptyText: '当前范围暂无可维护字段' }}
+            columns={[
+              { title: '原始字段', dataIndex: 'field', width: 220, ellipsis: true },
+              {
+                title: '业务显示名',
+                dataIndex: 'displayName',
+                width: 180,
+                ellipsis: true,
+                render: (value: string) => value || '—'
+              },
+              {
+                title: '角色',
+                dataIndex: 'role',
+                width: 110,
+                render: (value: FieldProfileRole | undefined) => value
+                  ? <Tag>{({ dimension: '维度', measure: '度量', time: '时间', identifier: '标识' } as const)[value]}</Tag>
+                  : '—'
+              },
+              {
+                title: '业务别名',
+                dataIndex: 'synonyms',
+                width: 260,
+                ellipsis: true,
+                render: (values: string[] | undefined) => values?.join('、') || '—'
+              },
+              {
+                title: '类型 / 覆盖率',
+                key: 'profile',
+                width: 180,
+                render: (_value, profile) => `${profile.declaredType ?? profile.inferredType} · ${Math.round(profile.nonNullRate * 100)}%`
+              },
+              {
+                title: '操作',
+                key: 'actions',
+                width: 100,
+                render: (_value, profile) => (
+                  <Button type="link" size="small" onClick={() => editSemanticProfile(profile)}>
+                    纠正
+                  </Button>
+                )
+              }
+            ]}
+          />
+        </div>
+      </Drawer>
+      <Modal
+        title={`纠正字段语义 · ${semanticEditing?.field ?? ''}`}
+        open={Boolean(semanticEditing)}
+        okText="保存语义"
+        cancelText="取消"
+        confirmLoading={semanticSaving}
+        width="min(640px, calc(100vw - 32px))"
+        onOk={() => void saveSemanticProfile()}
+        onCancel={() => setSemanticEditing(null)}
+      >
+        <Form layout="vertical" className="semantic-dictionary-form">
+          <Form.Item label="业务显示名" extra="留空可清除人工显示名，Agent 仍使用原始字段名。">
+            <Input
+              value={semanticDisplayName}
+              maxLength={120}
+              placeholder="例如：负责人"
+              onChange={(event) => setSemanticDisplayName(event.target.value)}
+            />
+          </Form.Item>
+          <Row gutter={16}>
+            <Col xs={24} sm={12}>
+              <Form.Item label="字段角色">
+                <Select<FieldProfileRole>
+                  value={semanticRole}
+                  options={[
+                    { value: 'dimension', label: '维度' },
+                    { value: 'measure', label: '度量' },
+                    { value: 'time', label: '时间' },
+                    { value: 'identifier', label: '唯一标识' }
+                  ]}
+                  onChange={setSemanticRole}
+                />
+              </Form.Item>
+            </Col>
+            <Col xs={24} sm={12}>
+              <Form.Item label="敏感级别">
+                <Select<FieldSensitivity>
+                  value={semanticSensitivity}
+                  options={[
+                    { value: 'normal', label: '普通' },
+                    { value: 'internal', label: '内部' },
+                    { value: 'sensitive', label: '敏感' }
+                  ]}
+                  onChange={setSemanticSensitivity}
+                />
+              </Form.Item>
+            </Col>
+          </Row>
+          <Form.Item label="业务别名" extra="使用顿号、逗号或换行分隔；留空可清除人工别名。">
+            <Input.TextArea
+              value={semanticSynonyms}
+              autoSize={{ minRows: 3, maxRows: 6 }}
+              placeholder="例如：责任人、经办人、Owner"
+              onChange={(event) => setSemanticSynonyms(event.target.value)}
+            />
+          </Form.Item>
+        </Form>
+      </Modal>
       <Drawer
         rootClassName="data-import-runs-drawer-shell"
         className="data-import-runs-drawer"
@@ -4205,7 +5178,10 @@ function SemanticizationPage({
       const result = await window.visslm.startRequirementSemanticization({
         ...input,
         ...(input.scope === 'selected' || input.scope === undefined ? { recordUids } : {}),
-        deepThinking: semanticDeepThinking
+        // Keep the legacy deepThinking flag for older IPC consumers while
+        // explicitly selecting the adaptive quality route when supported.
+        deepThinking: semanticDeepThinking,
+        qualityMode: semanticDeepThinking ? 'strict' : 'standard'
       })
       if (result.accepted > 0) {
         const timestamp = new Date().toISOString()
@@ -4221,9 +5197,10 @@ function SemanticizationPage({
           remaining: result.accepted,
           startedAt: timestamp,
           updatedAt: timestamp,
-          message: `已提交 ${result.accepted} 条记录，将逐条执行`,
+          message: `已提交 ${result.accepted} 条记录，任务将按所选模式自适应处理`,
           recentItems: [],
-          deepThinking: semanticDeepThinking
+          deepThinking: semanticDeepThinking,
+          qualityMode: semanticDeepThinking ? 'strict' : 'standard'
         })
         message.success(`已提交 ${result.accepted} 条记录进行 AI 语义化`)
       } else if (result.skipped > 0) {
@@ -4290,21 +5267,22 @@ function SemanticizationPage({
           <div className="semanticization-card-heading">
             <div>
               <Text strong>任务配置与数据范围</Text>
-              <Text type="secondary">批量任务会自动处理当前全部未就绪记录，并始终逐条调用 AI；模型能力由系统配置提供。</Text>
+              <Text type="secondary">批量任务会自动处理当前全部未就绪记录，并根据所选模式自适应执行；模型能力由系统配置提供。</Text>
             </div>
             <Button icon={<SettingOutlined />} onClick={onOpenSettings}>模型设置</Button>
           </div>
           <div className="page-toolbar semanticization-toolbar">
             <div className="semanticization-thinking-config">
             <div>
-              <span>深度思考</span>
-              <small>{semanticDeepThinking ? '准确优先，耗时更长' : '速度优先，仍执行三阶段分析'}</small>
+              <span>质量模式</span>
+              <small>{semanticTaskModeDescriptionOf(semanticDeepThinking ? 'strict' : 'standard')}</small>
             </div>
             <Switch
-              aria-label="语义化深度思考模式"
+              aria-label="语义化质量模式"
               checked={semanticDeepThinking}
-              checkedChildren="开启"
-              unCheckedChildren="关闭"
+              checkedChildren="严格"
+              unCheckedChildren="标准"
+              title={semanticTaskModeDescriptionOf(semanticDeepThinking ? 'strict' : 'standard')}
               disabled={semanticTaskIsActive}
               onChange={(checked) => {
                 setSemanticDeepThinking(checked)
@@ -4357,7 +5335,7 @@ function SemanticizationPage({
               </span>
             </div>
             <Text type="secondary" className="asset-semantic-task-message" aria-live="polite">
-              {semanticTask.message || '任务按单条记录顺序处理'}
+              {semanticTask.message || '任务将按所选模式自适应处理'}
             </Text>
           </div>
           <div className="asset-semantic-task-controls">
@@ -4369,7 +5347,7 @@ function SemanticizationPage({
           </div>
           <div className="asset-semantic-task-current">
             <div><span className="asset-semantic-task-label">当前记录</span><strong title={semanticTaskCurrentName(semanticTask)}>{semanticTaskCurrentName(semanticTask)}</strong><span className="asset-semantic-task-index">{semanticTask.total > 0 ? `${semanticTaskCurrentIndex(semanticTask)} / ${semanticTask.total}` : '—'}</span></div>
-            <div><span className="asset-semantic-task-label">当前阶段</span><strong>{semanticTaskStageLabels[semanticTask.currentStage]} · 深度思考{semanticTask.deepThinking === false ? '关闭' : '开启'}</strong></div>
+            <div><span className="asset-semantic-task-label">当前阶段</span><strong>{semanticTaskStageLabels[semanticTask.currentStage]} · {semanticTaskModeLabelOf(semanticTaskModeOf(semanticTask))}</strong></div>
           </div>
           <Tooltip title={`已完成 ${semanticTask.completed} / ${semanticTask.total} 条`}>
             <Progress percent={taskPercent} showInfo={false} status={semanticTask.status === 'completed' ? semanticTask.failed > 0 ? 'exception' : 'success' : semanticTask.status === 'stopped' ? 'exception' : 'active'} aria-label={`任务进度 ${taskPercent}%`} />
@@ -4806,10 +5784,12 @@ function ChatPage({
   dataScope,
   dataScopeSummary,
   onClearDataScope,
+  onRestoreDataScope,
   conversationId,
   onConversationIdChange,
   modelOnline,
   onOpenSettings,
+  onOpenAssetCenter,
   refreshKey
 }: {
   messages: ChatMessage[]
@@ -4825,10 +5805,12 @@ function ChatPage({
   dataScope: DataScope | null
   dataScopeSummary: string
   onClearDataScope: () => void
+  onRestoreDataScope: (scope: DataScope, summary: string) => void
   conversationId: string
   onConversationIdChange: (id: string) => void
   modelOnline: boolean | null
   onOpenSettings: () => void
+  onOpenAssetCenter: (tab: 'data' | 'knowledge') => void
   refreshKey: number
 }): React.JSX.Element {
   const { message, modal } = AntApp.useApp()
@@ -4853,8 +5835,28 @@ function ChatPage({
   const [agentRunStatus, setAgentRunStatus] = useState<AgentRunStatus>('idle')
   const [agentDetailsOpen, setAgentDetailsOpen] = useState(false)
   const [agentTaskTrace, setAgentTaskTrace] = useState<AssistantTaskView | null>(null)
+  const [activeExecutionSummary, setActiveExecutionSummary] = useState<AssistantExecutionSummary | null>(null)
+  const executionSummaryRef = useRef<AssistantExecutionSummary | null>(null)
+  const [planAwaitingConfirmation, setPlanAwaitingConfirmation] = useState(false)
+  const [planConfirming, setPlanConfirming] = useState(false)
+  const [planExpired, setPlanExpired] = useState(false)
+  const [planValidationErrors, setPlanValidationErrors] = useState<AssistantPlanValidationIssue[]>([])
+  const [planWarnings, setPlanWarnings] = useState<AssistantPlanValidationIssue[]>([])
+  const [planProjects, setPlanProjects] = useState<ProjectRow[]>([])
+  const [planNodeTypes, setPlanNodeTypes] = useState<string[]>([])
+  const [planMetadataLoading, setPlanMetadataLoading] = useState(false)
+  const [planMetadataError, setPlanMetadataError] = useState<string>()
+  const planMetadataRequestRef = useRef(0)
   const [messageRunMetadata, setMessageRunMetadata] = useState<Record<string, AgentRunMetadata>>({})
   const [clarificationByMessageId, setClarificationByMessageId] = useState<Record<string, string>>({})
+  const activeRunRef = useRef<ActiveChatRun | null>(null)
+  const conversationIdRef = useRef(conversationId)
+  conversationIdRef.current = conversationId
+  const answerStreamRef = useRef<AnswerStreamBuffer | null>(null)
+  const answerStreamFlushFrameRef = useRef<number | null>(null)
+  const [streamingAnswer, setStreamingAnswer] = useState<StreamingAnswerView | null>(null)
+  const [activeRunId, setActiveRunId] = useState<string | null>(null)
+  const [cancelPendingRunId, setCancelPendingRunId] = useState<string | null>(null)
   const [artifactAttached, setArtifactAttached] = useState(Boolean(activeArtifact))
   const persistQueueRef = useRef<Promise<void>>(Promise.resolve())
   const [historySessions, setHistorySessions] = useState<ChatSessionSummary[]>([])
@@ -4868,6 +5870,24 @@ function ChatPage({
   const userNearBottomRef = useRef(true)
   const [workspaceStats, setWorkspaceStats] = useState<KnowledgeStats | null>(null)
   const [workspaceDataStats, setWorkspaceDataStats] = useState<DashboardStats | null>(null)
+  const [workspaceProgress, setWorkspaceProgress] = useState<KnowledgeIndexProgress | null>(null)
+  const [workspaceStatusLoading, setWorkspaceStatusLoading] = useState(true)
+  const [workspaceStatusFailed, setWorkspaceStatusFailed] = useState(false)
+  const [workspaceIndexRebuilding, setWorkspaceIndexRebuilding] = useState(false)
+  const [artifactPreview, setArtifactPreview] = useState<AssistantArtifactPreview | null>(null)
+  const [artifactSaving, setArtifactSaving] = useState(false)
+  const [artifactExportFormat, setArtifactExportFormat] = useState<ArtifactExportFormat>('docx')
+  const [artifactGenerationStatus, setArtifactGenerationStatus] = useState<ArtifactExportGenerationStatus>('idle')
+  const [artifactGenerationMessage, setArtifactGenerationMessage] = useState('')
+  const [artifactHistoryOpen, setArtifactHistoryOpen] = useState(false)
+  const [assistantArtifacts, setAssistantArtifacts] = useState<AssistantArtifact[]>([])
+  const [artifactHistoryLoading, setArtifactHistoryLoading] = useState(false)
+  const [artifactExporting, setArtifactExporting] = useState<string | null>(null)
+  const [runHistoryOpen, setRunHistoryOpen] = useState(false)
+  const [runHistoryLoading, setRunHistoryLoading] = useState(false)
+  const [assistantRunHistory, setAssistantRunHistory] = useState<AssistantRunHistory[]>([])
+  const [assistantRunStats, setAssistantRunStats] = useState<AssistantRunHistoryStats | null>(null)
+  const workspaceStatusRequestRef = useRef(0)
   const selectedDataGroup = activeDataView?.groups.find(
     (group) => group.name === activeDataGroup
   ) ?? activeDataView?.groups[0]
@@ -4931,25 +5951,60 @@ function ChatPage({
     void refreshHistory()
   }, [refreshHistory])
 
-  useEffect(() => {
-    let active = true
-    void Promise.allSettled([
+  const refreshWorkspaceStatus = useCallback(async (): Promise<void> => {
+    const requestId = ++workspaceStatusRequestRef.current
+    setWorkspaceStatusLoading(true)
+    const [knowledgeResult, dataResult] = await Promise.allSettled([
       window.visslm.getKnowledgeStats(),
       window.visslm.getStats()
     ])
-      .then(([knowledgeResult, dataResult]) => {
-        if (!active) return
-        setWorkspaceStats(knowledgeResult.status === 'fulfilled' ? knowledgeResult.value : null)
-        setWorkspaceDataStats(dataResult.status === 'fulfilled' ? dataResult.value : null)
-      })
-    return () => {
-      active = false
-    }
-  }, [refreshKey])
+    if (requestId !== workspaceStatusRequestRef.current) return
+    setWorkspaceStats(knowledgeResult.status === 'fulfilled' ? knowledgeResult.value : null)
+    setWorkspaceDataStats(dataResult.status === 'fulfilled' ? dataResult.value : null)
+    setWorkspaceStatusFailed(knowledgeResult.status === 'rejected' || dataResult.status === 'rejected')
+    setWorkspaceStatusLoading(false)
+  }, [])
+
+  useEffect(() => {
+    void refreshWorkspaceStatus()
+  }, [refreshKey, refreshWorkspaceStatus])
+
+  useEffect(() => window.visslm.onKnowledgeProgress((next) => {
+    setWorkspaceProgress(next)
+    if (next.status !== 'running') void refreshWorkspaceStatus()
+  }), [refreshWorkspaceStatus])
 
   useEffect(() => {
     setArtifactAttached(Boolean(activeArtifact))
   }, [activeArtifact])
+
+  // Project and node-type choices are metadata only.  Load them when a plan
+  // arrives so range edits cannot invent IDs through a free-text control.
+  useEffect(() => {
+    const summary = activeExecutionSummary
+    if (!summary || !planAwaitingConfirmation || (summary.sourceMode !== 'records' && summary.sourceMode !== 'mixed')) {
+      return
+    }
+    const requestId = ++planMetadataRequestRef.current
+    setPlanMetadataLoading(true)
+    setPlanMetadataError(undefined)
+    void Promise.all([window.visslm.listProjects(), window.visslm.listNodeTypes()])
+      .then(([projects, nodeTypes]) => {
+        if (requestId !== planMetadataRequestRef.current) return
+        setPlanProjects(projects)
+        setPlanNodeTypes(nodeTypes)
+      })
+      .catch((error) => {
+        if (requestId !== planMetadataRequestRef.current) return
+        setPlanMetadataError(`范围目录加载失败：${error instanceof Error ? error.message : String(error)}`)
+      })
+      .finally(() => {
+        if (requestId === planMetadataRequestRef.current) setPlanMetadataLoading(false)
+      })
+    return () => {
+      if (requestId === planMetadataRequestRef.current) planMetadataRequestRef.current += 1
+    }
+  }, [activeExecutionSummary, planAwaitingConfirmation, refreshKey])
 
   const openDataView = (view: ChatDataView): void => {
     dataViewPageRequestRef.current += 1
@@ -5069,8 +6124,232 @@ function ChatPage({
     return persistQueueRef.current
   }, [message, refreshHistory])
 
+  const isCurrentRun = (runId: string): boolean => {
+    const activeRun = activeRunRef.current
+    return activeRun?.runId === runId && activeRun.sessionId === conversationIdRef.current
+  }
+
+  const clearAnswerStream = useCallback((runId?: string): void => {
+    const current = answerStreamRef.current
+    if (runId && current?.runId !== runId) {
+      // A stale continuation may only clear its own snapshot.  This keeps a
+      // newer run's visible buffer isolated even if an old promise settles
+      // after the user has started another request.
+      setStreamingAnswer((snapshot) => snapshot?.runId === runId ? null : snapshot)
+      return
+    }
+    if (answerStreamFlushFrameRef.current !== null) {
+      cancelAnimationFrame(answerStreamFlushFrameRef.current)
+      answerStreamFlushFrameRef.current = null
+    }
+    answerStreamRef.current = null
+    setStreamingAnswer((snapshot) => {
+      if (!runId || snapshot?.runId === runId) return null
+      return snapshot
+    })
+  }, [])
+
+  const scheduleAnswerStreamFlush = useCallback((): void => {
+    if (answerStreamFlushFrameRef.current !== null) return
+    answerStreamFlushFrameRef.current = requestAnimationFrame(() => {
+      answerStreamFlushFrameRef.current = null
+      const current = answerStreamRef.current
+      const activeRun = activeRunRef.current
+      if (!current || !activeRun || current.runId !== activeRun.runId ||
+        current.sessionId !== conversationIdRef.current) {
+        setStreamingAnswer((snapshot) => (
+          snapshot && (!current || snapshot.runId === current.runId) ? null : snapshot
+        ))
+        return
+      }
+      setStreamingAnswer({
+        runId: current.runId,
+        sessionId: current.sessionId,
+        content: current.content
+      })
+    })
+  }, [])
+
+  const beginAnswerStream = useCallback((run: Pick<ActiveChatRun, 'runId' | 'sessionId'>): void => {
+    clearAnswerStream()
+    answerStreamRef.current = {
+      runId: run.runId,
+      sessionId: run.sessionId,
+      content: '',
+      lastSequence: null,
+      done: false
+    }
+  }, [clearAnswerStream])
+
+  const acceptAnswerTextEvent = useCallback((
+    run: Pick<ActiveChatRun, 'runId' | 'sessionId'>,
+    event: Extract<AgentEvent, { type: 'text' }>
+  ): void => {
+    const current = answerStreamRef.current
+    if (!current || current.runId !== run.runId || current.sessionId !== run.sessionId ||
+      current.sessionId !== conversationIdRef.current || current.done) return
+
+    const sequence = event.sequence
+    if (sequence !== undefined) {
+      // Modern producers are strictly monotonic.  The first numbered event
+      // establishes the stream's baseline; all following events must be the
+      // immediate successor so duplicates and gaps cannot reorder the answer.
+      if (!Number.isSafeInteger(sequence) || sequence < 0) return
+      if (current.lastSequence !== null && sequence !== current.lastSequence + 1) return
+      current.lastSequence = sequence
+    } else if (current.lastSequence !== null) {
+      // Legacy unsequenced events are accepted only before a numbered event;
+      // once sequencing starts, an unnumbered event is unsafe to merge.
+      return
+    }
+
+    if (event.replace || event.reset) {
+      current.content = event.content
+    } else if (event.content) {
+      current.content += event.content
+    }
+    if (event.done) current.done = true
+    if (current.content || event.done || event.replace || event.reset) {
+      scheduleAnswerStreamFlush()
+    }
+  }, [scheduleAnswerStreamFlush])
+
+  const clearActiveRun = (runId: string): boolean => {
+    if (!isCurrentRun(runId)) return false
+    activeRunRef.current = null
+    setActiveRunId(null)
+    setCancelPendingRunId(null)
+    setPlanAwaitingConfirmation(false)
+    setPlanConfirming(false)
+    setPlanExpired(false)
+    setPlanValidationErrors([])
+    setPlanWarnings([])
+    return true
+  }
+
+  const finalizeCancelledRun = (run: ActiveChatRun, responseTaskTrace?: AssistantTaskTrace): void => {
+    if (!isCurrentRun(run.runId)) return
+    clearAnswerStream(run.runId)
+    executionSummaryRef.current = null
+    setActiveExecutionSummary(null)
+    const completedAt = new Date().toISOString()
+    const cancellationMetadata = mergeAgentRunMetadata(run.initialMetadata, agentRunMetadata)
+    const metadataTaskTrace = assistantTaskTraceViewFromObject({
+      runId: run.runId,
+      status: 'cancelled',
+      ...(canonicalAssistantExecutionAgentOf(cancellationMetadata.skill)
+        ? { primaryAgent: canonicalAssistantExecutionAgentOf(cancellationMetadata.skill) }
+        : {}),
+      ...(cancellationMetadata.taskType ? { taskType: cancellationMetadata.taskType } : {}),
+      ...(cancellationMetadata.sourceMode ? { sourceMode: cancellationMetadata.sourceMode } : {}),
+      ...(cancellationMetadata.resultMode ? { resultMode: cancellationMetadata.resultMode } : {})
+    }, 'cancelled')
+    const explicitExpertTaskTrace = cancellationMetadata.skill
+      ? assistantExpertTaskTraceViewOf({ expertId: cancellationMetadata.skill }, 'cancelled')
+      : undefined
+    const responseTask = responseTaskTrace
+      ? assistantTaskTraceViewOf({ taskTrace: responseTaskTrace }, 'cancelled')
+      : undefined
+    const fallbackTaskTrace: AssistantTaskView = {
+      runId: run.runId,
+      status: 'cancelled',
+      primaryAgent: 'conversation',
+      invokedAgents: [],
+      taskType: 'conversation',
+      sourceMode: 'conversation',
+      resultMode: 'answer',
+      startedAt: run.startedAt,
+      completedAt
+    }
+    const mergedTaskTrace = mergeAssistantTaskTraceViews(fallbackTaskTrace, agentTaskTrace, responseTask, explicitExpertTaskTrace, metadataTaskTrace, {
+      runId: run.runId,
+      status: 'cancelled',
+      invokedAgents: []
+    })
+    const cancelledTaskTrace: AssistantTaskView = {
+      ...(mergedTaskTrace ?? { invokedAgents: [] }),
+      runId: run.runId,
+      status: 'cancelled',
+      invokedAgents: mergedTaskTrace?.invokedAgents ?? [],
+      startedAt: mergedTaskTrace?.startedAt ?? run.startedAt,
+      completedAt
+    }
+    const persistedTaskTrace = assistantTaskTracePayloadOf(cancelledTaskTrace, 'cancelled')
+    const assistantMessageId = crypto.randomUUID()
+    const cancelledMessages: ChatMessage[] = [
+      ...run.baseMessages,
+      { ...run.userMessage, contextOutcome: 'undone' },
+      {
+        id: assistantMessageId,
+        role: 'assistant',
+        content: '本次任务已停止，可修改问题后重试。',
+        retryQuestion: run.question,
+        ...(persistedTaskTrace ? { taskTrace: persistedTaskTrace } : {}),
+        createdAt: completedAt,
+        contextOutcome: 'undone'
+      }
+    ]
+
+    // Invalidate the awaiting askAgent continuation before any state update.
+    // Its catch/finally handlers will then become no-ops for this run.
+    clearActiveRun(run.runId)
+    setLoading(false)
+    setQuestion(run.question)
+    setMentionOpen(false)
+    setAgentProgress([])
+    setAgentRunMetadata(cancellationMetadata)
+    setAgentRunStatus('cancelled')
+    setAgentTaskTrace(cancelledTaskTrace)
+    setAgentDetailsOpen(false)
+    setMessages(cancelledMessages)
+    setMessageRunMetadata((current) => ({ ...current, [assistantMessageId]: cancellationMetadata }))
+    void persistSession(run.sessionId, cancelledMessages)
+  }
+
+  const cancelActiveRun = async (): Promise<void> => {
+    const run = activeRunRef.current
+    if (!run || run.cancelRequested || cancelPendingRunId === run.runId) return
+    run.cancelRequested = true
+    setCancelPendingRunId(run.runId)
+    try {
+      const result = await window.visslm.cancelAgentRun(run.runId)
+      if (!isCurrentRun(run.runId)) return
+      if (result.runId && result.runId !== run.runId) {
+        run.cancelRequested = false
+        setCancelPendingRunId(null)
+        message.warning('停止请求未匹配当前任务，请继续等待结果')
+        return
+      }
+      const cancelStatus = String(result.status ?? '').trim().toLocaleLowerCase()
+      const accepted = result.ok || [
+        'cancel_requested',
+        'cancelling',
+        'canceling',
+        'stopping',
+        'requested'
+      ].includes(cancelStatus)
+      if (accepted) {
+        finalizeCancelledRun(run)
+        return
+      }
+      run.cancelRequested = false
+      setCancelPendingRunId(null)
+      message.info(result.message ?? '任务已完成或暂时无法停止，请等待最终结果')
+    } catch (error) {
+      if (!isCurrentRun(run.runId)) return
+      run.cancelRequested = false
+      setCancelPendingRunId(null)
+      message.warning(`停止任务失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
   const resetConversation = (successMessage = '已开始新会话'): void => {
+    if (activeRunRef.current) {
+      message.info('请先停止当前任务，再切换会话')
+      return
+    }
     const nextConversationId = crypto.randomUUID()
+    clearAnswerStream()
     onConversationIdChange(nextConversationId)
     setMessages([])
     setQuestion('')
@@ -5084,6 +6363,13 @@ function ChatPage({
     setAgentRunStatus('idle')
     setAgentDetailsOpen(false)
     setAgentTaskTrace(null)
+    executionSummaryRef.current = null
+    setActiveExecutionSummary(null)
+    setPlanAwaitingConfirmation(false)
+    setPlanConfirming(false)
+    setPlanExpired(false)
+    setPlanValidationErrors([])
+    setPlanWarnings([])
     setMessageRunMetadata({})
     setClarificationByMessageId({})
     setArtifactAttached(false)
@@ -5118,7 +6404,7 @@ function ChatPage({
   }
 
   const startNewConversation = (): void => {
-    if (loading) return
+    if (loading || activeRunRef.current || cancelPendingRunId) return
     if (messages.length === 0 && !question.trim()) {
       resetConversation()
       return
@@ -5133,6 +6419,11 @@ function ChatPage({
   }
 
   const loadSessionById = async (sessionId: string): Promise<void> => {
+    if (activeRunRef.current) {
+      message.info('请先停止当前任务，再切换会话')
+      return
+    }
+    clearAnswerStream()
     setHistoryLoading(true)
     try {
       const session = await window.visslm.getChatSession(sessionId)
@@ -5154,9 +6445,21 @@ function ChatPage({
       setAgentRunStatus('idle')
       setAgentDetailsOpen(false)
       setAgentTaskTrace(null)
+      executionSummaryRef.current = null
+      setActiveExecutionSummary(null)
+      setPlanAwaitingConfirmation(false)
+      setPlanConfirming(false)
+      setPlanExpired(false)
+      setPlanValidationErrors([])
+      setPlanWarnings([])
       setMessageRunMetadata({})
       setClarificationByMessageId({})
-      onClearDataScope()
+      const latestScopedMessage = [...session.messages].reverse().find((item) => item.dataScope)
+      if (latestScopedMessage?.dataScope) {
+        onRestoreDataScope(latestScopedMessage.dataScope, latestScopedMessage.dataScopeSummary || '已恢复会话数据范围')
+      } else {
+        onClearDataScope()
+      }
       closeDataView()
       const latestDashboardMessage = [...session.messages]
         .reverse()
@@ -5176,7 +6479,7 @@ function ChatPage({
   }
 
   const requestLoadSession = (session: ChatSessionSummary): void => {
-    if (loading || historyLoading || session.id === conversationId) return
+    if (loading || activeRunRef.current || cancelPendingRunId || historyLoading || session.id === conversationId) return
     const load = (): Promise<void> => loadSessionById(session.id)
     if (!messages.length && !question.trim()) {
       void load()
@@ -5192,7 +6495,7 @@ function ChatPage({
   }
 
   const requestDeleteSession = (session: ChatSessionSummary): void => {
-    if (loading || historyLoading) return
+    if (loading || activeRunRef.current || cancelPendingRunId || historyLoading) return
     modal.confirm({
       title: '删除历史会话？',
       content: `“${session.title}”及其消息记录将被删除，无法恢复。`,
@@ -5285,9 +6588,41 @@ function ChatPage({
     return () => cancelAnimationFrame(frame)
   }, [messages.length, loading, conversationId, updateMessageScrollState])
 
+  useEffect(() => {
+    if (!streamingAnswer?.content) return
+    const frame = requestAnimationFrame(() => {
+      const container = messageListRef.current
+      if (!container || !userNearBottomRef.current) return
+      // Stream updates follow the viewport only when the user is already at
+      // the latest message; browsing history must never be interrupted.
+      container.scrollTo({ top: container.scrollHeight, behavior: 'auto' })
+      updateMessageScrollState()
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [streamingAnswer?.content, updateMessageScrollState])
+
   useEffect(() => window.visslm.onAgentEvent((update) => {
-    if (update.conversationId !== conversationId) return
-    const statusEvent = update.event
+    const activeRun = activeRunRef.current
+    if (!activeRun || update.runId !== activeRun.runId) return
+    if (activeRun.sessionId !== conversationId) return
+    if (update.conversationId && update.conversationId !== conversationId) return
+    const event = update.event
+    if (event.type === 'text') {
+      acceptAnswerTextEvent(activeRun, event)
+      return
+    }
+    if (event.type === 'plan') {
+      executionSummaryRef.current = event.summary
+      setActiveExecutionSummary(event.summary)
+      setPlanAwaitingConfirmation(event.requiresConfirmation)
+      setPlanConfirming(false)
+      setPlanExpired(false)
+      setPlanValidationErrors([])
+      setPlanWarnings([])
+      setAgentRunStatus('running')
+      return
+    }
+    const statusEvent = event
     if (statusEvent.type !== 'status') return
     setAgentProgress((items) => [...items, statusEvent].slice(-80))
     const eventMetadata = agentRunMetadataOf(statusEvent)
@@ -5299,21 +6634,71 @@ function ChatPage({
       setAgentTaskTrace((current) => mergeAssistantTaskTraceViews(current, eventTaskTrace) ?? eventTaskTrace)
     }
     setAgentRunStatus('running')
-  }), [conversationId])
+  }), [acceptAnswerTextEvent, conversationId])
+
+  const confirmExecutionPlan = async (patch: AssistantPlanPatchInput = {}): Promise<void> => {
+    const run = activeRunRef.current
+    if (!run || !planAwaitingConfirmation || planConfirming || planExpired) return
+    setPlanConfirming(true)
+    try {
+      // Keep the call scoped to the run and send only the changed, editable
+      // patch.  The main process owns all normalization and authorization.
+      const confirmAgentPlan = window.visslm.confirmAgentPlan as unknown as (
+        runId: string,
+        planPatch?: AssistantPlanPatchInput
+      ) => Promise<ConfirmAgentPlanResult>
+      const result = await confirmAgentPlan(
+        run.runId,
+        Object.keys(patch).length ? patch : undefined
+      )
+      if (!isCurrentRun(run.runId)) return
+      if (result.status === 'invalid') {
+        setPlanValidationErrors(result.errors ?? [])
+        setPlanWarnings(result.warnings ?? [])
+        message.warning('执行计划校验未通过，请修正标记字段后重试')
+        return
+      }
+      if (result.status === 'not_found') {
+        setPlanExpired(true)
+        setPlanAwaitingConfirmation(false)
+        setPlanValidationErrors([])
+        setPlanWarnings([])
+        message.warning('执行计划已失效，请重新提交问题')
+        return
+      }
+      const effectiveSummary = result.effectiveSummary
+      if (effectiveSummary) {
+        executionSummaryRef.current = effectiveSummary
+        setActiveExecutionSummary(effectiveSummary)
+      }
+      setPlanExpired(false)
+      setPlanValidationErrors([])
+      setPlanWarnings(result.warnings ?? [])
+      setPlanAwaitingConfirmation(false)
+    } catch (error) {
+      if (!isCurrentRun(run.runId)) return
+      message.error(`确认执行计划失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      if (isCurrentRun(run.runId)) setPlanConfirming(false)
+    }
+  }
 
   const send = async (overrideQuestion?: string): Promise<void> => {
     const text = (overrideQuestion ?? question).trim()
-    if (!text || loading) return
+    if (!text || loading || activeRunRef.current) return
     if (modelOnline !== true) {
       message.warning('模型未连接，请先完成系统配置')
       return
     }
     const sessionId = conversationId
+    const runId = crypto.randomUUID()
+    const startedAt = new Date().toISOString()
     const userMessage: ChatMessage = {
       id: crypto.randomUUID(),
       role: 'user',
       content: text,
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
+      ...(dataScope ? { dataScope, dataScopeSummary } : {})
     }
     const next = [...messages, userMessage]
     const explicitSkill = explicitAgentSkillOf(text)
@@ -5322,6 +6707,19 @@ function ChatPage({
       explicitSkill ? { skill: explicitSkill } : {},
       isFollowUp ? { followUp: true } : {}
     )
+    activeRunRef.current = {
+      runId,
+      sessionId,
+      question: text,
+      userMessage,
+      baseMessages: [...messages],
+      startedAt,
+      initialMetadata: initialRunMetadata,
+      cancelRequested: false
+    }
+    beginAnswerStream({ runId, sessionId })
+    setActiveRunId(runId)
+    setCancelPendingRunId(null)
     setMessages(next)
     setQuestion('')
     setMentionOpen(false)
@@ -5329,11 +6727,38 @@ function ChatPage({
     setAgentRunMetadata(initialRunMetadata)
     setAgentRunStatus('running')
     setAgentDetailsOpen(false)
+    executionSummaryRef.current = null
+    setActiveExecutionSummary(null)
+    setPlanAwaitingConfirmation(false)
+    setPlanConfirming(false)
+    setPlanExpired(false)
+    setPlanValidationErrors([])
+    setPlanWarnings([])
     setLoading(true)
     try {
-      const hasExplicitExpertMention = /@(?:数据可视化专家|通用数据助手|需求分析专家)(?:\s|$)/.test(text)
+      const hasExplicitExpertMention = /@(?:数据可视化专家|通用数据助手|需求分析专家|知识库专家|交付物专家)(?:\s|$)/.test(text)
       const requestsVisualization = /@数据可视化专家(?:\s|$)/.test(text)
+      const requestsArtifactExport = /@交付物专家(?:\s|$)/.test(text)
       const requestArtifact = requestsVisualization && artifactAttached ? activeArtifact : null
+      const artifactSourceMessage = requestsArtifactExport
+        ? [...messages].reverse().find((item) => (
+            item.role === 'assistant' && item.contextOutcome !== 'failed' &&
+            item.contextOutcome !== 'undone' && item.evidenceBlocks?.length
+          ))
+        : undefined
+      const artifactSourceIndex = artifactSourceMessage
+        ? messages.findIndex((item) => item.id === artifactSourceMessage.id)
+        : -1
+      const artifactSourceQuestion = artifactSourceIndex > 0
+        ? [...messages.slice(0, artifactSourceIndex)].reverse().find((item) => item.role === 'user')?.content
+        : undefined
+      const requestedArtifactFormat: AssistantArtifactOutputFormat = /(?:xlsx|excel|表格)/i.test(text)
+        ? 'xlsx'
+        : /(?:pptx|ppt|演示|汇报)/i.test(text)
+          ? 'pptx'
+          : /(?:zip|导出包|打包)/i.test(text)
+            ? 'zip'
+            : 'docx'
       const contextMessages = messages
         .filter((message) => message.contextOutcome !== 'failed' && message.contextOutcome !== 'undone')
         .map(({ role, content, contextOutcome, contextRefs }) => ({
@@ -5343,6 +6768,7 @@ function ChatPage({
           ...(contextRefs?.length ? { contextRefs } : {})
         }))
       const response = await window.visslm.askAgent({
+        runId,
         question: text,
         conversationId: sessionId,
         entrypoint: 'chat',
@@ -5356,11 +6782,46 @@ function ChatPage({
                 ...(activeArtifactVersion === undefined ? {} : { version: activeArtifactVersion }),
                 dashboard: requestArtifact
               }
+          }
+          : {}),
+        ...(artifactSourceMessage?.evidenceBlocks?.length
+          ? {
+              artifactSource: {
+                type: 'delivery_draft' as const,
+                conversationId: sessionId,
+                messageId: artifactSourceMessage.id,
+                title: `交付物 · ${artifactSourceQuestion ?? artifactSourceMessage.content}`.slice(0, 120),
+                question: artifactSourceQuestion ?? artifactSourceMessage.content,
+                answer: artifactSourceMessage.content,
+                executionSummary: artifactSourceMessage.executionSummary,
+                evidenceBlocks: artifactSourceMessage.evidenceBlocks,
+                dataViews: artifactSourceMessage.dataViews ?? [],
+                sources: artifactSourceMessage.sources ?? [],
+                outputFormat: requestedArtifactFormat,
+                instructions: text.replace(/@交付物专家\s*/g, '').trim()
+              }
             }
           : {}),
         history: requestArtifact ? contextMessages : contextMessages.slice(-8)
       })
+      if (!isCurrentRun(runId)) return
+      if (response.taskTrace?.runId && response.taskTrace.runId !== runId) return
+      if (response.cancelled || response.taskTrace?.status === 'cancelled') {
+        const currentRun = activeRunRef.current
+        if (currentRun) finalizeCancelledRun(currentRun, response.taskTrace)
+        return
+      }
+      // The final response is authoritative.  Clear the transient buffer in
+      // the same update as the persisted message below so the answer never
+      // flashes through an empty state and no partial is saved to history.
+      clearAnswerStream(runId)
       const responseError = response.events?.find((event) => event.type === 'error')
+      if (response.artifactPreview) {
+        setArtifactExportFormat(response.artifactPreview.input.outputFormat ?? requestedArtifactFormat)
+        setArtifactGenerationStatus('idle')
+        setArtifactGenerationMessage('')
+        setArtifactPreview(response.artifactPreview)
+      }
       if (responseError?.recoverable) {
         setQuestion(text)
       }
@@ -5401,6 +6862,7 @@ function ChatPage({
           }
         : undefined
       const persistedTaskTrace = response.taskTrace ?? assistantTaskTracePayloadOf(responseTaskTrace, responseTaskStatus)
+      if (response.artifactPreview) setArtifactPreview(response.artifactPreview)
       const assistantMessageId = crypto.randomUUID()
       const clarificationQuestion = response.clarificationQuestion?.trim() ||
         (response.needsClarification ? response.answer.trim() : '')
@@ -5418,6 +6880,10 @@ function ChatPage({
           dashboardVersion,
           expertId: response.expertId,
           assistantIntent: response.assistantIntent,
+          executionSummary: response.executionSummary ?? executionSummaryRef.current ?? undefined,
+          recoverySuggestions: response.recoverySuggestions,
+          evidenceBlocks: response.evidenceBlocks,
+          ...(dataScope ? { dataScope, dataScopeSummary } : {}),
           ...(persistedTaskTrace ? { taskTrace: persistedTaskTrace } : {}),
           contextRefs: response.contextRefs,
           contextStats: response.contextStats,
@@ -5435,6 +6901,13 @@ function ChatPage({
       setAgentRunStatus(response.needsClarification ? 'clarification' : responseError ? 'failed' : 'idle')
       void persistSession(sessionId, completedMessages)
     } catch (error) {
+      if (!isCurrentRun(runId)) return
+      const currentRun = activeRunRef.current
+      if (currentRun?.cancelRequested) {
+        finalizeCancelledRun(currentRun)
+        return
+      }
+      clearAnswerStream(runId)
       const rawMessage = error instanceof Error ? error.message : String(error)
       const errorMessage = rawMessage.replace(
         /^Error invoking remote method '[^']+':\s*(?:Error:\s*)?/,
@@ -5456,8 +6929,12 @@ function ChatPage({
       setMessages(failedMessages)
       setAgentRunStatus('failed')
       void persistSession(sessionId, failedMessages)
-    } finally {
-      setLoading(false)
+  } finally {
+      if (isCurrentRun(runId)) {
+        clearAnswerStream(runId)
+        clearActiveRun(runId)
+        setLoading(false)
+      }
     }
   }
 
@@ -5470,9 +6947,196 @@ function ChatPage({
     }
   }
 
+  const artifactTypeLabel = (type: AssistantArtifactType): string => ({
+    analysis_snapshot: '分析快照',
+    saved_filter: '筛选视图',
+    report_draft: '报告草稿',
+    delivery_draft: '文件交付草稿'
+  })[type]
+
+  const previewArtifact = async (
+    type: AssistantArtifactType,
+    assistantMessage: ChatMessage,
+    userQuestion: string
+  ): Promise<void> => {
+    if (!assistantMessage.evidenceBlocks?.length) {
+      message.warning('当前回答没有可核验 EvidenceBlock，不能创建交付物')
+      return
+    }
+    try {
+      const preview = await window.visslm.previewAssistantArtifact({
+        type,
+        conversationId,
+        messageId: assistantMessage.id,
+        title: `${artifactTypeLabel(type)} · ${userQuestion}`.slice(0, 120),
+        question: userQuestion,
+        answer: assistantMessage.content,
+        executionSummary: assistantMessage.executionSummary,
+        evidenceBlocks: assistantMessage.evidenceBlocks,
+        dataViews: assistantMessage.dataViews ?? [],
+        sources: assistantMessage.sources ?? [],
+        outputFormat: artifactExportFormat
+      })
+      setArtifactPreview(preview)
+      setArtifactGenerationStatus('idle')
+      setArtifactGenerationMessage('')
+    } catch (error) {
+      message.error(`无法生成交付物预览：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  const commitArtifact = async (): Promise<void> => {
+    if (!artifactPreview || artifactSaving) return
+    setArtifactSaving(true)
+    setArtifactGenerationStatus('generating')
+    setArtifactGenerationMessage(`正在生成 ${artifactExportFormat.toUpperCase()} 文件`)
+    let saved: AssistantArtifact | null = null
+    try {
+      // Rebuild the signed preview after a format switch so the persisted
+      // artifact history reflects the file that is actually generated.
+      const confirmedPreview = artifactPreview.input.outputFormat === artifactExportFormat
+        ? artifactPreview
+        : await window.visslm.previewAssistantArtifact({
+            ...artifactPreview.input,
+            outputFormat: artifactExportFormat
+          })
+      const committed = await window.visslm.commitAssistantArtifact(confirmedPreview)
+      saved = committed
+      setAssistantArtifacts((current) => [committed, ...current.filter((item) => item.id !== committed.id)])
+      const result = await window.visslm.exportAssistantArtifact({
+        artifactId: committed.id,
+        format: artifactExportFormat
+      })
+      if (!result.ok || result.canceled) {
+        const reverted = await window.visslm.revertAssistantArtifact(committed.id)
+        setAssistantArtifacts((current) => current.map((item) => item.id === committed.id ? reverted : item))
+        setArtifactGenerationStatus('cancelled')
+        setArtifactGenerationMessage(result.message || '已取消生成，交付物记录已撤销')
+        return
+      }
+      setArtifactGenerationStatus('succeeded')
+      setArtifactGenerationMessage(result.message)
+      setArtifactPreview(null)
+      message.success(result.message)
+    } catch (error) {
+      if (saved) {
+        try {
+          const reverted = await window.visslm.revertAssistantArtifact(saved.id)
+          setAssistantArtifacts((current) => current.map((item) => item.id === saved!.id ? reverted : item))
+        } catch {
+          // Preserve the original export error; the history view exposes any active record for manual revert.
+        }
+      }
+      setArtifactGenerationStatus('failed')
+      setArtifactGenerationMessage(error instanceof Error ? error.message : String(error))
+      message.error(`保存交付物失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setArtifactSaving(false)
+    }
+  }
+
+  const loadArtifactHistory = async (): Promise<void> => {
+    setArtifactHistoryLoading(true)
+    try {
+      setAssistantArtifacts(await window.visslm.listAssistantArtifacts(100))
+      setArtifactHistoryOpen(true)
+    } catch (error) {
+      message.error(`读取交付物记录失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setArtifactHistoryLoading(false)
+    }
+  }
+
+  const revertArtifact = async (id: string): Promise<void> => {
+    try {
+      const reverted = await window.visslm.revertAssistantArtifact(id)
+      setAssistantArtifacts((current) => current.map((item) => item.id === id ? reverted : item))
+      message.success('交付物已撤销，原始数据未发生变化')
+    } catch (error) {
+      message.error(`撤销交付物失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  const exportArtifact = async (
+    artifact: AssistantArtifact,
+    format: AssistantArtifactOutputFormat
+  ): Promise<void> => {
+    const exportKey = `${artifact.id}:${format}`
+    setArtifactExporting(exportKey)
+    try {
+      const result = await window.visslm.exportAssistantArtifact({ artifactId: artifact.id, format })
+      if (result.ok) message.success(result.message)
+    } catch (error) {
+      message.error(`导出交付物失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setArtifactExporting(null)
+    }
+  }
+
+  const loadRunHistory = async (): Promise<void> => {
+    setRunHistoryLoading(true)
+    try {
+      const [runs, stats] = await Promise.all([
+        window.visslm.listAssistantRunHistory(200),
+        window.visslm.getAssistantRunHistoryStats()
+      ])
+      setAssistantRunHistory(runs)
+      setAssistantRunStats(stats)
+      setRunHistoryOpen(true)
+    } catch (error) {
+      message.error(`读取 Agent 运行历史失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setRunHistoryLoading(false)
+    }
+  }
+
+  const rebuildWorkspaceIndex = async (): Promise<void> => {
+    if (workspaceIndexRebuilding) return
+    setWorkspaceIndexRebuilding(true)
+    try {
+      const result = await window.visslm.rebuildKnowledgeIndex()
+      message.success(result.message)
+      setWorkspaceProgress(null)
+    } catch (error) {
+      message.error(`索引重建失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setWorkspaceIndexRebuilding(false)
+      await refreshWorkspaceStatus()
+    }
+  }
+
   const dataRecordCount = workspaceDataStats?.recordCount ?? 0
   const hasData = dataRecordCount > 0
-  const hasKnowledge = Boolean(workspaceStats?.indexedChunkCount)
+  const workspaceReadiness = deriveAssistantWorkspaceReadiness({
+    dataRecordCount: workspaceDataStats?.recordCount,
+    knowledgeStats: workspaceStats,
+    liveProgress: workspaceProgress,
+    loadFailed: workspaceStatusFailed
+  })
+  const workspaceReadinessCopy = (() => {
+    switch (workspaceReadiness.state) {
+      case 'loading':
+        return { title: '正在检查数据与索引', detail: '确认 Agent 当前可用的数据来源。' }
+      case 'unavailable':
+        return { title: '状态读取失败', detail: '暂时无法确认数据与索引状态，请刷新后再试。' }
+      case 'no_data':
+        return { title: '还没有可查询的数据', detail: '先同步或导入数据，也可以上传知识库文档。' }
+      case 'indexing': {
+        const progress = workspaceReadiness.progress
+        const count = progress?.total ? `（${progress.current}/${progress.total}）` : ''
+        return { title: '索引正在建立', detail: `${progress?.message || '数据已进入索引队列'}${count}` }
+      }
+      case 'index_failed':
+        return {
+          title: '索引建立失败',
+          detail: workspaceReadiness.progress?.message || '数据仍然保留，可以重建索引后继续提问。'
+        }
+      case 'index_missing':
+        return { title: '数据尚未建立索引', detail: '重建索引后，Agent 才能执行正文与知识语义检索。' }
+      default:
+        return { title: '数据与索引已就绪', detail: 'Agent 可以查询数据中心和知识库。' }
+    }
+  })()
   const latestStatus = agentProgress.at(-1)
   const activeAgentControlStep = agentControlStepOfStage(latestStatus?.stage) ?? 'understand'
   const observedAgentControlSteps = useMemo(
@@ -5534,15 +7198,26 @@ function ChatPage({
   const notify = message
   const activeHistorySession = historySessions.find((session) => session.id === conversationId)
   const chatTitle = chatSessionTitleOf(activeHistorySession, messages)
-  const chatStatusLabel = loading
-    ? 'Agent 执行中'
+  const isCancelling = Boolean(activeRunId && cancelPendingRunId === activeRunId)
+  const activeStreamingAnswer = streamingAnswer && streamingAnswer.runId === activeRunId &&
+    streamingAnswer.sessionId === conversationId && streamingAnswer.content.length > 0
+    ? streamingAnswer
+    : null
+  const chatStatusLabel = activeStreamingAnswer
+    ? '正在生成回答'
+    : loading
+    ? isCancelling
+      ? '正在停止任务'
+      : 'Agent 执行中'
     : agentRunStatus === 'failed'
       ? '上次任务失败，可重试'
       : agentRunStatus === 'clarification'
         ? '等待补充信息'
-        : messages.length
-          ? '可继续提问'
-          : '准备就绪'
+        : agentRunStatus === 'cancelled'
+          ? '任务已停止，可重试'
+          : messages.length
+            ? '可继续提问'
+            : '准备就绪'
 
   return (
     <div className={`chat-page chat-workspace-v2 ${historyCollapsed ? 'history-collapsed' : ''} ${historyMobileOpen ? 'history-mobile-open' : ''} ${userNearBottom ? 'user-near-bottom' : 'user-browsing'}`}>
@@ -5579,9 +7254,6 @@ function ChatPage({
         </div>
         <div className="chat-history-panel-body">
           <div className="chat-history-tools">
-            <Text type="secondary" className="chat-history-hint">
-              点击会话可继续提问
-            </Text>
             <Input
               className="chat-history-search"
               allowClear
@@ -5603,6 +7275,22 @@ function ChatPage({
                 </Button>
               )}
             </div>
+            <Button
+              size="small"
+              icon={<FileTextOutlined />}
+              loading={artifactHistoryLoading}
+              onClick={() => void loadArtifactHistory()}
+            >
+              交付物记录
+            </Button>
+            <Button
+              size="small"
+              icon={<HistoryOutlined />}
+              loading={runHistoryLoading}
+              onClick={() => void loadRunHistory()}
+            >
+              运行历史
+            </Button>
           </div>
           {historyLoading ? (
             <div className="chat-history-loading"><Spin /></div>
@@ -5611,8 +7299,8 @@ function ChatPage({
               {filteredHistorySessions.map((session) => (
                 <div
                   role="button"
-                  tabIndex={loading || historyLoading ? -1 : 0}
-                  aria-disabled={loading || historyLoading}
+                  tabIndex={loading || Boolean(activeRunId) || historyLoading ? -1 : 0}
+                  aria-disabled={loading || Boolean(activeRunId) || historyLoading}
                   aria-label={`打开历史会话：${session.title}`}
                   className={`chat-history-item ${session.id === conversationId ? 'active' : ''}`}
                   key={session.id}
@@ -5637,7 +7325,7 @@ function ChatPage({
                     type="text"
                     danger
                     icon={<DeleteOutlined />}
-                    disabled={loading || historyLoading}
+                    disabled={loading || Boolean(activeRunId) || historyLoading}
                     aria-label={`删除历史会话：${session.title}`}
                     onClick={(event) => {
                       event.stopPropagation()
@@ -5667,7 +7355,7 @@ function ChatPage({
         />
       )}
       <Card className="chat-card">
-        <div className="chat-toolbar chat-toolbar-v2">
+	        <div className="chat-toolbar chat-toolbar-v2">
           <Button
             className="chat-history-toggle chat-history-reopen"
             type="text"
@@ -5695,7 +7383,7 @@ function ChatPage({
               >
                 {chatTitle}
               </Text>
-              <span className={`chat-session-status ${loading ? 'running' : agentRunStatus === 'failed' ? 'failed' : agentRunStatus === 'clarification' ? 'waiting' : 'ready'}`}>
+              <span className={`chat-session-status ${loading ? (isCancelling ? 'stopping' : 'running') : agentRunStatus === 'failed' ? 'failed' : agentRunStatus === 'clarification' ? 'waiting' : agentRunStatus === 'cancelled' ? 'stopped' : 'ready'}`}>
                 <span className="chat-session-status-dot" aria-hidden="true" />
                 <span>{messages.length ? `${messages.length} 条消息 · ${chatStatusLabel}` : chatStatusLabel}</span>
               </span>
@@ -5712,14 +7400,65 @@ function ChatPage({
               className="new-conversation-button"
               type="text"
               icon={<PlusOutlined />}
-              disabled={loading}
+              disabled={loading || Boolean(activeRunId)}
               onClick={startNewConversation}
             >
               新建会话
             </Button>
           </div>
-        </div>
-        <div className="chat-message-region">
+	        </div>
+          {workspaceReadiness.state !== 'ready' && (
+            <div
+              className={`chat-workspace-readiness is-${workspaceReadiness.state}`}
+              role={workspaceReadiness.state === 'index_failed' || workspaceReadiness.state === 'unavailable' ? 'alert' : 'status'}
+              aria-live="polite"
+            >
+              <span className="chat-workspace-readiness-icon" aria-hidden="true">
+                {workspaceReadiness.state === 'loading' || workspaceReadiness.state === 'indexing'
+                  ? <SyncOutlined spin />
+                  : workspaceReadiness.state === 'index_failed' || workspaceReadiness.state === 'unavailable'
+                    ? <ExclamationCircleOutlined />
+                    : <DatabaseOutlined />}
+              </span>
+              <span className="chat-workspace-readiness-copy">
+                <strong>{workspaceReadinessCopy.title}</strong>
+                <small>{workspaceReadinessCopy.detail}</small>
+              </span>
+              <span className="chat-workspace-readiness-actions">
+                {workspaceReadiness.state === 'no_data' && (
+                  <>
+                    <Button size="small" type="primary" onClick={() => onOpenAssetCenter('data')}>准备数据</Button>
+                    <Button size="small" onClick={() => onOpenAssetCenter('knowledge')}>上传文档</Button>
+                  </>
+                )}
+                {(workspaceReadiness.state === 'index_failed' || workspaceReadiness.state === 'index_missing') && (
+                  <Button
+                    size="small"
+                    type="primary"
+                    icon={<ReloadOutlined />}
+                    loading={workspaceIndexRebuilding}
+                    onClick={() => void rebuildWorkspaceIndex()}
+                  >
+                    重建索引
+                  </Button>
+                )}
+                {workspaceReadiness.state === 'index_failed' && (
+                  <Button size="small" onClick={() => onOpenAssetCenter('knowledge')}>查看知识库</Button>
+                )}
+                {workspaceReadiness.state !== 'no_data' && (
+                  <Button
+                    size="small"
+                    icon={<SyncOutlined />}
+                    loading={workspaceStatusLoading}
+                    onClick={() => void refreshWorkspaceStatus()}
+                  >
+                    刷新状态
+                  </Button>
+                )}
+              </span>
+            </div>
+          )}
+	        <div className="chat-message-region">
         <div
           className="message-list"
           ref={messageListRef}
@@ -5745,10 +7484,11 @@ function ChatPage({
                 <span className={`chat-minimal-status-item ${hasData ? 'ready' : 'blocked'}`}>
                   {hasData ? <CheckCircleOutlined aria-hidden="true" /> : <ExclamationCircleOutlined aria-hidden="true" />}
                   <span>{hasData ? `${dataRecordCount} 条数据` : '暂无数据'}</span>
+                  {!hasData && <Button type="link" size="small" onClick={() => onOpenAssetCenter('data')}>准备</Button>}
                 </span>
-                <span className={`chat-minimal-status-item ${hasKnowledge ? 'ready' : 'blocked'}`}>
-                  {hasKnowledge ? <CheckCircleOutlined aria-hidden="true" /> : <BulbOutlined aria-hidden="true" />}
-                  <span>{hasKnowledge ? '知识库就绪' : '知识库待准备'}</span>
+                <span className={`chat-minimal-status-item ${workspaceReadiness.state === 'ready' ? 'ready' : workspaceReadiness.state === 'indexing' || workspaceReadiness.state === 'loading' ? 'pending' : 'blocked'}`}>
+                  {workspaceReadiness.state === 'ready' ? <CheckCircleOutlined aria-hidden="true" /> : workspaceReadiness.state === 'indexing' || workspaceReadiness.state === 'loading' ? <SyncOutlined spin aria-hidden="true" /> : <BulbOutlined aria-hidden="true" />}
+                  <span>{workspaceReadiness.state === 'ready' ? '索引就绪' : workspaceReadinessCopy.title}</span>
                 </span>
               </div>
               <div className="prompt-grid chat-minimal-prompts" aria-label="快捷问题">
@@ -5768,7 +7508,7 @@ function ChatPage({
               </div>
             </div>
           ) : (
-            messages.map((message) => {
+            messages.map((message, messageIndex) => {
               const messageMetadata = mergeAgentRunMetadata(
                 agentRunMetadataOf(message),
                 messageRunMetadata[message.id] ?? {}
@@ -5800,7 +7540,9 @@ function ChatPage({
                     <div className="message-body">
                       {message.role === 'assistant' ? (
                         <div className="chat-markdown">
-                          <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
+                          <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                            {restoreLegacyAssistantMarkdown(message.content)}
+                          </ReactMarkdown>
                         </div>
                       ) : (
                         <Paragraph>{message.content}</Paragraph>
@@ -5808,6 +7550,21 @@ function ChatPage({
                     </div>
                     {message.role === 'assistant' && messageTaskTrace ? (
                       <AgentTaskSummary task={messageTaskTrace} className="chat-answer-task-summary" />
+                    ) : null}
+                    {message.role === 'assistant' && message.executionSummary ? (
+                      <details className="agent-execution-summary is-persisted">
+                        <summary><span>本轮实际执行范围</span><small>展开核对检索计划</small></summary>
+                        <div className="agent-execution-summary-body">
+                          <div className="agent-execution-summary-grid">
+                            <span><small>检索词</small><strong>{message.executionSummary.searchTerms.join('、') || '无全文检索词'}</strong></span>
+                            <span><small>读取字段</small><strong>{message.executionSummary.fields.join('、') || '按任务所需字段'}</strong></span>
+                            <span><small>项目</small><strong>{message.executionSummary.scope.projectIds.join('、') || '全部项目'}</strong></span>
+                            <span><small>类型</small><strong>{message.executionSummary.scope.nodeTypes.join('、') || '全部类型'}</strong></span>
+                            <span><small>记录</small><strong>{message.executionSummary.scope.recordCount === undefined ? '当前范围全部记录' : `${message.executionSummary.scope.recordCount} 条指定记录`}</strong></span>
+                            <span><small>结果上限</small><strong>{message.executionSummary.limit} 条</strong></span>
+                          </div>
+                        </div>
+                      </details>
                     ) : null}
                     {message.role === 'assistant' && !messageTaskTrace && (
                       agentSkillLabelOf(messageMetadata, message.expertId) ||
@@ -5836,6 +7593,30 @@ function ChatPage({
                         </div>
                         <span>{clarificationQuestion}</span>
                         <small>已暂停工具执行，补充范围、字段或来源后可继续。</small>
+                      </div>
+                    ) : null}
+                    {message.role === 'assistant' && message.recoverySuggestions?.length ? (
+                      <div className="chat-recovery-suggestions" role="group" aria-label="安全改写建议">
+                        <div className="chat-recovery-suggestions-heading">
+                          <BulbOutlined aria-hidden="true" />
+                          <strong>可安全重试</strong>
+                          <span>只使用本轮已确认的字段、检索词和范围</span>
+                        </div>
+                        <div className="chat-recovery-suggestion-list">
+                          {message.recoverySuggestions.map((suggestion) => (
+                            <Button
+                              key={suggestion.id}
+                              disabled={loading}
+                              onClick={() => {
+                                setQuestion(suggestion.prompt)
+                                requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>('.composer textarea')?.focus())
+                              }}
+                            >
+                              <strong>{suggestion.label}</strong>
+                              <small>{suggestion.reason}</small>
+                            </Button>
+                          ))}
+                        </div>
                       </div>
                     ) : null}
                     {message.role === 'assistant' && message.contextStats &&
@@ -5878,20 +7659,33 @@ function ChatPage({
                         {message.contextOutcome === 'failed' && (
                           <Tag color="error">未完成</Tag>
                         )}
+                        {message.contextOutcome === 'undone' && (
+                          <Tag>已停止</Tag>
+                        )}
                       </div>
                     )}
-                    {message.dataViews?.length ? (
-                      <div className="chat-data-action">
-                        <Button
-                          icon={<EyeOutlined />}
-                          onClick={() => openDataView(message.dataViews![0])}
-                        >
-                          查看查询数据
-                        </Button>
-                        <Text type="secondary">
-                          {message.dataViews[0].total} 条
-                          {message.dataViews[0].isPreview ? '（摘要预览）' : ''}
-                        </Text>
+                    {message.role === 'assistant' && message.contextOutcome === 'success' && message.evidenceBlocks?.length ? (
+                      <div className="chat-artifact-actions" aria-label="创建受控交付物">
+                        <span>基于已验证证据创建</span>
+                        {([
+                          ['analysis_snapshot', '分析快照'],
+                          ['saved_filter', '保存筛选视图'],
+                          ['report_draft', '报告草稿'],
+                          ['delivery_draft', '文件交付草稿']
+                        ] as const).map(([type, label]) => (
+                          <Button
+                            key={type}
+                            size="small"
+                            disabled={loading}
+                            onClick={() => void previewArtifact(
+                              type,
+                              message,
+                              [...messages.slice(0, messageIndex)].reverse().find((item) => item.role === 'user')?.content ?? message.content
+                            )}
+                          >
+                            {label}
+                          </Button>
+                        ))}
                       </div>
                     ) : null}
                     {message.dashboard ? (
@@ -5907,6 +7701,57 @@ function ChatPage({
                           {message.dashboard.components.length} 个组件
                         </Text>
                       </div>
+                      ) : null}
+                      {message.role === 'assistant' && message.evidenceBlocks?.length ? (
+                        <section className="chat-evidence-block" aria-label="回答证据区">
+                          <div className="chat-evidence-block-heading">
+                            <BulbOutlined aria-hidden="true" />
+                            <strong>证据区</strong>
+                            <span>记录、文档、聚合与查询明细使用同一核验入口</span>
+                          </div>
+                          <div className="chat-evidence-block-grid">
+                            {message.evidenceBlocks.map((block) => {
+                              const view = block.dataViewId
+                                ? message.dataViews?.find((item) => item.id === block.dataViewId)
+                                : undefined
+                              const icon = block.kind === 'document'
+                                ? <FileTextOutlined aria-hidden="true" />
+                                : block.kind === 'record'
+                                  ? <DatabaseOutlined aria-hidden="true" />
+                                  : <EyeOutlined aria-hidden="true" />
+                              const body = (
+                                <>
+                                  {icon}
+                                  <span>
+                                    <strong>{block.title}</strong>
+                                    <small>{block.summary}</small>
+                                    <em>
+                                      {block.matchedCount === undefined
+                                        ? `${block.count} 项`
+                                        : `命中 ${block.matchedCount} 项${block.returnedCount === undefined ? '' : `，当前载入 ${block.returnedCount} 项`}`}
+                                      {block.truncated ? ' · 可分页核验' : ''}
+                                    </em>
+                                  </span>
+                                </>
+                              )
+                              return view ? (
+                                <Button
+                                  key={block.id}
+                                  type="text"
+                                  className={`chat-evidence-block-item ${block.kind}`}
+                                  aria-label={`打开${block.title}：${block.summary}`}
+                                  onClick={() => openDataView(view)}
+                                >
+                                  {body}
+                                </Button>
+                              ) : (
+                                <div key={block.id} className={`chat-evidence-block-item ${block.kind}`}>
+                                  {body}
+                                </div>
+                              )
+                            })}
+                          </div>
+                        </section>
                       ) : null}
                       {message.role === 'assistant' && message.sources?.length ? (
                         <div className="source-list">
@@ -5988,6 +7833,8 @@ function ChatPage({
             })
           )}
           {loading && (
+            <>
+            {!activeStreamingAnswer && (
             <div className="message-row assistant">
               <div className="message-avatar">
                 <ThemedAppIcon alt="VISSLM AI" />
@@ -5995,7 +7842,7 @@ function ChatPage({
               <div className="message-content">
                 <div className="message-meta">
                   <Text strong>VISSLM AI</Text>
-                  <Text type="secondary">{agentRunMetadata.followUp ? '追问处理中' : 'Agent 正在运行'}</Text>
+                  <Text type="secondary">{agentRunMetadata.followUp ? '追问处理中' : '正在处理'}</Text>
                 </div>
                 <div className="message-bubble thinking">
                   <div className="agent-run-panel" aria-live="polite">
@@ -6004,10 +7851,27 @@ function ChatPage({
                       <span>{latestStatus?.message ?? '正在准备任务'}</span>
                       <Tag>{agentStageLabelOf(latestStatus?.stage)}</Tag>
                     </div>
-                    <AgentTaskSummary
-                      task={agentTaskTrace ?? { status: 'running', invokedAgents: [] }}
-                      className="agent-run-task-summary"
-                    />
+                    {activeExecutionSummary && (
+                      <AssistantExecutionPlanCard
+                        summary={activeExecutionSummary}
+                        pending={planAwaitingConfirmation}
+                        confirming={planConfirming}
+                        cancelling={isCancelling}
+                        expired={planExpired}
+                        projects={planProjects}
+                        nodeTypes={planNodeTypes}
+                        metadataLoading={planMetadataLoading}
+                        metadataError={planMetadataError}
+                        errors={planValidationErrors}
+                        warnings={planWarnings}
+                        onConfirm={confirmExecutionPlan}
+                        onCancel={() => void cancelActiveRun()}
+                        onClearIssues={() => {
+                          setPlanValidationErrors([])
+                          setPlanWarnings([])
+                        }}
+                      />
+                    )}
                     {overallProgress && (
                       <div className="agent-run-progress-compact" aria-label={`整体进度 ${overallProgress.percent}%`}>
                         <div className="agent-run-progress-compact-heading">
@@ -6028,7 +7892,7 @@ function ChatPage({
                         aria-expanded={agentDetailsOpen}
                         onClick={() => setAgentDetailsOpen((open) => !open)}
                       >
-                        查看执行详情
+                        {agentDetailsOpen ? '收起执行详情' : '查看执行详情'}
                       </button>
                       {agentDetailsOpen && (
                       <div className="agent-details-content">
@@ -6127,6 +7991,37 @@ function ChatPage({
               </div>
               </div>
             </div>
+            )}
+            {activeStreamingAnswer && (
+                <div className="message-row assistant streaming-answer-row">
+                  <div className="message-avatar">
+                    <ThemedAppIcon alt="VISSLM AI" />
+                  </div>
+                  <div className="message-content">
+                    <div className="message-meta">
+                      <Text strong>VISSLM AI</Text>
+                      <Text type="secondary">正在生成回答</Text>
+                    </div>
+                    <div
+                      className="message-bubble streaming-answer-bubble"
+                      role="status"
+                      aria-live="polite"
+                      aria-atomic="false"
+                      aria-label="正在生成回答"
+                    >
+                      <div className="message-body">
+                        <div className="chat-markdown">
+                          <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                            {restoreLegacyAssistantMarkdown(activeStreamingAnswer.content)}
+                          </ReactMarkdown>
+                        </div>
+                        <span className="streaming-answer-cursor" aria-hidden="true" />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </>
           )}
         </div>
         {showScrollLatest && (
@@ -6264,26 +8159,182 @@ function ChatPage({
                     </span>
                   </span>
                   {modelOnline === false && (
-                    <Button type="link" size="small" onClick={onOpenSettings}>
-                      去配置
+                    <Button type="link" size="small" aria-label="配置模型" onClick={onOpenSettings}>
+                      配置
                     </Button>
                   )}
                   <Button
-                    className="chat-send-button"
-                    type="primary"
-                    icon={<SendOutlined aria-hidden="true" />}
-                    aria-label="发送"
-                    loading={loading}
-                    disabled={!question.trim() || modelOnline !== true}
-                    onClick={() => void send()}
+                    className={`chat-send-button ${isCancelling ? 'is-stopping' : ''}`.trim()}
+                    type={loading ? 'default' : 'primary'}
+                    danger={loading}
+                    icon={loading
+                      ? <StopOutlined aria-hidden="true" />
+                      : <SendOutlined aria-hidden="true" />}
+                    aria-label={loading
+                      ? (isCancelling ? '正在停止当前任务' : '停止当前任务')
+                      : '发送'}
+                    loading={isCancelling}
+                    disabled={loading
+                      ? isCancelling || !activeRunId
+                      : !question.trim() || modelOnline !== true}
+                    onClick={() => {
+                      if (loading) void cancelActiveRun()
+                      else void send()
+                    }}
                   >
-                    发送
+                    {loading ? (isCancelling ? '正在停止' : '停止') : '发送'}
                   </Button>
                 </div>
               </div>
            </div>
          </div>
       </Card>
+      <Modal
+        title={null}
+        open={Boolean(artifactPreview)}
+        footer={null}
+        width="min(1040px, calc(100vw - 32px))"
+        closable={!artifactSaving}
+        maskClosable={!artifactSaving}
+        destroyOnHidden
+        onCancel={() => {
+          if (artifactSaving) return
+          setArtifactPreview(null)
+          setArtifactGenerationStatus('cancelled')
+          setArtifactGenerationMessage('已取消')
+        }}
+      >
+        <ArtifactExportPanel
+          preview={artifactPreview}
+          format={artifactExportFormat}
+          onFormatChange={(format) => {
+            setArtifactExportFormat(format)
+            setArtifactGenerationStatus('idle')
+            setArtifactGenerationMessage('')
+          }}
+          busy={artifactSaving}
+          generationStatus={artifactGenerationStatus}
+          statusMessage={artifactGenerationMessage}
+          history={assistantArtifacts.map((artifact) => ({
+            id: artifact.id,
+            title: artifact.title,
+            format: artifact.payload.outputFormat ?? 'docx',
+            status: artifact.status,
+            updatedAt: artifact.updatedAt,
+            evidenceCount: artifact.payload.evidenceBlocks.length,
+            dataRowCount: artifact.payload.dataViews.reduce((sum, view) => sum + view.total, 0)
+          }))}
+          onConfirm={commitArtifact}
+          onCancel={() => {
+            if (artifactSaving) return
+            setArtifactPreview(null)
+            setArtifactGenerationStatus('cancelled')
+            setArtifactGenerationMessage('已取消')
+          }}
+          onHistorySelect={(item) => {
+            const artifact = assistantArtifacts.find((candidate) => candidate.id === item.id)
+            if (!artifact) return
+            void window.visslm.previewAssistantArtifact(artifact.payload).then((preview) => {
+              setArtifactPreview(preview)
+              setArtifactExportFormat(artifact.payload.outputFormat ?? 'docx')
+              setArtifactGenerationStatus('idle')
+              setArtifactGenerationMessage('')
+            })
+          }}
+        />
+      </Modal>
+      <Drawer
+        title="AI 交付物记录"
+        size={880}
+        open={artifactHistoryOpen}
+        onClose={() => setArtifactHistoryOpen(false)}
+      >
+        <div className="assistant-artifact-history">
+          <Alert
+            type="info"
+            showIcon
+            message="交付物是 EvidenceBlock 的本地版本，不会修改数据中心或知识库。撤销操作保留版本记录。"
+          />
+          <ResizableTable<AssistantArtifact>
+            tableKey="assistant-artifact-history"
+            rowKey="id"
+            dataSource={assistantArtifacts}
+            loading={artifactHistoryLoading}
+            pagination={{ pageSize: 20 }}
+            scroll={{ x: 1160, y: 'min(560px, max(260px, calc(100vh - 260px)))' }}
+            columns={[
+              { title: '标题', dataIndex: 'title', width: 320, ellipsis: true },
+              { title: '类型', dataIndex: 'type', width: 120, render: (type: AssistantArtifactType) => artifactTypeLabel(type) },
+              { title: '版本', dataIndex: 'version', width: 80, render: (version: number) => `v${version}` },
+              { title: '状态', dataIndex: 'status', width: 100, render: (status: AssistantArtifact['status']) => <Tag color={status === 'active' ? 'success' : 'default'}>{status === 'active' ? '有效' : '已撤销'}</Tag> },
+              { title: '更新时间', dataIndex: 'updatedAt', width: 180, render: formatDate },
+              {
+                title: '操作',
+                key: 'actions',
+                width: 300,
+                render: (_value, artifact) => artifact.status === 'active'
+                  ? (
+                    <Space size={4} wrap={false}>
+                      {(['docx', 'xlsx', 'pptx', 'zip'] as const).map((format) => (
+                        <Button
+                          key={format}
+                          type="link"
+                          size="small"
+                          loading={artifactExporting === `${artifact.id}:${format}`}
+                          disabled={Boolean(artifactExporting && artifactExporting !== `${artifact.id}:${format}`)}
+                          onClick={() => void exportArtifact(artifact, format)}
+                        >
+                          {format.toUpperCase()}
+                        </Button>
+                      ))}
+                      <Button danger type="link" size="small" onClick={() => void revertArtifact(artifact.id)}>撤销</Button>
+                    </Space>
+                  )
+                  : '—'
+              }
+            ]}
+          />
+        </div>
+      </Drawer>
+      <Drawer
+        title="Agent 运行历史与质量指标"
+        size={1040}
+        open={runHistoryOpen}
+        onClose={() => setRunHistoryOpen(false)}
+      >
+        <div className="assistant-run-history">
+          {assistantRunStats && (
+            <div className="assistant-run-stats" aria-label="Agent 运行统计">
+              <Statistic title="运行总数" value={assistantRunStats.total} />
+              <Statistic title="完成" value={assistantRunStats.completed} />
+              <Statistic title="失败" value={assistantRunStats.failed} />
+              <Statistic title="平均耗时" value={assistantRunStats.averageDurationMs} suffix="ms" />
+              <Statistic title="工具阶段" value={assistantRunStats.totalToolCalls} />
+              <Statistic title="累计命中" value={assistantRunStats.totalMatchedCount} />
+            </div>
+          )}
+          <ResizableTable<AssistantRunHistory>
+            tableKey="assistant-run-history"
+            rowKey="runId"
+            dataSource={assistantRunHistory}
+            loading={runHistoryLoading}
+            pagination={{ pageSize: 20, showSizeChanger: true }}
+            scroll={{ x: 1350, y: 'min(540px, max(260px, calc(100vh - 360px)))' }}
+            columns={[
+              { title: '状态', dataIndex: 'status', width: 110, render: (status: AssistantRunHistory['status']) => <Tag color={status === 'completed' ? 'success' : status === 'failed' ? 'error' : status === 'clarification' ? 'warning' : 'default'}>{({ completed: '完成', failed: '失败', cancelled: '已取消', clarification: '待澄清' } as const)[status]}</Tag> },
+              { title: '任务 / 来源', key: 'task', width: 210, render: (_value, run) => `${run.taskType} · ${run.sourceMode}` },
+              { title: '主 Agent', dataIndex: 'primaryAgent', width: 150 },
+              { title: '耗时', dataIndex: 'durationMs', width: 110, render: (value: number) => `${value} ms` },
+              { title: '工具阶段', dataIndex: 'toolCallCount', width: 100 },
+              { title: '命中数', dataIndex: 'matchedCount', width: 90 },
+              { title: '记录 / 文档依据', key: 'evidence', width: 150, render: (_value, run) => `${run.recordEvidenceCount} / ${run.documentEvidenceCount}` },
+              { title: '失败阶段', dataIndex: 'failedStage', width: 130, render: (value: string) => value || '—' },
+              { title: '完成时间', dataIndex: 'completedAt', width: 180, render: formatDate },
+              { title: 'Run ID', dataIndex: 'runId', width: 190, ellipsis: true }
+            ]}
+          />
+        </div>
+      </Drawer>
       <Drawer
         title={activeKnowledgeDetail?.fileName ?? '知识库文档'}
         size={720}
@@ -8246,6 +10297,134 @@ const updateStatusColor = (status: UpdateStatus | null): string => {
   return 'default'
 }
 
+const modelCapabilityCheckDefinitions: ReadonlyArray<{
+  key: keyof ModelCapabilityReport['checks']
+  label: string
+  description: string
+}> = [
+  { key: 'connection', label: '连接', description: '服务地址与模型是否可达' },
+  { key: 'minimalChat', label: '最小问答', description: '低 Token 文本问答探针' },
+  { key: 'structuredOutput', label: 'JSON Schema', description: '结构化输出探针' },
+  { key: 'toolCalling', label: '工具调用', description: 'Agent 工具调用协议探针' },
+  { key: 'contextWindow', label: '上下文长度', description: '可用上下文能力' },
+  { key: 'thinking', label: '思考模式', description: '模型思考参数能力' }
+]
+
+const modelCapabilityStatusLabels: Record<ModelCapabilityStatus, string> = {
+  supported: '支持',
+  limited: '有限支持',
+  unsupported: '不支持',
+  unknown: '未验证',
+  error: '检测失败'
+}
+
+const modelCapabilityEvidenceLabels: Record<ModelCapabilityEvidence, string> = {
+  metadata: '服务元数据',
+  'active-probe': '主动探针',
+  'provider-contract': '服务商能力声明'
+}
+
+const modelCapabilitySourceLabelOf = (source: ModelSource): string => (
+  source === 'local' ? '本地' : '在线'
+)
+
+const modelCapabilityProviderLabelOf = (provider: ModelProvider): string => (
+  provider === 'ollama'
+    ? 'Ollama'
+    : onlineModelProviders.find((item) => item.value === provider)?.label ?? provider
+)
+
+const modelCapabilityReportMatches = (
+  report: ModelCapabilityReport | undefined,
+  model: Pick<ModelSettings, 'source' | 'provider' | 'model'> | undefined
+): report is ModelCapabilityReport => Boolean(
+  report && model &&
+  report.source === model.source &&
+  report.provider === model.provider &&
+  report.model.trim() === model.model.trim()
+)
+
+const modelCapabilityValueLabelOf = (item: ModelCapabilityItem): string | undefined => {
+  if (item.value === undefined || item.value === '') return undefined
+  if (typeof item.value === 'boolean') return item.value ? '是' : '否'
+  return String(item.value)
+}
+
+const formatCapabilityCheckedAt = (value: string): string => {
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? '时间未知' : date.toLocaleString('zh-CN')
+}
+
+const testModelWithCapabilities = (
+  input: ModelSettings,
+  probeChat: boolean,
+  probeCapabilities: boolean
+): Promise<ConnectionResult> => window.visslm.testModel(input, probeChat, probeCapabilities)
+
+function ModelCapabilityMatrix({
+  report
+}: {
+  report: ModelCapabilityReport | null
+}): React.JSX.Element {
+  if (!report) {
+    return (
+      <section className="model-capability-panel" aria-labelledby="model-capability-title">
+        <div className="model-capability-heading">
+          <div>
+            <Title id="model-capability-title" level={5}>模型能力矩阵</Title>
+            <Text type="secondary">启动诊断或手动测试后显示结构化能力结果。</Text>
+          </div>
+        </div>
+        <div className="model-capability-empty" role="status" aria-live="polite">
+          尚无与当前来源、服务商和模型匹配的诊断报告。
+        </div>
+      </section>
+    )
+  }
+
+  return (
+    <section className="model-capability-panel" aria-labelledby="model-capability-title">
+      <div className="model-capability-heading">
+        <div>
+          <Title id="model-capability-title" level={5}>模型能力矩阵</Title>
+          <Text type="secondary">
+            {modelCapabilitySourceLabelOf(report.source)} · {modelCapabilityProviderLabelOf(report.provider)} · {report.model}
+          </Text>
+        </div>
+        <div className="model-capability-report-meta">
+          <span>{report.probeMode === 'active' ? '完整能力测试' : '连接诊断'}</span>
+          <span>检查于 {formatCapabilityCheckedAt(report.checkedAt)}</span>
+        </div>
+      </div>
+      <div className="model-capability-grid">
+        {modelCapabilityCheckDefinitions.map(({ key, label, description }) => {
+          const item = report.checks[key]
+          const valueLabel = modelCapabilityValueLabelOf(item)
+          return (
+            <article className={`model-capability-item status-${item.status}`} key={key}>
+              <div className="model-capability-item-heading">
+                <strong>{label}</strong>
+                <span
+                  className="model-capability-status"
+                  aria-label={`${label}：${modelCapabilityStatusLabels[item.status]}`}
+                >
+                  {modelCapabilityStatusLabels[item.status]}
+                </span>
+              </div>
+              <span className="model-capability-description">{description}</span>
+              <p>{item.summary || '暂无检测说明'}</p>
+              <div className="model-capability-evidence">
+                <span>依据：{modelCapabilityEvidenceLabels[item.evidence]}</span>
+                {valueLabel && <span>检测值：{valueLabel}</span>}
+              </div>
+            </article>
+          )
+        })}
+      </div>
+    </section>
+  )
+}
+
 type UpdateReleaseNoteBlock =
   | { type: 'heading'; level: number; text: string }
   | { type: 'paragraph'; text: string }
@@ -8387,10 +10566,12 @@ function UpdateReleaseNotes({ notes }: { notes: string }): React.JSX.Element {
 function SettingsPage({
   settings,
   onChanged,
+  modelCapabilityReport,
   initialTab = 'platform'
 }: {
   settings: AppSettings | null
   onChanged: (settings: AppSettings) => void
+  modelCapabilityReport: ModelCapabilityReport | null
   initialTab?: SystemSettingsTabKey
 }): React.JSX.Element {
   const { message } = AntApp.useApp()
@@ -8399,7 +10580,10 @@ function SettingsPage({
   const [modelForm] = Form.useForm<ModelSettings>()
   const [settingsTab, setSettingsTab] = useState<SystemSettingsTabKey>(initialTab)
   const [platformTesting, setPlatformTesting] = useState(false)
-  const [modelTesting, setModelTesting] = useState(false)
+  const [modelConnectionTesting, setModelConnectionTesting] = useState(false)
+  const [modelCapabilityTesting, setModelCapabilityTesting] = useState(false)
+  const modelTestInFlightRef = useRef(false)
+  const [displayedModelCapabilityReport, setDisplayedModelCapabilityReport] = useState<ModelCapabilityReport | null>(modelCapabilityReport)
   const [matchingForm] = Form.useForm<ProjectMatchingSettings>()
   const [modelSource, setModelSource] = useState<ModelSource>('local')
   const [modelProvider, setModelProvider] = useState<ModelProvider>('ollama')
@@ -8416,6 +10600,7 @@ function SettingsPage({
   const [dragOverFeature, setDragOverFeature] = useState<FeatureDropTarget | null>(null)
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null)
   const [updateAction, setUpdateAction] = useState<'check' | 'download' | 'install' | null>(null)
+  const watchedModelName = Form.useWatch('model', modelForm)
   const selectedProvider = onlineModelProviders.find((item) => item.value === modelProvider)
   const savedModelProfile = settings?.modelProfiles?.[modelSource]
     ?? (settings?.model.source === modelSource ? settings.model : undefined)
@@ -8436,9 +10621,22 @@ function SettingsPage({
               ? 'MiniMax M 系列为模型内置思考模型，当前兼容接口不提供通用的关闭参数。'
               : modelProvider === 'rawchat-codex'
                 ? 'RawChat Codex 使用 Responses API；思考强度会映射到 reasoning.effort，建议选择支持 Codex 的模型。'
-              : modelProvider === 'openai-compatible'
-                ? '通用兼容接口不发送厂商专有思考参数；深度分析由 Agent 提示和结构化解释校验保证。'
-                : '当前服务商没有通用思考参数；深度分析能力取决于所选模型。'
+                : modelProvider === 'openai-compatible'
+                  ? '通用兼容接口不发送厂商专有思考参数；深度分析由 Agent 提示和结构化解释校验保证。'
+                  : '当前服务商没有通用思考参数；深度分析能力取决于所选模型。'
+  const currentModelIdentity = settings
+    ? {
+        source: modelSource,
+        provider: modelProvider,
+        model: (watchedModelName ?? settings.model.model).trim()
+      }
+    : undefined
+  const visibleModelCapabilityReport = modelCapabilityReportMatches(
+    displayedModelCapabilityReport ?? undefined,
+    currentModelIdentity
+  )
+    ? displayedModelCapabilityReport
+    : null
 
   useEffect(() => {
     if (!settings) return
@@ -8463,6 +10661,10 @@ function SettingsPage({
     setFeatureSettings({ ...DEFAULT_FEATURE_MODULE_SETTINGS, ...settings.features })
     setNavigationOrder(normalizeFeatureNavigationOrder(settings.navigationOrder))
   }, [settings, settingsTab, platformForm, systemForm, modelForm, matchingForm])
+
+  useEffect(() => {
+    setDisplayedModelCapabilityReport(modelCapabilityReport)
+  }, [modelCapabilityReport])
 
   useEffect(() => {
     let mounted = true
@@ -8542,14 +10744,33 @@ function SettingsPage({
     }
   }
 
-  const testModel = async (): Promise<void> => {
+  const testModel = async (probeChat: boolean): Promise<void> => {
+    if (modelTestInFlightRef.current) return
     const values = await modelForm.validateFields()
-    setModelTesting(true)
+    const input: ModelSettings = {
+      ...values,
+      source: modelSource,
+      provider: modelProvider
+    }
+    const setTesting = probeChat ? setModelCapabilityTesting : setModelConnectionTesting
+    modelTestInFlightRef.current = true
+    setTesting(true)
     try {
-      const result = await window.visslm.testModel(values, true)
-      result.ok ? message.success(result.message) : message.error(result.message)
+      const result = await testModelWithCapabilities(input, probeChat, true)
+      const report = result.capabilityReport
+      setDisplayedModelCapabilityReport(
+        modelCapabilityReportMatches(report, input) ? report : null
+      )
+      if (result.ok) {
+        message.success(probeChat ? '完整能力测试已完成，请查看能力矩阵' : result.message)
+      } else {
+        message.error(result.message)
+      }
+    } catch (error) {
+      message.error(`模型测试失败：${error instanceof Error ? error.message : String(error)}`)
     } finally {
-      setModelTesting(false)
+      modelTestInFlightRef.current = false
+      setTesting(false)
     }
   }
 
@@ -8685,6 +10906,7 @@ function SettingsPage({
 
   const changeModelSource = (source: string | number): void => {
     if (source !== 'local' && source !== 'online') return
+    setDisplayedModelCapabilityReport(null)
     const currentValues = modelForm.getFieldsValue(true) as ModelSettings
     modelDraftsRef.current[modelSource] = {
       ...currentValues,
@@ -8723,6 +10945,7 @@ function SettingsPage({
   const changeOnlineProvider = (provider: ModelProvider): void => {
     const preset = onlineModelProviders.find((item) => item.value === provider)
     if (!preset) return
+    setDisplayedModelCapabilityReport(null)
     const thinking = Boolean(modelForm.getFieldValue('thinking'))
     setModelProvider(provider)
     modelForm.setFieldsValue({
@@ -8760,11 +10983,11 @@ function SettingsPage({
                       <Input autoComplete="off" />
                     </Form.Item>
                     <Form.Item
-                      label="平台登录密码（用于显示名查询和富文本图片上传）"
+                      label="平台登录密码（用于字段定义读取、显示名查询和富文本图片上传）"
                       name="uploadPassword"
                       extra={settings?.platform.hasUploadPassword
-                        ? '已使用操作系统安全存储加密；留空继续使用原密码。用户属性 Key 非空时，采集需用此密码解析显示名；含图片推送时也需要此密码。'
-                        : '密码将使用操作系统安全存储加密；用户属性 Key 非空时，采集需用此密码解析显示名；含图片推送时也需要此密码。'}
+                        ? '已使用操作系统安全存储加密；留空继续使用原密码。采集读取数据类型字段定义、解析用户显示名时，以及推送含图片的富文本时，都需要此密码。'
+                        : '密码将使用操作系统安全存储加密；采集读取数据类型字段定义、解析用户显示名时，以及推送含图片的富文本时，都需要此密码。'}
                     >
                       <Input.Password
                         autoComplete="new-password"
@@ -8813,7 +11036,12 @@ function SettingsPage({
                       />
                     )}
                   />
-                  <Form form={modelForm} layout="vertical" onFinish={(values) => void saveModel(values)}>
+                  <Form
+                    form={modelForm}
+                    layout="vertical"
+                    onValuesChange={() => setDisplayedModelCapabilityReport(null)}
+                    onFinish={(values) => void saveModel(values)}
+                  >
                     <Form.Item name="source" hidden><Input /></Form.Item>
                     <Form.Item name="provider" hidden={modelSource === 'local'} label="模型服务商">
                       <Select
@@ -8865,11 +11093,31 @@ function SettingsPage({
                         : '开关会随模型配置保存，并应用到在线模型请求；思考模式通常会增加响应时间和 Token 消耗。'}
                       className="model-settings-alert"
                     />
-                    <Space>
+                    <Space wrap className="model-test-actions">
                       <Button type="primary" htmlType="submit">保存模型配置</Button>
-                      <Button loading={modelTesting} onClick={() => void testModel()}>测试模型</Button>
+                      <Button
+                        loading={modelConnectionTesting}
+                        disabled={modelCapabilityTesting}
+                        aria-label="测试模型连接与元数据"
+                        onClick={() => void testModel(false)}
+                      >
+                        测试连接
+                      </Button>
+                      <Button
+                        loading={modelCapabilityTesting}
+                        disabled={modelConnectionTesting}
+                        aria-label="执行完整模型能力测试"
+                        title="会发送不含业务数据的低 Token 探测请求"
+                        onClick={() => void testModel(true)}
+                      >
+                        完整能力测试
+                      </Button>
                     </Space>
+                    <Text type="secondary" className="model-test-hint">
+                      测试连接只读取服务和模型元数据；完整能力测试会额外发送不含业务数据的低 Token 请求，验证最小问答、JSON Schema 与工具调用。
+                    </Text>
                   </Form>
+                  <ModelCapabilityMatrix report={visibleModelCapabilityReport} />
                 </div>
               )
             },
@@ -9190,19 +11438,22 @@ function WindowTitleBar({
 function AssetCenterPage({
   refreshKey,
   onDataChanged,
-  onVisualize
+  onVisualize,
+  activeTab,
+  onActiveTabChange
 }: {
   refreshKey: number
   onDataChanged: () => void
   onVisualize: (scope: DataScope, summary: string) => void
+  activeTab: 'data' | 'knowledge'
+  onActiveTabChange: (tab: 'data' | 'knowledge') => void
 }): React.JSX.Element {
-  const [activeTab, setActiveTab] = useState('data')
   return (
     <div className="asset-center-page page-stack">
       <Tabs
         className="page-inner-tabs asset-center-tabs"
         activeKey={activeTab}
-        onChange={setActiveTab}
+        onChange={(tab) => onActiveTabChange(tab as 'data' | 'knowledge')}
         items={[
           {
             key: 'data',
@@ -9233,6 +11484,7 @@ function AppShell({ themeMode, onThemeModeChange }: AppProps): React.JSX.Element
   const [syncing, setSyncing] = useState(false)
   const [refreshKey, setRefreshKey] = useState(0)
   const [modelOnline, setModelOnline] = useState<boolean | null>(null)
+  const [modelCapabilityReport, setModelCapabilityReport] = useState<ModelCapabilityReport | null>(null)
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
   const [chatQuestion, setChatQuestion] = useState('')
   const [chatLoading, setChatLoading] = useState(false)
@@ -9242,6 +11494,7 @@ function AppShell({ themeMode, onThemeModeChange }: AppProps): React.JSX.Element
   const [chatDataScope, setChatDataScope] = useState<DataScope | null>(null)
   const [chatDataScopeSummary, setChatDataScopeSummary] = useState('')
   const [settingsInitialTab, setSettingsInitialTab] = useState<SystemSettingsTabKey>('platform')
+  const [assetCenterTab, setAssetCenterTab] = useState<'data' | 'knowledge'>('data')
 
   const updateGeneratedDashboard = useCallback((dashboard: DashboardSpec, version?: number): void => {
     setGeneratedDashboard(dashboard)
@@ -9254,11 +11507,28 @@ function AppShell({ themeMode, onThemeModeChange }: AppProps): React.JSX.Element
 
   useEffect(() => {
     if (!settings) return
+    let active = true
     setModelOnline(null)
+    setModelCapabilityReport(null)
     void window.visslm
-      .testModel(settings.model)
-      .then((result) => setModelOnline(result.ok))
-      .catch(() => setModelOnline(false))
+      .testModel(settings.model, false, true)
+      .then((result) => {
+        if (!active) return
+        setModelOnline(result.ok)
+        setModelCapabilityReport(
+          modelCapabilityReportMatches(result.capabilityReport, settings.model)
+            ? result.capabilityReport
+            : null
+        )
+      })
+      .catch(() => {
+        if (!active) return
+        setModelOnline(false)
+        setModelCapabilityReport(null)
+      })
+    return () => {
+      active = false
+    }
   }, [settings])
 
   const enabledFeatures = settings?.features ?? DEFAULT_FEATURE_MODULE_SETTINGS
@@ -9332,6 +11602,8 @@ function AppShell({ themeMode, onThemeModeChange }: AppProps): React.JSX.Element
         <AssetCenterPage
           refreshKey={refreshKey}
           onDataChanged={() => setRefreshKey((key) => key + 1)}
+          activeTab={assetCenterTab}
+          onActiveTabChange={setAssetCenterTab}
            onVisualize={(scope, summary) => {
              setChatDataScope(scope)
              setChatDataScopeSummary(summary)
@@ -9376,13 +11648,21 @@ function AppShell({ themeMode, onThemeModeChange }: AppProps): React.JSX.Element
            dataScopeSummary={chatDataScopeSummary}
            conversationId={chatConversationId}
            onConversationIdChange={setChatConversationId}
-           modelOnline={modelOnline}
-           onOpenSettings={() => setPage('settings')}
-           refreshKey={refreshKey}
-          onClearDataScope={() => {
-            setChatDataScope(null)
-            setChatDataScopeSummary('')
-          }}
+	           modelOnline={modelOnline}
+	           onOpenSettings={() => setPage('settings')}
+	           onOpenAssetCenter={(tab) => {
+	             setAssetCenterTab(tab)
+	             setPage('data')
+	           }}
+	           refreshKey={refreshKey}
+	           onClearDataScope={() => {
+	             setChatDataScope(null)
+	             setChatDataScopeSummary('')
+	           }}
+	          onRestoreDataScope={(scope, summary) => {
+	            setChatDataScope(scope)
+	            setChatDataScopeSummary(summary)
+	          }}
           onOpenDashboard={(dashboard, version) => {
             updateGeneratedDashboard(dashboard, version)
             setPage('visualization')
@@ -9407,7 +11687,15 @@ function AppShell({ themeMode, onThemeModeChange }: AppProps): React.JSX.Element
         />
       )
     }
-    return <SettingsPage key={settingsInitialTab} settings={settings} onChanged={setSettings} initialTab={settingsInitialTab} />
+    return (
+      <SettingsPage
+        key={settingsInitialTab}
+        settings={settings}
+        onChanged={setSettings}
+        modelCapabilityReport={modelCapabilityReport}
+        initialTab={settingsInitialTab}
+      />
+    )
   }, [
     chatLoading,
     chatMessages,
@@ -9418,6 +11706,7 @@ function AppShell({ themeMode, onThemeModeChange }: AppProps): React.JSX.Element
     generatedDashboard,
     generatedDashboardVersion,
     modelOnline,
+    modelCapabilityReport,
     page,
     refreshKey,
     settings,

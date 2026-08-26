@@ -189,7 +189,8 @@ const testExecutionRegistryContract = (): void => {
     'data-center',
     'knowledge-base',
     'requirement-analysis',
-    'visualization'
+    'visualization',
+    'artifact'
   ]
   assert.deepEqual(
     [...assistantExecutionAgentRegistry.map((agent) => agent.id)].sort(),
@@ -230,7 +231,8 @@ const testExecutionRegistryContract = (): void => {
       sourceMode: 'records',
       primaryAgent: 'requirement-analysis',
       agents: ['requirement-analysis']
-    }
+    },
+    { taskType: 'artifact_generation', sourceMode: 'mixed', primaryAgent: 'artifact', agents: ['artifact'] }
   ]
   for (const routeCase of routeCases) {
     const route = resolveAssistantExecutionRoute(routeCase.taskType, routeCase.sourceMode)
@@ -264,6 +266,7 @@ const testExecutionRegistryContract = (): void => {
   assert.equal(getAssistantExecutionAgent('unknown-agent' as AssistantExecutionAgentId), undefined)
   assert.doesNotThrow(() => assertAssistantAgentToolAllowed('data-center', 'query_records_by_fields'))
   assert.doesNotThrow(() => assertAssistantAgentToolAllowed('knowledge-base', 'search_document_chunks'))
+  assert.doesNotThrow(() => assertAssistantAgentToolAllowed('artifact', 'render_docx'))
   assert.throws(
     () => assertAssistantAgentToolAllowed('data-center', 'search_document_chunks'),
     /不允许工具/u,

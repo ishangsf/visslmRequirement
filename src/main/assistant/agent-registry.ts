@@ -90,6 +90,16 @@ export const assistantExecutionAgentRegistry: readonly AssistantExecutionAgentDe
     allowedTools: ['list_field_profiles', 'execute_query', 'validate_dashboard_spec', 'patch_dashboard'],
     readonly: false,
     capabilities: ['field-profile', 'query-spec', 'dashboard-spec', 'dashboard-patch']
+  },
+  {
+    id: 'artifact',
+    name: 'Artifact Agent',
+    version: 'artifact-v1',
+    supportedTaskTypes: ['artifact_generation'],
+    allowedSources: ['records', 'knowledge', 'mixed'],
+    allowedTools: ['render_docx', 'render_xlsx', 'render_pptx', 'render_bundle'],
+    readonly: false,
+    capabilities: ['evidence-only-artifact', 'docx', 'xlsx', 'pptx', 'export-bundle']
   }
 ] as const
 
@@ -112,6 +122,9 @@ const routeAgents = (
   if (taskType === 'visualization' && sourceMode === 'records') return ['visualization']
   if (taskType === 'requirement_matching' && sourceMode === 'records') {
     return ['requirement-analysis']
+  }
+  if (taskType === 'artifact_generation' && sourceMode !== 'conversation') {
+    return ['artifact']
   }
   return []
 }

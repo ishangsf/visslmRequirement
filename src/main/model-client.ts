@@ -1,8 +1,18 @@
 import type {
   ConnectionResult,
+  ModelCapabilityEvidence,
+  ModelCapabilityItem,
+  ModelCapabilityReport,
+  ModelCapabilityStatus,
   ModelSettings,
   RequirementSemanticizationModelUsage
 } from '../shared/types'
+import {
+  AssistantRunCancelledError,
+  getAssistantRunContext,
+  isAssistantRunCancellation,
+  throwIfAssistantRunCancelled
+} from './assistant/run-controller'
 
 export interface ModelMessage {
   role: 'system' | 'user' | 'assistant' | 'tool'
@@ -33,6 +43,10 @@ export interface ModelChatInput {
   temperature?: number
   numPredict?: number
   timeoutMs?: number
+  /** Optional direct caller signal; assistant runs also contribute their ALS signal. */
+  signal?: AbortSignal
+  /** Receives only visible final-answer text when this request is streamed. */
+  onTextDelta?: (content: string) => void
 }
 
 const trimBaseUrl = (value: string): string => value.replace(/\/+$/, '')
@@ -60,9 +74,38 @@ const rawChatModelsUrl = (value: string): string => `${rawChatBaseUrl(value)}/mo
 
 const rawChatResponsesUrl = (value: string): string => `${rawChatBaseUrl(value)}/responses`
 
-const chatTimeoutSignal = (input: ModelChatInput): AbortSignal => AbortSignal.timeout(
-  Math.max(1_000, Math.round(input.timeoutMs ?? defaultChatTimeoutMs))
-)
+interface ManagedRequestSignal {
+  signal: AbortSignal
+  cleanup: () => void
+}
+
+const requestSignal = (timeoutMs: number, callerSignal?: AbortSignal): ManagedRequestSignal => {
+  throwIfAssistantRunCancelled()
+  const timeoutSignal = AbortSignal.timeout(Math.max(1_000, Math.round(timeoutMs)))
+  const runSignal = getAssistantRunContext()?.signal
+  const signals = [timeoutSignal, callerSignal, runSignal].filter(
+    (signal): signal is AbortSignal => Boolean(signal)
+  )
+  const controller = new AbortController()
+  const listeners = signals.map((signal) => {
+    const listener = (): void => {
+      if (!controller.signal.aborted) controller.abort(signal.reason)
+    }
+    if (signal.aborted) listener()
+    else signal.addEventListener('abort', listener, { once: true })
+    return { signal, listener }
+  })
+  return {
+    signal: controller.signal,
+    cleanup: () => listeners.forEach(({ signal, listener }) => signal.removeEventListener('abort', listener))
+  }
+}
+
+const throwIfRunWasCancelled = (error: unknown): void => {
+  const context = getAssistantRunContext()
+  if (context?.signal.aborted) throw new AssistantRunCancelledError(context.runId)
+  if (isAssistantRunCancellation(error)) throw error
+}
 
 class OllamaProtocolError extends Error {}
 
@@ -257,6 +300,541 @@ const rawChatTextFormat = (format: ModelChatInput['format']): Record<string, unk
   }
 }
 
+type TextDeltaCallback = (content: string) => void
+
+const emitVisibleTextDelta = (
+  callback: TextDeltaCallback | undefined,
+  signal: AbortSignal,
+  content: unknown
+): void => {
+  if (!callback || typeof content !== 'string' || !content || signal.aborted) return
+  throwIfAssistantRunCancelled()
+  if (signal.aborted) return
+  callback(content)
+}
+
+interface SseFrame {
+  event?: string
+  data: string
+}
+
+/**
+ * Consume an SSE response without assuming network chunk boundaries. The
+ * provider specific handlers decide which fields are visible answer text.
+ */
+const readSseStream = async (
+  response: Response,
+  signal: AbortSignal,
+  onFrame: (frame: SseFrame) => void
+): Promise<void> => {
+  if (!response.body) throw new ModelStreamProtocolError('流式响应缺少响应体')
+  const reader = response.body.getReader()
+  const cancelReader = (): void => {
+    void reader.cancel(signal.reason).catch(() => undefined)
+  }
+  if (signal.aborted) {
+    cancelReader()
+    throwIfAssistantRunCancelled()
+    throw signal.reason ?? new DOMException('The operation was aborted', 'AbortError')
+  }
+  signal.addEventListener('abort', cancelReader, { once: true })
+
+  let buffer = ''
+  let eventName = ''
+  let dataLines: string[] = []
+  const dispatch = (): void => {
+    if (!eventName && !dataLines.length) return
+    onFrame({
+      ...(eventName ? { event: eventName } : {}),
+      data: dataLines.join('\n')
+    })
+    eventName = ''
+    dataLines = []
+  }
+  const consumeLine = (rawLine: string): void => {
+    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine
+    if (!line) {
+      dispatch()
+      return
+    }
+    if (line.startsWith(':')) return
+    const separator = line.indexOf(':')
+    const field = separator < 0 ? line : line.slice(0, separator)
+    const value = separator < 0
+      ? ''
+      : line.slice(separator + 1).startsWith(' ')
+        ? line.slice(separator + 2)
+        : line.slice(separator + 1)
+    if (field === 'event') eventName = value
+    else if (field === 'data') dataLines.push(value)
+    // id/retry and unknown SSE fields are intentionally ignored.
+  }
+
+  try {
+    const decoder = new TextDecoder()
+    while (true) {
+      throwIfAssistantRunCancelled()
+      const result = await reader.read()
+      if (result.done) break
+      buffer += decoder.decode(result.value, { stream: true })
+      let newlineIndex = buffer.indexOf('\n')
+      while (newlineIndex >= 0) {
+        consumeLine(buffer.slice(0, newlineIndex))
+        buffer = buffer.slice(newlineIndex + 1)
+        newlineIndex = buffer.indexOf('\n')
+      }
+    }
+    buffer += decoder.decode()
+    if (buffer) consumeLine(buffer)
+    // A final event may legally end at EOF without an extra blank line.
+    dispatch()
+  } catch (error) {
+    throwIfRunWasCancelled(error)
+    throw error
+  } finally {
+    signal.removeEventListener('abort', cancelReader)
+    reader.releaseLock()
+  }
+}
+
+class ModelStreamProtocolError extends Error {}
+
+interface OpenAiStreamState {
+  content: string
+  toolCalls: Map<number, { id?: string; name: string; arguments: string }>
+  done: boolean
+  doneReason?: string
+  usage?: RequirementSemanticizationModelUsage
+}
+
+const parseStreamJson = (data: string, provider: string): Record<string, unknown> => {
+  try {
+    const parsed: unknown = JSON.parse(data)
+    const record = asRecord(parsed)
+    if (!record) throw new Error('not an object')
+    return record
+  } catch {
+    throw new ModelStreamProtocolError(`${provider} 流式响应包含无效 JSON 分片`)
+  }
+}
+
+const isEventStreamResponse = (response: Response): boolean => (
+  response.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase() === 'text/event-stream'
+)
+
+const capabilityItem = (
+  status: ModelCapabilityStatus,
+  summary: string,
+  evidence: ModelCapabilityEvidence,
+  value?: number | boolean | string
+): ModelCapabilityItem => ({
+  status,
+  summary,
+  evidence,
+  ...(value === undefined ? {} : { value })
+})
+
+const unknownCapability = (evidence: ModelCapabilityEvidence = 'metadata'): ModelCapabilityItem =>
+  capabilityItem('unknown', '尚未完成可验证探测', evidence)
+
+const probeErrorSummary = (error: unknown, apiKey?: string): string => {
+  const message = error instanceof Error ? error.message : String(error)
+  let sanitized = message
+    .replace(/Bearer\s+[^\s]+/gi, 'Bearer [已隐藏]')
+    .replace(/(api[-_ ]?key|token|password)\s*[:=]\s*[^\s,;]+/gi, '$1=[已隐藏]')
+    .trim()
+  const configuredApiKey = apiKey?.trim()
+  if (configuredApiKey) sanitized = sanitized.split(configuredApiKey).join('[已隐藏]')
+  return (sanitized || '探测请求失败').slice(0, 240)
+}
+
+const parseProbeObject = (content: string | undefined): Record<string, unknown> | undefined => {
+  if (!content) return undefined
+  const trimmed = content.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim()
+  try {
+    return asRecord(JSON.parse(trimmed))
+  } catch {
+    return undefined
+  }
+}
+
+const capabilityProbeMessages = (instruction: string): ModelMessage[] => [
+  {
+    role: 'system',
+    content: '这是模型能力探测，不涉及任何本地业务数据。请严格按用户要求返回结果，不要输出解释。'
+  },
+  { role: 'user', content: instruction }
+]
+
+const structuredProbeFormat: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: false,
+  properties: { ok: { type: 'boolean' } },
+  required: ['ok']
+}
+
+const toolProbe = {
+  type: 'function',
+  function: {
+    name: 'capability_probe',
+    description: '能力探测工具。只用于验证工具调用协议。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: { ok: { type: 'boolean' } },
+      required: ['ok']
+    }
+  }
+}
+
+const normalizeContextLength = (value: unknown): number | undefined => {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return undefined
+  return Math.round(value)
+}
+
+const metadataStrings = (value: unknown): string[] => {
+  if (Array.isArray(value)) return value.flatMap(metadataStrings)
+  if (typeof value === 'string') return [value.trim().toLowerCase()]
+  return []
+}
+
+interface OllamaShowMetadata {
+  capabilities: string[]
+  contextLength?: number
+  toolCalling?: boolean
+  thinking?: boolean
+}
+
+const ollamaShowMetadata = (payload: Record<string, unknown>): OllamaShowMetadata => {
+  const capabilities = metadataStrings(payload.capabilities)
+  const hasCapabilityList = Array.isArray(payload.capabilities)
+  const modelInfo = asRecord(payload.model_info) ?? {}
+  const parameters = typeof payload.parameters === 'string' ? payload.parameters : ''
+  const contextCandidates: unknown[] = [
+    payload.context_length,
+    payload.contextWindow,
+    payload.num_ctx,
+    payload.n_ctx
+  ]
+  for (const [key, value] of Object.entries(modelInfo)) {
+    if (/(?:context(?:_length|\.length)?|num_ctx|n_ctx)/i.test(key)) contextCandidates.push(value)
+  }
+  const parameterContext = parameters.match(/(?:num_ctx|n_ctx|context_length)\s*[:= ]\s*(\d+)/i)
+  if (parameterContext) contextCandidates.push(Number(parameterContext[1]))
+  const contextLength = contextCandidates.map(normalizeContextLength).find((value) => value !== undefined)
+  const capabilityText = capabilities.join(' ')
+  const toolCalling = hasCapabilityList
+    ? /\b(?:tool|tools|function(?:_?calling)?|completion_tool)\b/i.test(capabilityText)
+    : undefined
+  const thinking = hasCapabilityList
+    ? /\b(?:thinking|reasoning)\b/i.test(capabilityText)
+    : undefined
+  return { capabilities, contextLength, toolCalling, thinking }
+}
+
+const openAiStreamResponse = (
+  state: OpenAiStreamState,
+  onTextDelta: TextDeltaCallback | undefined,
+  signal: AbortSignal
+): ModelResponse => ({
+  done_reason: state.doneReason,
+  message: {
+    role: 'assistant',
+    content: state.content,
+    ...(state.toolCalls.size
+      ? {
+          tool_calls: [...state.toolCalls.entries()]
+            .sort(([left], [right]) => left - right)
+            .map(([, call]) => ({
+              id: call.id,
+              function: {
+                name: call.name,
+                arguments: parseToolArguments(call.arguments)
+              }
+            }))
+        }
+      : {})
+  },
+  ...(state.usage ? { usage: state.usage } : {})
+})
+
+const readOpenAiStream = async (
+  response: Response,
+  signal: AbortSignal,
+  onTextDelta?: TextDeltaCallback
+): Promise<ModelResponse> => {
+  const state: OpenAiStreamState = { content: '', toolCalls: new Map(), done: false }
+  await readSseStream(response, signal, (frame) => {
+    if (signal.aborted) return
+    const data = frame.data.trim()
+    if (!data) return
+    if (data === '[DONE]') {
+      state.done = true
+      return
+    }
+    const payload = parseStreamJson(data, 'OpenAI')
+    if (asRecord(payload.error)) {
+      const message = asString(asRecord(payload.error)?.message) ?? '模型流式响应失败'
+      throw new ModelStreamProtocolError(`OpenAI 模型生成失败：${message}`)
+    }
+    const choices = Array.isArray(payload.choices) ? payload.choices : []
+    for (const item of choices) {
+      const choice = asRecord(item)
+      if (!choice) continue
+      const delta = asRecord(choice.delta)
+      const content = asString(delta?.content)
+      if (content) {
+        state.content += content
+        emitVisibleTextDelta(onTextDelta, signal, content)
+      }
+      // Reasoning content is deliberately not copied into ModelResponse or
+      // exposed through onTextDelta.
+      const toolDeltas = Array.isArray(delta?.tool_calls) ? delta.tool_calls : []
+      for (const rawTool of toolDeltas) {
+        const tool = asRecord(rawTool)
+        if (!tool) continue
+        const index = typeof tool.index === 'number' && Number.isInteger(tool.index) ? tool.index : 0
+        const current = state.toolCalls.get(index) ?? { arguments: '', name: '' }
+        const functionPart = asRecord(tool.function)
+        const name = asString(functionPart?.name)
+        const args = asString(functionPart?.arguments)
+        if (name) current.name = name
+        if (args) current.arguments += args
+        if (asString(tool.id)) current.id = asString(tool.id)
+        state.toolCalls.set(index, current)
+      }
+      const legacyFunction = asRecord(delta?.function_call)
+      if (legacyFunction) {
+        const current = state.toolCalls.get(0) ?? { arguments: '', name: '' }
+        const name = asString(legacyFunction.name)
+        const args = asString(legacyFunction.arguments)
+        if (name) current.name = name
+        if (args) current.arguments += args
+        state.toolCalls.set(0, current)
+      }
+      const finishReason = asString(choice.finish_reason)
+      if (finishReason) state.doneReason = finishReason
+      const usage = asRecord(choice.usage) ?? asRecord(payload.usage)
+      if (usage) {
+        const normalized: RequirementSemanticizationModelUsage = {
+          promptTokens: finiteNumber(usage.prompt_tokens ?? usage.input_tokens),
+          completionTokens: finiteNumber(usage.completion_tokens ?? usage.output_tokens)
+        }
+        if (Object.values(normalized).some((value) => value !== undefined)) state.usage = normalized
+      }
+    }
+    const topLevelUsage = asRecord(payload.usage)
+    if (topLevelUsage) {
+      const normalized: RequirementSemanticizationModelUsage = {
+        promptTokens: finiteNumber(topLevelUsage.prompt_tokens ?? topLevelUsage.input_tokens),
+        completionTokens: finiteNumber(topLevelUsage.completion_tokens ?? topLevelUsage.output_tokens)
+      }
+      if (Object.values(normalized).some((value) => value !== undefined)) state.usage = normalized
+    }
+  })
+  if (!state.done) throw new ModelStreamProtocolError('OpenAI 流式响应未收到 [DONE] 结束帧')
+  throwIfAssistantRunCancelled()
+  return openAiStreamResponse(state, onTextDelta, signal)
+}
+
+interface RawChatStreamState {
+  content: string
+  toolCalls: Map<string, { id?: string; name: string; arguments: string }>
+  done: boolean
+  doneReason?: string
+  usage?: RequirementSemanticizationModelUsage
+}
+
+const rawChatStreamResponse = (state: RawChatStreamState): ModelResponse => ({
+  done_reason: state.doneReason,
+  message: {
+    role: 'assistant',
+    content: state.content,
+    ...(state.toolCalls.size
+      ? {
+          tool_calls: [...state.toolCalls.values()].map((call) => ({
+            id: call.id,
+            function: {
+              name: call.name,
+              arguments: parseToolArguments(call.arguments)
+            }
+          }))
+        }
+      : {})
+  },
+  ...(state.usage ? { usage: state.usage } : {})
+})
+
+const readRawChatStream = async (
+  response: Response,
+  signal: AbortSignal,
+  onTextDelta?: TextDeltaCallback
+): Promise<ModelResponse> => {
+  const state: RawChatStreamState = { content: '', toolCalls: new Map(), done: false }
+  await readSseStream(response, signal, (frame) => {
+    if (signal.aborted) return
+    const data = frame.data.trim()
+    if (!data) return
+    if (data === '[DONE]') {
+      state.done = true
+      return
+    }
+    const payload = parseStreamJson(data, 'RawChat Codex')
+    const eventType = asString(frame.event) ?? asString(payload.type) ?? ''
+    if (eventType === 'error' || eventType === 'response.failed') {
+      const errorRecord = asRecord(payload.error)
+      throw new ModelStreamProtocolError(
+        `RawChat Codex 模型生成失败：${asString(errorRecord?.message) ?? asString(payload.message) ?? '未知错误'}`
+      )
+    }
+    if (eventType === 'response.output_text.delta') {
+      const delta = asString(payload.delta)
+      if (delta) {
+        state.content += delta
+        emitVisibleTextDelta(onTextDelta, signal, delta)
+      }
+    } else if (eventType === 'response.function_call_arguments.delta') {
+      const key = asString(payload.item_id) ?? asString(payload.call_id) ?? String(payload.output_index ?? 0)
+      const current = state.toolCalls.get(key) ?? { arguments: '', name: '' }
+      const delta = asString(payload.delta)
+      if (delta) current.arguments += delta
+      if (asString(payload.call_id)) current.id = asString(payload.call_id)
+      state.toolCalls.set(key, current)
+    } else if (eventType === 'response.output_item.added' || eventType === 'response.output_item.done') {
+      const item = asRecord(payload.item)
+      if (item?.type === 'function_call') {
+        const key = asString(item.id) ?? asString(item.call_id) ?? String(payload.output_index ?? state.toolCalls.size)
+        const current = state.toolCalls.get(key) ?? { arguments: '', name: '' }
+        current.id = asString(item.call_id) ?? asString(item.id) ?? current.id
+        current.name = asString(item.name) ?? current.name
+        const args = asString(item.arguments)
+        if (args) current.arguments = args
+        state.toolCalls.set(key, current)
+      }
+    } else if (eventType === 'response.completed') {
+      const completed = asRecord(payload.response) ?? payload
+      const status = asString(completed.status)
+      state.doneReason = status === 'completed' ? 'stop' : status
+      const usage = asRecord(completed.usage)
+      if (usage) state.usage = rawChatUsage(usage)
+      state.done = true
+    } else if (eventType === 'response.incomplete') {
+      const incomplete = asRecord(payload.response) ?? payload
+      state.doneReason = asString(asRecord(incomplete.incomplete_details)?.reason) ?? 'length'
+      state.done = true
+    }
+  })
+  if (!state.done) throw new ModelStreamProtocolError('RawChat Codex 流式响应未收到结束帧')
+  throwIfAssistantRunCancelled()
+  return rawChatStreamResponse(state)
+}
+
+interface AnthropicStreamState {
+  content: string
+  toolCalls: Map<number, { id?: string; name: string; arguments: string }>
+  done: boolean
+  doneReason?: string
+  usage?: RequirementSemanticizationModelUsage
+}
+
+const anthropicStreamResponse = (state: AnthropicStreamState): ModelResponse => ({
+  done_reason: state.doneReason,
+  message: {
+    role: 'assistant',
+    content: state.content,
+    ...(state.toolCalls.size
+      ? {
+          tool_calls: [...state.toolCalls.entries()]
+            .sort(([left], [right]) => left - right)
+            .map(([, call]) => ({
+              id: call.id,
+              function: {
+                name: call.name,
+                arguments: parseToolArguments(call.arguments)
+              }
+            }))
+        }
+      : {})
+  },
+  ...(state.usage ? { usage: state.usage } : {})
+})
+
+const readAnthropicStream = async (
+  response: Response,
+  signal: AbortSignal,
+  onTextDelta?: TextDeltaCallback
+): Promise<ModelResponse> => {
+  const state: AnthropicStreamState = { content: '', toolCalls: new Map(), done: false }
+  await readSseStream(response, signal, (frame) => {
+    if (signal.aborted) return
+    const data = frame.data.trim()
+    if (!data) return
+    if (data === '[DONE]') {
+      state.done = true
+      return
+    }
+    const payload = parseStreamJson(data, 'Anthropic')
+    const eventType = asString(frame.event) ?? asString(payload.type) ?? ''
+    if (eventType === 'error') {
+      const errorRecord = asRecord(payload.error)
+      throw new ModelStreamProtocolError(
+        `Anthropic 模型生成失败：${asString(errorRecord?.message) ?? '未知错误'}`
+      )
+    }
+    if (eventType === 'message_start') {
+      const message = asRecord(payload.message)
+      const usage = asRecord(message?.usage)
+      if (usage) {
+        state.usage = {
+          promptTokens: finiteNumber(usage.input_tokens),
+          completionTokens: finiteNumber(usage.output_tokens)
+        }
+      }
+    } else if (eventType === 'content_block_start') {
+      const block = asRecord(payload.content_block)
+      if (block?.type === 'tool_use') {
+        const index = typeof payload.index === 'number' ? payload.index : state.toolCalls.size
+        state.toolCalls.set(index, {
+          id: asString(block.id),
+          name: asString(block.name) ?? '',
+          arguments: block.input ? JSON.stringify(block.input) : ''
+        })
+      }
+    } else if (eventType === 'content_block_delta') {
+      const delta = asRecord(payload.delta)
+      if (delta?.type === 'text_delta') {
+        const text = asString(delta.text)
+        if (text) {
+          state.content += text
+          emitVisibleTextDelta(onTextDelta, signal, text)
+        }
+      } else if (delta?.type === 'input_json_delta') {
+        const index = typeof payload.index === 'number' ? payload.index : 0
+        const current = state.toolCalls.get(index) ?? { arguments: '', name: '' }
+        const partial = asString(delta.partial_json)
+        if (partial) current.arguments += partial
+        state.toolCalls.set(index, current)
+      }
+      // thinking_delta, signature_delta and redacted thinking are ignored.
+    } else if (eventType === 'message_delta') {
+      const delta = asRecord(payload.delta)
+      state.doneReason = asString(delta?.stop_reason) ?? state.doneReason
+      const usage = asRecord(payload.usage)
+      if (usage) {
+        state.usage = {
+          ...(state.usage ?? {}),
+          completionTokens: finiteNumber(usage.output_tokens)
+        }
+      }
+    } else if (eventType === 'message_stop') {
+      state.done = true
+    }
+  })
+  if (!state.done) throw new ModelStreamProtocolError('Anthropic 流式响应未收到 message_stop 结束帧')
+  throwIfAssistantRunCancelled()
+  return anthropicStreamResponse(state)
+}
+
 export class ModelClient {
   constructor(private readonly settings: ModelSettings) {}
 
@@ -267,72 +845,115 @@ export class ModelClient {
     )
   }
 
-  async test(probeChat = false): Promise<ConnectionResult> {
+  async test(probeChat = false, probeCapabilities = false): Promise<ConnectionResult> {
     try {
       if (this.settings.source === 'local') {
         const connection = await this.testOllama()
-        if (!connection.ok || !probeChat) return connection
-        await this.chatOllama({
-          messages: [
-            { role: 'system', content: '这是模型连通性测试。请只返回 OK。' },
-            { role: 'user', content: 'OK' }
-          ],
-          forceThinking: false,
-          temperature: 0,
-          numPredict: 32
-        })
-        return { ...connection, message: `${connection.message}，最小问答测试通过` }
-      }
-      if (!this.settings.apiKey) throw new Error('请输入 API Key')
-      const response = await fetch(
-        this.usesRawChatResponses()
-          ? rawChatModelsUrl(this.settings.baseUrl)
-          : `${trimBaseUrl(this.settings.baseUrl)}/models`,
-        {
-          headers: this.onlineHeaders(),
-          signal: AbortSignal.timeout(15_000)
+        if (!connection.ok) {
+          return probeCapabilities
+            ? { ...connection, capabilityReport: this.capabilityReportForConnection(connection) }
+            : connection
         }
-      )
+
+        let report: ModelCapabilityReport | undefined
+        if (probeCapabilities) {
+          let metadata: OllamaShowMetadata | undefined
+          let metadataError: string | undefined
+          try {
+            metadata = ollamaShowMetadata(await this.fetchOllamaShow())
+          } catch (error) {
+            if (isAssistantRunCancellation(error)) throw error
+            metadataError = probeErrorSummary(error, this.settings.apiKey)
+          }
+          report = this.localCapabilityReport(connection, metadata, metadataError, probeChat)
+        }
+
+        const minimal = probeChat ? await this.probeMinimalChat() : undefined
+        if (minimal && report) report.checks.minimalChat = minimal
+        if (probeChat && probeCapabilities && report) {
+          report.checks.structuredOutput = await this.probeStructuredOutput()
+          report.checks.toolCalling = await this.probeToolCalling()
+        }
+        if (probeChat && !probeCapabilities && minimal?.status !== 'supported') {
+          return {
+            ...connection,
+            ok: false,
+            message: `${this.providerName()} 模型服务可访问，但最小问答测试失败：${minimal?.summary ?? '未知错误'}`
+          }
+        }
+        return {
+          ...connection,
+          ...(report ? { capabilityReport: report } : {}),
+          message: `${connection.message}${probeChat && minimal?.status === 'supported' ? '，最小问答测试通过' : ''}`
+        }
+      }
+
+      if (!this.settings.apiKey) throw new Error('请输入 API Key')
+      const request = requestSignal(15_000)
+      let response: Response
+      try {
+        response = await fetch(
+          this.usesRawChatResponses()
+            ? rawChatModelsUrl(this.settings.baseUrl)
+            : `${trimBaseUrl(this.settings.baseUrl)}/models`,
+          {
+            headers: this.onlineHeaders(),
+            signal: request.signal
+          }
+        )
+      } finally {
+        request.cleanup()
+      }
       if (!response.ok) throw await this.httpError(response)
       const payload = (await response.json()) as {
         data?: Array<{ id?: string }>
         models?: Array<{ id?: string }>
       }
       const models = (payload.data ?? payload.models ?? []).map((item) => item.id).filter(Boolean)
-      if (models.length && !models.includes(this.settings.model)) {
-        return {
-          ok: false,
-          message: `${this.providerName()} 已连接，但未找到模型 ${this.settings.model}`,
-          details: { models }
-        }
-      }
-      if (probeChat) {
-        try {
-          await this.chat({
-            messages: [
-              { role: 'system', content: '这是模型连通性测试。请只返回 OK。' },
-              { role: 'user', content: 'OK' }
-            ],
-            forceThinking: false,
-            temperature: 0,
-            numPredict: 32
-          })
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error)
-          return {
+      const connection: ConnectionResult = models.length && !models.includes(this.settings.model)
+        ? {
             ok: false,
-            message: `${this.providerName()} 模型列表可访问，但最小问答测试失败：${message}`,
+            message: `${this.providerName()} 已连接，但未找到模型 ${this.settings.model}`,
             details: { models }
           }
+        : {
+            ok: true,
+            message: `${this.providerName()} 连接成功${models.includes(this.settings.model) ? `，模型 ${this.settings.model} 可用` : ''}`,
+            details: { models }
+          }
+      if (!connection.ok) {
+        return probeCapabilities
+          ? { ...connection, capabilityReport: this.capabilityReportForConnection(connection) }
+          : connection
+      }
+
+      let report = probeCapabilities ? this.onlineCapabilityReport(connection, probeChat) : undefined
+      const minimal = probeChat ? await this.probeMinimalChat() : undefined
+      if (minimal && report) report.checks.minimalChat = minimal
+      if (probeChat && probeCapabilities && report) {
+        report.checks.structuredOutput = await this.probeStructuredOutput()
+        report.checks.toolCalling = await this.probeToolCalling()
+      }
+      if (probeChat && !probeCapabilities && minimal?.status !== 'supported') {
+        return {
+          ...connection,
+          ok: false,
+          message: `${this.providerName()} 模型列表可访问，但最小问答测试失败：${minimal?.summary ?? '未知错误'}`
         }
       }
       return {
-        ok: true,
-        message: `${this.providerName()} 连接成功${models.includes(this.settings.model) ? `，模型 ${this.settings.model} 可用` : ''}${probeChat ? '，最小问答测试通过' : ''}`,
-        details: { models }
+        ...connection,
+        ...(report ? { capabilityReport: report } : {}),
+        message: `${connection.message}${probeChat && minimal?.status === 'supported' ? '，最小问答测试通过' : ''}`
       }
     } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : String(error) }
+      if (isAssistantRunCancellation(error)) throw error
+      const message = probeErrorSummary(error, this.settings.apiKey)
+      return {
+        ok: false,
+        message,
+        ...(probeCapabilities ? { capabilityReport: this.capabilityReportForError(error) } : {})
+      }
     }
   }
 
@@ -355,10 +976,214 @@ export class ModelClient {
       : input.think ?? this.settings.thinking
   }
 
+  private async fetchOllamaShow(): Promise<Record<string, unknown>> {
+    const request = requestSignal(10_000)
+    let response: Response
+    try {
+      response = await fetch(`${trimBaseUrl(this.settings.baseUrl)}/api/show`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: this.settings.model, verbose: false }),
+        signal: request.signal
+      })
+    } catch (error) {
+      try {
+        throwIfRunWasCancelled(error)
+      } finally {
+        request.cleanup()
+      }
+      throw error
+    }
+    try {
+      if (!response.ok) throw await this.httpError(response)
+      const payload = asRecord(await response.json())
+      if (!payload) throw new Error('Ollama /api/show 返回的元数据不是有效对象')
+      return payload
+    } catch (error) {
+      throwIfRunWasCancelled(error)
+      throw error
+    } finally {
+      request.cleanup()
+    }
+  }
+
+  private async probeMinimalChat(): Promise<ModelCapabilityItem> {
+    try {
+      const response = await this.chat({
+        messages: capabilityProbeMessages('请只回复 OK。'),
+        forceThinking: false,
+        think: false,
+        temperature: 0,
+        numPredict: 32,
+        timeoutMs: 15_000
+      })
+      const content = response.message?.content?.trim()
+      return content
+        ? capabilityItem('supported', '最小问答主动探测成功', 'active-probe', true)
+        : capabilityItem('unsupported', '模型未返回可见文本', 'active-probe', false)
+    } catch (error) {
+      if (isAssistantRunCancellation(error)) throw error
+      return capabilityItem('error', `最小问答主动探测失败：${probeErrorSummary(error, this.settings.apiKey)}`, 'active-probe', false)
+    }
+  }
+
+  private async probeStructuredOutput(): Promise<ModelCapabilityItem> {
+    try {
+      const response = await this.chat({
+        messages: capabilityProbeMessages('请返回 JSON 对象 {"ok":true}，只允许这一对象。'),
+        forceThinking: false,
+        think: false,
+        temperature: 0,
+        numPredict: 64,
+        timeoutMs: 15_000,
+        format: structuredProbeFormat
+      })
+      const parsed = parseProbeObject(response.message?.content)
+      if (parsed?.ok === true) {
+        return capabilityItem('supported', 'JSON Schema 主动探测成功', 'active-probe', true)
+      }
+      return capabilityItem('unsupported', '模型未返回符合要求的 JSON Schema 对象', 'active-probe', false)
+    } catch (error) {
+      if (isAssistantRunCancellation(error)) throw error
+      return capabilityItem('error', `JSON Schema 主动探测失败：${probeErrorSummary(error, this.settings.apiKey)}`, 'active-probe', false)
+    }
+  }
+
+  private async probeToolCalling(): Promise<ModelCapabilityItem> {
+    try {
+      const response = await this.chat({
+        messages: capabilityProbeMessages('请调用唯一可用的 capability_probe 工具，并传入 {"ok":true}。不要输出普通文本。'),
+        tools: [toolProbe],
+        forceThinking: false,
+        think: false,
+        temperature: 0,
+        numPredict: 96,
+        timeoutMs: 15_000
+      })
+      const call = response.message?.tool_calls?.find((item) => item.function.name === 'capability_probe')
+      if (call?.function.arguments.ok === true) {
+        return capabilityItem('supported', '工具调用主动探测成功', 'active-probe', true)
+      }
+      return capabilityItem('unsupported', '模型未返回指定工具调用及有效参数', 'active-probe', false)
+    } catch (error) {
+      if (isAssistantRunCancellation(error)) throw error
+      return capabilityItem('error', `工具调用主动探测失败：${probeErrorSummary(error, this.settings.apiKey)}`, 'active-probe', false)
+    }
+  }
+
+  private capabilityReportForConnection(connection: ConnectionResult): ModelCapabilityReport {
+    const evidence: ModelCapabilityEvidence = this.settings.source === 'local'
+      ? 'metadata'
+      : 'provider-contract'
+    const connectionStatus: ModelCapabilityStatus = connection.ok
+      ? 'supported'
+      : /未找到模型/u.test(connection.message)
+        ? 'unsupported'
+        : 'error'
+    return this.createCapabilityReport(
+      capabilityItem(connectionStatus, connection.message, evidence, connection.ok),
+      evidence,
+      'metadata'
+    )
+  }
+
+  private capabilityReportForError(error: unknown): ModelCapabilityReport {
+    const evidence: ModelCapabilityEvidence = this.settings.source === 'local'
+      ? 'metadata'
+      : 'provider-contract'
+    return this.createCapabilityReport(
+      capabilityItem('error', probeErrorSummary(error, this.settings.apiKey), evidence, false),
+      evidence,
+      'metadata'
+    )
+  }
+
+  private createCapabilityReport(
+    connection: ModelCapabilityItem,
+    unknownEvidence: ModelCapabilityEvidence,
+    probeMode: 'metadata' | 'active'
+  ): ModelCapabilityReport {
+    return {
+      checkedAt: new Date().toISOString(),
+      probeMode,
+      source: this.settings.source,
+      provider: this.settings.provider,
+      model: this.settings.model,
+      checks: {
+        connection,
+        minimalChat: unknownCapability(unknownEvidence),
+        structuredOutput: unknownCapability(unknownEvidence),
+        toolCalling: unknownCapability(unknownEvidence),
+        contextWindow: unknownCapability(unknownEvidence),
+        thinking: unknownCapability(unknownEvidence)
+      }
+    }
+  }
+
+  private localCapabilityReport(
+    connection: ConnectionResult,
+    metadata: OllamaShowMetadata | undefined,
+    metadataError: string | undefined,
+    probeChat: boolean
+  ): ModelCapabilityReport {
+    const report = this.createCapabilityReport(
+      capabilityItem('supported', connection.message, 'metadata', true),
+      'metadata',
+      probeChat ? 'active' : 'metadata'
+    )
+    if (metadataError) {
+      const error = capabilityItem('error', `Ollama 模型元数据探测失败：${metadataError}`, 'metadata', false)
+      report.checks.toolCalling = error
+      report.checks.contextWindow = error
+      report.checks.thinking = error
+      return report
+    }
+    if (!metadata) return report
+    if (metadata.contextLength !== undefined) {
+      report.checks.contextWindow = capabilityItem(
+        metadata.contextLength < 32_768 ? 'limited' : 'supported',
+        `上下文窗口约 ${metadata.contextLength.toLocaleString()} tokens`,
+        'metadata',
+        metadata.contextLength
+      )
+    }
+    if (metadata.toolCalling !== undefined) {
+      report.checks.toolCalling = capabilityItem(
+        metadata.toolCalling ? 'supported' : 'unsupported',
+        metadata.toolCalling ? '模型元数据声明支持工具调用' : '模型元数据未声明工具调用能力',
+        'metadata',
+        metadata.toolCalling
+      )
+    }
+    if (metadata.thinking !== undefined) {
+      report.checks.thinking = capabilityItem(
+        metadata.thinking ? 'supported' : 'unsupported',
+        metadata.thinking ? '模型元数据声明支持 thinking' : '模型元数据未声明 thinking 能力',
+        'metadata',
+        metadata.thinking
+      )
+    }
+    return report
+  }
+
+  private onlineCapabilityReport(connection: ConnectionResult, probeChat: boolean): ModelCapabilityReport {
+    return this.createCapabilityReport(
+      capabilityItem('supported', connection.message, 'provider-contract', true),
+      'provider-contract',
+      probeChat ? 'active' : 'metadata'
+    )
+  }
+
   private async testOllama(): Promise<ConnectionResult> {
-    const response = await fetch(`${trimBaseUrl(this.settings.baseUrl)}/api/tags`, {
-      signal: AbortSignal.timeout(10_000)
-    })
+    const request = requestSignal(10_000)
+    let response: Response
+    try {
+      response = await fetch(`${trimBaseUrl(this.settings.baseUrl)}/api/tags`, {
+        signal: request.signal
+      })
+    } finally {
+      request.cleanup()
+    }
     if (!response.ok) throw await this.httpError(response)
     const payload = (await response.json()) as { models?: Array<{ name?: string }> }
     const models = (payload.models ?? []).map((item) => item.name).filter(Boolean)
@@ -373,6 +1198,7 @@ export class ModelClient {
   }
 
   private async chatOllama(input: ModelChatInput): Promise<ModelResponse> {
+    const request = requestSignal(input.timeoutMs ?? defaultChatTimeoutMs, input.signal)
     let response: Response
     try {
       response = await fetch(`${trimBaseUrl(this.settings.baseUrl)}/api/chat`, {
@@ -391,30 +1217,51 @@ export class ModelClient {
             num_predict: input.numPredict ?? 2048
           }
         }),
-        signal: chatTimeoutSignal(input)
+        signal: request.signal
       })
     } catch (error) {
+      try {
+        throwIfRunWasCancelled(error)
+      } finally {
+        request.cleanup()
+      }
       throw ollamaConnectionError(error)
     }
-    if (!response.ok) throw await this.httpError(response)
-    if (!input.stream) {
-      const payload = (await response.json()) as ModelResponse & Record<string, unknown>
-      const usage = ollamaUsage(payload)
-      return usage ? { ...payload, usage } : payload
-    }
-
     try {
-      return await this.readOllamaStream(response)
+      if (!response.ok) throw await this.httpError(response)
+      if (!input.stream) {
+        const payload = (await response.json()) as ModelResponse & Record<string, unknown>
+        const usage = ollamaUsage(payload)
+        throwIfAssistantRunCancelled()
+        return usage ? { ...payload, usage } : payload
+      }
+      return await this.readOllamaStream(response, request.signal, input.onTextDelta)
     } catch (error) {
+      throwIfRunWasCancelled(error)
       if (error instanceof OllamaProtocolError) throw error
       throw ollamaConnectionError(error)
+    } finally {
+      request.cleanup()
     }
   }
 
-  private async readOllamaStream(response: Response): Promise<ModelResponse> {
+  private async readOllamaStream(
+    response: Response,
+    signal: AbortSignal,
+    onTextDelta?: TextDeltaCallback
+  ): Promise<ModelResponse> {
     if (!response.body) throw new OllamaProtocolError('Ollama 流式响应缺少响应体')
 
     const reader = response.body.getReader()
+    const cancelReader = (): void => {
+      void reader.cancel(signal.reason).catch(() => undefined)
+    }
+    if (signal.aborted) {
+      cancelReader()
+      throwIfAssistantRunCancelled()
+      throw signal.reason ?? new DOMException('The operation was aborted', 'AbortError')
+    }
+    signal.addEventListener('abort', cancelReader, { once: true })
     const decoder = new TextDecoder()
     let buffer = ''
     let content = ''
@@ -443,7 +1290,10 @@ export class ModelClient {
         throw new OllamaProtocolError(`Ollama 流式响应第 ${lineNumber} 个分片不是有效 JSON`)
       }
       if (chunk.error) throw new OllamaProtocolError(`Ollama 模型生成失败：${chunk.error}`)
-      if (typeof chunk.message?.content === 'string') content += chunk.message.content
+      if (typeof chunk.message?.content === 'string') {
+        content += chunk.message.content
+        emitVisibleTextDelta(onTextDelta, signal, chunk.message.content)
+      }
       if (chunk.message?.tool_calls?.length) toolCalls.push(...chunk.message.tool_calls)
       usage = ollamaUsage(chunk as unknown as Record<string, unknown>) ?? usage
       if (chunk.done === true) {
@@ -452,28 +1302,38 @@ export class ModelClient {
       }
     }
 
-    while (true) {
-      const result = await reader.read()
-      if (result.done) break
-      buffer += decoder.decode(result.value, { stream: true })
-      const lines = buffer.split(/\r?\n/)
-      buffer = lines.pop() ?? ''
-      lines.forEach(consumeLine)
-    }
-    buffer += decoder.decode()
-    if (buffer.trim()) consumeLine(buffer)
+    try {
+      while (true) {
+        throwIfAssistantRunCancelled()
+        const result = await reader.read()
+        if (result.done) break
+        buffer += decoder.decode(result.value, { stream: true })
+        const lines = buffer.split(/\r?\n/)
+        buffer = lines.pop() ?? ''
+        lines.forEach(consumeLine)
+      }
+      buffer += decoder.decode()
+      if (buffer.trim()) consumeLine(buffer)
 
-    if (!done) {
-      throw new OllamaProtocolError('Ollama 流式响应意外中断：未收到完成标记')
-    }
-    return {
-      done_reason: doneReason,
-      message: {
-        role: 'assistant',
-        content,
-        ...(toolCalls.length ? { tool_calls: toolCalls } : {})
-      },
-      ...(usage ? { usage } : {})
+      if (!done) {
+        throw new OllamaProtocolError('Ollama 流式响应意外中断：未收到完成标记')
+      }
+      throwIfAssistantRunCancelled()
+      return {
+        done_reason: doneReason,
+        message: {
+          role: 'assistant',
+          content,
+          ...(toolCalls.length ? { tool_calls: toolCalls } : {})
+        },
+        ...(usage ? { usage } : {})
+      }
+    } catch (error) {
+      throwIfRunWasCancelled(error)
+      throw error
+    } finally {
+      signal.removeEventListener('abort', cancelReader)
+      reader.releaseLock()
     }
   }
 
@@ -503,6 +1363,7 @@ export class ModelClient {
       model: this.settings.model,
       messages,
       tools: input.tools,
+      ...(input.stream ? { stream: true } : {}),
       ...(reasoningModel
         ? { max_completion_tokens: input.numPredict ?? 2048 }
         : {
@@ -523,14 +1384,19 @@ export class ModelClient {
           }
         : {})
     }
-    const response = await fetch(`${trimBaseUrl(this.settings.baseUrl)}/chat/completions`, {
-      method: 'POST',
-      headers: this.onlineHeaders(),
-      body: JSON.stringify(body),
-      signal: chatTimeoutSignal(input)
-    })
-    if (!response.ok) throw await this.httpError(response)
-    const payload = (await response.json()) as {
+    const request = requestSignal(input.timeoutMs ?? defaultChatTimeoutMs, input.signal)
+    try {
+      const response = await fetch(`${trimBaseUrl(this.settings.baseUrl)}/chat/completions`, {
+        method: 'POST',
+        headers: this.onlineHeaders(),
+        body: JSON.stringify(body),
+        signal: request.signal
+      })
+      if (!response.ok) throw await this.httpError(response)
+      if (input.stream && isEventStreamResponse(response)) {
+        return await readOpenAiStream(response, request.signal, input.onTextDelta)
+      }
+      const payload = (await response.json()) as {
       choices?: Array<{
         finish_reason?: string
         message?: {
@@ -542,10 +1408,11 @@ export class ModelClient {
           }>
         }
       }>
-    }
-    const choice = payload.choices?.[0]
-    const reasoningContent = choice?.message?.reasoning_content
-    return {
+      }
+      const choice = payload.choices?.[0]
+      const reasoningContent = choice?.message?.reasoning_content
+      throwIfAssistantRunCancelled()
+      const result: ModelResponse = {
       done_reason: choice?.finish_reason,
       message: choice?.message
           ? {
@@ -566,6 +1433,16 @@ export class ModelClient {
             })
           }
         : undefined
+      }
+      if (input.stream) {
+        emitVisibleTextDelta(input.onTextDelta, request.signal, result.message?.content)
+      }
+      return result
+    } catch (error) {
+      throwIfRunWasCancelled(error)
+      throw error
+    } finally {
+      request.cleanup()
     }
   }
 
@@ -578,6 +1455,7 @@ export class ModelClient {
       model: this.settings.model,
       input: rawChatInput(input.messages),
       ...(tools ? { tools } : {}),
+      ...(input.stream ? { stream: true } : {}),
       ...(format ? { text: { format } } : {}),
       // RawChat's Codex channel is backed by reasoning models.  Temperature
       // and Chat Completions-only token fields are intentionally omitted.
@@ -586,18 +1464,28 @@ export class ModelClient {
       // reasoning tokens counted against the budget).
       max_output_tokens: Math.max(16, Math.round(input.numPredict ?? 2048))
     }
+    const request = requestSignal(input.timeoutMs ?? defaultChatTimeoutMs, input.signal)
     let response: Response
     try {
       response = await fetch(rawChatResponsesUrl(this.settings.baseUrl), {
         method: 'POST',
         headers: this.onlineHeaders(),
         body: JSON.stringify(body),
-        signal: chatTimeoutSignal(input)
+        signal: request.signal
       })
     } catch (error) {
+      try {
+        throwIfRunWasCancelled(error)
+      } finally {
+        request.cleanup()
+      }
       throw new Error(`RawChat Codex 连接失败：${error instanceof Error ? error.message : String(error)}`, { cause: error })
     }
-    if (!response.ok) throw await this.httpError(response)
+    try {
+      if (!response.ok) throw await this.httpError(response)
+      if (input.stream && isEventStreamResponse(response)) {
+        return await readRawChatStream(response, request.signal, input.onTextDelta)
+      }
 
     const payload = asRecord(await response.json())
     if (!payload) throw new Error('RawChat Codex 返回的响应不是有效对象')
@@ -647,7 +1535,8 @@ export class ModelClient {
       ? 'length'
       : incompleteReason ?? (status === 'completed' ? 'stop' : status)
     const usage = rawChatUsage(payload.usage)
-    return {
+    throwIfAssistantRunCancelled()
+    const result: ModelResponse = {
       done_reason: doneReason,
       message: {
         role: 'assistant',
@@ -655,6 +1544,16 @@ export class ModelClient {
         ...(toolCalls.length ? { tool_calls: toolCalls } : {})
       },
       ...(usage ? { usage } : {})
+    }
+    if (input.stream) {
+      emitVisibleTextDelta(input.onTextDelta, request.signal, result.message?.content)
+    }
+    return result
+    } catch (error) {
+      throwIfRunWasCancelled(error)
+      throw error
+    } finally {
+      request.cleanup()
     }
   }
 
@@ -706,6 +1605,15 @@ export class ModelClient {
             input_schema: tool.function.parameters
           }]
         : [])
+    const anthropicThinking = thinking ? this.anthropicThinkingParams() : {}
+    const anthropicOutputConfig = input.format && input.format !== 'json'
+      ? {
+          ...(asRecord(anthropicThinking.output_config) ?? {}),
+          format: { type: 'json_schema', schema: input.format }
+        }
+      : asRecord(anthropicThinking.output_config)
+    const request = requestSignal(input.timeoutMs ?? defaultChatTimeoutMs, input.signal)
+    try {
     const response = await fetch(`${trimBaseUrl(this.settings.baseUrl)}/messages`, {
       method: 'POST',
       headers: this.onlineHeaders(),
@@ -714,19 +1622,25 @@ export class ModelClient {
         system: [system, input.format ? '只输出符合要求的 JSON 对象，不要输出 Markdown。' : ''].filter(Boolean).join('\n'),
         messages,
         tools: anthropicTools,
+        ...(input.stream ? { stream: true } : {}),
         ...(thinking
           ? {
               max_tokens: Math.max(input.numPredict ?? 2048, 2048),
-              ...this.anthropicThinkingParams()
+              ...anthropicThinking,
+              ...(anthropicOutputConfig ? { output_config: anthropicOutputConfig } : {})
             }
           : {
               temperature: input.temperature ?? 0.1,
-              max_tokens: input.numPredict ?? 2048
+              max_tokens: input.numPredict ?? 2048,
+              ...(anthropicOutputConfig ? { output_config: anthropicOutputConfig } : {})
             })
       }),
-      signal: chatTimeoutSignal(input)
+      signal: request.signal
     })
     if (!response.ok) throw await this.httpError(response)
+    if (input.stream && isEventStreamResponse(response)) {
+      return await readAnthropicStream(response, request.signal, input.onTextDelta)
+    }
     const payload = (await response.json()) as {
       stop_reason?: string
       content?: Array<{
@@ -738,7 +1652,8 @@ export class ModelClient {
         input?: Record<string, unknown>
       }>
     }
-    return {
+    throwIfAssistantRunCancelled()
+    const result: ModelResponse = {
       done_reason: payload.stop_reason,
       message: {
         role: 'assistant',
@@ -750,6 +1665,16 @@ export class ModelClient {
             : []
         )
       }
+    }
+    if (input.stream) {
+      emitVisibleTextDelta(input.onTextDelta, request.signal, result.message?.content)
+    }
+    return result
+    } catch (error) {
+      throwIfRunWasCancelled(error)
+      throw error
+    } finally {
+      request.cleanup()
     }
   }
 

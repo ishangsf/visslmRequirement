@@ -3,6 +3,10 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { AppDatabase } from '../src/main/database'
+import {
+  restoreLegacyAssistantMarkdown,
+  sanitizeChatMessageContent
+} from '../src/shared/chat-message-format'
 import type { ChatContextRef, ChatMessage } from '../src/shared/types'
 
 const root = mkdtempSync(join(tmpdir(), 'visslm-chat-sessions-'))
@@ -51,6 +55,25 @@ try {
     message('assistant-2', 'assistant', 'Second answer')
   ]
 
+  const formattedAnswer = [
+    '查询结果',
+    '',
+    '### 姚稳（2 条）',
+    '',
+    '1. 第一条需求',
+    '2. 第二条需求'
+  ].join('\n')
+  assert.equal(
+    sanitizeChatMessageContent(formattedAnswer),
+    formattedAnswer,
+    'chat persistence must preserve Markdown line breaks'
+  )
+  assert.equal(
+    restoreLegacyAssistantMarkdown('查询结果 ### 姚稳（2 条） 1. 第一条需求 2. 第二条需求 3. 第三条需求'),
+    '查询结果\n\n### 姚稳（2 条）\n1. 第一条需求\n2. 第二条需求\n3. 第三条需求',
+    'legacy flattened answers must recover heading and list boundaries'
+  )
+
   db.saveChatSession({ id: sessionId, title: 'First question', messages: firstMessages })
   assert.equal(db.listChatSessions().length, 1)
   assert.equal(db.listChatSessions()[0]?.messageCount, 2)
@@ -68,7 +91,28 @@ try {
   assert.ok((persistedView.groups[0]?.rows.length ?? 0) <= 100)
   assert.ok(String(persistedView.groups[0]?.rows[0]?.values.HugeField ?? '').length <= 512)
 
-  console.log(JSON.stringify({ ok: true, historyRecords: sessions.length, messageCount: sessions[0]?.messageCount }))
+  const markdownSessionId = 'chat-session-markdown-smoke'
+  db.saveChatSession({
+    id: markdownSessionId,
+    title: 'Markdown answer',
+    messages: [
+      message('markdown-user', 'user', 'List requirements'),
+      message('markdown-assistant', 'assistant', formattedAnswer)
+    ]
+  })
+  assert.equal(
+    db.getChatSession(markdownSessionId)?.messages[1]?.content,
+    formattedAnswer,
+    'database round-trip must preserve Markdown structure'
+  )
+
+  console.log(JSON.stringify({
+    ok: true,
+    historyRecords: sessions.length,
+    messageCount: sessions[0]?.messageCount,
+    markdownRoundTrip: true,
+    legacyMarkdownRecovery: true
+  }))
 } finally {
   db.close()
   rmSync(root, { recursive: true, force: true })

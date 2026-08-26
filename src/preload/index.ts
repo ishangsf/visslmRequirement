@@ -1,6 +1,11 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import type {
   AppApi,
+  CancelAgentRunResult,
+  ConfirmAgentPlanResult,
+  AssistantPlanPatch,
+  AssistantArtifactInput,
+  AssistantArtifactPreview,
   ChatRequest,
   ChatSessionDeleteResult,
   ChatSessionSaveInput,
@@ -101,8 +106,8 @@ const api: AppApi = {
     ipcRenderer.invoke('settings:save-navigation-order', input),
   testPlatform: (input?: PlatformSettingsInput) =>
     ipcRenderer.invoke('connections:test-platform', input),
-  testModel: (input?: ModelSettings, probeChat = false) =>
-    ipcRenderer.invoke('connections:test-model', input, probeChat),
+  testModel: (input?: ModelSettings, probeChat = false, probeCapabilities = false) =>
+    ipcRenderer.invoke('connections:test-model', input, probeChat, probeCapabilities),
   listProjects: () => ipcRenderer.invoke('data:projects'),
   listNodeTypes: () => ipcRenderer.invoke('data:node-types'),
   listRecords: (query: RecordQuery) => ipcRenderer.invoke('data:records', query),
@@ -162,6 +167,24 @@ const api: AppApi = {
   listCollectionRequestLogs: (page?: number, pageSize?: number) =>
     ipcRenderer.invoke('sync:request-logs', page, pageSize),
   askAgent: (request: ChatRequest) => ipcRenderer.invoke('agent:ask', request),
+  cancelAgentRun: (runId: string): Promise<CancelAgentRunResult> =>
+    ipcRenderer.invoke('agent:cancel', runId),
+  confirmAgentPlan: (runId: string, patch?: AssistantPlanPatch): Promise<ConfirmAgentPlanResult> =>
+    ipcRenderer.invoke('agent:confirm-plan', runId, patch),
+  previewAssistantArtifact: (input: AssistantArtifactInput) =>
+    ipcRenderer.invoke('assistant-artifacts:preview', input),
+  commitAssistantArtifact: (preview: AssistantArtifactPreview) =>
+    ipcRenderer.invoke('assistant-artifacts:commit', preview),
+  listAssistantArtifacts: (limit?: number) =>
+    ipcRenderer.invoke('assistant-artifacts:list', limit),
+  revertAssistantArtifact: (id: string) =>
+    ipcRenderer.invoke('assistant-artifacts:revert', id),
+  listAssistantRunHistory: (limit?: number) =>
+    ipcRenderer.invoke('assistant-runs:list', limit),
+  getAssistantRunHistoryStats: () =>
+    ipcRenderer.invoke('assistant-runs:stats'),
+  exportAssistantArtifact: (input) =>
+    ipcRenderer.invoke('assistant-artifacts:export', input),
   listChatSessions: (limit?: number) => ipcRenderer.invoke('chat:sessions', limit),
   getChatSession: (id: string) => ipcRenderer.invoke('chat:session', id),
   saveChatSession: (input: ChatSessionSaveInput) =>

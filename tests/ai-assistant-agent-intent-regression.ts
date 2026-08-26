@@ -46,6 +46,21 @@ class RecordingIntentClient {
   }
 }
 
+class ScriptedIntentClient {
+  readonly calls: ModelChatInput[] = []
+  private responseIndex = 0
+
+  constructor(private readonly responses: readonly ModelResponse[]) {}
+
+  async chat(input: ModelChatInput): Promise<ModelResponse> {
+    this.calls.push(input)
+    const response = this.responses[this.responseIndex]
+    this.responseIndex += 1
+    if (!response) throw new Error(`unexpected intent classifier call #${this.responseIndex}`)
+    return response
+  }
+}
+
 const decisionResponse = (input: Partial<AssistantIntentDecision>): Record<string, unknown> => ({
   taskType: input.taskType ?? 'conversation',
   skillId: input.skillId ?? 'general',
@@ -59,6 +74,40 @@ const decisionResponse = (input: Partial<AssistantIntentDecision>): Record<strin
     : { clarificationQuestion: input.clarificationQuestion }),
   reason: input.reason ?? '由当前问题和已提供的历史上下文确定'
 })
+
+const modelDecisionResponse = (
+  response: Record<string, unknown>,
+  doneReason?: string
+): ModelResponse => ({
+  message: {
+    role: 'assistant',
+    content: JSON.stringify(response)
+  },
+  ...(doneReason ? { done_reason: doneReason } : {})
+})
+
+const emptyModelResponse = (doneReason = 'stop'): ModelResponse => ({
+  message: {
+    role: 'assistant',
+    content: ''
+  },
+  done_reason: doneReason
+})
+
+const assertIntentClassifierBudgets = (
+  calls: readonly ModelChatInput[],
+  expectedBudgets: readonly number[]
+): void => {
+  assert.deepEqual(
+    calls.map((call) => call.numPredict),
+    expectedBudgets,
+    'intent classification retries must use the bounded token budgets'
+  )
+  for (const call of calls) {
+    assert.equal(call.think, false, 'intent classification must keep model thinking disabled')
+    assert.equal(call.forceThinking, false, 'intent classification must not force model thinking')
+  }
+}
 
 const request = (
   question: string,
@@ -211,6 +260,93 @@ const testKnowledgeAndMixedUseDeclaredSources = async (): Promise<void> => {
   })
   assert.equal(mixed.client.calls.length, 1)
   assert.equal(mixed.client.calls.some((call) => Array.isArray(call.tools) && call.tools.length > 0), false)
+}
+
+const testKnowledgeQuestionRoutesWithOneClosedThinkingCall = async (): Promise<void> => {
+  const client = new RecordingIntentClient(decisionResponse({
+    taskType: 'knowledge_qa',
+    skillId: 'general',
+    sourceMode: 'knowledge',
+    resolvedQuestion: '说明 GJB5000B 的总体架构及基本概念',
+    resultMode: 'answer'
+  }))
+  const decision = await new AssistantIntentRouter(settings, client).resolve(
+    request('GJB5000B 总体架构及基本概念是什么？')
+  )
+
+  assertDecisionCore(decision, {
+    taskType: 'knowledge_qa',
+    sourceMode: 'knowledge',
+    resultMode: 'answer'
+  })
+  assert.equal(client.calls.length, 1, 'a normal valid intent response must not trigger a retry')
+  assertIntentClassifierBudgets(client.calls, [900])
+}
+
+const testEmptyClassifierResponseRetriesOnce = async (): Promise<void> => {
+  const client = new ScriptedIntentClient([
+    emptyModelResponse(),
+    modelDecisionResponse(decisionResponse({
+      taskType: 'record_query',
+      skillId: 'general',
+      sourceMode: 'records',
+      resolvedQuestion: '列出负责人甲的需求记录',
+      resultMode: 'list'
+    }))
+  ])
+  const decision = await new AssistantIntentRouter(settings, client).resolve(
+    request('列出负责人甲的需求记录')
+  )
+
+  assertDecisionCore(decision, {
+    taskType: 'record_query',
+    sourceMode: 'records',
+    resultMode: 'list'
+  })
+  assert.equal(client.calls.length, 2, 'an empty classifier response may retry exactly once')
+  assertIntentClassifierBudgets(client.calls, [900, 1800])
+}
+
+const testLengthClassifierResponseRetriesOnce = async (): Promise<void> => {
+  const client = new ScriptedIntentClient([
+    modelDecisionResponse(decisionResponse({
+      taskType: 'conversation',
+      skillId: 'general',
+      sourceMode: 'conversation',
+      resolvedQuestion: '被长度截断的临时分类结果',
+      resultMode: 'answer'
+    }), 'length'),
+    modelDecisionResponse(decisionResponse({
+      taskType: 'knowledge_qa',
+      skillId: 'general',
+      sourceMode: 'knowledge',
+      resolvedQuestion: '根据部署规范说明审批流程',
+      resultMode: 'answer'
+    }))
+  ])
+  const decision = await new AssistantIntentRouter(settings, client).resolve(
+    request('请根据上传的部署规范说明审批流程')
+  )
+
+  assertDecisionCore(decision, {
+    taskType: 'knowledge_qa',
+    sourceMode: 'knowledge',
+    resultMode: 'answer'
+  })
+  assert.equal(client.calls.length, 2, 'a length-truncated classifier response may retry exactly once')
+  assertIntentClassifierBudgets(client.calls, [900, 1800])
+}
+
+const testClassifierRetryIsCappedAtOne = async (): Promise<void> => {
+  const client = new ScriptedIntentClient([
+    emptyModelResponse(),
+    emptyModelResponse()
+  ])
+  const router = new AssistantIntentRouter(settings, client)
+
+  await assert.rejects(router.resolve(request('请处理一下')))
+  assert.equal(client.calls.length, 2, 'an invalid retry response must not cause a third classifier call')
+  assertIntentClassifierBudgets(client.calls, [900, 1800])
 }
 
 const testAmbiguousIntentStopsWithClarification = async (): Promise<void> => {
@@ -559,6 +695,10 @@ const main = async (): Promise<void> => {
   await testVisualizationSelectsSkillBeforeEvidence()
   await testExactRequirementIdKeepsRequirementSkill()
   await testKnowledgeAndMixedUseDeclaredSources()
+  await testKnowledgeQuestionRoutesWithOneClosedThinkingCall()
+  await testEmptyClassifierResponseRetriesOnce()
+  await testLengthClassifierResponseRetriesOnce()
+  await testClassifierRetryIsCappedAtOne()
   await testAmbiguousIntentStopsWithClarification()
   await testMultiturnGroupingUsesGroundedHistory()
   await testInventedGroupEntityFailsClosed()
@@ -574,6 +714,10 @@ const main = async (): Promise<void> => {
       'visualization intent selects its skill before evidence execution',
       'exact requirement IDs preserve requirement analysis routing',
       'knowledge and mixed modes preserve their declared source contract',
+      'GJB5000B knowledge questions route to knowledge with one closed-thinking call',
+      'empty classifier responses retry once with the expanded budget',
+      'length-truncated classifier responses retry once with the expanded budget',
+      'classifier retries are capped at one additional call',
       'ambiguous intent stops with clarification and no tools',
       'multiturn grouping inherits only grounded entities',
       'invented entities fail closed',

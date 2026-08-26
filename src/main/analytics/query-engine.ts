@@ -16,6 +16,7 @@ import type {
 import { validateQuerySpecShape } from '../../shared/query-spec'
 import type { AnalyticsRecord } from '../database'
 import { AppDatabase } from '../database'
+import type { FieldDefinition } from '../../shared/types'
 
 const metadataFields: Record<string, keyof Omit<AnalyticsRecord, 'raw'>> = {
   uid: 'uid',
@@ -29,6 +30,7 @@ const metadataFields: Record<string, keyof Omit<AnalyticsRecord, 'raw'>> = {
 type AnalyticsDatabase = Pick<AppDatabase, 'scanAnalyticsRecords'> & Partial<{
   getAnalyticsRevision(): number
   getFieldProfiles(scopeKey: string, dataRevision: number): FieldProfile[] | null
+  getFieldDefinitions?(nodeType: string | string[], fields?: string[]): FieldDefinition[]
   getFieldDisplayNames?(nodeType: string | string[], fields?: string[]): Record<string, string>
   saveFieldProfiles(scopeKey: string, dataRevision: number, profiles: FieldProfile[]): void
   updateFieldProfileSemantics(
@@ -594,13 +596,25 @@ export class QueryEngine {
     const dataRevision = safeRevision(this.db)
     const cacheKey = scopeCacheKey(scope)
     const fieldLabels = this.db.getFieldDisplayNames?.(scope.nodeTypes ?? [], []) ?? {}
-    const applyFieldLabels = (profiles: FieldProfile[]): FieldProfile[] => profiles.map((profile) => (
-      profile.displayName?.trim() || !fieldLabels[profile.field]
-        ? profile
-        : { ...profile, displayName: fieldLabels[profile.field] }
-    ))
+    const fieldDefinitions = new Map<string, FieldDefinition>()
+    for (const definition of this.db.getFieldDefinitions?.(scope.nodeTypes ?? [], []) ?? []) {
+      if (!fieldDefinitions.has(definition.field)) fieldDefinitions.set(definition.field, definition)
+    }
+    const applyFieldMetadata = (profiles: FieldProfile[]): FieldProfile[] => profiles.map((profile) => {
+      const definition = fieldDefinitions.get(profile.field)
+      const displayName = profile.displayName?.trim() || fieldLabels[profile.field]
+      return {
+        ...profile,
+        ...(displayName ? { displayName } : {}),
+        ...(definition ? {
+          declaredType: definition.normalizedType,
+          ...(definition.sourceType ? { sourceType: definition.sourceType } : {}),
+          ...(definition.attrType ? { attrType: definition.attrType } : {})
+        } : {})
+      }
+    })
     const cached = this.db.getFieldProfiles?.(cacheKey, dataRevision)
-    if (cached) return applyFieldLabels(cached)
+    if (cached) return applyFieldMetadata(cached)
 
     const records = scanRecords(this.db, scope)
     const fields = new Map<string, {
@@ -651,7 +665,7 @@ export class QueryEngine {
       })
       .sort((left, right) => right.nonNullRate - left.nonNullRate || left.field.localeCompare(right.field))
     this.db.saveFieldProfiles?.(cacheKey, dataRevision, profiles)
-    return applyFieldLabels(profiles)
+    return applyFieldMetadata(profiles)
   }
 
   updateFieldProfileSemantics(
@@ -664,7 +678,8 @@ export class QueryEngine {
     const update = this.db.updateFieldProfileSemantics
     if (!update) throw new Error('当前数据源不支持字段语义持久化')
     this.profile(scope)
-    const result = update(
+    const result = update.call(
+      this.db,
       scopeCacheKey(scope),
       normalizedField,
       normalizeSemanticPatch(patch)
