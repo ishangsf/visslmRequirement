@@ -97,7 +97,8 @@ export class SettingsService {
       platform: {
         baseUrl: this.db.getSetting('platform.baseUrl') ?? DEFAULT_PLATFORM_URL,
         username: this.db.getSetting('platform.username') ?? '',
-        hasToken: Boolean(this.db.getSetting('platform.token'))
+        hasToken: Boolean(this.db.getSetting('platform.token')),
+        hasUploadPassword: Boolean(this.db.getSetting('platform.uploadPassword'))
       },
       system: {
         userPropertyKeys: this.getUserPropertyKeys()
@@ -126,6 +127,7 @@ export class SettingsService {
     baseUrl: string
     username: string
     token: string
+    uploadPassword: string
     userPropertyKeys: string[]
   } {
     const settings = this.getAll()
@@ -133,6 +135,9 @@ export class SettingsService {
       baseUrl: override?.baseUrl?.trim() || settings.platform.baseUrl,
       username: override?.username?.trim() || settings.platform.username,
       token: override?.token?.trim() || this.readSecret('platform.token'),
+      uploadPassword: override?.uploadPassword?.length
+        ? override.uploadPassword
+        : this.readSecret('platform.uploadPassword'),
       userPropertyKeys: settings.system.userPropertyKeys
     }
   }
@@ -141,6 +146,7 @@ export class SettingsService {
     this.db.setSetting('platform.baseUrl', input.baseUrl.trim().replace(/\/+$/, ''))
     this.db.setSetting('platform.username', input.username.trim())
     if (input.token?.trim()) this.writeSecret('platform.token', input.token.trim())
+    if (input.uploadPassword?.length) this.writeSecret('platform.uploadPassword', input.uploadPassword)
     return this.getAll()
   }
 

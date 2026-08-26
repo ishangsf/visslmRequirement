@@ -10,6 +10,7 @@ import {
   CopyOutlined,
   DatabaseOutlined,
   DeleteOutlined,
+  DownOutlined,
   EyeOutlined,
   ExclamationCircleOutlined,
   ExportOutlined,
@@ -35,6 +36,7 @@ import {
   PlusOutlined,
   ProjectOutlined,
   ReloadOutlined,
+  RightOutlined,
   SearchOutlined,
   SendOutlined,
   SettingOutlined,
@@ -82,6 +84,16 @@ import appIconDark from './assets/visslm-icon.png'
 import appIconLight from './assets/visslm-icon-light.png'
 import { RichDescription } from './RichDescription'
 import { ResizableTable } from './ResizableTable'
+import {
+  buildDefaultPushFieldMappings,
+  isLegacyDefaultPushFieldMappings,
+  pushForbiddenSourceFields,
+  pushForbiddenTargetFields,
+  pushMappingIdentifierPattern,
+  readPushConfigDraft,
+  writePushConfigDraft
+} from './push-config-draft'
+import type { PushConfigDraft, PushFormValues } from './push-config-draft'
 import type { AppThemeMode } from './theme'
 import type { DashboardSpec } from '../../shared/dashboard'
 import type { DataScope } from '../../shared/query-spec'
@@ -93,8 +105,12 @@ import {
 } from '../../shared/types'
 import type {
   AppSettings,
+  AssistantExecutionAgentId,
+  AssistantTaskTrace,
+  ChatDataGroup,
   ChatDataRow,
   ChatDataView,
+  ChatDataViewPage,
   ChatMessage,
   ChatSessionSummary,
   CollectionRequestLogRow,
@@ -121,7 +137,9 @@ import type {
   PushFieldMapping,
   PushLogRow,
   PushResult,
+  RecordExportQuery,
   RecordDetail,
+  RecordImagePage,
   RecordMaintenanceIndexStatus,
   RecordMaintenanceOperation,
   RecordMaintenanceScope,
@@ -149,6 +167,7 @@ import type {
 
 const { Content, Sider } = Layout
 const { Title, Text, Paragraph } = Typography
+const MAX_CHAT_DETAIL_IMAGES = 12
 
 // Keep the two largest route modules out of the shell's initial chunk. The
 // remaining legacy page components currently live in this module, so these
@@ -256,8 +275,858 @@ const isSystemSettingsTabKey = (key: string): key is SystemSettingsTabKey =>
 const artifactVersionOf = (events: AgentEvent[] | undefined): number | undefined =>
   events?.find((event): event is Extract<AgentEvent, { type: 'artifact' }> => event.type === 'artifact')?.version
 
+/**
+ * The renderer receives status events from multiple built-in skills.  Keep a
+ * single user-facing vocabulary for the global orchestration pipeline while
+ * still accepting the older skill-specific stage names during the migration.
+ * Status messages remain operational summaries; model reasoning is never
+ * rendered here.
+ */
+const agentStageOrder = [
+  'classify',
+  'skill',
+  'scope',
+  'clarify',
+  'clarification',
+  'inspect',
+  'scan',
+  'retrieve',
+  'group',
+  'cite',
+  'verify',
+  'reason',
+  'answer',
+  'deliver',
+  'error'
+] as const
+
+const agentStageLabels: Record<string, string> = {
+  classify: '识别任务',
+  skill: '选择技能',
+  scope: '确认范围',
+  inspect: '检查字段',
+  scan: '扫描数据',
+  retrieve: '检索依据',
+  group: '整理分组',
+  cite: '整理引用',
+  verify: '校验结果',
+  reason: '分析证据',
+  answer: '整理回答',
+  deliver: '准备交付',
+  clarify: '等待补充',
+  clarification: '等待补充',
+  route: '理解需求',
+  locate: '检查实体',
+  recall: '混合召回',
+  rerank: '候选重排',
+  score: '确定性评分',
+  explain: '解释证据',
+  critique: '复核结果',
+  summary: '整理结果',
+  match: '匹配数据',
+  plan: '制定计划',
+  query: '查询数据',
+  validate: '校验结果',
+  error: '任务中断'
+}
+
+const legacyAgentStageAliases: Record<string, string> = {
+  route: 'classify',
+  plan: 'scope',
+  locate: 'inspect',
+  query: 'scan',
+  recall: 'retrieve',
+  rerank: 'retrieve',
+  match: 'group',
+  score: 'verify',
+  critique: 'verify',
+  explain: 'reason',
+  summary: 'deliver',
+  validate: 'verify',
+  intent: 'classify',
+  profile: 'inspect',
+  execute: 'scan',
+  compose: 'deliver',
+  persist: 'deliver',
+  repair: 'verify'
+}
+
+const canonicalAgentStageOf = (stage: string | undefined): string => {
+  const normalized = stage?.trim().toLocaleLowerCase()
+  if (!normalized) return 'classify'
+  return legacyAgentStageAliases[normalized] ?? normalized
+}
+
+const agentStageLabelOf = (stage: string | undefined): string => {
+  const normalized = stage?.trim().toLocaleLowerCase()
+  const canonical = canonicalAgentStageOf(normalized)
+  return agentStageLabels[canonical] ?? agentStageLabels[normalized ?? ''] ?? '执行任务'
+}
+
+const agentStageRankOf = (stage: string): number => {
+  const normalized = stage.trim().toLocaleLowerCase()
+  const canonical = canonicalAgentStageOf(normalized)
+  const rank = agentStageOrder.indexOf(canonical as (typeof agentStageOrder)[number])
+  if (rank === -1) return agentStageOrder.length * 100
+
+  // Preserve useful legacy skill sub-stages without letting event arrival
+  // order move the global rail around. Canonical stages always sort first in
+  // their group, followed by the old granular progress labels.
+  const legacyOffset: Record<string, number> = {
+    route: 1,
+    plan: 1,
+    locate: 1,
+    query: 1,
+    recall: 1,
+    rerank: 2,
+    match: 1,
+    score: 1,
+    critique: 2,
+    explain: 2,
+    summary: 1,
+    validate: 1
+  }
+  return rank * 100 + (legacyOffset[normalized] ?? 0)
+}
+
+type ChatSourceSummary = {
+  records: number
+  documents: number
+}
+
+const chatSourceSummaryOf = (sources: ChatMessage['sources']): ChatSourceSummary =>
+  (sources ?? []).reduce<ChatSourceSummary>((summary, source) => {
+    // Legacy persisted sources omitted sourceType and were always data-center
+    // records. Treat them as records so an old session never loses its count.
+    if (source.sourceType === 'document') summary.documents += 1
+    else summary.records += 1
+    return summary
+  }, { records: 0, documents: 0 })
+
 const appTableScrollY = 'min(560px, max(260px, calc(100vh - 300px)))'
 const compactTableScrollY = 'min(360px, max(180px, calc(100vh - 420px)))'
+
+const normalizedChatRecordUidsOf = (value: unknown): string[] | undefined => {
+  if (!Array.isArray(value)) return undefined
+  return [...new Set(
+    value
+      .filter((uid): uid is string => typeof uid === 'string')
+      .map((uid) => uid.trim())
+      .filter(Boolean)
+  )]
+}
+
+const chatDataGroupRecordUidsOf = (
+  group: ChatDataGroup
+): string[] | undefined => normalizedChatRecordUidsOf(group.recordUids)
+
+/**
+ * Grouped views own their paging scope.  The top-level list remains the
+ * compatibility fallback for older flat views that predate group recordUids.
+ * An explicit empty group list is preserved as empty and must not fall back to
+ * the view-wide list.
+ */
+const chatDataViewPageScopeForGroup = (
+  view: ChatDataView,
+  groupName: string
+): { recordUids?: string[] } | undefined => {
+  const group = view.groups.find((candidate) => candidate.name === groupName)
+  const groupRecordUids = group ? chatDataGroupRecordUidsOf(group) : undefined
+  if (groupRecordUids !== undefined) return { recordUids: groupRecordUids }
+  // A top-level UID list belongs to the legacy single-group shape.  Reusing it
+  // for an unscoped multi-group view would load one group's records into
+  // another group, so leave those groups non-pageable until they carry their
+  // own UID snapshot.
+  if (view.groups.length > 1) return undefined
+  const recordUids = normalizedChatRecordUidsOf(view.recordUids)
+  return recordUids === undefined ? undefined : { recordUids }
+}
+
+const chatDataViewRecordUidsForGroup = (
+  view: ChatDataView,
+  groupName: string
+): string[] | undefined => {
+  const pageScope = chatDataViewPageScopeForGroup(view, groupName)
+  return pageScope?.recordUids
+}
+
+const isRecordObject = (value: unknown): value is Record<string, unknown> => (
+  Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+)
+
+type AgentControlStepKey = 'understand' | 'skill' | 'plan' | 'tool' | 'verify' | 'deliver'
+type AgentControlStepState = 'pending' | 'active' | 'complete'
+type AgentRunStatus = 'idle' | 'running' | 'clarification' | 'failed'
+
+type AgentRunMetadata = {
+  skill?: string
+  taskType?: string
+  sourceMode?: string
+  intent?: string
+  resultMode?: string
+  followUp?: boolean
+  clarificationQuestion?: string
+}
+
+type AssistantTaskStatus = 'pending' | 'running' | 'completed' | 'clarification' | 'failed'
+
+type AssistantTaskView = {
+  runId?: AssistantTaskTrace['runId']
+  status?: AssistantTaskStatus
+  primaryAgent?: AssistantExecutionAgentId
+  invokedAgents: AssistantExecutionAgentId[]
+  taskType?: string
+  sourceMode?: string
+  resultMode?: string
+  startedAt?: string
+  completedAt?: string
+  clarificationQuestion?: string
+  error?: string
+}
+
+const assistantTaskStatusLabels: Record<AssistantTaskStatus, string> = {
+  pending: '准备中',
+  running: '执行中',
+  completed: '已完成',
+  clarification: '等待补充',
+  failed: '执行失败'
+}
+
+const assistantTaskStatusClassOf = (status: AssistantTaskStatus | undefined): string => (
+  status === 'failed'
+    ? 'failed'
+    : status === 'clarification'
+      ? 'clarification'
+      : status === 'completed'
+        ? 'completed'
+        : status === 'running'
+          ? 'running'
+          : 'pending'
+)
+
+const assistantTaskStatusOf = (
+  value: unknown,
+  fallback: AssistantTaskStatus = 'pending'
+): AssistantTaskStatus => {
+  if (typeof value !== 'string') return fallback
+  const normalized = value.trim().toLocaleLowerCase()
+  if (['success', 'succeeded', 'complete', 'completed', 'done'].includes(normalized)) return 'completed'
+  if (['clarification', 'needs_clarification', 'paused', 'waiting'].includes(normalized)) return 'clarification'
+  if (['failed', 'failure', 'error', 'aborted'].includes(normalized)) return 'failed'
+  if (['running', 'in_progress', 'active', 'executing'].includes(normalized)) return 'running'
+  if (['pending', 'queued', 'created'].includes(normalized)) return 'pending'
+  return fallback
+}
+
+const agentControlStepOrder: readonly AgentControlStepKey[] = [
+  'understand',
+  'skill',
+  'plan',
+  'tool',
+  'verify',
+  'deliver'
+]
+
+const agentControlStepLabels: Record<AgentControlStepKey, string> = {
+  understand: '理解目标 / 识别意图',
+  skill: '选择技能',
+  plan: '制定计划',
+  tool: '执行工具',
+  verify: '校验证据',
+  deliver: '准备交付'
+}
+
+const agentControlStepDescriptions: Record<AgentControlStepKey, string> = {
+  understand: '确认问题和意图',
+  skill: '匹配可用能力',
+  plan: '限定来源与范围',
+  tool: '获取结构化依据',
+  verify: '核对结果和引用',
+  deliver: '整理回答或交付物'
+}
+
+const agentControlStepLabelsByStage: Record<string, AgentControlStepKey> = {
+  classify: 'understand',
+  route: 'understand',
+  skill: 'skill',
+  scope: 'plan',
+  inspect: 'plan',
+  plan: 'plan',
+  clarify: 'plan',
+  clarification: 'plan',
+  scan: 'tool',
+  retrieve: 'tool',
+  group: 'tool',
+  query: 'tool',
+  recall: 'tool',
+  rerank: 'tool',
+  match: 'tool',
+  cite: 'verify',
+  verify: 'verify',
+  reason: 'verify',
+  score: 'verify',
+  critique: 'verify',
+  validate: 'verify',
+  explain: 'verify',
+  answer: 'deliver',
+  deliver: 'deliver',
+  summary: 'deliver'
+}
+
+const agentSkillLabels: Record<string, string> = {
+  general: '通用数据助手',
+  visualization: '数据可视化专家',
+  'requirement-analysis': '需求分析专家'
+}
+
+const agentSourceModeLabels: Record<string, string> = {
+  conversation: '普通对话',
+  records: '数据中心记录',
+  record: '数据中心记录',
+  knowledge: '知识库文档',
+  document: '知识库文档',
+  mixed: '混合取证'
+}
+
+const agentTaskTypeLabels: Record<string, string> = {
+  conversation: '普通对话',
+  records: '记录查询',
+  knowledge: '知识库问答',
+  mixed: '混合取证',
+  schema_inspection: '字段检查',
+  total: '汇总统计',
+  field_aggregate: '分组统计',
+  record_lookup: '记录查找',
+  filter_records: '条件查询',
+  count_matching: '条件统计',
+  search_content: '知识检索',
+  visualization: '可视化交付',
+  requirement_analysis: '需求分析',
+  'requirement-analysis': '需求分析'
+}
+
+const agentIntentLabels: Record<string, string> = {
+  conversation: '普通对话',
+  schema_inspection: '字段检查',
+  total: '汇总统计',
+  field_aggregate: '分组统计',
+  record_lookup: '记录查找',
+  filter_records: '条件查询',
+  count_matching: '条件统计',
+  search_content: '知识检索'
+}
+
+const normalizedMetadataValueOf = (value: string | undefined): string | undefined => {
+  const normalized = value?.trim()
+  if (!normalized || normalized.length > 80 || /[\r\n]/.test(normalized)) return undefined
+  return normalized
+}
+
+const stringPropertyOf = (
+  value: Record<string, unknown>,
+  keys: readonly string[]
+): string | undefined => {
+  for (const key of keys) {
+    const candidate = value[key]
+    if (typeof candidate === 'string') {
+      const normalized = normalizedMetadataValueOf(candidate)
+      if (normalized) return normalized
+    }
+  }
+  return undefined
+}
+
+/**
+ * Read only explicit orchestration metadata.  Status text, answer text and
+ * evidence snippets are deliberately excluded so model prose can never be
+ * mistaken for a skill, task type or system instruction.
+ */
+const agentRunMetadataOf = (value: unknown): AgentRunMetadata => {
+  if (!isRecordObject(value)) return {}
+  const candidates = [
+    value,
+    isRecordObject(value.taskTrace) ? value.taskTrace : null,
+    isRecordObject(value.assistantIntent) ? value.assistantIntent : null,
+    isRecordObject(value.metadata) ? value.metadata : null,
+    isRecordObject(value.progress) ? value.progress : null
+  ].filter(isRecordObject)
+  const read = (keys: readonly string[]): string | undefined => {
+    for (const candidate of candidates) {
+      const result = stringPropertyOf(candidate, keys)
+      if (result) return result
+    }
+    return undefined
+  }
+  const followUp = candidates.some((candidate) =>
+    candidate.followUp === true || candidate.isFollowUp === true
+  )
+  return {
+    ...(read(['skillLabel', 'skillName', 'selectedSkill', 'skill', 'expertName', 'expertId'])
+      ? { skill: read(['skillLabel', 'skillName', 'selectedSkill', 'skill', 'expertName', 'expertId']) }
+      : {}),
+    ...(read(['taskTypeLabel', 'taskType', 'taskTypeId', 'requestType'])
+      ? { taskType: read(['taskTypeLabel', 'taskType', 'taskTypeId', 'requestType']) }
+      : {}),
+    ...(read(['sourceMode', 'sourceType', 'sourceScope', 'mode'])
+      ? { sourceMode: read(['sourceMode', 'sourceType', 'sourceScope', 'mode']) }
+      : {}),
+    ...(read(['resultMode', 'resultType'])
+      ? { resultMode: read(['resultMode', 'resultType']) }
+      : {}),
+    ...(read(['intent', 'intentType']) ? { intent: read(['intent', 'intentType']) } : {}),
+    ...(followUp ? { followUp: true } : {}),
+    ...(read(['clarificationQuestion'])
+      ? { clarificationQuestion: read(['clarificationQuestion']) }
+      : {})
+  }
+}
+
+const mergeAgentRunMetadata = (...metadata: AgentRunMetadata[]): AgentRunMetadata => (
+  metadata.reduce<AgentRunMetadata>((merged, current) => ({
+    ...merged,
+    ...current,
+    ...(current.followUp ? { followUp: true } : {}),
+    ...(current.skill ? { skill: current.skill } : {}),
+    ...(current.taskType ? { taskType: current.taskType } : {}),
+    ...(current.sourceMode ? { sourceMode: current.sourceMode } : {}),
+    ...(current.intent ? { intent: current.intent } : {}),
+    ...(current.resultMode ? { resultMode: current.resultMode } : {}),
+    ...(current.clarificationQuestion ? { clarificationQuestion: current.clarificationQuestion } : {})
+  }), {})
+)
+
+const agentControlStepOfStage = (stage: string | undefined): AgentControlStepKey | undefined => {
+  if (!stage) return undefined
+  const normalized = canonicalAgentStageOf(stage)
+  return agentControlStepLabelsByStage[normalized]
+}
+
+const readableAgentValueOf = (
+  value: string | undefined,
+  labels: Record<string, string>
+): string | undefined => {
+  const normalized = normalizedMetadataValueOf(value)
+  if (!normalized) return undefined
+  return labels[normalized.toLocaleLowerCase()] ?? normalized.replace(/[_-]+/g, ' ')
+}
+
+const agentSkillLabelOf = (
+  metadata: AgentRunMetadata | undefined,
+  fallbackExpertId?: ExpertId
+): string | undefined => readableAgentValueOf(metadata?.skill ?? fallbackExpertId, agentSkillLabels)
+
+const agentTaskTypeLabelOf = (
+  metadata: AgentRunMetadata | undefined,
+  message?: ChatMessage
+): string | undefined => {
+  const direct = readableAgentValueOf(metadata?.taskType, agentTaskTypeLabels)
+  if (direct) return direct
+  const sourceMode = readableAgentValueOf(metadata?.sourceMode, agentSourceModeLabels)
+  if (sourceMode) return sourceMode
+  const intent = readableAgentValueOf(metadata?.intent, agentIntentLabels)
+  if (intent) return intent
+  if (message?.dashboard) return '可视化交付'
+  if (message?.dataViews?.length) return '记录查询'
+  const sourceSummary = chatSourceSummaryOf(message?.sources)
+  if (sourceSummary.records > 0 && sourceSummary.documents > 0) return '混合取证'
+  if (sourceSummary.documents > 0) return '知识库问答'
+  if (sourceSummary.records > 0) return '记录查询'
+  if (message?.expertId === 'visualization') return '可视化交付'
+  if (message?.expertId === 'requirement-analysis') return '需求分析'
+  return undefined
+}
+
+const explicitAgentSkillOf = (question: string): string | undefined => {
+  if (/@数据可视化专家(?:\s|$)/.test(question)) return 'visualization'
+  if (/@需求分析专家(?:\s|$)/.test(question)) return 'requirement-analysis'
+  if (/@通用数据助手(?:\s|$)/.test(question)) return 'general'
+  return undefined
+}
+
+const followUpQuestionOf = (question: string): boolean => (
+  /(?:刚才|上一轮|前面|上述|以上|前述|继续(?:查|分析|看|说)?|这些(?:记录|数据|文档|结果)?|它们|这个结果|那个结果)/.test(question)
+)
+
+const assistantExecutionAgentLabels: Record<AssistantExecutionAgentId, string> = {
+  conversation: 'Conversation Agent',
+  'data-center': '数据中心 Agent',
+  'knowledge-base': '知识库 Agent',
+  'requirement-analysis': '需求分析 Agent',
+  visualization: '可视化 Agent'
+}
+
+const assistantTaskTypeLabels: Record<string, string> = {
+  conversation: '普通对话',
+  record_query: '数据中心查询',
+  knowledge_qa: '知识库问答',
+  mixed_analysis: '混合分析',
+  visualization: '可视化交付',
+  requirement_matching: '需求匹配'
+}
+
+const assistantResultModeLabels: Record<string, string> = {
+  answer: '回答',
+  list: '列表',
+  grouped_list: '分组列表',
+  table: '数据表',
+  dashboard: '大屏交付'
+}
+
+const assistantSourceModeLabels: Record<string, string> = {
+  conversation: '普通对话',
+  records: '数据中心记录',
+  knowledge: '知识库文档',
+  mixed: '记录与文档'
+}
+
+const canonicalAssistantExecutionAgentOf = (
+  value: string | undefined
+): AssistantExecutionAgentId | undefined => {
+  const normalized = value?.trim().toLocaleLowerCase()
+  if (!normalized) return undefined
+  if (['conversation', 'conversation-agent', 'chat'].includes(normalized)) return 'conversation'
+  if (
+    ['data-center', 'data-center-agent', 'data', 'records', 'record', 'record-agent'].includes(normalized) ||
+    /数据中心|记录|record|data-center/.test(normalized)
+  ) return 'data-center'
+  if (
+    ['knowledge-base', 'knowledge-base-agent', 'knowledge', 'document', 'document-agent', 'kb'].includes(normalized) ||
+    /知识库|文档|knowledge|document/.test(normalized)
+  ) return 'knowledge-base'
+  if (
+    ['requirement-analysis', 'requirement-analysis-agent', 'requirement'].includes(normalized) ||
+    /需求分析|requirement/.test(normalized)
+  ) return 'requirement-analysis'
+  if (
+    ['visualization', 'visualization-agent', 'visual'].includes(normalized) ||
+    /可视化|大屏|visual/.test(normalized)
+  ) return 'visualization'
+  return undefined
+}
+
+const assistantExecutionAgentLabelOf = (value: string | undefined): string | undefined => {
+  const agentId = canonicalAssistantExecutionAgentOf(value)
+  return agentId ? assistantExecutionAgentLabels[agentId] : undefined
+}
+
+const assistantExecutionAgentsFor = (
+  sourceMode: string | undefined,
+  taskType: string | undefined,
+  skillId?: string
+): AssistantExecutionAgentId[] => {
+  const skillAgent = canonicalAssistantExecutionAgentOf(skillId)
+  if (skillAgent === 'visualization' || skillAgent === 'requirement-analysis') return [skillAgent]
+  const normalizedTask = taskType?.trim().toLocaleLowerCase()
+  const normalizedSource = sourceMode?.trim().toLocaleLowerCase()
+  if (normalizedTask === 'conversation' || normalizedSource === 'conversation') return ['conversation']
+  if (normalizedTask === 'knowledge_qa' || normalizedSource === 'knowledge') return ['knowledge-base']
+  if (normalizedTask === 'mixed_analysis' || normalizedSource === 'mixed') {
+    return ['data-center', 'knowledge-base']
+  }
+  if (normalizedTask === 'visualization') return ['visualization']
+  if (normalizedTask === 'requirement_matching') return ['requirement-analysis']
+  if (normalizedTask === 'record_query' || normalizedSource === 'records') return ['data-center']
+  return skillAgent ? [skillAgent] : []
+}
+
+const agentIdentifierOf = (value: unknown): string | undefined => {
+  if (typeof value === 'string') return normalizedMetadataValueOf(value)
+  if (!isRecordObject(value)) return undefined
+  return stringPropertyOf(value, ['id', 'agentId', 'name', 'label'])
+}
+
+const agentIdentifiersPropertyOf = (
+  value: Record<string, unknown>,
+  keys: readonly string[]
+): AssistantExecutionAgentId[] => {
+  for (const key of keys) {
+    const candidate = value[key]
+    if (!Array.isArray(candidate)) continue
+    return candidate
+      .map((item) => agentIdentifierOf(item))
+      .filter((item): item is string => Boolean(item))
+      .map((item) => canonicalAssistantExecutionAgentOf(item))
+      .filter((item): item is AssistantExecutionAgentId => Boolean(item))
+  }
+  return []
+}
+
+const textPropertyOf = (
+  value: Record<string, unknown>,
+  keys: readonly string[]
+): string | undefined => {
+  for (const key of keys) {
+    const candidate = value[key]
+    if (typeof candidate === 'string') {
+      const normalized = normalizedMetadataValueOf(candidate)
+      if (normalized) return normalized
+    }
+    if (isRecordObject(candidate)) {
+      const nested = stringPropertyOf(candidate, ['message', 'text', 'detail'])
+      if (nested) return nested
+    }
+  }
+  return undefined
+}
+
+const assistantTaskErrorOf = (value: unknown): string | undefined => {
+  if (typeof value === 'string') return normalizedMetadataValueOf(value)
+  if (!isRecordObject(value)) return undefined
+  return textPropertyOf(value, ['message', 'detail', 'error'])
+}
+
+const assistantTaskTraceViewFromObject = (
+  raw: Record<string, unknown>,
+  statusOverride?: AssistantTaskStatus
+): AssistantTaskView | undefined => {
+  const hasTaskFields = [
+    'runId', 'status', 'primaryAgent', 'invokedAgents', 'taskType', 'sourceMode',
+    'resultMode', 'startedAt', 'completedAt', 'clarificationQuestion', 'error'
+  ].some((key) => key in raw)
+  if (!hasTaskFields) return undefined
+
+  const taskType = stringPropertyOf(raw, ['taskType'])
+  const sourceMode = stringPropertyOf(raw, ['sourceMode'])
+  const resultMode = stringPropertyOf(raw, ['resultMode'])
+  const directPrimary = canonicalAssistantExecutionAgentOf(agentIdentifierOf(raw.primaryAgent))
+  const directInvoked = agentIdentifiersPropertyOf(raw, ['invokedAgents'])
+  const derivedAgents = assistantExecutionAgentsFor(sourceMode, taskType, agentIdentifierOf(raw.primaryAgent))
+  const status = assistantTaskStatusOf(raw.status, statusOverride ?? 'pending')
+  const invokedAgents: AssistantExecutionAgentId[] = [
+    ...new Set<AssistantExecutionAgentId>(directInvoked.length ? directInvoked : derivedAgents)
+  ]
+  const primaryAgent = directPrimary ?? invokedAgents[0]
+  const clarificationQuestion = textPropertyOf(raw, ['clarificationQuestion'])
+  const error = assistantTaskErrorOf(raw.error)
+  return {
+    ...(stringPropertyOf(raw, ['runId']) ? { runId: stringPropertyOf(raw, ['runId']) } : {}),
+    status,
+    ...(status === 'clarification' ? {} : primaryAgent ? { primaryAgent } : {}),
+    invokedAgents: status === 'clarification' ? [] : invokedAgents,
+    ...(taskType ? { taskType } : {}),
+    ...(sourceMode ? { sourceMode } : {}),
+    ...(resultMode ? { resultMode } : {}),
+    ...(stringPropertyOf(raw, ['startedAt']) ? { startedAt: stringPropertyOf(raw, ['startedAt']) } : {}),
+    ...(stringPropertyOf(raw, ['completedAt']) ? { completedAt: stringPropertyOf(raw, ['completedAt']) } : {}),
+    ...(clarificationQuestion ? { clarificationQuestion } : {}),
+    ...(error ? { error } : {})
+  }
+}
+
+const assistantTaskTraceViewOf = (
+  value: unknown,
+  statusOverride?: AssistantTaskStatus
+): AssistantTaskView | undefined => {
+  if (!isRecordObject(value)) return undefined
+  if (isRecordObject(value.taskTrace)) {
+    return assistantTaskTraceViewFromObject(value.taskTrace, statusOverride)
+  }
+  return assistantTaskTraceViewFromObject(value, statusOverride)
+}
+
+const assistantIntentTaskTraceViewOf = (
+  value: unknown,
+  statusOverride?: AssistantTaskStatus
+): AssistantTaskView | undefined => {
+  if (!isRecordObject(value) || !isRecordObject(value.assistantIntent)) return undefined
+  const intent = value.assistantIntent
+  const taskType = stringPropertyOf(intent, ['taskType'])
+  const sourceMode = stringPropertyOf(intent, ['sourceMode'])
+  const resultMode = stringPropertyOf(intent, ['resultMode'])
+  const skillId = stringPropertyOf(intent, ['skillId'])
+  if (!taskType && !sourceMode && !resultMode && !skillId) return undefined
+  const status = intent.needsClarification === true
+    ? 'clarification'
+    : assistantTaskStatusOf(undefined, statusOverride ?? 'completed')
+  const agents = assistantExecutionAgentsFor(sourceMode, taskType, skillId)
+  return {
+    status,
+    ...(status === 'clarification' ? {} : agents[0] ? { primaryAgent: agents[0] } : {}),
+    invokedAgents: status === 'clarification' ? [] : agents,
+    ...(taskType ? { taskType } : {}),
+    ...(sourceMode ? { sourceMode } : {}),
+    ...(resultMode ? { resultMode } : {}),
+    ...(textPropertyOf(intent, ['clarificationQuestion'])
+      ? { clarificationQuestion: textPropertyOf(intent, ['clarificationQuestion']) }
+      : {})
+  }
+}
+
+const assistantEventTaskTraceViewOf = (
+  value: unknown,
+  statusOverride: AssistantTaskStatus = 'running'
+): AssistantTaskView | undefined => {
+  if (!isRecordObject(value)) return undefined
+  const metadata = isRecordObject(value.metadata) ? value.metadata : undefined
+  return metadata
+    ? assistantTaskTraceViewFromObject(metadata, statusOverride)
+    : assistantTaskTraceViewFromObject(value, statusOverride)
+}
+
+const assistantExpertTaskTraceViewOf = (
+  value: unknown,
+  statusOverride: AssistantTaskStatus
+): AssistantTaskView | undefined => {
+  if (!isRecordObject(value)) return undefined
+  const expertId = stringPropertyOf(value, ['expertId'])
+  const agent = canonicalAssistantExecutionAgentOf(expertId)
+  if (agent !== 'visualization' && agent !== 'requirement-analysis') return undefined
+  return {
+    status: statusOverride,
+    primaryAgent: agent,
+    invokedAgents: [agent],
+    taskType: agent === 'visualization' ? 'visualization' : 'requirement_matching',
+    sourceMode: 'records',
+    resultMode: agent === 'visualization' ? 'dashboard' : 'answer'
+  }
+}
+
+const mergeAssistantTaskTraceViews = (
+  ...tasks: Array<AssistantTaskView | undefined | null>
+): AssistantTaskView | undefined => {
+  const available = tasks.filter((task): task is AssistantTaskView => Boolean(task))
+  if (!available.length) return undefined
+  const merged = available.reduce<AssistantTaskView>((current, next) => ({
+    ...current,
+    ...next,
+    invokedAgents: [...new Set([...current.invokedAgents, ...next.invokedAgents])]
+  }), { invokedAgents: [] })
+  if (merged.status === 'clarification') {
+    merged.invokedAgents = []
+    delete merged.primaryAgent
+  }
+  return merged
+}
+
+const assistantTaskTraceForMessage = (
+  message: ChatMessage,
+  metadata?: AgentRunMetadata
+): AssistantTaskView | undefined => {
+  const fallbackStatus: AssistantTaskStatus = message.contextOutcome === 'failed' ? 'failed' : 'completed'
+  const metadataTaskTrace = metadata && (
+    metadata.skill || metadata.taskType || metadata.sourceMode || metadata.resultMode
+  )
+    ? assistantTaskTraceViewFromObject({
+        taskType: metadata.taskType,
+        sourceMode: metadata.sourceMode,
+        resultMode: metadata.resultMode,
+        ...(metadata.skill ? { primaryAgent: metadata.skill } : {})
+      }, fallbackStatus)
+    : undefined
+  return mergeAssistantTaskTraceViews(
+    assistantExpertTaskTraceViewOf(message, fallbackStatus),
+    assistantIntentTaskTraceViewOf(message, fallbackStatus),
+    metadataTaskTrace,
+    assistantTaskTraceViewOf(message, fallbackStatus)
+  )
+}
+
+const assistantTaskTraceLabelOf = (
+  value: string | undefined,
+  labels: Record<string, string>
+): string | undefined => readableAgentValueOf(value, labels)
+
+const shortTraceIdOf = (runId: string | undefined): string | undefined => {
+  const normalized = runId?.trim()
+  if (!normalized) return undefined
+  return normalized.length > 10 ? normalized.slice(0, 8) : normalized
+}
+
+const assistantTaskTracePayloadOf = (
+  task: AssistantTaskView | undefined,
+  fallbackStatus: AssistantTaskStatus
+): AssistantTaskTrace | undefined => {
+  if (!task?.runId || !task.primaryAgent || !task.taskType || !task.sourceMode || !task.resultMode) return undefined
+  const status = task.status ?? fallbackStatus
+  if (!['completed', 'clarification', 'failed'].includes(status)) return undefined
+  return {
+    runId: task.runId,
+    status: status as AssistantTaskTrace['status'],
+    primaryAgent: task.primaryAgent,
+    invokedAgents: status === 'clarification' ? [] : task.invokedAgents,
+    taskType: task.taskType as AssistantTaskTrace['taskType'],
+    sourceMode: task.sourceMode as AssistantTaskTrace['sourceMode'],
+    resultMode: task.resultMode as AssistantTaskTrace['resultMode'],
+    startedAt: task.startedAt ?? new Date().toISOString(),
+    completedAt: task.completedAt ?? new Date().toISOString(),
+    ...(task.clarificationQuestion ? { clarificationQuestion: task.clarificationQuestion } : {}),
+    ...(task.error ? { error: { code: 'ASSISTANT_TASK_FAILED', message: task.error } } : {})
+  }
+}
+
+function AgentTaskSummary({
+  task,
+  className = ''
+}: {
+  task?: AssistantTaskView | null
+  className?: string
+}): React.JSX.Element {
+  const [detailsOpen, setDetailsOpen] = useState(false)
+  const status = task?.status ?? 'running'
+  const statusLabel = assistantTaskStatusLabels[status]
+  const statusClass = assistantTaskStatusClassOf(status)
+  const isClarification = status === 'clarification'
+  const primaryLabel = isClarification
+    ? '尚未执行'
+    : assistantExecutionAgentLabelOf(task?.primaryAgent) ?? '路由中'
+  const invokedLabels = (task?.invokedAgents ?? [])
+    .map((agent) => assistantExecutionAgentLabels[agent])
+    .filter((label, index, labels) => labels.indexOf(label) === index)
+  const invokedLabel = isClarification
+    ? '暂无（等待补充）'
+    : invokedLabels.length
+      ? invokedLabels.join('、')
+      : status === 'running' || status === 'pending'
+        ? '选择中'
+        : '未记录'
+  const taskTypeLabel = assistantTaskTraceLabelOf(task?.taskType, assistantTaskTypeLabels)
+  const sourceModeLabel = assistantTaskTraceLabelOf(task?.sourceMode, assistantSourceModeLabels)
+  const resultModeLabel = assistantTaskTraceLabelOf(task?.resultMode, assistantResultModeLabels)
+  const traceId = shortTraceIdOf(task?.runId)
+  const summaryDetails = [primaryLabel, taskTypeLabel, sourceModeLabel]
+    .filter(Boolean)
+    .join(' · ')
+  return (
+    <details
+      className={`agent-task-summary ${className}`.trim()}
+      role="group"
+      aria-label="Agent 任务摘要"
+      open={detailsOpen}
+      onToggle={(event) => setDetailsOpen(event.currentTarget.open)}
+    >
+      <summary className={`agent-task-summary-summary status-${statusClass}`} aria-expanded={detailsOpen}>
+        <span className="agent-task-summary-summary-title">Agent 任务 · {statusLabel}</span>
+        <span className="agent-task-summary-summary-copy">{summaryDetails}</span>
+        {traceId && <span className="agent-task-trace">追踪 {traceId}</span>}
+        <span className="agent-task-summary-summary-action">{detailsOpen ? '收起详情' : '查看详情'}</span>
+      </summary>
+      <div className="agent-task-summary-detail-body">
+        <div className="agent-task-summary-grid">
+          <div className="agent-task-summary-item">
+            <span>主执行 Agent</span>
+            <strong>{primaryLabel}</strong>
+          </div>
+          <div className="agent-task-summary-item">
+            <span>参与 Agent</span>
+            <strong>{invokedLabel}</strong>
+          </div>
+          <div className={`agent-task-summary-item status ${statusClass}`}>
+            <span>任务状态</span>
+            <strong>{statusLabel}</strong>
+          </div>
+        </div>
+        {(taskTypeLabel || sourceModeLabel || resultModeLabel || task?.error) && (
+          <div className="agent-task-summary-details" aria-label="任务轨迹详情">
+            {taskTypeLabel && <span>任务：{taskTypeLabel}</span>}
+            {sourceModeLabel && <span>来源：{sourceModeLabel}</span>}
+            {resultModeLabel && <span>交付：{resultModeLabel}</span>}
+            {task?.error && <span className="agent-task-summary-error">错误：{task.error}</span>}
+          </div>
+        )}
+      </div>
+    </details>
+  )
+}
 
 const semanticTaskStatusLabels: Record<SemanticizationTaskStatus, string> = {
   queued: '排队中',
@@ -1297,6 +2166,18 @@ const formatChatSessionTime = (value: string): string => {
   return date.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' })
 }
 
+const chatSessionTitleOf = (
+  session: ChatSessionSummary | undefined,
+  messages: ChatMessage[]
+): string => {
+  const storedTitle = session?.title?.replace(/\s+/g, ' ').trim()
+  if (storedTitle) return storedTitle
+  const firstQuestion = messages.find((item) => item.role === 'user')?.content
+    ?.replace(/\s+/g, ' ')
+    .trim()
+  return firstQuestion || '新的数据任务'
+}
+
 const plainTextFromHtml = (value?: string): string => {
   if (!value) return ''
   const document = new DOMParser().parseFromString(value, 'text/html')
@@ -2043,6 +2924,9 @@ function DataPage({
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(20)
   const [search, setSearch] = useState('')
+  const [releaseText, setReleaseText] = useState<string | undefined>(undefined)
+  const [releaseValues, setReleaseValues] = useState<RecordReleaseValue[]>([])
+  const [releaseValuesLoading, setReleaseValuesLoading] = useState(false)
   const [projectId, setProjectId] = useState<string>()
   const [nodeType, setNodeType] = useState<string>()
   const [semanticStatusFilter, setSemanticStatusFilter] = useState<RequirementSemanticizationStatus | 'all'>('all')
@@ -2072,23 +2956,39 @@ function DataPage({
   const maintenancePreviewRequestRef = useRef(0)
   const [maintenancePreviewRefreshKey, setMaintenancePreviewRefreshKey] = useState(0)
 
+  const recordFilters = useMemo<RecordExportQuery>(() => ({
+    search,
+    projectId,
+    nodeType,
+    ...(releaseText !== undefined ? { releaseText } : {}),
+    ...(semanticStatusFilter !== 'all' ? { semanticStatus: semanticStatusFilter } : {})
+  }), [search, projectId, nodeType, releaseText, semanticStatusFilter])
+
   const load = useCallback(async (): Promise<void> => {
     setLoading(true)
     try {
       const data = await window.visslm.listRecords({
         page,
         pageSize,
-        search,
-        projectId,
-        nodeType,
-        ...(semanticStatusFilter !== 'all' ? { semanticStatus: semanticStatusFilter } : {})
+        ...recordFilters
       })
       setRecords(data.rows)
       setTotal(data.total)
     } finally {
       setLoading(false)
     }
-  }, [page, pageSize, search, projectId, nodeType, semanticStatusFilter])
+  }, [page, pageSize, recordFilters])
+
+  const loadReleaseValues = useCallback(async (): Promise<void> => {
+    setReleaseValuesLoading(true)
+    try {
+      setReleaseValues(await window.visslm.listRecordReleaseValues())
+    } catch (error) {
+      message.error(`读取发布属性候选失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setReleaseValuesLoading(false)
+    }
+  }, [message])
 
   useEffect(() => {
     void Promise.all([window.visslm.listProjects(), window.visslm.listNodeTypes()]).then(
@@ -2102,6 +3002,10 @@ function DataPage({
   useEffect(() => {
     void load()
   }, [load, refreshKey])
+
+  useEffect(() => {
+    void loadReleaseValues()
+  }, [loadReleaseValues, refreshKey])
 
   useEffect(() => {
     maintenanceDetailUidRef.current = detail?.uid ?? null
@@ -2373,16 +3277,23 @@ function DataPage({
   }
 
   const exportData = async (): Promise<void> => {
+    if (!total) {
+      message.info('当前筛选结果没有可导出的数据')
+      return
+    }
     setExporting(true)
     try {
-      const result = await window.visslm.exportData()
+      const result = await window.visslm.exportData(recordFilters)
       if (result.canceled) return
       if (!result.ok) {
         message.error(result.message)
         return
       }
       const transferMeta = dataTransferMetaText(result)
-      message.success(transferMeta ? `${result.message}（${transferMeta}）` : result.message)
+      const exportCount = `实际导出 ${result.recordCount} 条记录`
+      message.success(transferMeta
+        ? `${result.message}（${exportCount} · ${transferMeta}）`
+        : `${result.message}（${exportCount}）`)
     } catch (error) {
       message.error(error instanceof Error ? error.message : String(error))
     } finally {
@@ -2479,10 +3390,15 @@ function DataPage({
           <Button
             icon={<ExportOutlined />}
             loading={exporting}
-            title="默认导出 .visslmpack 二进制资源包；图片不会嵌入 Base64"
+            disabled={loading || !total}
+            title={loading
+              ? '正在更新当前筛选结果，请稍候'
+              : total
+              ? `按当前筛选条件导出全部 ${total} 条记录，不受分页限制；生成 .visslmpack 二进制资源包`
+              : '当前筛选结果为 0 条，暂无可导出数据'}
             onClick={() => void exportData()}
           >
-            导出资源包（.visslmpack）
+            导出当前筛选结果（{total}）
           </Button>
           <Button
             icon={<ThunderboltOutlined />}
@@ -2522,7 +3438,7 @@ function DataPage({
         </Space>
       </div>
       <Card className="data-workbench-card">
-        <div className="filter-bar">
+        <div className="filter-bar asset-center-filter-bar">
           <Input.Search
             allowClear
             placeholder="搜索名称、编号和正文"
@@ -2555,6 +3471,33 @@ function DataPage({
             options={nodeTypes.map((type) => ({ label: type, value: type }))}
             style={{ width: 160 }}
           />
+          <Select<string>
+            allowClear
+            showSearch
+            className="asset-release-filter"
+            loading={releaseValuesLoading}
+            value={releaseText}
+            placeholder="发布属性（_valm_Release_text）"
+            aria-label="按发布属性（_valm_Release_text）筛选"
+            style={{ width: 280 }}
+            filterOption={(input, option) => String(option?.value ?? '').toLocaleLowerCase().includes(input.trim().toLocaleLowerCase())}
+            options={releaseValues.map(({ value, count }) => ({
+              value,
+              label: (
+                <span className="push-release-option">
+                  <span className="push-release-option-value" title={value || '空值'}>
+                    {value || '（空值）'}
+                  </span>
+                  <span className="push-release-option-count">{count} 条</span>
+                </span>
+              )
+            }))}
+            onChange={(value) => {
+              setReleaseText(value)
+              setPage(1)
+              setSelectedRowKeys([])
+            }}
+          />
           <Select<RequirementSemanticizationStatus | 'all'>
             value={semanticStatusFilter}
             onChange={(value) => {
@@ -2581,7 +3524,7 @@ function DataPage({
           }}
           loading={loading}
           dataSource={records}
-          scroll={{ x: 1450, y: appTableScrollY }}
+          scroll={{ x: 1670, y: appTableScrollY }}
           pagination={{
             current: page,
             pageSize,
@@ -2615,6 +3558,15 @@ function DataPage({
             },
             { title: '类型', dataIndex: 'nodeType', width: 130, render: (v) => <Tag>{v || '—'}</Tag> },
             { title: '对象编号', dataIndex: 'itemId', width: 180, ellipsis: true },
+            {
+              title: '发布属性',
+              dataIndex: 'releaseText',
+              width: 220,
+              ellipsis: true,
+              render: (value: string) => (
+                <span title={value || '空值'}>{value || '—'}</span>
+              )
+            },
             {
               title: '描述',
               dataIndex: 'description',
@@ -3857,9 +4809,7 @@ function ChatPage({
   conversationId,
   onConversationIdChange,
   modelOnline,
-  modelName,
   onOpenSettings,
-  onOpenSync,
   refreshKey
 }: {
   messages: ChatMessage[]
@@ -3878,34 +4828,93 @@ function ChatPage({
   conversationId: string
   onConversationIdChange: (id: string) => void
   modelOnline: boolean | null
-  modelName?: string
   onOpenSettings: () => void
-  onOpenSync: () => void
   refreshKey: number
 }): React.JSX.Element {
   const { message, modal } = AntApp.useApp()
   const messageListRef = useRef<HTMLDivElement>(null)
   const [activeDataView, setActiveDataView] = useState<ChatDataView | null>(null)
   const [activeDataGroup, setActiveDataGroup] = useState('')
+  const [dataViewPage, setDataViewPage] = useState(1)
+  const [dataViewPageSize, setDataViewPageSize] = useState(20)
+  const [dataViewPageLoading, setDataViewPageLoading] = useState(false)
+  const dataViewPageRequestRef = useRef(0)
   const [activeRecordDetail, setActiveRecordDetail] = useState<RecordDetail | null>(null)
   const [recordDetailModalOpen, setRecordDetailModalOpen] = useState(false)
   const [activeKnowledgeDetail, setActiveKnowledgeDetail] = useState<KnowledgeDocumentDetail | null>(null)
   const [recordDetailLoading, setRecordDetailLoading] = useState(false)
+  const [recordImagePage, setRecordImagePage] = useState<RecordImagePage | null>(null)
+  const [recordImagesLoading, setRecordImagesLoading] = useState(false)
   const [mentionOpen, setMentionOpen] = useState(false)
   const [mentionQuery, setMentionQuery] = useState('')
   const [mentionIndex, setMentionIndex] = useState(0)
   const [agentProgress, setAgentProgress] = useState<Array<Extract<AgentEvent, { type: 'status' }>>>([])
+  const [agentRunMetadata, setAgentRunMetadata] = useState<AgentRunMetadata>({})
+  const [agentRunStatus, setAgentRunStatus] = useState<AgentRunStatus>('idle')
+  const [agentDetailsOpen, setAgentDetailsOpen] = useState(false)
+  const [agentTaskTrace, setAgentTaskTrace] = useState<AssistantTaskView | null>(null)
+  const [messageRunMetadata, setMessageRunMetadata] = useState<Record<string, AgentRunMetadata>>({})
+  const [clarificationByMessageId, setClarificationByMessageId] = useState<Record<string, string>>({})
   const [artifactAttached, setArtifactAttached] = useState(Boolean(activeArtifact))
   const persistQueueRef = useRef<Promise<void>>(Promise.resolve())
   const [historySessions, setHistorySessions] = useState<ChatSessionSummary[]>([])
   const [historyRefreshing, setHistoryRefreshing] = useState(false)
   const [historyLoading, setHistoryLoading] = useState(false)
+  const [historyQuery, setHistoryQuery] = useState('')
+  const [historyCollapsed, setHistoryCollapsed] = useState(false)
+  const [historyMobileOpen, setHistoryMobileOpen] = useState(false)
+  const [showScrollLatest, setShowScrollLatest] = useState(false)
+  const [userNearBottom, setUserNearBottom] = useState(true)
+  const userNearBottomRef = useRef(true)
   const [workspaceStats, setWorkspaceStats] = useState<KnowledgeStats | null>(null)
   const [workspaceDataStats, setWorkspaceDataStats] = useState<DashboardStats | null>(null)
-  const [workspaceStatsLoading, setWorkspaceStatsLoading] = useState(true)
   const selectedDataGroup = activeDataView?.groups.find(
     (group) => group.name === activeDataGroup
   ) ?? activeDataView?.groups[0]
+  const selectedDataGroupRecordUids = activeDataView && selectedDataGroup
+    ? chatDataViewRecordUidsForGroup(activeDataView, selectedDataGroup.name)
+    : undefined
+  const selectedDataGroupPageable = Boolean(selectedDataGroupRecordUids?.length)
+
+  const filteredHistorySessions = useMemo(() => {
+    const query = historyQuery.trim().toLocaleLowerCase()
+    if (!query) return historySessions
+    return historySessions.filter((session) => (
+      `${session.title ?? ''} ${session.preview ?? ''}`.toLocaleLowerCase().includes(query)
+    ))
+  }, [historyQuery, historySessions])
+
+  const updateMessageScrollState = useCallback((): void => {
+    const container = messageListRef.current
+    if (!container) return
+    const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight
+    const nearBottom = distanceFromBottom <= 64
+    userNearBottomRef.current = nearBottom
+    setUserNearBottom(nearBottom)
+    setShowScrollLatest(!nearBottom && container.scrollHeight > container.clientHeight + 8)
+  }, [])
+
+  const scrollToLatest = useCallback((behavior: ScrollBehavior = 'smooth'): void => {
+    const container = messageListRef.current
+    if (!container) return
+    userNearBottomRef.current = true
+    setUserNearBottom(true)
+    setShowScrollLatest(false)
+    container.scrollTo({ top: container.scrollHeight, behavior })
+  }, [])
+
+  const handleMessageScroll = useCallback((): void => {
+    updateMessageScrollState()
+  }, [updateMessageScrollState])
+
+  useEffect(() => {
+    if (!historyMobileOpen) return
+    const closeOnEscape = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') setHistoryMobileOpen(false)
+    }
+    window.addEventListener('keydown', closeOnEscape)
+    return () => window.removeEventListener('keydown', closeOnEscape)
+  }, [historyMobileOpen])
 
   const refreshHistory = useCallback(async (): Promise<void> => {
     setHistoryRefreshing(true)
@@ -3924,7 +4933,6 @@ function ChatPage({
 
   useEffect(() => {
     let active = true
-    setWorkspaceStatsLoading(true)
     void Promise.allSettled([
       window.visslm.getKnowledgeStats(),
       window.visslm.getStats()
@@ -3933,9 +4941,6 @@ function ChatPage({
         if (!active) return
         setWorkspaceStats(knowledgeResult.status === 'fulfilled' ? knowledgeResult.value : null)
         setWorkspaceDataStats(dataResult.status === 'fulfilled' ? dataResult.value : null)
-      })
-      .finally(() => {
-        if (active) setWorkspaceStatsLoading(false)
       })
     return () => {
       active = false
@@ -3947,19 +4952,102 @@ function ChatPage({
   }, [activeArtifact])
 
   const openDataView = (view: ChatDataView): void => {
+    dataViewPageRequestRef.current += 1
+    setDataViewPageLoading(false)
     setActiveDataView(view)
-    setActiveDataGroup(view.groups[0]?.name ?? '')
+    const firstGroup = view.groups[0]
+    const firstGroupName = firstGroup?.name ?? ''
+    setActiveDataGroup(firstGroupName)
+    setDataViewPage(1)
+    setDataViewPageSize(20)
     setActiveRecordDetail(null)
+    setRecordImagePage(null)
     setRecordDetailModalOpen(false)
+    if (firstGroup && chatDataViewRecordUidsForGroup(view, firstGroupName)?.length) {
+      void loadDataViewPage(view, firstGroupName, 1, 20)
+    }
+  }
+
+  const changeActiveDataGroup = (groupName: string): void => {
+    dataViewPageRequestRef.current += 1
+    setDataViewPageLoading(false)
+    setActiveDataGroup(groupName)
+    setDataViewPage(1)
+    setDataViewPageSize(20)
+    if (activeDataView && chatDataViewRecordUidsForGroup(activeDataView, groupName)?.length) {
+      void loadDataViewPage(activeDataView, groupName, 1, 20)
+    }
+  }
+
+  const loadDataViewPage = async (
+    view: ChatDataView,
+    groupName: string,
+    page: number,
+    pageSize: number
+  ): Promise<void> => {
+    const pageScope = chatDataViewPageScopeForGroup(view, groupName)
+    const recordUids = pageScope?.recordUids
+    if (!recordUids?.length) return
+    const requestId = ++dataViewPageRequestRef.current
+    setDataViewPageLoading(true)
+    try {
+      const result: ChatDataViewPage = await window.visslm.getChatDataViewPage(
+        { ...pageScope, fields: view.fields },
+        page,
+        pageSize
+      )
+      if (requestId !== dataViewPageRequestRef.current) return
+      setDataViewPage(result.page)
+      setDataViewPageSize(result.pageSize)
+      setActiveDataView((current) => {
+        if (!current || current.id !== view.id) return current
+        const targetGroupIndex = current.groups.findIndex((group) => group.name === groupName)
+        if (targetGroupIndex === -1) return current
+        const groupedRecordUids = current.groups.some(
+          (group) => chatDataGroupRecordUidsOf(group) !== undefined
+        )
+        const nextGroups = [...current.groups]
+        const targetGroup = nextGroups[targetGroupIndex]
+        if (!targetGroup) return current
+        nextGroups[targetGroupIndex] = {
+          ...targetGroup,
+          count: result.total,
+          rows: result.rows
+        }
+        return {
+          ...current,
+          // Keep the view-level preview metadata for legacy flat views only;
+          // grouped views have independent row/count snapshots per group.
+          ...(groupedRecordUids
+            ? {}
+            : {
+                loadedRows: result.rows.length,
+                isPreview: result.rows.length < result.total
+              }),
+          groups: nextGroups
+        }
+      })
+    } catch (error) {
+      if (requestId !== dataViewPageRequestRef.current) return
+      message.warning(`查询数据分页加载失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      if (requestId === dataViewPageRequestRef.current) setDataViewPageLoading(false)
+    }
   }
 
   const closeDataView = (): void => {
+    dataViewPageRequestRef.current += 1
+    setDataViewPageLoading(false)
     setActiveDataView(null)
     setActiveDataGroup('')
+    setDataViewPage(1)
+    setDataViewPageSize(20)
     setActiveRecordDetail(null)
     setRecordDetailModalOpen(false)
     setActiveKnowledgeDetail(null)
     setRecordDetailLoading(false)
+    setRecordImagePage(null)
+    setRecordImagesLoading(false)
   }
 
   const persistSession = useCallback((sessionId: string, sessionMessages: ChatMessage[]): Promise<void> => {
@@ -3986,8 +5074,18 @@ function ChatPage({
     onConversationIdChange(nextConversationId)
     setMessages([])
     setQuestion('')
+    userNearBottomRef.current = true
+    setUserNearBottom(true)
+    setShowScrollLatest(false)
+    setHistoryMobileOpen(false)
     setMentionOpen(false)
     setAgentProgress([])
+    setAgentRunMetadata({})
+    setAgentRunStatus('idle')
+    setAgentDetailsOpen(false)
+    setAgentTaskTrace(null)
+    setMessageRunMetadata({})
+    setClarificationByMessageId({})
     setArtifactAttached(false)
     onClearDataScope()
     closeDataView()
@@ -4046,8 +5144,18 @@ function ChatPage({
       onConversationIdChange(session.id)
       setMessages(session.messages)
       setQuestion('')
+      userNearBottomRef.current = true
+      setUserNearBottom(true)
+      setShowScrollLatest(false)
+      setHistoryMobileOpen(false)
       setMentionOpen(false)
       setAgentProgress([])
+      setAgentRunMetadata({})
+      setAgentRunStatus('idle')
+      setAgentDetailsOpen(false)
+      setAgentTaskTrace(null)
+      setMessageRunMetadata({})
+      setClarificationByMessageId({})
       onClearDataScope()
       closeDataView()
       const latestDashboardMessage = [...session.messages]
@@ -4116,16 +5224,27 @@ function ChatPage({
 
   const openRecordDetail = async (row: ChatDataRow, standalone = false): Promise<void> => {
     if (standalone) {
+      dataViewPageRequestRef.current += 1
+      setDataViewPageLoading(false)
       setActiveDataView(null)
       setActiveDataGroup('')
       setRecordDetailModalOpen(true)
     }
     setActiveRecordDetail(null)
+    setRecordImagePage(null)
     setRecordDetailLoading(true)
     try {
-      const detail = await window.visslm.getRecord(row.uid)
+      const detail = await window.visslm.getRecordForChat(row.uid)
       if (detail) {
         setActiveRecordDetail(detail)
+        if (detail.imageCount > 0) {
+          setRecordImagesLoading(true)
+          try {
+            setRecordImagePage(await window.visslm.getRecordImagePage(row.uid, 1, MAX_CHAT_DETAIL_IMAGES))
+          } finally {
+            setRecordImagesLoading(false)
+          }
+        }
       } else {
         message.warning('回答依据对应的记录不存在或已被删除')
         if (standalone) setRecordDetailModalOpen(false)
@@ -4139,25 +5258,47 @@ function ChatPage({
   }
 
   const openKnowledgeDetail = async (documentId: string): Promise<void> => {
-    const detail = await window.visslm.getKnowledgeDocument(documentId)
-    if (detail) setActiveKnowledgeDetail(detail)
+    try {
+      const detail = await window.visslm.getKnowledgeDocument(documentId)
+      if (detail) {
+        setActiveKnowledgeDetail(detail)
+      } else {
+        message.warning('回答依据对应的知识文档不存在或已被删除')
+      }
+    } catch (error) {
+      message.error(`知识文档详情加载失败：${error instanceof Error ? error.message : String(error)}`)
+    }
   }
 
   useEffect(() => {
     const frame = requestAnimationFrame(() => {
       const container = messageListRef.current
-      if (container) {
+      if (!container) return
+      // New messages follow the user's viewport only while they are already
+      // near the latest reply. Once they browse older messages, incoming
+      // progress and answers must not take control of the scroll position.
+      if (userNearBottomRef.current) {
         container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' })
       }
+      updateMessageScrollState()
     })
     return () => cancelAnimationFrame(frame)
-  }, [messages.length, loading])
+  }, [messages.length, loading, conversationId, updateMessageScrollState])
 
   useEffect(() => window.visslm.onAgentEvent((update) => {
     if (update.conversationId !== conversationId) return
     const statusEvent = update.event
     if (statusEvent.type !== 'status') return
     setAgentProgress((items) => [...items, statusEvent].slice(-80))
+    const eventMetadata = agentRunMetadataOf(statusEvent)
+    if (Object.keys(eventMetadata).length) {
+      setAgentRunMetadata((current) => mergeAgentRunMetadata(current, eventMetadata))
+    }
+    const eventTaskTrace = assistantEventTaskTraceViewOf(statusEvent, 'running')
+    if (eventTaskTrace) {
+      setAgentTaskTrace((current) => mergeAssistantTaskTraceViews(current, eventTaskTrace) ?? eventTaskTrace)
+    }
+    setAgentRunStatus('running')
   }), [conversationId])
 
   const send = async (overrideQuestion?: string): Promise<void> => {
@@ -4175,10 +5316,19 @@ function ChatPage({
       createdAt: new Date().toISOString()
     }
     const next = [...messages, userMessage]
+    const explicitSkill = explicitAgentSkillOf(text)
+    const isFollowUp = followUpQuestionOf(text) && messages.some((item) => item.role === 'assistant')
+    const initialRunMetadata = mergeAgentRunMetadata(
+      explicitSkill ? { skill: explicitSkill } : {},
+      isFollowUp ? { followUp: true } : {}
+    )
     setMessages(next)
     setQuestion('')
     setMentionOpen(false)
     setAgentProgress([])
+    setAgentRunMetadata(initialRunMetadata)
+    setAgentRunStatus('running')
+    setAgentDetailsOpen(false)
     setLoading(true)
     try {
       const hasExplicitExpertMention = /@(?:数据可视化专家|通用数据助手|需求分析专家)(?:\s|$)/.test(text)
@@ -4186,10 +5336,11 @@ function ChatPage({
       const requestArtifact = requestsVisualization && artifactAttached ? activeArtifact : null
       const contextMessages = messages
         .filter((message) => message.contextOutcome !== 'failed' && message.contextOutcome !== 'undone')
-        .map(({ role, content, contextOutcome }) => ({
+        .map(({ role, content, contextOutcome, contextRefs }) => ({
           role,
           content,
-          ...(contextOutcome ? { outcome: contextOutcome } : {})
+          ...(contextOutcome ? { outcome: contextOutcome } : {}),
+          ...(contextRefs?.length ? { contextRefs } : {})
         }))
       const response = await window.visslm.askAgent({
         question: text,
@@ -4221,11 +5372,43 @@ function ChatPage({
         onDashboardUpdate(response.dashboard, dashboardVersion)
         setArtifactAttached(true)
       }
+      const responseMetadata = mergeAgentRunMetadata(
+        initialRunMetadata,
+        ...agentProgress.map((event) => agentRunMetadataOf(event)),
+        ...(response.events ?? []).map((event) => agentRunMetadataOf(event)),
+        agentRunMetadataOf(response),
+        response.expertId ? { skill: response.expertId } : {}
+      )
+      const responseTaskStatus: AssistantTaskStatus = responseError
+        ? 'failed'
+        : response.needsClarification
+          ? 'clarification'
+          : 'completed'
+      const responseTaskTraceCandidate = mergeAssistantTaskTraceViews(
+        agentTaskTrace,
+        assistantExpertTaskTraceViewOf(response, responseTaskStatus),
+        ...(response.events ?? []).map((event) => assistantEventTaskTraceViewOf(event, 'running')),
+        assistantIntentTaskTraceViewOf(response, responseTaskStatus),
+        assistantTaskTraceViewOf(response, responseTaskStatus)
+      )
+      const responseTaskTrace = responseTaskTraceCandidate
+        ? {
+            ...responseTaskTraceCandidate,
+            status: responseTaskStatus,
+            ...(responseTaskStatus === 'clarification'
+              ? { invokedAgents: [] as AssistantExecutionAgentId[] }
+              : {})
+          }
+        : undefined
+      const persistedTaskTrace = response.taskTrace ?? assistantTaskTracePayloadOf(responseTaskTrace, responseTaskStatus)
+      const assistantMessageId = crypto.randomUUID()
+      const clarificationQuestion = response.clarificationQuestion?.trim() ||
+        (response.needsClarification ? response.answer.trim() : '')
       const completedMessages: ChatMessage[] = [
         ...messages,
         { ...userMessage, contextOutcome: responseError ? 'failed' : 'success' },
         {
-          id: crypto.randomUUID(),
+          id: assistantMessageId,
           role: 'assistant',
           content: response.answer,
           ...(responseError ? { retryQuestion: text } : {}),
@@ -4234,11 +5417,22 @@ function ChatPage({
           dashboard: response.dashboard,
           dashboardVersion,
           expertId: response.expertId,
+          assistantIntent: response.assistantIntent,
+          ...(persistedTaskTrace ? { taskTrace: persistedTaskTrace } : {}),
+          contextRefs: response.contextRefs,
+          contextStats: response.contextStats,
           createdAt: new Date().toISOString(),
           contextOutcome: responseError ? 'failed' : 'success'
         }
       ]
       setMessages(completedMessages)
+      setMessageRunMetadata((current) => ({ ...current, [assistantMessageId]: responseMetadata }))
+      if (clarificationQuestion) {
+        setClarificationByMessageId((current) => ({ ...current, [assistantMessageId]: clarificationQuestion }))
+      }
+      setAgentRunMetadata(responseMetadata)
+      setAgentTaskTrace(responseTaskTrace ?? null)
+      setAgentRunStatus(response.needsClarification ? 'clarification' : responseError ? 'failed' : 'idle')
       void persistSession(sessionId, completedMessages)
     } catch (error) {
       const rawMessage = error instanceof Error ? error.message : String(error)
@@ -4260,6 +5454,7 @@ function ChatPage({
         }
       ]
       setMessages(failedMessages)
+      setAgentRunStatus('failed')
       void persistSession(sessionId, failedMessages)
     } finally {
       setLoading(false)
@@ -4279,28 +5474,35 @@ function ChatPage({
   const hasData = dataRecordCount > 0
   const hasKnowledge = Boolean(workspaceStats?.indexedChunkCount)
   const latestStatus = agentProgress.at(-1)
-  const agentStageLabel: Record<string, string> = {
-    route: '理解需求',
-    locate: '定位编号',
-    recall: '混合召回',
-    rerank: '候选重排',
-    score: '确定性评分',
-    explain: '批量 AI 解释',
-    summary: '整理结果',
-    retrieve: '检索数据',
-    match: '匹配数据',
-    plan: '制定计划',
-    query: '查询数据',
-    verify: '校验结果',
-    reason: '分析结果',
-    critique: '复核结果',
-    answer: '整理回答',
-    error: '任务中断'
-  }
+  const activeAgentControlStep = agentControlStepOfStage(latestStatus?.stage) ?? 'understand'
+  const observedAgentControlSteps = useMemo(
+    () => new Set(agentProgress.map((event) => agentControlStepOfStage(event.stage)).filter(
+      (step): step is AgentControlStepKey => Boolean(step)
+    )),
+    [agentProgress]
+  )
+  const agentControlFlow = useMemo(() => {
+    const activeIndex = agentControlStepOrder.indexOf(activeAgentControlStep)
+    const selectedSkill = Boolean(agentSkillLabelOf(agentRunMetadata))
+    return agentControlStepOrder.map((step, index) => {
+      let state: AgentControlStepState = 'pending'
+      if (index < activeIndex || observedAgentControlSteps.has(step)) state = 'complete'
+      if (step === activeAgentControlStep && agentRunStatus === 'running') state = 'active'
+      if (step === 'skill' && selectedSkill && index <= activeIndex) state = 'complete'
+      return { step, state }
+    })
+  }, [activeAgentControlStep, agentRunMetadata, agentRunStatus, observedAgentControlSteps])
   const visibleAgentProgress = useMemo(() => {
     const latestByStage = new Map<string, Extract<AgentEvent, { type: 'status' }>>()
-    agentProgress.forEach((event) => latestByStage.set(event.stage, event))
-    return [...latestByStage.values()].slice(-6)
+    agentProgress.forEach((event) => {
+      // Keep the original event key so existing requirement-matching labels
+      // remain visible, while the ranker places legacy sub-stages under the
+      // corresponding global phase.
+      latestByStage.set(event.stage.trim().toLocaleLowerCase(), event)
+    })
+    return [...latestByStage.entries()]
+      .sort(([left], [right]) => agentStageRankOf(left) - agentStageRankOf(right))
+      .map(([, event]) => event)
   }, [agentProgress])
   const overallProgress = useMemo(() => requirementAnalysisProgressOf(agentProgress), [agentProgress])
   const matchProgress = useMemo(() => parseRequirementMatchProgress(agentProgress), [agentProgress])
@@ -4314,65 +5516,104 @@ function ChatPage({
   const promptSuggestions = [
     {
       prompt: '@需求分析专家 分析需求编号 VISSLM-TSIS-3959',
-      title: '分析需求匹配',
-      description: '按编号核对相似数据',
-      icon: <FileSearchOutlined />
+      title: '分析需求匹配'
     },
     {
       prompt: '按类型统计当前数据',
-      title: '分析数据分布',
-      description: '按对象类型汇总知识库',
-      icon: <BarChartOutlined />
+      title: '分析数据分布'
     },
     {
       prompt: '有哪些最近修改的任务？',
-      title: '查找最近变更',
-      description: '定位近期更新的数据',
-      icon: <FileSearchOutlined />
+      title: '查找最近变更'
     },
     {
       prompt: '知识库中有多少张图片？',
-      title: '统计图片资源',
-      description: '了解已采集图片数量',
-      icon: <PictureOutlined />
-    },
-    {
-      prompt: '当前数据有哪些可用字段？',
-      title: '查看数据结构',
-      description: '确认字段、覆盖率和样例',
-      icon: <DatabaseOutlined />
+      title: '统计图片资源'
     }
   ]
+  const notify = message
+  const activeHistorySession = historySessions.find((session) => session.id === conversationId)
+  const chatTitle = chatSessionTitleOf(activeHistorySession, messages)
+  const chatStatusLabel = loading
+    ? 'Agent 执行中'
+    : agentRunStatus === 'failed'
+      ? '上次任务失败，可重试'
+      : agentRunStatus === 'clarification'
+        ? '等待补充信息'
+        : messages.length
+          ? '可继续提问'
+          : '准备就绪'
 
   return (
-    <div className="chat-page chat-workspace-v2">
-      <aside className="chat-history-panel" aria-label="历史会话">
+    <div className={`chat-page chat-workspace-v2 ${historyCollapsed ? 'history-collapsed' : ''} ${historyMobileOpen ? 'history-mobile-open' : ''} ${userNearBottom ? 'user-near-bottom' : 'user-browsing'}`}>
+      <aside
+        className={`chat-history-panel ${historyCollapsed ? 'is-collapsed' : ''} ${historyMobileOpen ? 'is-mobile-open' : ''}`}
+        aria-label="历史会话"
+        aria-hidden={historyCollapsed && !historyMobileOpen ? true : undefined}
+      >
         <div className="chat-history-panel-header">
           <div className="chat-history-title">
             <HistoryOutlined />
             <span>历史会话</span>
           </div>
-          <Button
-            type="text"
-            icon={<ReloadOutlined />}
-            loading={historyRefreshing}
-            aria-label="刷新历史会话"
-            onClick={() => void refreshHistory()}
-          />
+          <div className="chat-history-panel-actions">
+            <Button
+              type="text"
+              icon={<ReloadOutlined />}
+              loading={historyRefreshing}
+              aria-label="刷新历史会话"
+              onClick={() => void refreshHistory()}
+            />
+            <Button
+              className="chat-history-toggle"
+              type="text"
+              icon={<LeftOutlined />}
+              aria-label={historyMobileOpen ? '关闭历史会话' : '收起历史会话'}
+              title={historyMobileOpen ? '关闭历史会话' : '收起历史会话'}
+              onClick={() => {
+                if (historyMobileOpen) setHistoryMobileOpen(false)
+                else setHistoryCollapsed(true)
+              }}
+            />
+          </div>
         </div>
         <div className="chat-history-panel-body">
-          <Text type="secondary" className="chat-history-hint">
-            点击会话可继续提问
-          </Text>
+          <div className="chat-history-tools">
+            <Text type="secondary" className="chat-history-hint">
+              点击会话可继续提问
+            </Text>
+            <Input
+              className="chat-history-search"
+              allowClear
+              prefix={<SearchOutlined aria-hidden="true" />}
+              value={historyQuery}
+              aria-label="搜索历史会话"
+              placeholder="搜索标题或预览"
+              onChange={(event) => setHistoryQuery(event.target.value)}
+            />
+            <div className="chat-history-result-row" aria-live="polite">
+              <Text type="secondary" className="chat-history-result-count">
+                {historyQuery.trim()
+                  ? `找到 ${filteredHistorySessions.length} / ${historySessions.length} 个会话`
+                  : `${historySessions.length} 个会话`}
+              </Text>
+              {historyQuery.trim() && (
+                <Button type="link" size="small" onClick={() => setHistoryQuery('')}>
+                  清除搜索
+                </Button>
+              )}
+            </div>
+          </div>
           {historyLoading ? (
             <div className="chat-history-loading"><Spin /></div>
-          ) : historySessions.length ? (
+          ) : filteredHistorySessions.length ? (
             <div className="chat-history-list">
-              {historySessions.map((session) => (
+              {filteredHistorySessions.map((session) => (
                 <div
                   role="button"
                   tabIndex={loading || historyLoading ? -1 : 0}
                   aria-disabled={loading || historyLoading}
+                  aria-label={`打开历史会话：${session.title}`}
                   className={`chat-history-item ${session.id === conversationId ? 'active' : ''}`}
                   key={session.id}
                   onClick={() => requestLoadSession(session)}
@@ -4411,20 +5652,53 @@ function ChatPage({
             <Empty
               className="chat-history-empty"
               image={Empty.PRESENTED_IMAGE_SIMPLE}
-              description="暂无历史会话"
+              description={historySessions.length ? '没有匹配的历史会话' : '暂无历史会话'}
             />
           )}
         </div>
       </aside>
+      {historyMobileOpen && (
+        <button
+          type="button"
+          className="chat-history-backdrop"
+          tabIndex={-1}
+          aria-label="关闭历史会话"
+          onClick={() => setHistoryMobileOpen(false)}
+        />
+      )}
       <Card className="chat-card">
         <div className="chat-toolbar chat-toolbar-v2">
+          <Button
+            className="chat-history-toggle chat-history-reopen"
+            type="text"
+            icon={<RightOutlined />}
+            aria-label="展开历史会话"
+            title="展开历史会话"
+            onClick={() => setHistoryCollapsed(false)}
+          />
+          <Button
+            className="chat-history-mobile-toggle"
+            type="text"
+            icon={<HistoryOutlined />}
+            aria-label={historyMobileOpen ? '关闭历史会话' : '打开历史会话'}
+            aria-expanded={historyMobileOpen}
+            onClick={() => setHistoryMobileOpen((open) => !open)}
+          />
           <div className="chat-session-label">
             <MessageOutlined />
             <div className="chat-session-copy">
-              <Text strong>{messages.length ? '工作会话' : '新的数据任务'}</Text>
-              <Text type="secondary">
-                {messages.length ? `${messages.length} 条消息` : '从问题开始，让 Agent 执行可核验的查询'}
+              <Text
+                strong
+                className="chat-session-title"
+                data-chat-session-title={chatTitle}
+                title={chatTitle}
+              >
+                {chatTitle}
               </Text>
+              <span className={`chat-session-status ${loading ? 'running' : agentRunStatus === 'failed' ? 'failed' : agentRunStatus === 'clarification' ? 'waiting' : 'ready'}`}>
+                <span className="chat-session-status-dot" aria-hidden="true" />
+                <span>{messages.length ? `${messages.length} 条消息 · ${chatStatusLabel}` : chatStatusLabel}</span>
+              </span>
             </div>
           </div>
           <div className="chat-toolbar-actions">
@@ -4432,10 +5706,6 @@ function ChatPage({
               <span className={`chat-health-item ${modelOnline === true ? 'success' : modelOnline === false ? 'error' : 'pending'}`}>
                 {modelOnline === true ? <CheckCircleOutlined /> : modelOnline === false ? <ExclamationCircleOutlined /> : <InfoCircleOutlined />}
                 <span>{modelOnline === true ? '模型可用' : modelOnline === false ? '模型离线' : '检测模型'}</span>
-              </span>
-              <span className={`chat-health-item ${hasData ? 'success' : 'warning'}`}>
-                <DatabaseOutlined />
-                <span>{workspaceStatsLoading ? '读取数据' : hasData ? `${dataRecordCount} 条记录` : '暂无数据'}</span>
               </span>
             </div>
             <Button
@@ -4449,86 +5719,64 @@ function ChatPage({
             </Button>
           </div>
         </div>
-        <div className="message-list" ref={messageListRef}>
+        <div className="chat-message-region">
+        <div
+          className="message-list"
+          ref={messageListRef}
+          role="log"
+          aria-label="当前会话消息"
+          aria-live="polite"
+          onScroll={handleMessageScroll}
+        >
           {messages.length === 0 ? (
-            <div className="chat-empty chat-welcome">
-              <div className="chat-welcome-hero">
-                <div className="assistant-orb">
-                  <ThemedAppIcon alt="VISSLM AI" />
-                  <span className="assistant-orb-status" />
-                </div>
-                <div className="chat-welcome-copy">
-                  <Tag className="knowledge-ready-tag" icon={hasKnowledge ? <CheckCircleOutlined /> : <BulbOutlined />}>
-                    {hasKnowledge ? '知识库可检索' : '知识库待准备'}
-                  </Tag>
-                  <Title level={3}>把数据问题交给 Agent</Title>
-                  <Text type="secondary" className="chat-empty-description">
-                    先确认事实，再给出结论；每个查询都可展开查看原始记录和依据。
-                  </Text>
-                </div>
+            <div className="chat-empty chat-welcome chat-minimal-welcome">
+              <div className="chat-minimal-intro">
+                <Title level={3}>把数据问题交给 Agent</Title>
+                <Text type="secondary" className="chat-empty-description">
+                  先确认事实，再给出结论；需要时可展开查看依据。
+                </Text>
               </div>
-              <div className="chat-welcome-status-grid">
-                <div className={modelOnline === true ? 'ready' : modelOnline === false ? 'blocked' : 'pending'}>
-                  {modelOnline === true ? <CheckCircleOutlined /> : modelOnline === false ? <ExclamationCircleOutlined /> : <InfoCircleOutlined />}
-                  <span>
-                    <strong>{modelOnline === true ? '模型服务已连接' : modelOnline === false ? '模型服务未连接' : '正在检测模型服务'}</strong>
-                    <small>{modelName || '请在系统配置中选择模型'}</small>
-                  </span>
-                  {modelOnline === false && <Button type="link" size="small" onClick={onOpenSettings}>去配置</Button>}
-                </div>
-                <div className={hasData ? 'ready' : 'blocked'}>
-                  {hasData ? <CheckCircleOutlined /> : <ExclamationCircleOutlined />}
-                  <span>
-                    <strong>{hasData ? '数据资产可用' : '还没有可查询数据'}</strong>
-                    <small>{hasData ? `${dataRecordCount} 条记录 · ${workspaceStats?.indexedChunkCount ?? 0} 个索引分块` : '先完成一次数据采集'}</small>
-                  </span>
-                  {!hasData && <Button type="link" size="small" onClick={onOpenSync}>去采集</Button>}
-                </div>
+              <div className="chat-minimal-status" aria-label="AI 工作区状态">
+                <span className={`chat-minimal-status-item ${modelOnline === true ? 'ready' : modelOnline === false ? 'blocked' : 'pending'}`}>
+                  {modelOnline === true ? <CheckCircleOutlined aria-hidden="true" /> : modelOnline === false ? <ExclamationCircleOutlined aria-hidden="true" /> : <InfoCircleOutlined aria-hidden="true" />}
+                  <span>{modelOnline === true ? '模型可用' : modelOnline === false ? '模型未连接' : '检测模型'}</span>
+                  {modelOnline === false && <Button type="link" size="small" onClick={onOpenSettings}>配置</Button>}
+                </span>
+                <span className={`chat-minimal-status-item ${hasData ? 'ready' : 'blocked'}`}>
+                  {hasData ? <CheckCircleOutlined aria-hidden="true" /> : <ExclamationCircleOutlined aria-hidden="true" />}
+                  <span>{hasData ? `${dataRecordCount} 条数据` : '暂无数据'}</span>
+                </span>
+                <span className={`chat-minimal-status-item ${hasKnowledge ? 'ready' : 'blocked'}`}>
+                  {hasKnowledge ? <CheckCircleOutlined aria-hidden="true" /> : <BulbOutlined aria-hidden="true" />}
+                  <span>{hasKnowledge ? '知识库就绪' : '知识库待准备'}</span>
+                </span>
               </div>
-              {modelOnline === false && (
-                <Alert
-                  className="chat-welcome-alert"
-                  type="warning"
-                  showIcon
-                  icon={<ExclamationCircleOutlined />}
-                  title="当前不能执行模型任务"
-                  description="请检查模型地址、模型名称和 API Key。"
-                  action={<Button size="small" onClick={onOpenSettings}>打开配置</Button>}
-                />
-              )}
-              <div className="chat-task-prompt-heading">
-                <div>
-                  <Text strong>从一个具体问题开始</Text>
-                  <Text type="secondary">常用任务</Text>
-                </div>
-                <Tag icon={<InfoCircleOutlined />}>支持自然语言追问</Tag>
-              </div>
-              <div className="prompt-grid">
+              <div className="prompt-grid chat-minimal-prompts" aria-label="快捷问题">
                 {promptSuggestions.map((item) => (
                   <Button
-                    className="prompt-card"
+                    className="prompt-card chat-minimal-prompt"
                     key={item.prompt}
+                    aria-label={`填入快捷问题：${item.title}`}
                     onClick={() => {
                       setQuestion(item.prompt)
                       requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>('.composer textarea')?.focus())
                     }}
                   >
-                    <span className="prompt-card-icon">{item.icon}</span>
-                    <span className="prompt-card-copy">
-                      <strong>{item.title}</strong>
-                      <small>{item.description}</small>
-                    </span>
-                    <span className="prompt-card-arrow">→</span>
+                    <span className="chat-minimal-prompt-label">{item.title}</span>
                   </Button>
                 ))}
               </div>
-              <div className="chat-welcome-footnote">
-                <BulbOutlined />
-                <span>结果会标注数据依据；不确定时会明确说明，而不是补写不存在的结论。</span>
-              </div>
             </div>
           ) : (
-            messages.map((message) => (
+            messages.map((message) => {
+              const messageMetadata = mergeAgentRunMetadata(
+                agentRunMetadataOf(message),
+                messageRunMetadata[message.id] ?? {}
+              )
+              const messageTaskTrace = assistantTaskTraceForMessage(message, messageMetadata)
+              const clarificationQuestion = messageTaskTrace?.clarificationQuestion ||
+                clarificationByMessageId[message.id]
+              return (
               <div className={`message-row ${message.role}`} key={message.id}>
                 <div className="message-avatar">
                   {message.role === 'assistant'
@@ -4551,11 +5799,59 @@ function ChatPage({
                   >
                     <div className="message-body">
                       {message.role === 'assistant' ? (
-                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
+                        <div className="chat-markdown">
+                          <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
+                        </div>
                       ) : (
                         <Paragraph>{message.content}</Paragraph>
                       )}
                     </div>
+                    {message.role === 'assistant' && messageTaskTrace ? (
+                      <AgentTaskSummary task={messageTaskTrace} className="chat-answer-task-summary" />
+                    ) : null}
+                    {message.role === 'assistant' && !messageTaskTrace && (
+                      agentSkillLabelOf(messageMetadata, message.expertId) ||
+                      agentTaskTypeLabelOf(messageMetadata, message)
+                    ) ? (
+                      <div className="chat-answer-meta" aria-label="本次 Agent 任务信息">
+                        {agentSkillLabelOf(messageMetadata, message.expertId) && (
+                          <span className="chat-answer-meta-item">
+                            <span>技能</span>
+                            <strong>{agentSkillLabelOf(messageMetadata, message.expertId)}</strong>
+                          </span>
+                        )}
+                        {agentTaskTypeLabelOf(messageMetadata, message) && (
+                          <span className="chat-answer-meta-item">
+                            <span>任务类型</span>
+                            <strong>{agentTaskTypeLabelOf(messageMetadata, message)}</strong>
+                          </span>
+                        )}
+                      </div>
+                    ) : null}
+                    {message.role === 'assistant' && clarificationQuestion ? (
+                      <div className="chat-clarification" role="status" aria-live="polite">
+                        <div className="chat-clarification-heading">
+                          <InfoCircleOutlined aria-hidden="true" />
+                          <strong>需要补充信息</strong>
+                        </div>
+                        <span>{clarificationQuestion}</span>
+                        <small>已暂停工具执行，补充范围、字段或来源后可继续。</small>
+                      </div>
+                    ) : null}
+                    {message.role === 'assistant' && message.contextStats &&
+                      (message.contextStats.detailOmittedCount > 0 || message.contextStats.requestOmittedCount > 0) && (
+                        <div className="chat-context-summary" role="status">
+                          <InfoCircleOutlined aria-hidden="true" />
+                          <span>
+                            上下文已压缩：保留 {message.contextStats.detailIncludedCount} 条完整详情，
+                            省略 {message.contextStats.detailOmittedCount} 条；
+                            {message.contextStats.requestOmittedCount > 0
+                              ? `另有 ${message.contextStats.requestOmittedCount} 条请求超出单次上限。`
+                              : '完整编号索引仍可核验。'}
+                            {message.contextStats.recoveryHint ? ` ${message.contextStats.recoveryHint}` : ''}
+                          </span>
+                        </div>
+                      )}
                     {message.role === 'assistant' && (
                       <div className="message-tools">
                         <Tooltip title="复制回答">
@@ -4594,6 +5890,7 @@ function ChatPage({
                         </Button>
                         <Text type="secondary">
                           {message.dataViews[0].total} 条
+                          {message.dataViews[0].isPreview ? '（摘要预览）' : ''}
                         </Text>
                       </div>
                     ) : null}
@@ -4610,45 +5907,85 @@ function ChatPage({
                           {message.dashboard.components.length} 个组件
                         </Text>
                       </div>
-                    ) : null}
-                    {message.role === 'assistant' && message.sources?.length ? (
-                      <div className="source-list">
-                        <div className="source-list-title">
-                          <BulbOutlined />
-                          <Text strong>回答依据</Text>
-                          <Text type="secondary" className="source-list-count">{message.sources.length} 条</Text>
-                        </div>
-                        <div className="source-chips">
-                          {message.sources.map((source, index) => (
-                            <Button
-                              type="text"
-                              className="source-chip"
-                              key={`${source.chunkId ?? source.uid}-${index}`}
-                              aria-label={`打开回答依据 ${source.name}`}
-                              onClick={() => source.sourceType === 'document' && source.documentId
-                                ? void openKnowledgeDetail(source.documentId)
-                                : void openRecordDetail({
-                                    uid: source.uid,
-                                    name: source.name,
-                                    nodeType: source.nodeType,
-                                    itemId: source.itemId,
-                                    values: {}
-                                  }, true)}
+                      ) : null}
+                      {message.role === 'assistant' && message.sources?.length ? (
+                        <div className="source-list">
+                          <div className="source-list-title">
+                            <BulbOutlined />
+                            <Text strong>回答依据</Text>
+                            <div
+                              className="source-list-count"
+                              aria-label={`回答依据：${[
+                                chatSourceSummaryOf(message.sources).records
+                                  ? `${chatSourceSummaryOf(message.sources).records} 条数据记录`
+                                  : '',
+                                chatSourceSummaryOf(message.sources).documents
+                                  ? `${chatSourceSummaryOf(message.sources).documents} 份知识文档`
+                                  : ''
+                              ].filter(Boolean).join('，')}`}
                             >
-                              {source.sourceType === 'document' ? <FileTextOutlined /> : <DatabaseOutlined />}
-                              <span>
-                                <strong>[{index + 1}] {source.name}</strong>
-                                <small>{source.location || source.nodeType}{source.snippet ? ` · ${source.snippet.slice(0, 80)}` : ''}</small>
-                              </span>
-                            </Button>
-                          ))}
+                              {chatSourceSummaryOf(message.sources).records > 0 && (
+                                <span className="source-kind-count record">
+                                  <DatabaseOutlined aria-hidden="true" />
+                                  <span>{chatSourceSummaryOf(message.sources).records} 条记录</span>
+                                </span>
+                              )}
+                              {chatSourceSummaryOf(message.sources).documents > 0 && (
+                                <span className="source-kind-count document">
+                                  <FileTextOutlined aria-hidden="true" />
+                                  <span>{chatSourceSummaryOf(message.sources).documents} 份文档</span>
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                          <div className="source-chips">
+                            {message.sources.map((source, index) => {
+                              const sourceIsDocument = source.sourceType === 'document'
+                              const sourceTypeLabel = sourceIsDocument ? '知识文档' : '数据记录'
+                              const sourceLocation = source.location || source.fileName || source.nodeType || '来源详情'
+                              const snippet = source.snippet?.trim()
+                              return (
+                                <Button
+                                  type="text"
+                                  className={`source-chip ${sourceIsDocument ? 'document' : 'record'}`}
+                                  key={`${source.chunkId ?? source.uid}-${index}`}
+                                  aria-label={`打开${sourceTypeLabel}依据：${source.name}`}
+                                  data-source-type={sourceIsDocument ? 'document' : 'record'}
+                                  onClick={() => {
+                                    if (sourceIsDocument) {
+                                      if (source.documentId) void openKnowledgeDetail(source.documentId)
+                                      else notify.warning('该知识文档依据缺少文档标识，暂时无法打开详情')
+                                      return
+                                    }
+                                    void openRecordDetail({
+                                      uid: source.uid,
+                                      name: source.name,
+                                      nodeType: source.nodeType,
+                                      itemId: source.itemId,
+                                      values: {}
+                                    }, true)
+                                  }}
+                                >
+                                  {sourceIsDocument ? <FileTextOutlined aria-hidden="true" /> : <DatabaseOutlined aria-hidden="true" />}
+                                  <span>
+                                    <strong>[{index + 1}] {source.name}</strong>
+                                    <small>
+                                      <span className="source-chip-type">{sourceTypeLabel}</span>
+                                      <span className="source-chip-location"> · {sourceLocation}</span>
+                                      {snippet ? ` · 原文片段：${snippet.slice(0, 80)}` : ''}
+                                    </small>
+                                  </span>
+                                </Button>
+                              )
+                            })}
+                          </div>
                         </div>
-                      </div>
-                    ) : null}
+                      ) : null}
                   </div>
                 </div>
               </div>
-            ))
+              )
+            })
           )}
           {loading && (
             <div className="message-row assistant">
@@ -4658,49 +5995,101 @@ function ChatPage({
               <div className="message-content">
                 <div className="message-meta">
                   <Text strong>VISSLM AI</Text>
-                  <Text type="secondary">正在思考</Text>
+                  <Text type="secondary">{agentRunMetadata.followUp ? '追问处理中' : 'Agent 正在运行'}</Text>
                 </div>
                 <div className="message-bubble thinking">
                   <div className="agent-run-panel" aria-live="polite">
                     <div className="agent-run-current">
                       <span className="thinking-dots"><i /><i /><i /></span>
                       <span>{latestStatus?.message ?? '正在准备任务'}</span>
-                      <Tag>{agentStageLabel[latestStatus?.stage ?? 'route'] ?? '执行中'}</Tag>
+                      <Tag>{agentStageLabelOf(latestStatus?.stage)}</Tag>
                     </div>
-                    <div className="agent-run-steps" aria-label="Agent 执行阶段">
-                      {(visibleAgentProgress.length ? visibleAgentProgress : [{ stage: 'route', message: '准备执行' }]).map((event, index, items) => (
-                        <span className={index === items.length - 1 ? 'active' : 'complete'} key={`${event.stage}-${index}`}>
-                          {index === items.length - 1 ? <InfoCircleOutlined /> : <CheckCircleOutlined />}
-                          <span>{agentStageLabel[event.stage] ?? event.stage}</span>
+                    <AgentTaskSummary
+                      task={agentTaskTrace ?? { status: 'running', invokedAgents: [] }}
+                      className="agent-run-task-summary"
+                    />
+                    {overallProgress && (
+                      <div className="agent-run-progress-compact" aria-label={`整体进度 ${overallProgress.percent}%`}>
+                        <div className="agent-run-progress-compact-heading">
+                          <span>整体进度</span>
+                          <strong>{overallProgress.percent}%</strong>
+                        </div>
+                        <Progress
+                          percent={overallProgress.percent}
+                          showInfo={false}
+                          aria-label={`整体进度 ${overallProgress.percent}%`}
+                        />
+                      </div>
+                    )}
+                    <div className="agent-details-disclosure">
+                      <button
+                        type="button"
+                        className="agent-details-toggle"
+                        aria-expanded={agentDetailsOpen}
+                        onClick={() => setAgentDetailsOpen((open) => !open)}
+                      >
+                        查看执行详情
+                      </button>
+                      {agentDetailsOpen && (
+                      <div className="agent-details-content">
+                    <div className="agent-run-context" aria-label="本次 Agent 任务信息">
+                      <div className="agent-run-context-item">
+                        <span>任务类型</span>
+                        <strong>
+                          {agentTaskTypeLabelOf(agentRunMetadata) ?? (latestStatus ? '识别中' : '待识别')}
+                        </strong>
+                      </div>
+                      <div className="agent-run-context-item">
+                        <span>选择技能</span>
+                        <strong>{agentSkillLabelOf(agentRunMetadata) ?? '自动选择中'}</strong>
+                      </div>
+                      {agentRunMetadata.followUp && (
+                        <Tag className="agent-run-follow-up" icon={<HistoryOutlined />}>
+                          追问 · 沿用会话上下文
+                        </Tag>
+                      )}
+                    </div>
+                    <div className="agent-control-flow" aria-label="Agent 控制流">
+                      {agentControlFlow.map(({ step, state }) => (
+                        <span
+                          className={`agent-control-step ${state}`}
+                          key={step}
+                          aria-current={state === 'active' ? 'step' : undefined}
+                          title={`${agentControlStepLabels[step]}：${agentControlStepDescriptions[step]}`}
+                        >
+                          {state === 'complete'
+                            ? <CheckCircleOutlined aria-hidden="true" />
+                            : state === 'active'
+                              ? <InfoCircleOutlined aria-hidden="true" />
+                              : <span className="agent-control-step-index" aria-hidden="true">{agentControlStepOrder.indexOf(step) + 1}</span>}
+                          <span className="agent-control-step-label">{agentControlStepLabels[step]}</span>
+                          <small>{agentControlStepDescriptions[step]}</small>
                         </span>
                       ))}
                     </div>
-                    {(overallProgress || matchProgress.hasMatch) && (
+                    <div className="agent-run-detail-heading">执行阶段</div>
+                    <div className="agent-run-steps" aria-label="Agent 详细执行阶段">
+                      {(visibleAgentProgress.length ? visibleAgentProgress : [{ stage: 'classify', message: '准备执行' }]).map((event, index) => {
+                        const isActive = latestStatus ? event === latestStatus : index === 0
+                        return (
+                          <span
+                            className={isActive ? 'active' : 'complete'}
+                            key={`${event.stage}-${index}`}
+                            aria-current={isActive ? 'step' : undefined}
+                            title={event.message}
+                          >
+                            {isActive ? <InfoCircleOutlined /> : <CheckCircleOutlined />}
+                            <span>{agentStageLabelOf(event.stage)}</span>
+                          </span>
+                        )
+                      })}
+                    </div>
+                    {matchProgress.hasMatch && (
                       <div className="agent-review-progress" aria-label="需求分析进度">
                         <div className="agent-review-progress-heading">
                           <strong>{matchProgress.hasMatch ? '需求分析匹配进度' : '需求分析进度'}</strong>
                           {matchProgress.hasMatch && <Tag>逐条处理</Tag>}
                         </div>
-                        {overallProgress && (
-                          <div className="agent-overall-progress">
-                            <div className="agent-overall-progress-heading">
-                              <span>整体进度</span>
-                              <strong>{overallProgress.percent}%</strong>
-                            </div>
-                            <Progress
-                              percent={overallProgress.percent}
-                              showInfo={false}
-                              aria-label={`整体进度 ${overallProgress.percent}%`}
-                            />
-                            <div className="agent-overall-progress-details">
-                              <span>当前需求 <strong>{overallProgress.currentItem} / {overallProgress.totalItems}</strong></span>
-                              <span>已完成 <strong>{overallProgress.completedItems} / {overallProgress.totalItems}</strong></span>
-                              {overallProgress.stageCurrent !== undefined && overallProgress.stageTotal !== undefined && (
-                                <span>阶段进度 <strong>{overallProgress.stageCurrent} / {overallProgress.stageTotal}</strong></span>
-                              )}
-                            </div>
-                          </div>
-                        )}
                         {matchProgress.hasMatch && (
                           <div className="agent-review-progress-metrics">
                             <div className="agent-review-progress-metric">
@@ -4731,14 +6120,26 @@ function ChatPage({
                         )}
                       </div>
                     )}
-                    <Text type="secondary" className="agent-run-note">
-                      只使用本地数据和已检索依据，完成后可打开查询明细核对。
-                    </Text>
-                  </div>
+                      </div>
+                      )}
+                    </div>
                 </div>
+              </div>
               </div>
             </div>
           )}
+        </div>
+        {showScrollLatest && (
+          <Button
+            className="chat-scroll-latest"
+            type="default"
+            icon={<DownOutlined aria-hidden="true" />}
+            aria-label="回到最新"
+            onClick={() => scrollToLatest('smooth')}
+          >
+            回到最新
+          </Button>
+        )}
         </div>
         <div className="composer">
           {(dataScope || (artifactAttached && activeArtifact)) && (
@@ -4828,42 +6229,60 @@ function ChatPage({
               }}
               autoSize={{ minRows: 1, maxRows: 5 }}
               variant="borderless"
+              aria-label="输入问题"
               placeholder="直接向 VISSLM AI 提问；需要专业数据处理时 @ 专家…"
             />
-            <div className="composer-footer">
-              <span className="composer-hint">
-                <kbd>Enter</kbd> 发送
-                <span className="composer-hint-divider">·</span>
-                <kbd>Shift + Enter</kbd> 换行
-              </span>
-              <Button
-                size="small"
-                icon={<FundProjectionScreenOutlined />}
-                onClick={() => {
-                  const prefix = question && !question.endsWith(' ') ? `${question} ` : question
-                  updateQuestion(`${prefix}@`)
-                }}
-              >
-                选择专家
-              </Button>
-              <Button
-                className="chat-send-button"
-                type="primary"
-                icon={<SendOutlined />}
-                loading={loading}
-                disabled={!question.trim() || modelOnline !== true}
-                onClick={() => void send()}
-              >
-                发送
-              </Button>
-            </div>
-          </div>
-          <Text type="secondary" className="composer-disclaimer">
-            {modelOnline === false
-              ? '模型未连接，发送前请先完成系统配置'
-              : `${modelName || '当前模型'} · 未 @ 专家时自动判断问题类型`}
-          </Text>
-        </div>
+              <div className="composer-footer composer-toolbar">
+                <div className="composer-toolbar-start">
+                  <Button
+                    className="chat-expert-button"
+                    size="small"
+                    icon={<FundProjectionScreenOutlined aria-hidden="true" />}
+                    aria-label="选择专家"
+                    onClick={() => {
+                      const prefix = question && !question.endsWith(' ') ? `${question} ` : question
+                      updateQuestion(`${prefix}@`)
+                    }}
+                  >
+                    选择专家
+                  </Button>
+                  <span className="composer-hint">
+                    <kbd>Enter</kbd> 发送
+                    <span className="composer-hint-divider">·</span>
+                    <kbd>Shift + Enter</kbd> 换行
+                  </span>
+                </div>
+                <div className="composer-toolbar-end">
+                  <span className={`composer-model-state ${modelOnline === true ? 'online' : modelOnline === false ? 'offline' : 'checking'}`} role="status" aria-live="polite">
+                    <span className="composer-model-dot" aria-hidden="true" />
+                    <span className="composer-model-note composer-disclaimer">
+                      {modelOnline === false
+                        ? '模型未连接'
+                        : modelOnline === true
+                          ? '模型可用'
+                          : '正在检测模型'}
+                    </span>
+                  </span>
+                  {modelOnline === false && (
+                    <Button type="link" size="small" onClick={onOpenSettings}>
+                      去配置
+                    </Button>
+                  )}
+                  <Button
+                    className="chat-send-button"
+                    type="primary"
+                    icon={<SendOutlined aria-hidden="true" />}
+                    aria-label="发送"
+                    loading={loading}
+                    disabled={!question.trim() || modelOnline !== true}
+                    onClick={() => void send()}
+                  >
+                    发送
+                  </Button>
+                </div>
+              </div>
+           </div>
+         </div>
       </Card>
       <Drawer
         title={activeKnowledgeDetail?.fileName ?? '知识库文档'}
@@ -4941,23 +6360,62 @@ function ChatPage({
                     {formatDate(activeRecordDetail.lastModifyTime)}
                   </Descriptions.Item>
                 </Descriptions>
-                {activeRecordDetail.images.length > 0 && (
+                {activeRecordDetail.imageCount > 0 && (
                   <>
                     <Divider titlePlacement="start">图片资源</Divider>
-                    <Image.PreviewGroup>
-                      <div className="image-grid">
-                        {activeRecordDetail.images.map((image) => (
-                          <div className="image-tile" key={image.id}>
-                            <Image
-                              src={image.assetUrl ?? ''}
-                              alt={image.name}
-                              fallback=""
-                            />
-                            <div>{image.name}</div>
-                          </div>
-                        ))}
+                    {activeRecordDetail.imageCount > MAX_CHAT_DETAIL_IMAGES && (
+                      <Text type="secondary">
+                        当前记录包含 {activeRecordDetail.imageCount} 个图片资源，按页加载，每页最多 {MAX_CHAT_DETAIL_IMAGES} 个。
+                      </Text>
+                    )}
+                    <Spin spinning={recordImagesLoading}>
+                      <Image.PreviewGroup>
+                        <div className="image-grid">
+                          {(recordImagePage?.images ?? []).map((image) => (
+                            <div className="image-tile" key={image.id}>
+                              <Image
+                                loading="lazy"
+                                src={image.assetUrl ?? ''}
+                                alt={image.name}
+                                fallback=""
+                              />
+                              <div>{image.name}</div>
+                            </div>
+                          ))}
+                        </div>
+                      </Image.PreviewGroup>
+                    </Spin>
+                    {(recordImagePage?.total ?? 0) > (recordImagePage?.pageSize ?? MAX_CHAT_DETAIL_IMAGES) && (
+                      <div className="chat-image-pagination">
+                        <Button
+                          disabled={(recordImagePage?.page ?? 1) <= 1 || recordImagesLoading}
+                          onClick={() => {
+                            if (!activeRecordDetail || !recordImagePage) return
+                            setRecordImagesLoading(true)
+                            void window.visslm.getRecordImagePage(
+                              activeRecordDetail.uid,
+                              recordImagePage.page - 1,
+                              recordImagePage.pageSize
+                            ).then(setRecordImagePage).finally(() => setRecordImagesLoading(false))
+                          }}
+                        >上一页</Button>
+                        <Text type="secondary">
+                          第 {recordImagePage?.page ?? 1} / {Math.ceil((recordImagePage?.total ?? 0) / (recordImagePage?.pageSize ?? MAX_CHAT_DETAIL_IMAGES))} 页
+                        </Text>
+                        <Button
+                          disabled={!recordImagePage || recordImagePage.page * recordImagePage.pageSize >= recordImagePage.total || recordImagesLoading}
+                          onClick={() => {
+                            if (!activeRecordDetail || !recordImagePage) return
+                            setRecordImagesLoading(true)
+                            void window.visslm.getRecordImagePage(
+                              activeRecordDetail.uid,
+                              recordImagePage.page + 1,
+                              recordImagePage.pageSize
+                            ).then(setRecordImagePage).finally(() => setRecordImagesLoading(false))
+                          }}
+                        >下一页</Button>
                       </div>
-                    </Image.PreviewGroup>
+                    )}
                   </>
                 )}
                 <Divider titlePlacement="start">知识文本</Divider>
@@ -4982,7 +6440,7 @@ function ChatPage({
                 <div className="chat-data-summary">
                   <div>
                     <strong>{activeDataView.total}</strong>
-                    <span>查询命中</span>
+                    <span>查询命中{activeDataView.isPreview ? '（当前为摘要预览）' : ''}</span>
                   </div>
                   <Text type="secondary">{activeDataView.description}</Text>
                 </div>
@@ -4991,7 +6449,7 @@ function ChatPage({
                     <Text strong>查看分组</Text>
                     <Select
                       value={selectedDataGroup?.name}
-                      onChange={setActiveDataGroup}
+                      onChange={changeActiveDataGroup}
                       options={activeDataView.groups.map((group) => ({
                         value: group.name,
                         label: `${group.name}（${group.count} 条）`
@@ -5007,6 +6465,9 @@ function ChatPage({
                       <Text type="secondary">
                         共 {selectedDataGroup.count} 条，当前展示{' '}
                         {selectedDataGroup.rows.length} 条
+                        {(activeDataView.isPreview || selectedDataGroupPageable) && selectedDataGroup.rows.length < selectedDataGroup.count
+                          ? '（其余记录按需查询）'
+                          : ''}
                       </Text>
                     </div>
                     <ResizableTable<ChatDataRow>
@@ -5016,11 +6477,22 @@ function ChatPage({
                       dataSource={selectedDataGroup.rows}
                       scroll={{ x: 960, y: appTableScrollY }}
                       pagination={{
+                        current: selectedDataGroupPageable ? dataViewPage : undefined,
                         pageSize: 20,
+                        ...(selectedDataGroupPageable
+                          ? {
+                              pageSize: dataViewPageSize,
+                              total: selectedDataGroup.count,
+                              onChange: (page: number, nextPageSize: number) => {
+                                void loadDataViewPage(activeDataView, selectedDataGroup.name, page, nextPageSize)
+                              }
+                            }
+                          : {}),
                         showSizeChanger: true,
                         pageSizeOptions: [20, 50, 100],
                         showTotal: (count) => `当前清单 ${count} 条`
                       }}
+                      loading={dataViewPageLoading}
                       columns={[
                         {
                           title: '名称',
@@ -5890,26 +7362,48 @@ function PushPage({
   onPushed: () => void
 }): React.JSX.Element {
   const { message, modal } = AntApp.useApp()
-  const [form] = Form.useForm<Omit<PushConfig, 'recordUids'>>()
-  const [fieldMappings, setFieldMappings] = useState<PushFieldMapping[]>([])
+  const [storedDraft] = useState<PushConfigDraft | null>(() => readPushConfigDraft())
+  const [form] = Form.useForm<PushFormValues>()
+  const [formValues, setFormValues] = useState<Partial<PushFormValues>>(() => ({
+    insertAfterId: '-1',
+    ...(storedDraft?.formValues ?? {})
+  }))
+  const [fieldMappings, setFieldMappings] = useState<PushFieldMapping[]>(() => storedDraft?.fieldMappings ?? [])
+  const mappingInitializedRef = useRef(storedDraft?.mappingInitialized ?? false)
   const [records, setRecords] = useState<RecordRow[]>([])
   const [total, setTotal] = useState(0)
-  const [page, setPage] = useState(1)
-  const [pageSize, setPageSize] = useState(20)
-  const [search, setSearch] = useState('')
-  const [releaseText, setReleaseText] = useState<string | undefined>(undefined)
+  const [page, setPage] = useState(storedDraft?.page ?? 1)
+  const [pageSize, setPageSize] = useState(storedDraft?.pageSize ?? 20)
+  const [search, setSearch] = useState(storedDraft?.search ?? '')
+  const [releaseText, setReleaseText] = useState<string | undefined>(storedDraft?.releaseText)
   const [releaseValues, setReleaseValues] = useState<RecordReleaseValue[]>([])
   const [releaseValuesLoading, setReleaseValuesLoading] = useState(false)
   const [loading, setLoading] = useState(false)
   const [previewing, setPreviewing] = useState(false)
   const [pushing, setPushing] = useState(false)
-  const [selectedRowKeys, setSelectedRowKeys] = useState<string[]>([])
+  const [selectedRowKeys, setSelectedRowKeys] = useState<string[]>(() => storedDraft?.selectedRowKeys ?? [])
   const [selectingAll, setSelectingAll] = useState(false)
   const [result, setResult] = useState<PushResult | null>(null)
   const [pushLogs, setPushLogs] = useState<PushLogRow[]>([])
   const [pushLogTotal, setPushLogTotal] = useState(0)
   const [logsLoading, setLogsLoading] = useState(false)
   const [activeTab, setActiveTab] = useState<'config' | 'logs'>('config')
+
+  useEffect(() => {
+    const draft: PushConfigDraft = {
+      version: 1,
+      formValues,
+      fieldMappings,
+      mappingInitialized: mappingInitializedRef.current,
+      selectedRowKeys,
+      search,
+      ...(releaseText !== undefined ? { releaseText } : {}),
+      page,
+      pageSize
+    }
+    writePushConfigDraft(draft)
+    return () => writePushConfigDraft(draft)
+  }, [fieldMappings, formValues, page, pageSize, releaseText, search, selectedRowKeys])
 
   const load = useCallback(async (): Promise<void> => {
     setLoading(true)
@@ -5958,6 +7452,40 @@ function PushPage({
     void loadReleaseValues()
   }, [loadReleaseValues, refreshKey])
 
+  // The first visible record is the source of the initial field list. If the
+  // current page is temporarily empty, fall back to the first selected UID
+  // so a restored draft can still initialize while the table is loading.
+  const firstMappingRecordUid = records[0]?.uid ?? selectedRowKeys[0]
+
+  useEffect(() => {
+    const initializingDefaults = !mappingInitializedRef.current
+    const inspectingLegacyDefaults = !initializingDefaults &&
+      fieldMappings.length > 0 &&
+      fieldMappings.every((mapping) => mapping.sourceField === mapping.targetField)
+    if ((!initializingDefaults && !inspectingLegacyDefaults) || !firstMappingRecordUid) return
+    let canceled = false
+    // The mapping needs only raw attributes; avoid loading the record's image
+    // collection just to build the initial key list.
+    const loadRecord = window.visslm.getRecordForChat ?? window.visslm.getRecord
+    if (typeof loadRecord !== 'function') return
+    void loadRecord(firstMappingRecordUid)
+      .then((detail) => {
+        if (canceled || !detail) return
+        if (initializingDefaults && mappingInitializedRef.current) return
+        const raw = isRecordObject(detail.raw) ? detail.raw : {}
+        if (inspectingLegacyDefaults && !isLegacyDefaultPushFieldMappings(fieldMappings, raw)) return
+        mappingInitializedRef.current = true
+        setFieldMappings(buildDefaultPushFieldMappings(raw))
+        setResult(null)
+      })
+      .catch(() => {
+        // A transient detail lookup failure should not prevent a manual mapping.
+      })
+    return () => {
+      canceled = true
+    }
+  }, [fieldMappings, firstMappingRecordUid, refreshKey])
+
   const clearSelection = (): void => {
     setSelectedRowKeys([])
     setResult(null)
@@ -6004,13 +7532,16 @@ function PushPage({
       if (!mapping.sourceField.trim() || !mapping.targetField.trim()) {
         throw new Error('请完整填写字段映射的源属性 Key 和目标属性 Key')
       }
-      if (!/^[A-Za-z_][A-Za-z0-9_.]*$/.test(mapping.sourceField.trim())) {
+      if (!pushMappingIdentifierPattern.test(mapping.sourceField.trim())) {
         throw new Error(`源属性 Key ${mapping.sourceField} 格式无效`)
       }
-      if (!/^[A-Za-z_][A-Za-z0-9_.]*$/.test(mapping.targetField.trim())) {
+      if (pushForbiddenSourceFields.has(mapping.sourceField.trim())) {
+        throw new Error(`源属性 Key ${mapping.sourceField} 是消息体禁止字段`)
+      }
+      if (!pushMappingIdentifierPattern.test(mapping.targetField.trim())) {
         throw new Error(`目标属性 Key ${mapping.targetField} 格式无效`)
       }
-      if (['_valm_Uid', '_valm_NodeType', '_valm_ItemID'].includes(mapping.targetField.trim())) {
+      if (pushForbiddenTargetFields.has(mapping.targetField.trim())) {
         throw new Error(`目标属性 Key ${mapping.targetField} 是消息体禁止字段`)
       }
     }
@@ -6039,6 +7570,7 @@ function PushPage({
   }
 
   const addFieldMapping = (): void => {
+    mappingInitializedRef.current = true
     setFieldMappings((current) => [
       ...current,
       { id: crypto.randomUUID(), sourceField: '', targetField: '' }
@@ -6050,6 +7582,7 @@ function PushPage({
     id: string,
     patch: Partial<PushFieldMapping>
   ): void => {
+    mappingInitializedRef.current = true
     setFieldMappings((current) =>
       current.map((mapping) => mapping.id === id ? { ...mapping, ...patch } : mapping)
     )
@@ -6057,6 +7590,7 @@ function PushPage({
   }
 
   const removeFieldMapping = (id: string): void => {
+    mappingInitializedRef.current = true
     setFieldMappings((current) => current.filter((mapping) => mapping.id !== id))
     setResult(null)
   }
@@ -6094,7 +7628,7 @@ function PushPage({
       content: (
         <div className="push-confirm-copy">
           <span>
-            图片资源会先逐项上传或复用，然后才调用 <code>/alm/rest/items</code> 执行真实 POST 写入。
+            图片资源会先逐项调用 <code>UploadRichImg</code>，同一记录内相同内容只复用本次上传结果，然后才调用 <code>/alm/rest/items</code> 执行真实 POST 写入。
           </span>
           <span className="push-confirm-warning">
             任一记录的图片上传失败时，该记录不会创建；请先检查请求预览中的资源状态、参数和消息体。
@@ -6181,8 +7715,11 @@ function PushPage({
           form={form}
           layout="vertical"
           className="compact-push-form"
-          initialValues={{ insertAfterId: '-1' }}
-          onValuesChange={() => setResult(null)}
+          initialValues={formValues}
+          onValuesChange={(_changedValues, values) => {
+            setFormValues(values)
+            setResult(null)
+          }}
         >
           <Row gutter={[14, 0]}>
             <Col xs={24} md={12}>
@@ -6247,7 +7784,7 @@ function PushPage({
           <div className="push-mapping-heading">
             <div>
               <Text strong>字段映射</Text>
-              <Text type="secondary">将本地属性重命名为目标平台属性 Key</Text>
+              <Text type="secondary">首次加载默认取第一条记录的属性；未映射属性不会写入消息体</Text>
             </div>
             <Button icon={<PlusOutlined />} onClick={addFieldMapping}>
               新增映射
@@ -6314,7 +7851,7 @@ function PushPage({
             />
           ) : (
             <div className="push-mapping-empty">
-              暂无字段映射，未配置的属性将保持原 Key
+              暂无字段映射，未映射属性不会写入请求消息体
             </div>
           )}
         </div>
@@ -6323,8 +7860,8 @@ function PushPage({
           showIcon
           type="warning"
           className="compact-push-alert"
-          title="图片先上传/复用；失败会阻止对应记录创建"
-          description="测试预览不上传图片也不发送请求；真实推送会先完成全部图片资源处理，再调用 /alm/rest/items，并强制移除 _valm_Uid、_valm_NodeType 和 _valm_ItemID。"
+          title="图片先上传；失败会阻止对应记录创建"
+          description="请求消息体仅保留字段映射表中的属性；测试预览不上传图片也不发送请求；真实推送会先完成全部图片资源处理，再调用 /alm/rest/items，并强制移除 _valm_Uid、_valm_NodeType 和 _valm_ItemID。"
         />
       </Card>}
 
@@ -6344,7 +7881,11 @@ function PushPage({
             allowClear
             aria-label="搜索待推送数据"
             placeholder="搜索名称、编号和正文"
+            defaultValue={search}
             onSearch={(value) => applyRecordFilter(value, releaseText)}
+            onChange={(event) => {
+              if (!event.target.value && search) applyRecordFilter('', releaseText)
+            }}
             style={{ width: 320 }}
           />
           <Select<string>
@@ -6474,7 +8015,7 @@ function PushPage({
               title="图片资源失败会阻止对应记录创建"
               description={
                 result.preview
-                  ? '预览已标记失败资源；真实推送时必须先完成全部图片上传或复用，才会调用 /alm/rest/items。'
+                  ? '预览已标记失败资源；真实推送时必须先完成全部图片上传，才会调用 /alm/rest/items。'
                   : `有 ${resultImageStats.failed} 个图片资源未上传成功，对应记录未调用 /alm/rest/items。`
               }
             />
@@ -6905,7 +8446,8 @@ function SettingsPage({
       platformForm.setFieldsValue({
         baseUrl: settings.platform.baseUrl,
         username: settings.platform.username,
-        token: ''
+        token: '',
+        uploadPassword: ''
       })
     }
     if (settingsTab === 'model') {
@@ -6957,7 +8499,7 @@ function SettingsPage({
   const savePlatform = async (values: PlatformSettingsInput): Promise<void> => {
     const next = await window.visslm.savePlatformSettings(values)
     onChanged(next)
-    platformForm.setFieldValue('token', '')
+    platformForm.setFieldsValue({ token: '', uploadPassword: '' })
     message.success('平台配置已安全保存')
   }
 
@@ -7216,6 +8758,20 @@ function SettingsPage({
                     </Form.Item>
                     <Form.Item label="用户名" name="username" rules={[{ required: true, message: '请输入用户名' }]}>
                       <Input autoComplete="off" />
+                    </Form.Item>
+                    <Form.Item
+                      label="平台登录密码（用于显示名查询和富文本图片上传）"
+                      name="uploadPassword"
+                      extra={settings?.platform.hasUploadPassword
+                        ? '已使用操作系统安全存储加密；留空继续使用原密码。用户属性 Key 非空时，采集需用此密码解析显示名；含图片推送时也需要此密码。'
+                        : '密码将使用操作系统安全存储加密；用户属性 Key 非空时，采集需用此密码解析显示名；含图片推送时也需要此密码。'}
+                    >
+                      <Input.Password
+                        autoComplete="new-password"
+                        placeholder={settings?.platform.hasUploadPassword
+                          ? '••••••••'
+                          : '输入 VISSLM 网页登录密码'}
+                      />
                     </Form.Item>
                     <Form.Item
                       label="API Token"
@@ -7815,16 +9371,14 @@ function AppShell({ themeMode, onThemeModeChange }: AppProps): React.JSX.Element
           setLoading={setChatLoading}
           activeArtifact={generatedDashboard}
           activeArtifactVersion={generatedDashboardVersion}
-          onDashboardUpdate={updateGeneratedDashboard}
-          dataScope={chatDataScope}
-          dataScopeSummary={chatDataScopeSummary}
-          conversationId={chatConversationId}
-          onConversationIdChange={setChatConversationId}
-          modelOnline={modelOnline}
-          modelName={settings?.model.model}
-          onOpenSettings={() => setPage('settings')}
-          onOpenSync={() => setPage('sync')}
-          refreshKey={refreshKey}
+           onDashboardUpdate={updateGeneratedDashboard}
+           dataScope={chatDataScope}
+           dataScopeSummary={chatDataScopeSummary}
+           conversationId={chatConversationId}
+           onConversationIdChange={setChatConversationId}
+           modelOnline={modelOnline}
+           onOpenSettings={() => setPage('settings')}
+           refreshKey={refreshKey}
           onClearDataScope={() => {
             setChatDataScope(null)
             setChatDataScopeSummary('')

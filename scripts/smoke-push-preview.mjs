@@ -132,6 +132,8 @@ console.log(JSON.stringify({
   fieldMappingApplied:
     !('_valm_LastModifyTime' in request.body) &&
     'MappedLastModifyTime' in request.body,
+  bodyAllowListed:
+    Object.keys(request.body).every((key) => key === 'MappedLastModifyTime'),
   ui,
   screenshot,
   debugScreenshot

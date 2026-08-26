@@ -38,7 +38,21 @@ export interface AgentProgress {
 }
 
 export type AgentEvent =
-  | { type: 'status'; stage: string; message: string; progress?: AgentProgress }
+  | {
+      type: 'status'
+      stage: string
+      message: string
+      progress?: AgentProgress
+      /** Auditable control metadata; never derived from status prose. */
+      metadata?: {
+        expertId?: ExpertId
+        taskType?: string
+        sourceMode?: string
+        resultMode?: string
+        followUp?: boolean
+        clarificationQuestion?: string
+      }
+    }
   | { type: 'text'; content: string }
   | { type: 'artifact'; artifactId: string; version: number; dashboard: DashboardSpec }
   | {

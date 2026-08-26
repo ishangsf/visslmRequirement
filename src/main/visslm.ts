@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import type {
   ConnectionResult,
   DataReviewApplyResult,
@@ -12,6 +12,10 @@ import type {
   SyncResult,
   SyncScopeConfig
 } from '../shared/types'
+import {
+  pushForbiddenSourceFields,
+  pushForbiddenTargetFields
+} from '../shared/push-field-mapping'
 import { AppDatabase, type RecordInput } from './database'
 import {
   findRichTextImageSources,
@@ -35,6 +39,7 @@ interface Credentials {
   baseUrl: string
   username: string
   token: string
+  uploadPassword?: string
   userPropertyKeys?: string[]
 }
 
@@ -51,6 +56,18 @@ class VisslmRequestError extends Error {
   ) {
     super(message)
     this.name = 'VisslmRequestError'
+  }
+}
+
+/** A GET that was expected to be JSON returned a page or another text body. */
+class VisslmInvalidJsonResponseError extends Error {
+  constructor(
+    message: string,
+    readonly httpStatus: number,
+    readonly loginPage: boolean
+  ) {
+    super(message)
+    this.name = 'VisslmInvalidJsonResponseError'
   }
 }
 
@@ -153,18 +170,122 @@ export const normalizeText = (
 }
 
 const imageExtension = /\.(png|jpe?g|gif|webp|bmp|svg)(?:$|[?#])/i
+const MAX_JPEG_TRAILING_BYTES = 64 * 1024
+
+const richImageMimeExtensions: Readonly<Record<string, string>> = {
+  'image/avif': '.avif',
+  'image/bmp': '.bmp',
+  'image/gif': '.gif',
+  'image/heic': '.heic',
+  'image/heif': '.heif',
+  'image/jpeg': '.jpg',
+  'image/jpg': '.jpg',
+  'image/png': '.png',
+  'image/svg+xml': '.svg',
+  'image/tiff': '.tif',
+  'image/webp': '.webp',
+  'image/x-icon': '.ico'
+}
+
+const normalizeRichImageMimeType = (input: string): string => {
+  const candidate = input.trim().toLowerCase().split(';', 1)[0] || 'application/octet-stream'
+  // A few older VISSLM deployments report image/jpg.  Keep the original
+  // extension mapping below, but send the standards spelling in the part
+  // headers so multipart parsers do not reject the upload.
+  return candidate === 'image/jpg' ? 'image/jpeg' : candidate
+}
+
+const normalizeRichImageFileName = (input: string, mimeType: string): string => {
+  const extension = richImageMimeExtensions[mimeType] ?? ''
+  let name = input
+    .trim()
+    .replace(/[?#].*$/, '')
+    .replace(/[\\/\u0000-\u001f\u007f]/g, '_')
+    .trim()
+  if (!name || name === '.' || name === '..') name = 'image'
+  // Rich-text references collected from HTML use the generic label
+  // “富文本图片”, which has no suffix.  Old multipart handlers often infer
+  // the stored file type from the filename, so append a MIME-compatible
+  // suffix when the caller did not provide one.
+  if (extension && !/\.[A-Za-z0-9]{1,12}$/.test(name)) name += extension
+  if (name.length <= 180) return name
+  const suffix = extension && name.toLocaleLowerCase().endsWith(extension)
+    ? extension
+    : ''
+  const stemLength = Math.max(1, 180 - suffix.length)
+  return `${name.slice(0, stemLength)}${suffix}`
+}
 
 const imageBytesMatchMime = (mimeType: string, bytes: Buffer): boolean => {
   const mime = mimeType.trim().toLowerCase()
+  if (!bytes.byteLength) return false
   if (!mime.startsWith('image/')) return false
-  if (mime === 'image/png') return bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
-  if (mime === 'image/jpeg' || mime === 'image/jpg') return bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff
-  if (mime === 'image/gif') return bytes.subarray(0, 6).toString('ascii') === 'GIF87a' || bytes.subarray(0, 6).toString('ascii') === 'GIF89a'
-  if (mime === 'image/webp') return bytes.length >= 12 && bytes.subarray(0, 4).toString('ascii') === 'RIFF' && bytes.subarray(8, 12).toString('ascii') === 'WEBP'
-  if (mime === 'image/bmp') return bytes.subarray(0, 2).toString('ascii') === 'BM'
-  if (mime === 'image/svg+xml') return /^\s*(?:<\?xml[^>]*>\s*)?<svg\b/i.test(bytes.subarray(0, 4096).toString('utf8'))
+  if (mime === 'image/png') {
+    return bytes.length >= 24 &&
+      bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) &&
+      bytes.subarray(bytes.length - 8, bytes.length - 4).equals(Buffer.from('IEND', 'ascii'))
+  }
+  if (mime === 'image/jpeg' || mime === 'image/jpg') {
+    if (bytes.length < 5 || bytes[0] !== 0xff || bytes[1] !== 0xd8 || bytes[2] !== 0xff) return false
+    const eoi = bytes.lastIndexOf(Buffer.from([0xff, 0xd9]))
+    if (eoi < 3) return false
+    return bytes.length - (eoi + 2) <= MAX_JPEG_TRAILING_BYTES
+  }
+  if (mime === 'image/gif') {
+    return bytes.length >= 7 &&
+      (bytes.subarray(0, 6).toString('ascii') === 'GIF87a' || bytes.subarray(0, 6).toString('ascii') === 'GIF89a') &&
+      bytes[bytes.length - 1] === 0x3b
+  }
+  if (mime === 'image/webp') {
+    if (bytes.length < 12 || bytes.subarray(0, 4).toString('ascii') !== 'RIFF' ||
+      bytes.subarray(8, 12).toString('ascii') !== 'WEBP') return false
+    const declaredLength = bytes.readUInt32LE(4)
+    return declaredLength >= 4 && declaredLength <= bytes.length - 8
+  }
+  if (mime === 'image/bmp') {
+    if (bytes.length < 14 || bytes.subarray(0, 2).toString('ascii') !== 'BM') return false
+    const declaredLength = bytes.readUInt32LE(2)
+    return declaredLength >= 14 && declaredLength <= bytes.length
+  }
+  if (mime === 'image/svg+xml') {
+    const text = bytes.subarray(0, Math.min(bytes.length, 64 * 1024)).toString('utf8')
+    return /^\s*(?:<\?xml[^>]*>\s*)?<svg\b/i.test(text) && /<\/svg\s*>/i.test(text)
+  }
   return true
 }
+
+const redactUrlForError = (input: string | URL): string => {
+  try {
+    const safe = new URL(input.toString())
+    safe.username = ''
+    safe.password = ''
+    safe.hash = ''
+    for (const key of [...safe.searchParams.keys()]) {
+      if (/(?:token|secret|password|passwd|cookie|auth|credential|key)/i.test(key)) {
+        safe.searchParams.delete(key)
+      }
+    }
+    return safe.toString()
+  } catch {
+    return '[已脱敏 URL]'
+  }
+}
+
+const imagePayloadDiagnostic = (input: {
+  reason: string
+  httpStatus: number
+  contentType: string
+  bytes: Buffer
+  url: string | URL
+}): string => {
+  const preview = input.bytes.subarray(0, 16).toString('hex') || '（空）'
+  return `${input.reason}；HTTP ${input.httpStatus}；Content-Type ${input.contentType || '未知'}；字节数 ${input.bytes.byteLength}；前16字节 hex ${preview}；URL ${redactUrlForError(input.url)}`
+}
+
+const sanitizeImageErrorMessage = (message: string): string => message
+  .replace(/https?:\/\/[^\s"'<>]+/gi, (url) => redactUrlForError(url))
+  .replace(/((?:api)?token|secret|password|passwd|cookie|authorization)=([^\s&]+)/gi, '$1=[已脱敏]')
+  .slice(0, 1_000)
 
 const ITEM_BASE_PROPERTIES = [
   '_valm_Uid',
@@ -336,6 +457,61 @@ const parseJsonPayload = (input: unknown): unknown => {
   return current
 }
 
+const createdUidKeys = ['_valm_Uid', '_valm_UID', 'uid', 'Uid', 'UID'] as const
+const createdUidContainerKeys = [
+  'Data',
+  'data',
+  'Item',
+  'item',
+  'Result',
+  'result',
+  'propList',
+  'PropList',
+  'props',
+  'Props',
+  'prop',
+  'Prop'
+] as const
+
+/**
+ * POST /rest/items has returned both propList/props and nested Data payloads
+ * across platform versions.  Read only known UID keys and response containers
+ * so an unrelated id from a status object cannot be mistaken for the created
+ * item UID.
+ */
+const extractCreatedItemUid = (input: unknown): string => {
+  const queue: Array<{ value: unknown; depth: number }> = [{ value: parseJsonPayload(input), depth: 0 }]
+  const visited = new Set<unknown>()
+  while (queue.length) {
+    const current = queue.shift()!
+    if (current.depth > 4 || visited.has(current.value)) continue
+    visited.add(current.value)
+    if (Array.isArray(current.value)) {
+      current.value.forEach((item) => queue.push({ value: parseJsonPayload(item), depth: current.depth + 1 }))
+      continue
+    }
+    if (!current.value || typeof current.value !== 'object') continue
+    const object = current.value as JsonObject
+    for (const key of createdUidKeys) {
+      const candidate = object[key]
+      if (typeof candidate !== 'string' && typeof candidate !== 'number') continue
+      const uid = String(candidate).trim()
+      if (uid) return uid
+    }
+    if (current.depth >= 4) continue
+    for (const key of createdUidContainerKeys) {
+      if (!Object.prototype.hasOwnProperty.call(object, key)) continue
+      const nested = parseJsonPayload(object[key])
+      if (nested !== undefined && nested !== object[key]) {
+        queue.push({ value: nested, depth: current.depth + 1 })
+      } else if (nested && typeof nested === 'object') {
+        queue.push({ value: nested, depth: current.depth + 1 })
+      }
+    }
+  }
+  return ''
+}
+
 const describeInvalidJsonResponse = (response: Response, body: string): string => {
   const contentType = response.headers.get('content-type')?.split(';', 1)[0]?.trim()
   const normalizedBody = body.trimStart()
@@ -381,15 +557,171 @@ const decodeJavaScriptString = (input: string): string | null => {
   return output
 }
 
-/** Parse only CKEditor's callback path; never evaluate the returned script. */
+const richImageCallbackPattern = /(?:\bwindow\s*\.\s*)?(?:parent\s*\.\s*)?CKEDITOR\s*\.\s*tools\s*\.\s*callFunction\s*\(/gi
+
+const safeRichImageContentType = (response: Response): string => {
+  const contentType = response.headers.get('content-type')?.split(';', 1)[0]?.trim() || ''
+  // Content-Type is a server-controlled value.  Keep it to a MIME-shaped
+  // token so an error response cannot inject arbitrary text into the log.
+  return /^[\w!#$%&'*+.^`|~-]+\/[\w!#$%&'*+.^`|~-]+$/.test(contentType)
+    ? contentType.slice(0, 100)
+    : '未知'
+}
+
+const isRichImageLoginResponse = (body: string): boolean => {
+  const sample = body.slice(0, 128 * 1024)
+  if (!sample) return false
+  if (/\/(?:logon|login)(?:[/?#"'\s]|$)/i.test(sample)) return true
+  const looksLikeHtml = /<(?:!doctype\s+html|html|head|body|form)\b/i.test(sample)
+  if (!looksLikeHtml) return false
+  return /(?:\blogon\b|\blogin\b|登录)/i.test(sample)
+}
+
+const classifyRichImageUploadResponse = (body: string, contentType: string): string => {
+  const normalized = body.trimStart()
+  if (!normalized) return '空响应'
+  if (isRichImageLoginResponse(body)) return '登录页/LogOn'
+  if (/json/i.test(contentType) || /^[{[]/.test(normalized)) return 'JSON'
+  if (/^<(?:!doctype\s+html|html|head|body|script)\b/i.test(normalized)) return 'HTML'
+  if (richImageCallbackPattern.test(body)) {
+    richImageCallbackPattern.lastIndex = 0
+    return 'CKEditor 回调'
+  }
+  richImageCallbackPattern.lastIndex = 0
+  return '其他文本'
+}
+
+const richImageUploadDiagnostic = (input: {
+  reason: string
+  response: Response
+  body: string
+}): string => {
+  const contentType = safeRichImageContentType(input.response)
+  const format = classifyRichImageUploadResponse(input.body, contentType)
+  const length = Buffer.byteLength(input.body, 'utf8')
+  return `${input.reason}（HTTP ${input.response.status}；Content-Type ${contentType}；响应长度 ${length} 字节；响应格式 ${format}）`
+}
+
+const normalizeRichImagePath = (input: string): string | null => {
+  const path = input.trim()
+  if (!path || path.length > 8_192) return null
+  if (/[\u0000-\u001f\u007f\\]/.test(path) || path.includes('#')) return null
+  if (/^(?:[a-z][a-z\d+.-]*:|\/\/)/i.test(path)) return null
+
+  const queryIndex = path.indexOf('?')
+  const rawPath = queryIndex >= 0 ? path.slice(0, queryIndex) : path
+  const rawQuery = queryIndex >= 0 ? path.slice(queryIndex + 1) : ''
+  if (!rawPath || rawQuery.length > 4_096) return null
+
+  let decodedPath: string
+  try {
+    decodedPath = decodeURIComponent(rawPath)
+    // Validate percent escapes in the query without changing the value that
+    // will be written into the rich text.
+    decodeURIComponent(rawQuery)
+  } catch {
+    return null
+  }
+  if (
+    !decodedPath ||
+    /[\u0000-\u001f\u007f\\\s?#]/.test(decodedPath) ||
+    /[\u0000-\u001f\u007f\\]/.test(decodeURIComponent(rawQuery)) ||
+    /^(?:[a-z][a-z\d+.-]*:|\/\/)/i.test(decodedPath) ||
+    decodedPath.startsWith('//')
+  ) return null
+
+  const pathWithoutLeadingSlash = decodedPath.startsWith('/')
+    ? decodedPath.slice(1)
+    : decodedPath
+  const segments = pathWithoutLeadingSlash.split('/')
+  if (segments.some((segment) => segment === '..' || !segment)) return null
+  const resourceIndex = segments.findIndex((segment, index) =>
+    segment.toLocaleLowerCase() === 'filecenterimg' &&
+    segments[index + 1]?.toLocaleLowerCase() === 'index'
+  )
+  if (resourceIndex < 0 || resourceIndex + 2 >= segments.length) return null
+  if (segments.slice(resourceIndex + 2).some((segment) => segment === '..' || !segment)) return null
+
+  // Preserve the server-provided spelling and query string, while keeping the
+  // historical relative-path return shape used by rich-text replacement.
+  return `${rawPath.replace(/^\/+/, '')}${queryIndex >= 0 ? `?${rawQuery}` : ''}`
+}
+
+const richImageUploadMarkerIsSuccess = (input: unknown): boolean => {
+  if (input === undefined) return true
+  if (input === true) return true
+  if (typeof input === 'number') return input === 1
+  if (typeof input !== 'string') return false
+  return ['1', 'true', 'ok', 'success'].includes(input.trim().toLocaleLowerCase())
+}
+
+const richImageErrorCodeIsSuccess = (input: unknown): boolean => {
+  if (typeof input === 'number') return input === 0
+  if (typeof input !== 'string') return false
+  return ['0', 'ok', 'success'].includes(input.trim().toLocaleLowerCase())
+}
+
+const parseRichImageUploadJson = (body: string): string | null => {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(body.trim()) as unknown
+  } catch {
+    return null
+  }
+
+  const queue: Array<{ value: unknown; depth: number }> = [{ value: parsed, depth: 0 }]
+  const visited = new Set<unknown>()
+  while (queue.length) {
+    const current = queue.shift()!
+    if (current.depth > 3 || visited.has(current.value)) continue
+    visited.add(current.value)
+    if (Array.isArray(current.value)) {
+      current.value.forEach((item) => queue.push({ value: item, depth: current.depth + 1 }))
+      continue
+    }
+    if (!current.value || typeof current.value !== 'object') continue
+    const object = current.value as JsonObject
+    const hasErrorCode = Object.prototype.hasOwnProperty.call(object, 'ErrorCode') ||
+      Object.prototype.hasOwnProperty.call(object, 'errorCode')
+    const errorCode = object.ErrorCode ?? object.errorCode
+    if (hasErrorCode && !richImageErrorCodeIsSuccess(errorCode)) continue
+    const hasSuccess = Object.prototype.hasOwnProperty.call(object, 'success') ||
+      Object.prototype.hasOwnProperty.call(object, 'Success')
+    const success = object.success ?? object.Success
+    if (hasSuccess && !richImageUploadMarkerIsSuccess(success)) continue
+    const uploaded = object.uploaded ?? object.Uploaded
+    const hasUploaded = Object.prototype.hasOwnProperty.call(object, 'uploaded') ||
+      Object.prototype.hasOwnProperty.call(object, 'Uploaded')
+    // An explicit failed upload marker applies to the whole response object,
+    // including a nested data payload.  Do not accept a stale/error URL from it.
+    if (hasUploaded && !richImageUploadMarkerIsSuccess(uploaded)) continue
+    for (const key of ['url', 'Url', 'URL', 'path', 'Path']) {
+      const candidate = object[key]
+      if (typeof candidate !== 'string') continue
+      const normalized = normalizeRichImagePath(candidate)
+      if (normalized) return normalized
+    }
+    if (current.depth >= 3) continue
+    for (const key of ['Data', 'data']) {
+      const nested = parseJsonPayload(object[key])
+      if (nested !== object[key] && nested !== undefined) {
+        queue.push({ value: nested, depth: current.depth + 1 })
+      } else if (nested && typeof nested === 'object') {
+        queue.push({ value: nested, depth: current.depth + 1 })
+      }
+    }
+  }
+  return null
+}
+
+/** Parse only CKEditor's callback/JSON path; never evaluate returned script. */
 export const parseRichImageUploadCallback = (body: string): string => {
-  const callbackPattern = /window\s*\.\s*parent\s*\.\s*CKEDITOR\s*\.\s*tools\s*\.\s*callFunction\s*\(/gi
-  for (const match of body.matchAll(callbackPattern)) {
+  for (const match of body.matchAll(richImageCallbackPattern)) {
     let index = (match.index ?? 0) + match[0].length
     while (/\s/.test(body[index] ?? '')) index += 1
     const functionStart = index
     while (/\d/.test(body[index] ?? '')) index += 1
-    if (body.slice(functionStart, index) !== '0') continue
+    if (functionStart === index) continue
     while (/\s/.test(body[index] ?? '')) index += 1
     if (body[index] !== ',') continue
     index += 1
@@ -416,15 +748,14 @@ export const parseRichImageUploadCallback = (body: string): string => {
     if (!closed) continue
     const path = decodeJavaScriptString(raw)
     if (!path) continue
-    let decodedPath = path
-    if (path.includes('%')) {
-      try { decodedPath = decodeURIComponent(path) } catch { continue }
-    }
-    if ([path, decodedPath].some((candidate) =>
-      candidate.includes('://') || /[\\\u0000-\u001f\u007f]/.test(candidate) || candidate.includes('..')
-    )) continue
-    if (!/^\/?FileCenterImg\/Index\/[^\s?#]+$/i.test(path)) continue
-    return path.replace(/^\/+/, '')
+    const normalized = normalizeRichImagePath(path)
+    if (normalized) return normalized
+  }
+
+  const jsonPath = parseRichImageUploadJson(body)
+  if (jsonPath) return jsonPath
+  if (isRichImageLoginResponse(body)) {
+    throw new Error('图片上传鉴权失败：服务器返回登录页面或 LogOn 页面')
   }
   throw new Error('图片上传响应未返回合法的 CKEditor 图片路径')
 }
@@ -510,9 +841,16 @@ const hasDisplayText = (input: unknown): boolean => {
   return String(input).trim() !== ''
 }
 
+/** Split supported account separators; ordinary spaces stay part of a login. */
+const splitUserLoginNames = (input: string): string[] => input
+  .split(/[,，;；]/)
+  .map((part) => part.trim())
+  .filter(Boolean)
+
 const userLookupValue = (input: unknown): string[] => {
   if (Array.isArray(input)) return input.flatMap(userLookupValue)
-  if (typeof input === 'string' || typeof input === 'number') {
+  if (typeof input === 'string') return splitUserLoginNames(input)
+  if (typeof input === 'number') {
     const normalized = String(input).trim()
     return normalized ? [normalized] : []
   }
@@ -659,6 +997,12 @@ export class VisslmClient {
 
   private readonly userPropertyKeys: ReadonlySet<string>
 
+  private readonly sessionCookies = new Map<string, string>()
+
+  private richImageLoginPromise: Promise<void> | undefined
+
+  private richImageAuthenticated = false
+
   constructor(private readonly credentials: Credentials) {
     if (!credentials.baseUrl || !credentials.username || !credentials.token) {
       throw new Error('请先完整配置 VISSLM 地址、用户名和 API Token')
@@ -688,6 +1032,158 @@ export class VisslmClient {
       if (val !== '') url.searchParams.set(key, val)
     }
     return url
+  }
+
+  /** Build a URL for an already authenticated browser session. */
+  private sessionUrl(pathOrUrl: string, query?: Record<string, string>): URL {
+    const url = /^https?:\/\//i.test(pathOrUrl)
+      ? new URL(pathOrUrl)
+      : this.endpoint(pathOrUrl)
+    for (const [key, val] of Object.entries(query ?? {})) {
+      if (val !== '') url.searchParams.set(key, val)
+    }
+    return url
+  }
+
+  private sessionCookieHeader(extra?: { name: string; value: string }): string {
+    const cookies = new Map(this.sessionCookies)
+    if (extra) cookies.set(extra.name, extra.value)
+    return [...cookies.entries()]
+      .filter(([name, value]) => name && value)
+      .map(([name, value]) => `${name}=${value}`)
+      .join('; ')
+  }
+
+  private updateSessionCookies(response: Response): void {
+    const headers = response.headers as Headers & { getSetCookie?: () => string[] }
+    const setCookies = typeof headers.getSetCookie === 'function'
+      ? headers.getSetCookie()
+      : (() => {
+          const combined = response.headers.get('set-cookie')
+          return combined ? combined.split(/,(?=\s*[^;,=\s]+=[^;,]*)/) : []
+        })()
+    for (const setCookie of setCookies) {
+      const pair = setCookie.split(';', 1)[0] ?? ''
+      const separator = pair.indexOf('=')
+      if (separator <= 0) continue
+      const name = pair.slice(0, separator).trim()
+      const cookieValue = pair.slice(separator + 1).trim()
+      if (!/^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/.test(name)) continue
+      const expired = !cookieValue || /(?:^|;)\s*max-age\s*=\s*0(?:;|$)/i.test(setCookie)
+      if (expired) this.sessionCookies.delete(name)
+      else this.sessionCookies.set(name, cookieValue)
+    }
+  }
+
+  private hasSessionCookie(name: string): boolean {
+    return Boolean(this.sessionCookies.get(name)?.trim())
+  }
+
+  private clearRichImageSession(): void {
+    this.sessionCookies.clear()
+    this.richImageAuthenticated = false
+  }
+
+  private async loginForRichImage(): Promise<void> {
+    const password = this.credentials.uploadPassword
+    if (typeof password !== 'string' || password.length === 0) {
+      throw new Error('未配置 VISSLM 图片上传密码，无法登录图片上传接口')
+    }
+
+    this.clearRichImageSession()
+    const logOnResponse = await this.requestWithRetry(this.endpoint('/User/LogOn'), {
+      method: 'GET',
+      headers: { accept: 'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8' }
+    })
+    this.updateSessionCookies(logOnResponse)
+    try { await logOnResponse.text() } catch { /* best effort: status/cookies are enough */ }
+    if (!logOnResponse.ok) {
+      throw new VisslmRequestError(`VISSLM 登录页请求失败 HTTP ${logOnResponse.status}`, logOnResponse.status)
+    }
+    if (!this.hasSessionCookie('JSESSIONID')) {
+      throw new Error('VISSLM 登录页未返回 JSESSIONID，无法建立图片上传会话')
+    }
+
+    let encodedUsername: string
+    try {
+      // Match the V2.00.01.22 browser client: encodeURI first, then base64
+      // without padding.  encodeURI keeps the same reserved characters as
+      // the platform JavaScript implementation.
+      const encoded = Buffer.from(encodeURI(this.credentials.username), 'utf8')
+        .toString('base64')
+        .replace(/=/g, '')
+      encodedUsername = `${randomBytes(3).toString('hex')}${encoded}${randomBytes(3).toString('hex').toUpperCase()}`
+    } catch {
+      throw new Error('VISSLM 用户名无法编码，无法登录图片上传接口')
+    }
+    const passwordDigest = createHash('md5')
+      .update(password)
+      .digest('hex')
+      .toUpperCase()
+    const upassword = `*${createHash('md5')
+      .update(`${this.credentials.username.toUpperCase()}:VISSLM:${passwordDigest}`)
+      .digest('hex')}`
+    const form = new URLSearchParams({
+      uname: encodedUsername,
+      upassword,
+      rememberPwd: 'false'
+    })
+    const loginResponse = await this.requestWithRetry(this.endpoint('/User/UPLogOn'), {
+      method: 'POST',
+      headers: {
+        accept: 'application/json,text/plain,*/*',
+        'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        cookie: this.sessionCookieHeader(),
+        origin: new URL(this.baseUrl).origin,
+        referer: this.endpoint('/User/LogOn').toString()
+      },
+      body: form.toString()
+    })
+    this.updateSessionCookies(loginResponse)
+    const responseText = await loginResponse.text()
+    let payload: unknown
+    try {
+      payload = responseText.trim() ? JSON.parse(responseText) as unknown : null
+    } catch {
+      throw new Error('VISSLM 图片上传登录响应不是有效 JSON')
+    }
+    if (!loginResponse.ok || !payload || typeof payload !== 'object') {
+      throw new VisslmRequestError(
+        `VISSLM 图片上传登录失败 HTTP ${loginResponse.status}`,
+        loginResponse.status,
+        undefined
+      )
+    }
+    const result = payload as JsonObject
+    const errorCode = result.ErrorCode ?? result.errorCode
+    const numericErrorCode = typeof errorCode === 'string' || typeof errorCode === 'number'
+      ? Number(errorCode)
+      : Number.NaN
+    if (errorCode === undefined || errorCode === null || numericErrorCode !== 0) {
+      const errorMessage = typeof (result.ErrorMessage ?? result.ErrorMsg) === 'string'
+        ? String(result.ErrorMessage ?? result.ErrorMsg).trim().slice(0, 200)
+        : ''
+      const safeErrorMessage = errorMessage && password
+        ? errorMessage.split(password).join('[已脱敏]')
+        : errorMessage
+      throw new Error(`VISSLM 图片上传登录失败${safeErrorMessage ? `：${safeErrorMessage}` : ''}`)
+    }
+    if (!this.hasSessionCookie('JSESSIONID')) {
+      throw new Error('VISSLM 图片上传登录成功但未返回 JSESSIONID')
+    }
+    this.richImageAuthenticated = true
+  }
+
+  private async ensureRichImageLogin(): Promise<void> {
+    if (this.richImageAuthenticated && this.hasSessionCookie('JSESSIONID')) return
+    if (!this.richImageLoginPromise) {
+      this.richImageLoginPromise = this.loginForRichImage()
+    }
+    try {
+      await this.richImageLoginPromise
+    } finally {
+      this.richImageLoginPromise = undefined
+    }
   }
 
   /**
@@ -744,12 +1240,66 @@ export class VisslmClient {
     try {
       data = responseText.trim() ? JSON.parse(responseText) as AlmResponse | unknown : null
     } catch {
-      throw new Error(describeInvalidJsonResponse(response, responseText))
+      throw new VisslmInvalidJsonResponseError(
+        describeInvalidJsonResponse(response, responseText),
+        response.status,
+        isRichImageLoginResponse(responseText)
+      )
     }
     if (data && typeof data === 'object' && 'ErrorCode' in data) {
       const result = data as AlmResponse
       if (Number(result.ErrorCode) !== 0) {
         throw new Error(result.ErrorMessage || result.ErrorMsg || `VISSLM 错误 ${result.ErrorCode}`)
+      }
+    }
+    return data
+  }
+
+  /**
+   * Read JSON through the browser login session, without putting the API
+   * token in the URL.  This is used only for endpoints that reject token
+   * authentication while still allowing an authenticated JSESSIONID.
+   */
+  private async getJsonWithSession(
+    path: string,
+    query?: Record<string, string>
+  ): Promise<AlmResponse | unknown> {
+    const response = await this.requestWithRetry(
+      this.sessionUrl(path, query),
+      {
+        method: 'GET',
+        headers: {
+          accept: 'application/json,text/plain,*/*',
+          cookie: this.sessionCookieHeader(),
+          origin: new URL(this.baseUrl).origin,
+          referer: this.endpoint('/User/LogOn').toString()
+        }
+      },
+      true
+    )
+    this.updateSessionCookies(response)
+    const responseText = await response.text()
+    if (!response.ok) {
+      throw new VisslmRequestError(`VISSLM HTTP ${response.status}`, response.status)
+    }
+    let data: AlmResponse | unknown = null
+    try {
+      data = responseText.trim() ? JSON.parse(responseText) as AlmResponse | unknown : null
+    } catch {
+      throw new VisslmInvalidJsonResponseError(
+        describeInvalidJsonResponse(response, responseText),
+        response.status,
+        isRichImageLoginResponse(responseText)
+      )
+    }
+    if (data && typeof data === 'object' && 'ErrorCode' in data) {
+      const result = data as AlmResponse
+      if (Number(result.ErrorCode) !== 0) {
+        throw new VisslmRequestError(
+          result.ErrorMessage || result.ErrorMsg || `VISSLM 错误 ${result.ErrorCode}`,
+          response.status,
+          data
+        )
       }
     }
     return data
@@ -807,27 +1357,36 @@ export class VisslmClient {
     return this.postJson('/rest/items', params, body)
   }
 
-  /** Upload one rich-text image using the CKEditor File Browser contract. */
-  async uploadRichImage(input: {
+  private async uploadRichImageOnce(input: {
     projectId: string
     bytes: Buffer
     mimeType: string
     fileName: string
-  }): Promise<{ remotePath: string; httpStatus: number }> {
-    const projectId = input.projectId.trim()
-    if (!projectId) throw new Error('图片上传缺少目标项目 UID')
-    if (!input.bytes.byteLength) throw new Error('不能上传空图片')
-    const token = randomBytes(32).toString('hex')
-    const url = this.authenticatedUrl('/FileCenterImg/UploadRichImg', {
+    fieldName?: string
+    dataId?: string
+    hideMember?: string
+  }): Promise<{
+    remotePath?: string
+    httpStatus: number
+    loginPage: boolean
+  }> {
+    const token = this.sessionCookies.get('ckCsrfToken') || randomBytes(32).toString('hex')
+    this.sessionCookies.set('ckCsrfToken', token)
+    const url = this.endpoint('/FileCenterImg/UploadRichImg')
+    const query: Record<string, string> = {
       type: 'image',
-      proId: projectId,
-      CKEditor: 'Replyrecord',
+      proId: input.projectId.trim(),
+      CKEditor: input.fieldName?.trim() || 'Replyrecord',
       CKEditorFuncNum: '0',
       langCode: 'zh-cn'
-    })
+    }
+    if (input.dataId?.trim()) query.dataId = input.dataId.trim()
+    if (input.hideMember?.trim()) query.hideMember = input.hideMember.trim()
+    for (const [key, value] of Object.entries(query)) url.searchParams.set(key, value)
+
     const form = new FormData()
-    const mimeType = input.mimeType.trim().toLowerCase() || 'application/octet-stream'
-    const safeName = input.fileName.trim().replace(/[\\/\u0000-\u001f\u007f]/g, '_').slice(0, 180) || 'image'
+    const mimeType = normalizeRichImageMimeType(input.mimeType)
+    const safeName = normalizeRichImageFileName(input.fileName, mimeType)
     const uploadBytes = new ArrayBuffer(input.bytes.byteLength)
     new Uint8Array(uploadBytes).set(input.bytes)
     form.append('upload', new Blob([uploadBytes], { type: mimeType }), safeName)
@@ -837,18 +1396,92 @@ export class VisslmClient {
       headers: {
         // Do not set Content-Type: undici must add the multipart boundary.
         accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        cookie: `ckCsrfToken=${token}`
+        cookie: this.sessionCookieHeader({ name: 'ckCsrfToken', value: token }),
+        origin: new URL(this.baseUrl).origin,
+        referer: this.endpoint('/User/LogOn').toString()
       },
       body: form
     })
-    const responseText = await response.text()
+    this.updateSessionCookies(response)
+    let responseText = ''
+    try {
+      responseText = await response.text()
+    } catch {
+      throw new VisslmRequestError(
+        richImageUploadDiagnostic({
+          reason: '图片上传响应读取失败',
+          response,
+          body: responseText
+        }),
+        response.status
+      )
+    }
+    const loginPage = isRichImageLoginResponse(responseText)
+    if (loginPage) {
+      return { httpStatus: response.status, loginPage: true }
+    }
     if (!response.ok) {
-      throw new VisslmRequestError(`图片上传失败 HTTP ${response.status}`, response.status)
+      throw new VisslmRequestError(
+        richImageUploadDiagnostic({
+          reason: response.status === 401 || response.status === 403
+            ? '图片上传鉴权失败：服务器拒绝请求'
+            : '图片上传失败',
+          response,
+          body: responseText
+        }),
+        response.status
+      )
     }
-    return {
-      remotePath: parseRichImageUploadCallback(responseText),
-      httpStatus: response.status
+    try {
+      return {
+        remotePath: parseRichImageUploadCallback(responseText),
+        httpStatus: response.status,
+        loginPage: false
+      }
+    } catch {
+      throw new VisslmRequestError(
+        richImageUploadDiagnostic({
+          reason: '图片上传响应无法解析',
+          response,
+          body: responseText
+        }),
+        response.status
+      )
     }
+  }
+
+  /** Upload one rich-text image using the CKEditor File Browser contract. */
+  async uploadRichImage(input: {
+    projectId: string
+    bytes: Buffer
+    mimeType: string
+    fileName: string
+    fieldName?: string
+    dataId?: string
+    hideMember?: string
+  }): Promise<{ remotePath: string; httpStatus: number }> {
+    const projectId = input.projectId.trim()
+    if (!projectId) throw new Error('图片上传缺少目标项目 UID')
+    if (!input.bytes.byteLength) throw new Error('不能上传空图片')
+    await this.ensureRichImageLogin()
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const uploaded = await this.uploadRichImageOnce({ ...input, projectId })
+      if (!uploaded.loginPage) {
+        if (!uploaded.remotePath) throw new Error('图片上传响应未返回远端路径')
+        return { remotePath: uploaded.remotePath, httpStatus: uploaded.httpStatus }
+      }
+      if (attempt === 1) {
+        throw new VisslmRequestError(
+          `图片上传鉴权失败：服务器返回登录页面或 LogOn 页面（HTTP ${uploaded.httpStatus}）`,
+          uploaded.httpStatus
+        )
+      }
+      // Only an explicit LogOn page authorizes replaying this POST.  Timeouts,
+      // generic 4xx/5xx responses, and malformed callbacks are never replayed.
+      this.clearRichImageSession()
+      await this.ensureRichImageLogin()
+    }
+    throw new Error('图片上传流程未完成')
   }
 
   async test(): Promise<ConnectionResult> {
@@ -910,7 +1543,17 @@ export class VisslmClient {
     const source = input as JsonObject
     const result: JsonObject = {}
     for (const [key, current] of Object.entries(source)) {
+      if (key === '_valm_Description_text') {
+        continue
+      }
       if (key.endsWith('_text')) {
+        result[key] = current
+        continue
+      }
+      // `_valm_Description` is opaque rich-text content.  A numeric-looking
+      // description is still text, not an item UID, so do not recurse into it
+      // or synthesize a `${key}_text` display value for it.
+      if (key === '_valm_Description') {
         result[key] = current
         continue
       }
@@ -981,13 +1624,17 @@ export class VisslmClient {
         ? object as JsonObject
         : { ...(input as JsonObject) }
       if (Object.prototype.hasOwnProperty.call(input, 'key')) {
-        resolved.key_text = Array.isArray((input as JsonObject).key) ? names : names[0]
+        resolved.key_text = Array.isArray((input as JsonObject).key)
+          ? names
+          : names.length > 1 ? names.join(',') : names[0]
         result[key] = resolved
         return
       }
     }
 
-    result[textKey] = Array.isArray(input) ? names : names[0]
+    result[textKey] = Array.isArray(input)
+      ? names
+      : names.length > 1 ? names.join(',') : names[0]
   }
 
   private async lookupItemName(uid: string): Promise<string> {
@@ -1030,18 +1677,44 @@ export class VisslmClient {
     const pending = this.userDisplayNameRequests.get(loginName)
     if (pending) return pending
 
-    const request = this.displayLookupLimiter.run(() =>
-      this.getJson('/ssf/user/getUserByName', { name: loginName })
-    )
-      .then((data) => {
+    const request = this.displayLookupLimiter.run(async () => {
+      try {
+        const data = await this.getJson('/ssf/user/getUserByName', { name: loginName })
         const name = findUserDisplayName(data, loginName)
+        // An empty name from valid JSON is a successful, cacheable result.
         this.userDisplayNameCache.set(loginName, name)
         return name
-      })
-      .catch(() => {
-        this.userDisplayNameCache.set(loginName, '')
-        return ''
-      })
+      } catch (error) {
+        // Some VISSLM deployments return the LogOn page with HTTP 200 when
+        // this token-authenticated endpoint is called.  Only an explicit
+        // Login/LogOn page gets the browser-session fallback; ordinary HTTP
+        // failures, malformed JSON, and unrelated HTML remain failures.
+        if (
+          !(error instanceof VisslmInvalidJsonResponseError) ||
+          error.httpStatus !== 200 ||
+          !error.loginPage
+        ) {
+          throw new Error(
+            'VISSLM 用户显示值查询失败，请检查 API Token、平台地址和用户查询权限后重试'
+          )
+        }
+
+        try {
+          await this.ensureRichImageLogin()
+          const data = await this.getJsonWithSession('/ssf/user/getUserByName', { name: loginName })
+          const name = findUserDisplayName(data, loginName)
+          this.userDisplayNameCache.set(loginName, name)
+          return name
+        } catch {
+          // Do not include the login name, token, password, or upstream body
+          // in a collection error.  The setting name is intentionally
+          // actionable because this fallback requires the platform password.
+          throw new Error(
+            'VISSLM 用户显示值查询登录失败，请在平台配置中填写正确的平台登录密码，并检查平台地址和权限后重试'
+          )
+        }
+      }
+    })
     this.userDisplayNameRequests.set(loginName, request)
     try {
       return await request
@@ -1273,23 +1946,97 @@ export class VisslmClient {
     }
     url.searchParams.set('user', this.credentials.username)
     url.searchParams.set('ApiToken', this.credentials.token)
-    const response = await this.requestWithRetry(url, { method: 'GET' }, true)
-    if (!response.ok) throw new Error(`图片下载失败 HTTP ${response.status}`)
-    const bytes = Buffer.from(await response.arrayBuffer())
-    return {
-      bytes,
-      mimeType: response.headers.get('content-type')?.split(';')[0] || 'application/octet-stream',
-      sourceUrl: this.redactUrl(url)
+    const sourceUrl = this.redactUrl(url)
+    let lastError: Error | undefined
+    for (let attempt = 1; attempt <= SAFE_REQUEST_MAX_ATTEMPTS; attempt += 1) {
+      let response: Response | undefined
+      try {
+        response = await fetch(url, {
+          method: 'GET',
+          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+        })
+      } catch (error) {
+        if (attempt < SAFE_REQUEST_MAX_ATTEMPTS && isRetryableNetworkError(error)) {
+          await new Promise((resolve) => setTimeout(resolve, SAFE_REQUEST_BACKOFF_MS[attempt - 1] ?? 500))
+          continue
+        }
+        throw new Error(imagePayloadDiagnostic({
+          reason: '图片下载网络失败',
+          httpStatus: 0,
+          contentType: '',
+          bytes: Buffer.alloc(0),
+          url: sourceUrl
+        }))
+      }
+
+      const contentType = response.headers.get('content-type')?.split(';', 1)[0]?.trim() || 'application/octet-stream'
+      let bytes: Buffer
+      try {
+        // Always consume the response body, including non-2xx responses, so a
+        // retry does not retain an undrained connection in undici's pool.
+        bytes = Buffer.from(await response.arrayBuffer())
+      } catch (error) {
+        try { await response.body?.cancel() } catch { /* best effort */ }
+        lastError = new Error(imagePayloadDiagnostic({
+          reason: `图片响应读取失败（${error instanceof Error ? error.name : '未知错误'}）`,
+          httpStatus: response.status,
+          contentType,
+          bytes: Buffer.alloc(0),
+          url: sourceUrl
+        }))
+        if (
+          attempt < SAFE_REQUEST_MAX_ATTEMPTS &&
+          isRetryableNetworkError(error) &&
+          RETRYABLE_HTTP_STATUSES.has(response.status)
+        ) {
+          await new Promise((resolve) => setTimeout(resolve, SAFE_REQUEST_BACKOFF_MS[attempt - 1] ?? 500))
+          continue
+        }
+        throw lastError
+      }
+
+      if (!response.ok) {
+        lastError = new Error(imagePayloadDiagnostic({
+          reason: '图片下载失败',
+          httpStatus: response.status,
+          contentType,
+          bytes,
+          url: sourceUrl
+        }))
+        if (attempt < SAFE_REQUEST_MAX_ATTEMPTS && RETRYABLE_HTTP_STATUSES.has(response.status)) {
+          const delay = retryAfterDelayMs(response) ?? SAFE_REQUEST_BACKOFF_MS[attempt - 1] ?? 500
+          await new Promise((resolve) => setTimeout(resolve, delay))
+          continue
+        }
+        throw lastError
+      }
+
+      if (!imageBytesMatchMime(contentType, bytes)) {
+        lastError = new Error(imagePayloadDiagnostic({
+          reason: '图片响应 MIME/文件签名校验失败',
+          httpStatus: response.status,
+          contentType,
+          bytes,
+          url: sourceUrl
+        }))
+        if (attempt < SAFE_REQUEST_MAX_ATTEMPTS) {
+          await new Promise((resolve) => setTimeout(resolve, SAFE_REQUEST_BACKOFF_MS[attempt - 1] ?? 500))
+          continue
+        }
+        throw lastError
+      }
+
+      return {
+        bytes,
+        mimeType: contentType,
+        sourceUrl
+      }
     }
+    throw lastError ?? new Error('图片下载重试次数已用尽')
   }
 
   private redactUrl(url: URL): string {
-    const safe = new URL(url)
-    safe.searchParams.delete('ApiToken')
-    safe.searchParams.delete('apiToken')
-    safe.searchParams.delete('UToken')
-    safe.searchParams.delete('utoken')
-    return safe.toString()
+    return redactUrlForError(url)
   }
 }
 
@@ -1318,11 +2065,6 @@ export class PushService {
       sourceField: mapping.sourceField.trim(),
       targetField: mapping.targetField.trim()
     }))
-    const forbiddenBodyFields = new Set([
-      '_valm_Uid',
-      '_valm_ItemID',
-      '_valm_NodeType'
-    ])
     const sourceFields = new Set<string>()
     const targetFields = new Set<string>()
     for (const mapping of mappings) {
@@ -1332,10 +2074,13 @@ export class PushService {
       if (!identifierPattern.test(mapping.sourceField)) {
         throw new Error(`源属性 Key ${mapping.sourceField} 格式无效`)
       }
+      if (pushForbiddenSourceFields.has(mapping.sourceField)) {
+        throw new Error(`源属性 Key ${mapping.sourceField} 是消息体禁止字段`)
+      }
       if (!identifierPattern.test(mapping.targetField)) {
         throw new Error(`目标属性 Key ${mapping.targetField} 格式无效`)
       }
-      if (forbiddenBodyFields.has(mapping.targetField)) {
+      if (pushForbiddenTargetFields.has(mapping.targetField)) {
         throw new Error(`目标属性 Key ${mapping.targetField} 是消息体禁止字段`)
       }
       if (sourceFields.has(mapping.sourceField)) {
@@ -1362,18 +2107,23 @@ export class PushService {
       } else if (config.insertAfterId?.trim()) {
         params.insertAfterId = config.insertAfterId.trim()
       }
-      const body = { ...detail.raw }
+      // The renderer always sends an explicit fieldMappings array. In that
+      // mode the request body is intentionally allow-listed: only values
+      // referenced by the mapping table are copied, so an omitted local field
+      // cannot leak into the platform request. Keep the legacy behavior for
+      // callers that predate fieldMappings and omit the option entirely.
+      const hasExplicitMappings = Array.isArray(config.fieldMappings)
+      const body: Record<string, unknown> = hasExplicitMappings ? {} : { ...detail.raw }
       for (const mapping of mappings) {
         if (Object.prototype.hasOwnProperty.call(detail.raw, mapping.sourceField)) {
           body[mapping.targetField] = detail.raw[mapping.sourceField]
-          if (mapping.sourceField !== mapping.targetField) {
-            delete body[mapping.sourceField]
-          }
         }
       }
-      for (const field of forbiddenBodyFields) delete body[field]
-      if (!body._valm_Name) body._valm_Name = detail.name
-      const previewAssets = this.inspectBodyAssets(client, config.projectId.trim(), body)
+      if (!hasExplicitMappings) {
+        for (const field of pushForbiddenTargetFields) delete body[field]
+        if (!body._valm_Name) body._valm_Name = detail.name
+      }
+      const previewAssets = this.inspectBodyAssets(body)
       return {
         id: index + 1,
         recordUid: detail.uid,
@@ -1411,12 +2161,11 @@ export class PushService {
   }
 
   private inspectBodyAssets(
-    client: VisslmClient,
-    projectId: string,
     body: Record<string, unknown>
   ): Pick<PushRequestTrace, 'imageTotal' | 'imageUpload' | 'imageReuse' | 'imageFailed' | 'imageErrors'> {
     const tokenPattern = /visslm-asset:\/\/([a-f0-9]{64})\/[A-Za-z0-9_-]{1,128}/gi
     const hashes = new Set<string>()
+    const occurrences = new Map<string, number>()
     const failedHashes = new Set<string>()
     let imageTotal = 0
     let imageFailed = 0
@@ -1431,6 +2180,7 @@ export class PushService {
         for (const match of matches) {
           const sha256 = match[1].toLowerCase()
           hashes.add(sha256)
+          occurrences.set(sha256, (occurrences.get(sha256) ?? 0) + 1)
           if (!this.db.getAssetBlob(sha256) || !this.db.readAssetBytes(sha256)) {
             imageFailed += 1
             failedHashes.add(sha256)
@@ -1454,13 +2204,12 @@ export class PushService {
       }
     }
     visit(body)
-    let imageReuse = 0
-    for (const sha256 of hashes) {
-      if (!failedHashes.has(sha256) && this.db.getPushAssetUpload(client.baseUrl, projectId, sha256)) imageReuse += 1
-    }
+    const imageReuse = [...occurrences.entries()]
+      .filter(([sha256]) => !failedHashes.has(sha256))
+      .reduce((total, [, count]) => total + Math.max(0, count - 1), 0)
     return {
       imageTotal,
-      imageUpload: Math.max(0, hashes.size - imageReuse - failedHashes.size),
+      imageUpload: Math.max(0, hashes.size - failedHashes.size),
       imageReuse,
       imageFailed,
       ...(imageErrors.length ? { imageErrors } : {})
@@ -1501,10 +2250,7 @@ export class PushService {
         imageFailed += prepared.imageFailed
         const created = await client.createItem(params, prepared.body)
         const response = created.data
-        const result = response as AlmResponse
-        const pushedUid =
-          value(result.propList?.[0] ?? {}, '_valm_Uid') ||
-          value(result.props ?? result.prop ?? {}, '_valm_Uid')
+        const pushedUid = extractCreatedItemUid(response)
         this.db.finishPushLog(logId, 'success', {
           httpStatus: created.httpStatus,
           response,
@@ -1595,12 +2341,8 @@ export class PushService {
     )
     const tokenPattern = /visslm-asset:\/\/([a-f0-9]{64})\/([A-Za-z0-9_-]{1,128})/gi
     const remoteBySha = new Map<string, string>()
-
     const resolveString = async (valueInput: string): Promise<string> => {
       const richSources = findRichTextImageSources(valueInput)
-      const tokenSources = new Set(richSources
-        .map((source) => source.source)
-        .filter((source) => Boolean(parseAssetToken(source))))
       const matches = [...valueInput.matchAll(tokenPattern)]
       const replacements: Array<{ start: number; end: number; value: string }> = []
       for (const match of matches) {
@@ -1610,46 +2352,36 @@ export class PushService {
         imageTotal += 1
         let remotePath = remoteBySha.get(parsed.sha256)
         if (!remotePath) {
-          const cached = this.db.getPushAssetUpload(client.baseUrl, projectId, parsed.sha256)
-          if (cached?.remotePath?.trim()) {
-            remotePath = cached.remotePath
-            imageReuse += 1
-          } else {
-            const blob = this.db.getAssetBlob(parsed.sha256)
-            const bytes = this.db.readAssetBytes(parsed.sha256)
-            if (!blob) {
-              imageFailed += 1
-              fail(`图片资源 ${parsed.sha256.slice(0, 12)}… 不存在或校验失败`)
-            }
-            if (!bytes) {
-              imageFailed += 1
-              fail(`图片资源 ${parsed.sha256.slice(0, 12)}… 不存在或校验失败`)
-            }
-            const resolvedBlob = blob as NonNullable<typeof blob>
-            const resolvedBytes = bytes as Buffer
-            const reference = references.get(parsed.referenceId)
-            try {
-              const uploaded = await client.uploadRichImage({
-                projectId,
-                bytes: resolvedBytes,
-                mimeType: resolvedBlob.mimeType,
-                fileName: reference?.sourceName || `image-${parsed.sha256.slice(0, 12)}`
-              })
-              remotePath = uploaded.remotePath
-              this.db.savePushAssetUpload({
-                baseUrl: client.baseUrl,
-                projectId,
-                sha256: parsed.sha256,
-                remotePath: uploaded.remotePath
-              })
-              imageUpload += 1
-            } catch (error) {
-              imageFailed += 1
-              fail(error instanceof Error ? error.message : String(error))
-            }
+          const reference = references.get(parsed.referenceId)
+          const blob = this.db.getAssetBlob(parsed.sha256)
+          const bytes = this.db.readAssetBytes(parsed.sha256)
+          if (!blob) {
+            imageFailed += 1
+            fail(`图片资源 ${parsed.sha256.slice(0, 12)}… 不存在或校验失败`)
+          }
+          if (!bytes) {
+            imageFailed += 1
+            fail(`图片资源 ${parsed.sha256.slice(0, 12)}… 不存在或校验失败`)
+          }
+          const resolvedBlob = blob as NonNullable<typeof blob>
+          const resolvedBytes = bytes as Buffer
+          try {
+            const uploaded = await client.uploadRichImage({
+              projectId,
+              bytes: resolvedBytes,
+              mimeType: resolvedBlob.mimeType,
+              fileName: reference?.sourceName || `image-${parsed.sha256.slice(0, 12)}`
+            })
+            remotePath = uploaded.remotePath
+            imageUpload += 1
+          } catch (error) {
+            imageFailed += 1
+            fail(error instanceof Error ? error.message : String(error))
           }
           const resolvedRemotePath = remotePath || fail(`图片资源 ${parsed.sha256.slice(0, 12)}… 未返回远端路径`)
           remoteBySha.set(parsed.sha256, resolvedRemotePath)
+        } else {
+          imageReuse += 1
         }
         const resolvedRemotePath = remotePath || fail(`图片资源 ${parsed.sha256.slice(0, 12)}… 未返回远端路径`)
         const start = match.index ?? 0
@@ -1658,7 +2390,7 @@ export class PushService {
       // An un-tokenized image means collection/import could not retain the
       // binary resource.  Refuse to create a partial remote record.
       for (const source of richSources) {
-        if (!tokenSources.has(source.source)) {
+        if (!parseAssetToken(source.source)) {
           imageFailed += 1
           fail('富文本中存在未解析图片，已阻止推送')
         }
@@ -1673,7 +2405,11 @@ export class PushService {
     const visit = async (input: unknown): Promise<unknown> => {
       if (typeof input === 'string') return resolveString(input)
       if (Array.isArray(input)) {
-        return mapWithConcurrency(input, (item) => visit(item))
+        // Uploads are non-idempotent.  Visit one record's fields in order so
+        // duplicate SHA tokens cannot race and create two remote files.
+        const result: unknown[] = []
+        for (const item of input) result.push(await visit(item))
+        return result
       }
       if (!input || typeof input !== 'object') return input
       const result: JsonObject = {}
@@ -1887,6 +2623,14 @@ export class SyncService {
                 value(existingDetail?.raw ?? {}, '_valm_NodeType') ||
                 record.nodeType ||
                 existing.nodeType
+            }
+            // `_valm_Description_text` was historically synthesized when a
+            // numeric-looking rich-text description was mistaken for an item
+            // UID.  Once the real description is present in this response,
+            // remove that derived legacy field while preserving the opaque
+            // `_valm_Description` value itself.
+            if (hasIncomingField('_valm_Description')) {
+              delete mergedRaw._valm_Description_text
             }
             // Derive the row metadata from the merged payload so a field that
             // is omitted by ReturnProperty remains intact, while an explicitly
@@ -2173,7 +2917,7 @@ export class SyncService {
             name,
             mimeType,
             sourceUrl: source,
-            errorMessage: message
+            errorMessage: sanitizeImageErrorMessage(message)
           })
         } catch {
           // The unresolved marker is best-effort; the original HTML remains
@@ -2186,7 +2930,13 @@ export class SyncService {
         if (/^data:image\//i.test(source)) {
           const match = source.match(/^data:([^;,]+);base64,([A-Za-z0-9+/]*={0,2})$/s)
           if (!match || match[2].length % 4 === 1) {
-            markUnresolved('内嵌图片 Base64 格式无效')
+            markUnresolved(imagePayloadDiagnostic({
+              reason: '内嵌图片 Base64 格式无效',
+              httpStatus: 0,
+              contentType: mimeType,
+              bytes: Buffer.alloc(0),
+              url: 'inline:data-uri'
+            }))
             continue
           }
           mimeType = match[1].toLowerCase()
@@ -2199,10 +2949,23 @@ export class SyncService {
           sourceUrl = downloaded.sourceUrl
         }
         if (!imageBytesMatchMime(mimeType, bytes)) {
-          markUnresolved('图片 MIME 与文件签名不匹配')
+          markUnresolved(imagePayloadDiagnostic({
+            reason: '图片 MIME/文件签名校验失败',
+            httpStatus: 0,
+            contentType: mimeType,
+            bytes,
+            url: sourceUrl
+          }))
           continue
         }
-        const savedImage = this.db.saveImage({ recordUid, name, mimeType, sourceUrl, bytes })
+        const savedImage = this.db.saveImage({
+          recordUid,
+          name,
+          mimeType,
+          sourceUrl,
+          unresolvedSourceUrl: source,
+          bytes
+        })
         savedBySource.set(source, {
           id: savedImage.id,
           sha256: savedImage.sha256,

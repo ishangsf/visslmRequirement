@@ -1,5 +1,6 @@
 import type { ChatRequest, ChatResponse, ModelSettings } from '../shared/types'
 import { ModelClient, type ModelMessage } from './model-client'
+import { selectHistoryWithSummary } from './context-budget'
 
 export interface PlainChatClient {
   chat(input: {
@@ -25,8 +26,8 @@ const plainChatSystemPrompt = [
 ].join('\n')
 
 const historyMessages = (request: ChatRequest): ModelMessage[] => (
-  (request.history ?? []).slice(-8).map((message) => ({
-    role: message.role,
+  selectHistoryWithSummary(request.history, 8, 1_200, 1_600).map((message) => ({
+    role: message.role as ModelMessage['role'],
     content: message.content
   }))
 )
@@ -62,4 +63,3 @@ export class PlainChatAgent {
     }
   }
 }
-

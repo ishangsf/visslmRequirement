@@ -51,6 +51,11 @@ export interface KnowledgeSearchHit {
   score: number
 }
 
+export interface KnowledgeSearchOptions {
+  /** Restrict semantic search to one provenance class; legacy callers may omit it. */
+  sourceType?: 'document' | 'record' | 'all'
+}
+
 export interface KnowledgeRecordMatch {
   recordUid: string
   recordName: string
@@ -1018,14 +1023,23 @@ export class KnowledgeService {
     return rows
   }
 
-  async search(question: string, limit = 8): Promise<KnowledgeSearchHit[]> {
+  async search(
+    question: string,
+    limitOrOptions: number | KnowledgeSearchOptions = 8,
+    options?: KnowledgeSearchOptions
+  ): Promise<KnowledgeSearchHit[]> {
     const query = question.trim()
     if (!query) return []
+    const limit = typeof limitOrOptions === 'number' ? limitOrOptions : 8
+    const searchOptions = typeof limitOrOptions === 'number' ? options : limitOrOptions
+    const sourceType = searchOptions?.sourceType === 'document' || searchOptions?.sourceType === 'record'
+      ? searchOptions.sourceType
+      : 'all'
     const safeLimit = Math.min(20, Math.max(1, Math.trunc(Number.isFinite(limit) ? limit : 8)))
     await this.waitForIndexReady()
     await this.embeddings.prepare()
     if (!this.embeddings.available) return []
-    const cacheKey = `${this.modelVersion}:${safeLimit}:${query.replace(/\s+/g, ' ').toLocaleLowerCase()}`
+    const cacheKey = `${this.modelVersion}:${sourceType}:${safeLimit}:${query.replace(/\s+/g, ' ').toLocaleLowerCase()}`
     const cached = this.searchResultCache.get(cacheKey)
     if (cached && Date.now() - cached.createdAt <= SEARCH_RESULT_CACHE_TTL_MS) {
       return cached.result
@@ -1033,7 +1047,9 @@ export class KnowledgeService {
     if (cached) this.searchResultCache.delete(cacheKey)
     const [queryVector] = await this.embeddings.embedMany([query])
     await this.waitForIndexReady()
-    const allCandidates = this.vectorRowsForSearch()
+    const allCandidates = this.vectorRowsForSearch().filter(({ chunk }) => (
+      sourceType === 'all' || chunk.sourceType === sourceType
+    ))
     if (!queryVector || !allCandidates.length) {
       this.rememberSearchResult(cacheKey, [])
       return []

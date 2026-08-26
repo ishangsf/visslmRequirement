@@ -15,6 +15,8 @@ import { basename, dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import type {
   ChatMessage,
+  ChatDataView,
+  ChatDataViewPage,
   ChatSession,
   ChatSessionDeleteResult,
   ChatSessionSaveInput,
@@ -47,6 +49,7 @@ import type {
   PushLogRow,
   PushLogStatus,
   RecordDetail,
+  RecordImagePage,
   RecordMaintenanceFailedItem,
   RecordMaintenanceIndexStatus,
   RecordMaintenanceOperation,
@@ -65,6 +68,12 @@ import type {
   RequirementSemanticizationAnalysisTrace,
   SyncRun
 } from '../shared/types'
+import {
+  compactChatContextRefs,
+  compactChatDataViews,
+  compactRecordUids,
+  sanitizeContextText
+} from './context-budget'
 import {
   buildRequirementBusinessText,
   isAiRequirementSemanticCard,
@@ -158,6 +167,8 @@ export interface ImageInput {
   name: string
   mimeType: string
   sourceUrl: string
+  /** Original candidate URL used to key an unresolved marker, when download normalizes sourceUrl. */
+  unresolvedSourceUrl?: string
   bytes: Buffer
 }
 
@@ -709,13 +720,27 @@ export interface FieldQueryResult {
   totalScanned: number
   matchedCount: number
   returnedCount: number
+  /** Complete matched UID index for UI paging, capped to a bounded safety limit. */
+  recordUids: string[]
+  /**
+   * Complete UID snapshots for each normalized search term. The index is
+   * derived from the full matched set rather than preview rows, so a grouped
+   * view can page each group independently when more than 50 rows match.
+   * Optional only for compatibility with older planner/test results; database
+   * queries always provide it.
+   */
+  recordUidsByTerm?: Record<string, string[]>
   fields: string[]
   fieldLabels?: Record<string, string>
   records: Array<{
     source: ChatSource
     values: Record<string, string | string[]>
+    /** Search terms from the request that matched this record. */
+    matchedTerms?: string[]
   }>
 }
+
+export const FIELD_QUERY_UID_LIMIT = 10_000
 
 export interface AnalyticsRecord {
   uid: string
@@ -2584,7 +2609,16 @@ export class AppDatabase {
         typeof message.id === 'string' &&
         typeof message.createdAt === 'string'
       )
-    })
+    }).map((message) => ({
+      ...message,
+      content: sanitizeContextText(message.content, 8_000),
+      ...(message.contextRefs?.length
+        ? { contextRefs: compactChatContextRefs(message.contextRefs) }
+        : {}),
+      ...(message.dataViews?.length
+        ? { dataViews: compactChatDataViews(message.dataViews) }
+        : {})
+    }))
   }
 
   private mapChatSessionSummary(row: SqlRow): ChatSessionSummary {
@@ -7279,7 +7313,11 @@ export class AppDatabase {
   saveImage(input: ImageInput): ImageAsset {
     this.statsCache = null
     const sha256 = createHash('sha256').update(input.bytes).digest('hex')
-    const unresolvedMarker = unresolvedImageMarker(input.recordUid, input.name, input.sourceUrl)
+    const unresolvedMarker = unresolvedImageMarker(
+      input.recordUid,
+      input.name,
+      input.unresolvedSourceUrl ?? input.sourceUrl
+    )
     this.db.prepare('DELETE FROM images WHERE record_uid = ? AND sha256 = ? AND state = \'unresolved\'')
       .run(input.recordUid, unresolvedMarker)
     const existing = this.db
@@ -7824,6 +7862,74 @@ export class AppDatabase {
     return rows.map((row) => String(row.uid))
   }
 
+  getChatDataViewPage(
+    view: Pick<ChatDataView, 'recordUids' | 'fields'>,
+    page = 1,
+    pageSize = 20
+  ): ChatDataViewPage {
+    const ids = compactRecordUids(view.recordUids)
+    const safePage = Math.max(1, Math.trunc(page || 1))
+    const safePageSize = Math.min(100, Math.max(1, Math.trunc(pageSize || 20)))
+    const selectedFields = [...new Set((view.fields ?? []).map((field) => field.trim()).filter(Boolean))].slice(0, 40)
+    if (!ids.length) return { page: safePage, pageSize: safePageSize, total: 0, rows: [] }
+    const placeholders = ids.map(() => '?').join(',')
+    const rows = this.db.prepare(`
+      SELECT uid, name, node_type, item_id, raw_json
+      FROM records
+      WHERE uid IN (${placeholders})
+      ORDER BY last_modify_time DESC, uid DESC
+      LIMIT ? OFFSET ?
+    `).all(...ids, safePageSize, (safePage - 1) * safePageSize) as SqlRow[]
+    const totalRow = this.db.prepare(`SELECT COUNT(*) AS total FROM records WHERE uid IN (${placeholders})`).get(...ids) as SqlRow
+    const fieldValue = (raw: Record<string, unknown>, path: string): string | string[] => {
+      const value = path.split('.').reduce<unknown>((current, key) => (
+        current && typeof current === 'object' ? (current as Record<string, unknown>)[key] : undefined
+      ), raw)
+      if (Array.isArray(value)) return value.slice(0, 12).map((item) => sanitizeContextText(item, 512))
+      return sanitizeContextText(value, 512)
+    }
+    return {
+      page: safePage,
+      pageSize: safePageSize,
+      total: Number(totalRow.total ?? ids.length),
+      rows: rows.map((row) => {
+        let raw: Record<string, unknown> = {}
+        try {
+          const parsed = JSON.parse(String(row.raw_json ?? '{}')) as unknown
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) raw = parsed as Record<string, unknown>
+        } catch { /* malformed raw fields remain empty */ }
+        return {
+          uid: String(row.uid),
+          name: sanitizeContextText(row.name, 240),
+          nodeType: sanitizeContextText(row.node_type, 120),
+          itemId: sanitizeContextText(row.item_id, 160),
+          values: Object.fromEntries(selectedFields.map((field) => [field, fieldValue(raw, field)]))
+        }
+      })
+    }
+  }
+
+  getRecordImagePage(uid: string, page = 1, pageSize = 12): RecordImagePage {
+    const normalizedUid = uid.trim()
+    const safePage = Math.max(1, Math.trunc(page || 1))
+    const safePageSize = Math.min(48, Math.max(1, Math.trunc(pageSize || 12)))
+    if (!normalizedUid) return { page: safePage, pageSize: safePageSize, total: 0, images: [] }
+    const totalRow = this.db.prepare('SELECT COUNT(*) AS total FROM images WHERE record_uid = ?')
+      .get(normalizedUid) as SqlRow
+    const rows = this.db.prepare(`
+      SELECT * FROM images
+      WHERE record_uid = ?
+      ORDER BY created_at, id
+      LIMIT ? OFFSET ?
+    `).all(normalizedUid, safePageSize, (safePage - 1) * safePageSize) as SqlRow[]
+    return {
+      page: safePage,
+      pageSize: safePageSize,
+      total: Number(totalRow.total ?? 0),
+      images: rows.map((row) => this.mapImage(row))
+    }
+  }
+
   getRecord(
     uid: string,
     includeImages = true,
@@ -8237,7 +8343,8 @@ export class AppDatabase {
           uid: row.uid,
           name: row.name,
           nodeType: row.nodeType,
-          itemId: row.itemId
+          itemId: row.itemId,
+          sourceType: 'record' as const
         },
         text: detail.normalizedText ?? '',
         raw: detail.raw
@@ -8456,7 +8563,8 @@ export class AppDatabase {
               uid: String(row.uid),
               name: String(row.name),
               nodeType: String(row.node_type),
-              itemId: String(row.item_id)
+              itemId: String(row.item_id),
+              sourceType: 'record' as const
             }
           })
         }
@@ -8588,14 +8696,18 @@ export class AppDatabase {
     const filters = (options.filters ?? [])
       .filter((filter) => filter.field?.trim())
       .slice(0, 10)
+    const normalizeSearchTerm = (value: unknown): string => String(value ?? '')
+      .normalize('NFKC')
+      .trim()
+      .toLocaleLowerCase()
     const searchTerms = [
       ...(options.searchTerms ?? []),
       ...(options.search?.trim() ? [options.search] : [])
     ]
-      .map((term) => term.trim().toLocaleLowerCase())
+      .map(normalizeSearchTerm)
       .filter(Boolean)
       .filter((term, index, values) => values.indexOf(term) === index)
-      .slice(0, 10)
+      .slice(0, 12)
     const searchMode = options.searchMode === 'all' ? 'all' : 'any'
 
     const matched = rows.flatMap((row) => {
@@ -8605,17 +8717,19 @@ export class AppDatabase {
       } catch {
         return []
       }
+      let matchedTerms: string[] = []
       if (searchTerms.length) {
         const searchable = [
           String(row.name),
           String(row.item_id),
           String(row.normalized_text)
-        ].join('\n').toLocaleLowerCase()
+        ].join('\n').normalize('NFKC').toLocaleLowerCase()
         const termMatches = searchTerms.map((term) => searchable.includes(term))
         if (
           (searchMode === 'all' && !termMatches.every(Boolean)) ||
           (searchMode === 'any' && !termMatches.some(Boolean))
         ) return []
+        matchedTerms = searchTerms.filter((_term, index) => termMatches[index])
       }
       const passes = filters.every((filter) => {
         const values = normalizedFieldValues(
@@ -8636,9 +8750,11 @@ export class AppDatabase {
           uid: String(row.uid),
           name: String(row.name),
           nodeType: String(row.node_type),
-          itemId: String(row.item_id)
+          itemId: String(row.item_id),
+          sourceType: 'record' as const
         },
         values,
+        ...(matchedTerms.length ? { matchedTerms } : {}),
         raw
       }]
     })
@@ -8660,7 +8776,26 @@ export class AppDatabase {
     }
 
     const limit = Math.min(50, Math.max(1, Math.trunc(options.limit ?? 10)))
-    const records = matched.slice(0, limit).map(({ source, values }) => ({ source, values }))
+    const records = matched.slice(0, limit).map(({ source, values, matchedTerms }) => ({
+      source,
+      values,
+      ...(matchedTerms?.length ? { matchedTerms } : {})
+    }))
+    const recordUids = compactRecordUids(
+      matched.map(({ source }) => source.uid),
+      FIELD_QUERY_UID_LIMIT
+    )
+    const recordUidsByTerm = Object.fromEntries(
+      searchTerms.map((term) => [
+        term,
+        compactRecordUids(
+          matched
+            .filter(({ matchedTerms }) => matchedTerms?.includes(term))
+            .map(({ source }) => source.uid),
+          FIELD_QUERY_UID_LIMIT
+        )
+      ])
+    )
     const fieldLabels = this.getFieldDisplayNames(
       options.nodeType?.trim() || [...new Set(matched.map((item) => item.source.nodeType))],
       fields
@@ -8669,6 +8804,8 @@ export class AppDatabase {
       totalScanned: rows.length,
       matchedCount: matched.length,
       returnedCount: records.length,
+      recordUids,
+      recordUidsByTerm,
       fields,
       ...(Object.keys(fieldLabels).length ? { fieldLabels } : {}),
       records
@@ -8830,24 +8967,28 @@ export class AppDatabase {
     }
   }
 
-  *iterateExportRows(): Generator<Record<string, unknown>> {
+  *iterateExportRows(recordUids?: ReadonlySet<string>): Generator<Record<string, unknown>> {
     const rows = this.db
       .prepare('SELECT * FROM records ORDER BY project_id, node_type, uid')
       .iterate() as Iterable<SqlRow>
     for (const row of rows) {
+      if (recordUids && !recordUids.has(String(row.uid))) continue
       yield this.mapExportRow(row)
     }
   }
 
-  *iterateExportRowsWithoutBinary(): Generator<Record<string, unknown>> {
+  *iterateExportRowsWithoutBinary(recordUids?: ReadonlySet<string>): Generator<Record<string, unknown>> {
     const rows = this.db
       .prepare('SELECT * FROM records ORDER BY project_id, node_type, uid')
       .iterate() as Iterable<SqlRow>
-    for (const row of rows) yield this.mapExportRow(row, false)
+    for (const row of rows) {
+      if (recordUids && !recordUids.has(String(row.uid))) continue
+      yield this.mapExportRow(row, false)
+    }
   }
 
-  exportRows(): Array<Record<string, unknown>> {
-    return [...this.iterateExportRows()]
+  exportRows(recordUids?: ReadonlySet<string>): Array<Record<string, unknown>> {
+    return [...this.iterateExportRows(recordUids)]
   }
 
   private mapDataImportRun(row: SqlRow): DataImportRunSnapshot {

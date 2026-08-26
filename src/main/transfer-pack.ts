@@ -15,8 +15,8 @@ const MAX_ENTRY_COUNT = 200_000
 type JsonObject = Record<string, unknown>
 
 export interface TransferPackDatabase {
-  iterateExportRows(): Generator<Record<string, unknown>>
-  iterateExportRowsWithoutBinary?(): Generator<Record<string, unknown>>
+  iterateExportRows(recordUids?: ReadonlySet<string>): Generator<Record<string, unknown>>
+  iterateExportRowsWithoutBinary?(recordUids?: ReadonlySet<string>): Generator<Record<string, unknown>>
   readAssetBytes(sha256: string): Buffer | null
   getAssetBlob(sha256: string): { sha256: string; mimeType: string; byteSize: number; filePath: string } | null
   saveAssetBlob?(input: { sha256: string; mimeType: string; bytes: Buffer }): unknown
@@ -261,6 +261,52 @@ const tokenizeLegacyDescription = (row: JsonObject): JsonObject => {
   }
 }
 
+/**
+ * Rewrite rich-text image sources while allowing a resolver to explicitly
+ * remove a source.  replaceRichTextImageSources intentionally leaves an
+ * unresolved source untouched, which is useful during collection but would
+ * leave a dangling URL in a transfer pack.
+ */
+const replaceRichTextSourcesForExport = (
+  html: string,
+  resolver: (source: ReturnType<typeof findRichTextImageSources>[number]) => string | undefined
+): string => {
+  const ranges: Array<{ start: number; end: number; value: string }> = []
+  for (const source of findRichTextImageSources(html)) {
+    const value = resolver(source)
+    if (value === undefined) continue
+    ranges.push({ start: source.start, end: source.end, value })
+  }
+  let result = html
+  for (const range of ranges.sort((left, right) => right.start - left.start)) {
+    result = result.slice(0, range.start) + range.value + result.slice(range.end)
+  }
+  return result
+}
+
+/** Remove any remaining standalone embedded image payloads from JSON values. */
+const stripImageDataUris = (value: unknown): unknown => {
+  if (typeof value === 'string') return /^\s*data:image\//i.test(value) ? '' : value
+  if (Array.isArray(value)) return value.map(stripImageDataUris)
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as JsonObject).map(([key, child]) => [key, stripImageDataUris(child)])
+    )
+  }
+  return value
+}
+
+const imageSha256 = (image: JsonObject): string => {
+  const direct = text(image.sha256).trim().toLowerCase()
+  if (/^[a-f0-9]{64}$/.test(direct)) return direct
+  return parseAssetToken(text(image.assetUrl))?.sha256 ?? ''
+}
+
+const safeImageReferenceId = (value: unknown, fallback: string): string => {
+  const candidate = text(value).trim()
+  return /^[A-Za-z0-9_-]{1,128}$/.test(candidate) ? candidate : fallback
+}
+
 const mergeImportResults = (results: DataImportResult[]): DataImportResult => {
   const first = results[0]
   const duplicates: DataReviewItem[] = results.flatMap((result) => result.duplicates)
@@ -286,7 +332,8 @@ const mergeImportResults = (results: DataImportResult[]): DataImportResult => {
 /** Stream a .visslmpack file without building the archive in memory. */
 export async function exportVisslmPack(
   db: TransferPackDatabase,
-  targetPath: string
+  targetPath: string,
+  recordUids?: ReadonlySet<string>
 ): Promise<DataExportResult> {
   const temporaryPath = `${targetPath}.part-${process.pid}-${randomUUID()}`
   mkdirSync(dirname(targetPath), { recursive: true })
@@ -310,63 +357,150 @@ export async function exportVisslmPack(
     })
     const recordsEntry = new ZipDeflate('records.jsonl', { level: 6 })
     zip.add(recordsEntry)
-    const addAsset = (sha256Input: string, image: JsonObject): void => {
+    let skippedImageCount = 0
+    const skippedKeys = new Set<string>()
+    const noteSkipped = (recordLabel: string, key: string): void => {
+      const dedupeKey = `${recordLabel}\u0000${key}`
+      if (skippedKeys.has(dedupeKey)) return
+      skippedKeys.add(dedupeKey)
+      skippedImageCount += 1
+    }
+    const addAsset = (sha256Input: string, image: JsonObject): boolean => {
       const sha256 = sha256Input.trim().toLowerCase()
-      if (!/^[a-f0-9]{64}$/.test(sha256) || assets.has(sha256)) return
-      const blob = db.getAssetBlob(sha256)
+      if (!/^[a-f0-9]{64}$/.test(sha256)) return false
+      if (assets.has(sha256)) return true
+      let blob: ReturnType<TransferPackDatabase['getAssetBlob']> = null
+      try { blob = db.getAssetBlob(sha256) } catch { blob = null }
       let fallbackPath: string | undefined
-      if (!blob) {
+      let sourcePath: string | undefined
+      let bytes: Buffer | null = null
+      if (blob) {
+        try { bytes = db.readAssetBytes(sha256) } catch { bytes = null }
+        if (bytes) sourcePath = blob.filePath
+      }
+      if (!bytes) {
         const encoded = text(image.base64).replace(/\s+/g, '')
-        if (!encoded || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded) || encoded.length % 4 === 1) {
-          throw new Error(`图片资源 ${sha256.slice(0, 12)}… 不存在或缺少二进制内容`)
-        }
-        const bytes = Buffer.from(encoded, 'base64')
-        validateAssetBytes(sha256, normalizePackMime(image.mimeType), bytes)
+        if (!encoded || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded) || encoded.length % 4 === 1) return false
+        bytes = Buffer.from(encoded, 'base64')
         fallbackPath = join(fallbackDirectory, sha256)
         writeFileSync(fallbackPath, bytes)
       }
+      const declaredMime = text(image.mimeType).trim() || text(blob?.mimeType).trim()
+      const mimeType = normalizePackMime(declaredMime || detectMimeType(bytes))
+      try {
+        validateAssetBytes(sha256, mimeType, bytes)
+      } catch {
+        return false
+      }
       assets.set(sha256, {
         sha256,
-        mimeType: normalizePackMime(text(image.mimeType) || blob?.mimeType || 'application/octet-stream'),
-        byteSize: Number(image.byteSize ?? blob?.byteSize ?? 0),
-        sourcePath: blob?.filePath,
+        mimeType,
+        byteSize: bytes.byteLength,
+        sourcePath,
         fallbackPath
       })
+      return true
     }
-    const rows = db.iterateExportRowsWithoutBinary?.() ?? db.iterateExportRows()
+    const rows = db.iterateExportRowsWithoutBinary?.(recordUids) ?? db.iterateExportRows(recordUids)
     for (const originalRow of rows) {
       const row = tokenizeLegacyDescription(stripBinaryFields(originalRow))
       const images = Array.isArray(originalRow.images) ? originalRow.images : []
-      for (const input of images) {
+      const imageBySha = new Map<string, JsonObject>()
+      const validImages: JsonObject[] = []
+      const unavailableAssetShas = new Set<string>()
+      const recordLabel = text(row.documentId) || text(row.title) || '未命名记录'
+      for (const [imageIndex, input] of images.entries()) {
         const image = asObject(input)
         if (!image) continue
-        if (text(image.state) === 'unresolved') {
-          throw new Error(`记录 ${text(row.documentId) || text(row.title)} 含未解析图片，不能完整导出`)
+        const sha256 = imageSha256(image)
+        const skipKey = sha256 ? `asset:${sha256}` : `source:${text(image.sourceUrl) || imageIndex}`
+        if (text(image.state).trim().toLowerCase() !== 'ready') {
+          if (sha256) unavailableAssetShas.add(sha256)
+          noteSkipped(recordLabel, skipKey)
+          continue
         }
-        addAsset(text(image.sha256), image)
+        if (!addAsset(sha256, image)) {
+          if (sha256) unavailableAssetShas.add(sha256)
+          noteSkipped(recordLabel, skipKey)
+          continue
+        }
+        unavailableAssetShas.delete(sha256)
+        imageBySha.set(sha256, image)
+        const strippedImages = stripBinaryFields({ images: [image] }).images
+        const sanitized = asObject(Array.isArray(strippedImages) ? strippedImages[0] : null) ?? {}
+        const { base64: _base64, dataUri: _dataUri, errorMessage: _errorMessage, ...metadata } = sanitized
+        const asset = assets.get(sha256)
+        if (!asset) continue
+        const referenceId = safeImageReferenceId(
+          metadata.id,
+          `export-${sha256.slice(0, 16)}`
+        )
+        validImages.push({
+          ...metadata,
+          sha256,
+          mimeType: asset.mimeType,
+          byteSize: asset.byteSize,
+          assetPath: `assets/${sha256}`,
+          assetUrl: `visslm-asset://${sha256}/${referenceId}`,
+          state: 'ready'
+        })
       }
       const raw = asObject(row.raw)
       const description = text(raw?._valm_Description)
+      let nextDescription = description
       if (description) {
-        for (const source of findRichTextImageSources(description)) {
+        nextDescription = replaceRichTextSourcesForExport(description, (source) => {
           const parsed = parseAssetToken(source.source)
           if (parsed) {
+            if (unavailableAssetShas.has(parsed.sha256)) {
+              noteSkipped(recordLabel, `asset:${parsed.sha256}`)
+              return ''
+            }
+            const candidate = imageBySha.get(parsed.sha256)
             const blob = db.getAssetBlob(parsed.sha256)
-            if (!blob) throw new Error(`图片资源 ${parsed.sha256.slice(0, 12)}… 不存在或校验失败`)
-            addAsset(parsed.sha256, {
+            const image = {
+              ...(candidate ?? {}),
               sha256: parsed.sha256,
-              mimeType: blob.mimeType,
-              byteSize: blob.byteSize
-            })
-            continue
+              mimeType: text(candidate?.mimeType) || text(blob?.mimeType)
+            }
+            if (addAsset(parsed.sha256, image)) return source.source
+            unavailableAssetShas.add(parsed.sha256)
+            noteSkipped(recordLabel, `asset:${parsed.sha256}`)
+            return ''
           }
-          throw new Error(`记录 ${text(row.documentId) || text(row.title)} 含未解析正文图片，不能完整导出`)
+          noteSkipped(recordLabel, `source:${source.source}`)
+          return ''
+        })
+      }
+      const sourceReferences = Array.isArray(row.imageReferences) ? row.imageReferences : []
+      const validReferences = sourceReferences.flatMap((input, referenceIndex) => {
+        const reference = asObject(input)
+        if (!reference) {
+          noteSkipped(recordLabel, `reference:${referenceIndex}`)
+          return []
         }
+        const sha256 = text(reference.assetSha256 || reference.sha256).trim().toLowerCase()
+        if (!/^[a-f0-9]{64}$/.test(sha256) || !assets.has(sha256)) {
+          noteSkipped(
+            recordLabel,
+            sha256 ? `asset:${sha256}` : `source:${text(reference.originalSource) || referenceIndex}`
+          )
+          return []
+        }
+        const sanitized = stripImageDataUris(reference) as JsonObject
+        return [{ ...sanitized, assetSha256: sha256 }]
+      })
+      let exportRow: JsonObject = {
+        ...row,
+        images: validImages,
+        imageReferences: validReferences,
+        ...(raw && description ? { raw: { ...raw, _valm_Description: nextDescription } } : {})
       }
-      if (containsImageDataUri(row)) {
-        throw new Error(`记录 ${text(row.documentId) || text(row.title)} 含未解析 Base64 图片，不能完整导出`)
+      if (containsImageDataUri(exportRow)) {
+        noteSkipped(recordLabel, 'source:embedded-data-uri')
+        exportRow = stripImageDataUris(exportRow) as JsonObject
       }
-      const line = Buffer.from(`${JSON.stringify(row)}\n`, 'utf8')
+      const line = Buffer.from(`${JSON.stringify(exportRow)}\n`, 'utf8')
       recordHash.update(line)
       recordBytes += line.byteLength
       recordCount += 1
@@ -421,7 +555,7 @@ export async function exportVisslmPack(
       ok: true,
       path: targetPath,
       recordCount,
-      message: `已导出 ${recordCount} 条数据和 ${assets.size} 个二进制资源`,
+      message: `已导出 ${recordCount} 条数据和 ${assets.size} 个二进制资源${skippedImageCount ? `，跳过 ${skippedImageCount} 张无法恢复的图片` : ''}`,
       format: 'visslmpack',
       packVersion: PACK_VERSION,
       assetCount: assets.size,

@@ -18,8 +18,10 @@ import type {
   ModelSettings,
   PlatformSettingsInput,
   ProjectMatchingSettings,
+  ChatDataView,
   SystemSettingsInput,
   PushConfig,
+  RecordExportQuery,
   RecordQuery,
   RecordMaintenancePreview,
   RecordMaintenanceStartInput,
@@ -108,6 +110,14 @@ const api: AppApi = {
   listRecordUids: (query: Omit<RecordQuery, 'page' | 'pageSize'>) =>
     ipcRenderer.invoke('data:record-uids', query),
   getRecord: (uid: string) => ipcRenderer.invoke('data:record', uid),
+  getRecordForChat: (uid: string) => ipcRenderer.invoke('chat:record', uid),
+  getRecordImagePage: (uid: string, page: number, pageSize: number) =>
+    ipcRenderer.invoke('chat:record-images', uid, page, pageSize),
+  getChatDataViewPage: (
+    view: Pick<ChatDataView, 'recordUids' | 'fields'>,
+    page: number,
+    pageSize: number
+  ) => ipcRenderer.invoke('chat:data-view-page', view, page, pageSize),
   previewRecordMaintenance: (
     input: Pick<RecordMaintenanceStartInput, 'scope' | 'recordUids'>
   ): Promise<RecordMaintenancePreview> => ipcRenderer.invoke('data:maintenance-preview', input),
@@ -204,7 +214,7 @@ const api: AppApi = {
   getDataImportRun: (id: string): Promise<DataImportRunSnapshot | null> =>
     ipcRenderer.invoke('data:import-run', id),
   resumeDataImportRun: (id: string) => ipcRenderer.invoke('data:import-resume', id),
-  exportData: () => ipcRenderer.invoke('data:export'),
+  exportData: (query?: RecordExportQuery) => ipcRenderer.invoke('data:export', query),
   deleteData: (uids?: string[]) => ipcRenderer.invoke('data:delete', uids),
   previewPush: (config: PushConfig) => ipcRenderer.invoke('push:preview', config),
   startPush: (config: PushConfig) => ipcRenderer.invoke('push:start', config),

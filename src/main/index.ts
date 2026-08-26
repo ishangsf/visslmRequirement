@@ -15,7 +15,11 @@ import { Readable } from 'node:stream'
 import { promisify } from 'node:util'
 import * as XLSX from 'xlsx'
 import type {
+  AssistantIntentDecision,
+  AssistantExecutionAgentId,
+  ChatResponse,
   ChatRequest,
+  ChatDataView,
   ChatSessionDeleteResult,
   ChatSessionSaveInput,
   DataImportResult,
@@ -30,6 +34,7 @@ import type {
   ProjectMatchingSettings,
   SystemSettingsInput,
   PushConfig,
+  RecordExportQuery,
   RecordQuery,
   RecordMaintenanceStartInput,
   RequirementSemanticizationStartInput,
@@ -76,7 +81,16 @@ import { diagnoseDashboard } from './dashboards/diagnostics'
 import { repairDashboardComponent } from './dashboards/component-repair'
 import { dashboardSpecHash } from './dashboards/spec-hash'
 import { ExpertRouter } from './experts/router'
-import { autoRequirementIds, resolveAutoChatRoute } from './experts/auto-routing'
+import { autoRequirementIds } from './experts/auto-routing'
+import { resolveAssistantIntent } from './assistant/intent-router'
+import {
+  validateAssistantExecutionRoute
+} from './assistant/agent-registry'
+import {
+  createAssistantTaskTrace,
+  traceContextFromDecision,
+  type AssistantTraceContext
+} from './assistant/task-trace'
 import { RequirementAnalysisAgent } from './experts/requirement-analysis-agent'
 import { RequirementSemanticizationService } from './requirements/semanticization-service'
 import { VisualizationAgent } from './experts/visualization-agent'
@@ -84,6 +98,7 @@ import { resolveVisualizationRequestMode } from './experts/visualization-intent'
 import { OllamaAgent } from './ollama'
 import { PlainChatAgent } from './plain-chat'
 import { DirectRequirementDataAnalysisAgent } from './direct-data-analysis'
+import { chatHistoryFromMessages, contextRefsFromResponse } from './context-budget'
 import { SettingsService } from './settings'
 import { PushService, SyncService, VisslmClient } from './visslm'
 import { KnowledgeService } from './knowledge'
@@ -99,6 +114,11 @@ import {
 import { ProjectManagementService } from './project-management'
 import { exportVisslmPack, importVisslmPack } from './transfer-pack'
 import type { UpdateManager } from './updater'
+import {
+  isUnsupportedWindowsVersion,
+  unsupportedWindowsMessage
+} from './platform-compat'
+import { isNavigationAbortedError } from './navigation-error'
 import { createProjectWorkbook } from './project-export'
 import {
   createDashboardOfflineArchive,
@@ -116,6 +136,7 @@ protocol.registerSchemesAsPrivileged([{
   privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true }
 }])
 let mainWindow: BrowserWindow | null = null
+let backendReady = false
 let updateManager: UpdateManager | null = null
 let updateManagerInitError: string | null = null
 let db: AppDatabase
@@ -473,6 +494,56 @@ const recordDashboardAudit = (input: DashboardAuditLogInput): void => {
   }
 }
 
+const exportSemanticStatuses = new Set(['pending', 'processing', 'ready', 'failed'])
+
+const normalizeDataExportQuery = (input: unknown): RecordExportQuery | undefined => {
+  if (input === undefined || input === null) return undefined
+  if (typeof input !== 'object' || Array.isArray(input)) {
+    throw new Error('导出筛选条件必须是对象')
+  }
+  const source = input as Record<string, unknown>
+  const normalized: RecordExportQuery = {}
+  const readText = (
+    key: 'search' | 'projectId' | 'nodeType' | 'releaseText',
+    preserveEmpty = false
+  ): void => {
+    const value = source[key]
+    if (value === undefined || value === null) return
+    if (typeof value !== 'string') throw new Error(`导出筛选条件 ${key} 必须是字符串`)
+    const trimmed = value.trim()
+    if (trimmed || preserveEmpty) normalized[key] = trimmed
+  }
+  readText('search')
+  readText('projectId')
+  readText('nodeType')
+  readText('releaseText', true)
+  if (source.semanticStatus !== undefined && source.semanticStatus !== null) {
+    if (typeof source.semanticStatus !== 'string' || !exportSemanticStatuses.has(source.semanticStatus)) {
+      throw new Error('导出筛选条件 semanticStatus 无效')
+    }
+    normalized.semanticStatus = source.semanticStatus as NonNullable<RecordExportQuery['semanticStatus']>
+  }
+  // Unknown fields (including page/pageSize and excludeProjectAssetProjectId)
+  // are deliberately ignored instead of being forwarded to the database.
+  return Object.keys(normalized).length ? normalized : undefined
+}
+
+const exportAuditMetadata = (
+  query: RecordExportQuery | undefined,
+  recordCount: number
+): Record<string, string | number | boolean | null> => ({
+  filtered: Boolean(query),
+  searchPresent: Boolean(query?.search),
+  searchLength: query?.search?.length ?? 0,
+  ...(query?.projectId ? { projectId: query.projectId } : {}),
+  ...(query?.nodeType ? { nodeType: query.nodeType } : {}),
+  ...(query && Object.prototype.hasOwnProperty.call(query, 'releaseText')
+    ? { releaseText: query.releaseText ?? '' }
+    : {}),
+  ...(query?.semanticStatus ? { semanticStatus: query.semanticStatus } : {}),
+  recordCount
+})
+
 const specAuditMetadata = (
   spec: DashboardSpec | undefined,
   metadata: Record<string, string | number | boolean | null> = {}
@@ -523,13 +594,63 @@ const dashboardPatchErrorCode = (run: VisualizationRunInput | undefined): string
   return 'DASHBOARD_AI_PATCH_FAILED'
 }
 
-const createWindow = (): void => {
+const startupPageHtml = `<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>VISSLM Agent</title>
+    <style>
+      :root { color-scheme: dark; font-family: "Microsoft YaHei", sans-serif; }
+      html, body { width: 100%; height: 100%; margin: 0; background: #090b10; color: #eef1f7; }
+      body { display: grid; place-items: center; }
+      main { width: min(460px, calc(100vw - 48px)); text-align: center; }
+      h1 { margin: 0 0 12px; font-size: 22px; font-weight: 600; }
+      p { margin: 0; color: #929bad; font-size: 13px; line-height: 1.6; }
+      .spinner { width: 24px; height: 24px; margin: 0 auto 20px; border: 3px solid #2b3040; border-top-color: #7c6cff; border-radius: 50%; animation: spin 0.9s linear infinite; }
+      @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+  </head>
+  <body>
+    <main role="status" aria-live="polite">
+      <div class="spinner" aria-hidden="true"></div>
+      <h1>VISSLM Agent</h1>
+      <p>正在准备本地数据，请稍候…</p>
+    </main>
+  </body>
+</html>`
+
+const showRendererError = (message: string, detail?: string): void => {
+  console.error(`[renderer] ${message}${detail ? `: ${detail}` : ''}`)
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  if (!mainWindow.isVisible()) mainWindow.show()
+  void dialog.showMessageBox(mainWindow, {
+    type: 'error',
+    title: 'VISSLM Agent 界面加载失败',
+    message,
+    detail: detail || '请重启应用；如果问题持续，请保留此错误信息。'
+  }).catch(() => undefined)
+}
+
+const loadRendererPage = (): void => {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  const loadTask = process.env.ELECTRON_RENDERER_URL
+    ? mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL)
+    : mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
+  void loadTask.catch((error: unknown) => {
+    if (isNavigationAbortedError(error)) return
+    showRendererError('正式界面无法加载', updateErrorMessage(error))
+  })
+  scheduleKnowledgeInitialization()
+}
+
+const createWindow = ({ loadRenderer = true }: { loadRenderer?: boolean } = {}): void => {
   mainWindow = new BrowserWindow({
     width: 1440,
     height: 920,
     minWidth: 1120,
     minHeight: 700,
-    show: false,
+    show: !loadRenderer,
     frame: false,
     titleBarStyle: 'hidden',
     autoHideMenuBar: true,
@@ -574,17 +695,25 @@ const createWindow = (): void => {
     mainWindow?.webContents.send('window:maximized-changed', false)
   )
   mainWindow.webContents.on('did-fail-load', (_event, code, description, url) => {
+    if (code === -3) return
     console.error(`[renderer-load] ${code} ${description} ${url}`)
+    showRendererError('正式界面加载失败', `${description} (${code})\n${url}`)
+  })
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    showRendererError('界面进程已退出', `原因：${details.reason || '未知'}${details.exitCode ? `，退出码 ${details.exitCode}` : ''}`)
   })
   mainWindow.webContents.on('console-message', (details) => {
     if (details.level === 'error' || details.level === 'warning') {
       console.error(`[renderer:${details.level}] ${details.message}`)
     }
   })
-  if (process.env.ELECTRON_RENDERER_URL) {
-    void mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL)
+  if (loadRenderer) {
+    loadRendererPage()
   } else {
-    void mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
+    void mainWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(startupPageHtml)}`).catch((error: unknown) => {
+      if (isNavigationAbortedError(error)) return
+      showRendererError('启动页无法加载', updateErrorMessage(error))
+    })
   }
 }
 
@@ -645,6 +774,15 @@ const registerIpc = (): void => {
   )
   ipcMain.handle('data:record', (_event, uid: string) =>
     db.getRecord(uid, true, requirementSemanticizationService.context(), knowledgeService.modelVersion))
+  ipcMain.handle('chat:record', (_event, uid: string) =>
+    db.getRecord(uid, false, requirementSemanticizationService.context(), knowledgeService.modelVersion))
+  ipcMain.handle('chat:record-images', (_event, uid: string, page?: number, pageSize?: number) =>
+    db.getRecordImagePage(uid, page, pageSize))
+  ipcMain.handle(
+    'chat:data-view-page',
+    (_event, view: Pick<ChatDataView, 'recordUids' | 'fields'>, page?: number, pageSize?: number) =>
+      db.getChatDataViewPage(view, page, pageSize)
+  )
   ipcMain.handle(
     'data:maintenance-preview',
     (_event, input: Pick<RecordMaintenanceStartInput, 'scope' | 'recordUids'>) =>
@@ -718,30 +856,235 @@ const registerIpc = (): void => {
   ipcMain.handle('chat:delete-session', (_event, id: string): ChatSessionDeleteResult =>
     db.deleteChatSession(id)
   )
-  ipcMain.handle('agent:ask', (ipcEvent, request: ChatRequest) => {
-    const autoRequirementIdsForRequest = request.chatMode === 'auto' && request.entrypoint !== 'dashboard'
+  ipcMain.handle('agent:ask', async (ipcEvent, request: ChatRequest) => {
+    const isAutoChat = request.chatMode === 'auto' && request.entrypoint !== 'dashboard'
+    let assistantIntent: AssistantIntentDecision | undefined
+    const traceStartedAt = new Date().toISOString()
+    const fallbackTraceContext: AssistantTraceContext = {
+      taskType: 'conversation',
+      sourceMode: 'conversation',
+      resultMode: 'answer',
+      primaryAgent: 'conversation',
+      invokedAgents: []
+    }
+    let selectedTraceContext: AssistantTraceContext = fallbackTraceContext
+    const traceContextForResponse = (override?: AssistantTraceContext): AssistantTraceContext => {
+      if (override) return override
+      if (assistantIntent) {
+        try {
+          return traceContextFromDecision(assistantIntent)
+        } catch {
+          // Invalid combinations are handled below before dispatch. A failed
+          // response still needs a truthful, non-evidence trace fallback.
+        }
+      }
+      return selectedTraceContext
+    }
+    const attachAssistantIntent = (
+      response: ChatResponse,
+      options: Parameters<typeof createAssistantTaskTrace>[1] = {},
+      contextOverride?: AssistantTraceContext
+    ): ChatResponse => {
+      const enriched = assistantIntent
+        ? { ...response, assistantIntent }
+        : response
+      if (enriched.taskTrace) return enriched
+      return {
+        ...enriched,
+        taskTrace: createAssistantTaskTrace(traceContextForResponse(contextOverride), {
+          startedAt: traceStartedAt,
+          ...options
+        })
+      }
+    }
+    // A renderer restart can lose its in-memory history. This recovery is
+    // deliberately callable only after the first Auto intent decision and
+    // before any evidence agent, field catalog, or index access. If the first
+    // decision asks for clarification, the caller returns without touching
+    // the persisted session.
+    const recoverPersistedHistory = (): boolean => {
+      if (!request.conversationId || request.history?.length) return false
+      const persisted = db.getChatSession(request.conversationId)
+      if (!persisted?.messages.length) return false
+      request = {
+        ...request,
+        history: chatHistoryFromMessages(persisted.messages)
+      }
+      return true
+    }
+    if (isAutoChat) {
+      const emitIntentStatus = (
+        stage: 'classify' | 'skill',
+        message: string,
+        metadata?: Extract<AgentEvent, { type: 'status' }>['metadata']
+      ): void => {
+        ipcEvent.sender.send('agent:event', {
+          conversationId: request.conversationId,
+          event: { type: 'status' as const, stage, message, ...(metadata ? { metadata } : {}) }
+        })
+      }
+      emitIntentStatus('classify', '正在理解目标、上下文与任务类型')
+      try {
+        // The main process is the trust boundary. Auto-mode decisions supplied
+        // by the renderer are ignored and always recomputed before data access.
+        assistantIntent = await resolveAssistantIntent(
+          request,
+          settings.getModelCredentials()
+        )
+        if (!assistantIntent.needsClarification && recoverPersistedHistory()) {
+          // Recompute against recovered bounded user history so follow-ups
+          // can ground entities without trusting renderer-provided intent.
+          assistantIntent = await resolveAssistantIntent(
+            request,
+            settings.getModelCredentials()
+          )
+        }
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error)
+        emitIntentStatus('classify', `统一意图判断失败：${errorMessage}`)
+        return {
+          answer: '本次请求无法安全判断任务类型，未访问数据中心或知识库。请补充问题范围后重试。',
+          sources: [],
+          dataViews: [],
+          needsClarification: true,
+          clarificationQuestion: '请明确要进行普通对话、数据中心查询、知识库问答、混合分析、可视化或需求匹配中的哪一种任务。',
+          expertId: 'general',
+          taskTrace: createAssistantTaskTrace(fallbackTraceContext, {
+            startedAt: traceStartedAt,
+            status: 'failed',
+            invokedAgents: [],
+            error: {
+              code: 'AUTO_INTENT_CLASSIFICATION_FAILED',
+              message: errorMessage
+            }
+          }),
+          events: [{
+            type: 'error' as const,
+            code: 'AUTO_INTENT_CLASSIFICATION_FAILED',
+            message: errorMessage,
+            recoverable: true,
+            stage: 'classify'
+          }]
+        }
+      }
+      const routeValidation = validateAssistantExecutionRoute(assistantIntent)
+      if (!routeValidation.ok) {
+        const errorMessage = routeValidation.error
+        emitIntentStatus('skill', `任务与来源组合未通过校验：${errorMessage}`)
+        return {
+          ...attachAssistantIntent({
+            answer: '本次请求的任务与数据来源组合无法安全执行，未访问数据中心或知识库。请重新说明目标。',
+            sources: [],
+            dataViews: [],
+            needsClarification: true,
+            clarificationQuestion: '请重新明确要进行普通对话、数据中心查询、知识库问答、混合分析、可视化或需求匹配中的哪一种任务。',
+            expertId: assistantIntent.skillId,
+            events: [{
+              type: 'error' as const,
+              code: 'ASSISTANT_EXECUTION_ROUTE_INVALID',
+              message: errorMessage,
+              recoverable: true,
+              stage: 'route'
+            }]
+          }, {
+            status: 'failed',
+            invokedAgents: [],
+            error: { code: 'ASSISTANT_EXECUTION_ROUTE_INVALID', message: errorMessage }
+          })
+        }
+      }
+      const taskLabels: Record<AssistantIntentDecision['taskType'], string> = {
+        conversation: '普通对话',
+        record_query: '数据中心查询',
+        knowledge_qa: '知识库问答',
+        mixed_analysis: '混合分析',
+        visualization: '可视化交付',
+        requirement_matching: '需求匹配'
+      }
+      const skillLabels: Record<AssistantIntentDecision['skillId'], string> = {
+        general: '通用数据助手',
+        visualization: '数据可视化专家',
+        'requirement-analysis': '需求分析专家'
+      }
+      emitIntentStatus(
+        'skill',
+        `已选择任务：${taskLabels[assistantIntent.taskType]}；技能：${skillLabels[assistantIntent.skillId]}`,
+        {
+          expertId: assistantIntent.skillId,
+          taskType: assistantIntent.taskType,
+          sourceMode: assistantIntent.sourceMode,
+          resultMode: assistantIntent.resultMode,
+          followUp: Boolean(request.history?.length),
+          ...(assistantIntent.clarificationQuestion
+            ? { clarificationQuestion: assistantIntent.clarificationQuestion }
+            : {})
+        }
+      )
+      if (assistantIntent.needsClarification) {
+        const clarificationQuestion = assistantIntent.clarificationQuestion ||
+          '为了避免执行猜测性查询，请补充任务范围或数据来源。'
+        return attachAssistantIntent({
+          answer: clarificationQuestion,
+          sources: [],
+          dataViews: [],
+          needsClarification: true,
+          clarificationQuestion,
+          expertId: assistantIntent.skillId,
+        }, {
+          status: 'clarification',
+          invokedAgents: []
+        })
+      }
+      request = {
+        ...request,
+        question: assistantIntent.resolvedQuestion,
+        assistantIntent
+      }
+    }
+    if (!isAutoChat) recoverPersistedHistory()
+    const autoRequirementIdsForRequest = isAutoChat && assistantIntent?.taskType === 'requirement_matching'
       ? autoRequirementIds(request.question, request.history)
       : null
-    const autoRoute = request.chatMode === 'auto' && request.entrypoint !== 'dashboard'
-      ? resolveAutoChatRoute(request.question, request.history)
-      : null
-    const routedRequest = autoRoute === 'general'
+    const routedRequest = assistantIntent
       ? {
           ...request,
-          expertId: 'general' as const,
+          expertId: assistantIntent.skillId,
           chatMode: 'expert' as const
         }
       : request
     const route = expertRouter.route(routedRequest)
+    selectedTraceContext = assistantIntent
+      ? traceContextForResponse()
+      : route.expert.id === 'visualization'
+        ? {
+            taskType: 'visualization',
+            sourceMode: 'records',
+            resultMode: 'dashboard',
+            primaryAgent: 'visualization',
+            invokedAgents: []
+          }
+        : route.expert.id === 'requirement-analysis'
+          ? {
+              taskType: 'requirement_matching',
+              sourceMode: 'records',
+              resultMode: 'answer',
+              primaryAgent: 'requirement-analysis',
+              invokedAgents: []
+            }
+          : route.expert.id === 'general'
+            ? fallbackTraceContext
+            : fallbackTraceContext
     if (autoRequirementIdsForRequest?.length) {
       const agent = new DirectRequirementDataAnalysisAgent(db, settings.getModelCredentials())
       return agent.ask({
         ...request,
         question: request.question,
         extractedRequirementIds: autoRequirementIdsForRequest
-      }).then((response) => response).catch((error: unknown) => {
+      }).then((response) => attachAssistantIntent(response, {
+        invokedAgents: ['requirement-analysis']
+      })).catch((error: unknown) => {
         const errorMessage = error instanceof Error ? error.message : String(error)
-        return {
+        return attachAssistantIntent({
           answer: `本次需求数据分析没有完成。\n\n${errorMessage}\n\n请检查需求编号对应的本地数据后重试。`,
           sources: [],
           dataViews: [],
@@ -752,17 +1095,23 @@ const registerIpc = (): void => {
             recoverable: true,
             stage: 'answer'
           }]
-        }
+        }, {
+          status: 'failed',
+          invokedAgents: ['requirement-analysis'],
+          error: {
+            code: 'DIRECT_REQUIREMENT_DATA_ANALYSIS_FAILED',
+            message: errorMessage
+          }
+        })
       })
     }
-    if (request.entrypoint !== 'dashboard' && (
-      request.chatMode === 'plain' ||
-      (request.chatMode === 'auto' && autoRoute === 'plain')
-    )) {
+    if (request.entrypoint !== 'dashboard' && request.chatMode === 'plain') {
       const agent = new PlainChatAgent(settings.getModelCredentials())
-      return agent.ask({ ...request, question: route.question }).then((response) => response).catch((error: unknown) => {
+      return agent.ask({ ...request, question: route.question }).then((response) => attachAssistantIntent(response, {
+        invokedAgents: ['conversation']
+      })).catch((error: unknown) => {
         const errorMessage = error instanceof Error ? error.message : String(error)
-        return {
+        return attachAssistantIntent({
           answer: `本次普通对话没有完成。\n\n${errorMessage}\n\n你可以检查模型连接后重试。`,
           sources: [],
           dataViews: [],
@@ -773,21 +1122,79 @@ const registerIpc = (): void => {
             recoverable: true,
             stage: 'answer'
           }]
-        }
+        }, {
+          status: 'failed',
+          invokedAgents: ['conversation'],
+          error: {
+            code: 'PLAIN_CHAT_FAILED',
+            message: errorMessage
+          }
+        })
       })
     }
     if (route.expert.id === 'visualization') {
       const activeArtifact = request.activeArtifact
       const focusComponentId = request.focusComponentId?.trim() || undefined
       if (activeArtifact && activeArtifact.artifactId !== activeArtifact.dashboard.id) {
-        throw new Error('活动大屏标识与 DashboardSpec 不一致，无法执行修改')
+        const message = '活动大屏标识与 DashboardSpec 不一致，无法执行修改'
+        return attachAssistantIntent({
+          answer: '本次大屏修改未应用，当前画布保持不变。',
+          sources: [],
+          dataViews: [],
+          expertId: route.expert.id,
+          events: [{
+            type: 'error' as const,
+            code: 'DASHBOARD_ARTIFACT_MISMATCH',
+            message,
+            recoverable: true,
+            stage: 'validate'
+          }]
+        }, {
+          status: 'failed',
+          invokedAgents: [],
+          error: { code: 'DASHBOARD_ARTIFACT_MISMATCH', message }
+        })
       }
       if (focusComponentId && !activeArtifact) {
-        throw new Error('指定组件修改需要先打开一个活动大屏')
+        const message = '指定组件修改需要先打开一个活动大屏'
+        return attachAssistantIntent({
+          answer: '本次大屏修改未应用，当前画布保持不变。',
+          sources: [],
+          dataViews: [],
+          expertId: route.expert.id,
+          events: [{
+            type: 'error' as const,
+            code: 'DASHBOARD_ACTIVE_ARTIFACT_REQUIRED',
+            message,
+            recoverable: true,
+            stage: 'validate'
+          }]
+        }, {
+          status: 'failed',
+          invokedAgents: [],
+          error: { code: 'DASHBOARD_ACTIVE_ARTIFACT_REQUIRED', message }
+        })
       }
       if (focusComponentId && activeArtifact &&
           !activeArtifact.dashboard.components.some((component) => component.id === focusComponentId)) {
-        throw new Error(`指定组件 ${focusComponentId} 不存在，无法执行修改`)
+        const message = `指定组件 ${focusComponentId} 不存在，无法执行修改`
+        return attachAssistantIntent({
+          answer: '本次大屏修改未应用，当前画布保持不变。',
+          sources: [],
+          dataViews: [],
+          expertId: route.expert.id,
+          events: [{
+            type: 'error' as const,
+            code: 'DASHBOARD_COMPONENT_NOT_FOUND',
+            message,
+            recoverable: true,
+            stage: 'validate'
+          }]
+        }, {
+          status: 'failed',
+          invokedAgents: [],
+          error: { code: 'DASHBOARD_COMPONENT_NOT_FOUND', message }
+        })
       }
       const scope = request.dataScope ?? activeArtifact?.dashboard.components
         .find((component) => component.query?.scope)?.query?.scope ?? {
@@ -863,10 +1270,13 @@ const registerIpc = (): void => {
               answer: `已完成对“${response.dashboard?.title ?? '当前大屏'}”的修改，结果已通过校验，等待保存为新版本。`
             }
           : response)
+        .then((response) => attachAssistantIntent(response, {
+          invokedAgents: ['visualization']
+        }))
         .catch((error: unknown) => {
           const message = error instanceof Error ? error.message : String(error)
           if (message === '当前数据范围没有可用字段，请先采集数据') {
-            return {
+            return attachAssistantIntent({
               answer: '当前数据范围内没有可用于生成大屏的记录。请先完成数据采集，或调整数据范围后重试。',
               sources: [],
               dataViews: [],
@@ -877,13 +1287,17 @@ const registerIpc = (): void => {
                 message,
                 recoverable: true
               }]
-            }
+            }, {
+              status: 'failed',
+              invokedAgents: ['visualization'],
+              error: { code: 'NO_ANALYTICS_DATA', message }
+            })
           }
           if (activeArtifact && isPatchRequest) {
             const failedTool = [...(latestVisualizationRun?.toolCalls ?? [])]
               .reverse()
               .find((call) => call.status === 'failed')
-            return {
+            return attachAssistantIntent({
               answer: '本次大屏修改未应用，当前画布保持不变。',
               sources: [],
               dataViews: [],
@@ -896,9 +1310,32 @@ const registerIpc = (): void => {
                 stage: failedTool?.tool,
                 attemptCount: latestVisualizationRun?.attemptCount
               }]
-            }
+            }, {
+              status: 'failed',
+              invokedAgents: ['visualization'],
+              error: {
+                code: dashboardPatchErrorCode(latestVisualizationRun),
+                message
+              }
+            })
           }
-          throw error
+          return attachAssistantIntent({
+            answer: '本次可视化任务没有完成。',
+            sources: [],
+            dataViews: [],
+            expertId: route.expert.id,
+            events: [{
+              type: 'error' as const,
+              code: 'VISUALIZATION_FAILED',
+              message,
+              recoverable: true,
+              stage: 'execute'
+            }]
+          }, {
+            status: 'failed',
+            invokedAgents: ['visualization'],
+            error: { code: 'VISUALIZATION_FAILED', message }
+          })
         })
     }
     if (route.expert.id === 'requirement-analysis') {
@@ -911,12 +1348,15 @@ const registerIpc = (): void => {
           event
         })
       )
-      return agent.ask({ ...request, question: route.question }).then((response) => ({
+      return agent.ask({ ...request, question: route.question }).then((response) => attachAssistantIntent({
         ...response,
+        contextRefs: response.contextRefs ?? contextRefsFromResponse(response),
         expertId: route.expert.id
+      }, {
+        invokedAgents: ['requirement-analysis']
       })).catch((error: unknown) => {
         const errorMessage = error instanceof Error ? error.message : String(error)
-        return {
+        return attachAssistantIntent({
           answer: `需求分析未完成。\n\n${errorMessage}\n\n请检查需求编号和本地数据索引后重试。`,
           sources: [],
           dataViews: [],
@@ -928,7 +1368,14 @@ const registerIpc = (): void => {
             recoverable: true,
             stage: 'error'
           }]
-        }
+        }, {
+          status: 'failed',
+          invokedAgents: ['requirement-analysis'],
+          error: {
+            code: 'REQUIREMENT_ANALYSIS_FAILED',
+            message: errorMessage
+          }
+        })
       })
     }
     const agent = new OllamaAgent(
@@ -940,12 +1387,17 @@ const registerIpc = (): void => {
         event
       })
     )
-    return agent.ask({ ...request, question: route.question }).then((response) => ({
+    return agent.ask({ ...request, question: route.question }).then((response) => attachAssistantIntent({
       ...response,
+      contextRefs: response.contextRefs ?? contextRefsFromResponse(response),
       expertId: route.expert.id
     })).catch((error: unknown) => {
       const errorMessage = error instanceof Error ? error.message : String(error)
-      return {
+      const failure = error as {
+        invokedAgents?: AssistantExecutionAgentId[]
+        traceContext?: AssistantTraceContext
+      }
+      return attachAssistantIntent({
         answer: `本次任务没有完成。\n\n${errorMessage}\n\n你可以检查模型连接、缩小问题范围后重试。`,
         sources: [],
         dataViews: [],
@@ -956,8 +1408,15 @@ const registerIpc = (): void => {
           message: errorMessage,
           recoverable: true,
           stage: 'error'
-        }]
-      }
+          }]
+      }, {
+        status: 'failed',
+        invokedAgents: failure.invokedAgents ?? [],
+        error: {
+          code: 'AGENT_REQUEST_FAILED',
+          message: errorMessage
+        }
+      }, failure.traceContext)
     })
   })
   ipcMain.handle('analytics:field-profiles', (_event, scope?: DataScope) =>
@@ -1305,8 +1764,10 @@ const registerIpc = (): void => {
     }
   })
 
-  ipcMain.handle('data:export', async () => {
+  ipcMain.handle('data:export', async (_event, input?: unknown) => {
+    let query: RecordExportQuery | undefined
     try {
+      query = normalizeDataExportQuery(input)
       if (!mainWindow || mainWindow.isDestroyed()) {
         return {
           ok: false,
@@ -1323,19 +1784,26 @@ const registerIpc = (): void => {
         recordDashboardAudit({
           action: 'export-data',
           status: 'canceled',
-          format: 'visslmpack'
+          format: 'visslmpack',
+          metadata: exportAuditMetadata(query, 0)
         })
         return { ok: false, canceled: true, recordCount: 0, message: '已取消导出' }
       }
-      const exported = await recordIndexLock.runExclusive(() =>
-        exportVisslmPack(db, result.filePath)
-      )
+      const exported = await recordIndexLock.runExclusive(async () => {
+        // Freeze the complete matching UID set while the index lock prevents
+        // concurrent sync/import changes.  The set is passed to the pack
+        // iterator, never as a page-limited SQLite IN clause.
+        const frozenRecordUids = query
+          ? new Set(db.listRecordUids(query, requirementSemanticizationService.context()))
+          : undefined
+        return exportVisslmPack(db, result.filePath, frozenRecordUids)
+      })
       recordDashboardAudit({
         action: 'export-data',
         status: 'success',
         format: 'visslmpack',
         metadata: {
-          recordCount: exported.recordCount,
+          ...exportAuditMetadata(query, exported.recordCount),
           assetCount: exported.assetCount ?? 0,
           assetBytes: exported.assetBytes ?? 0
         }
@@ -1346,6 +1814,7 @@ const registerIpc = (): void => {
         action: 'export-data',
         status: 'failed',
         format: 'visslmpack',
+        metadata: exportAuditMetadata(query, 0),
         errorMessage: error instanceof Error ? error.message : String(error)
       })
       throw error
@@ -1747,10 +2216,26 @@ if (!hasSingleInstanceLock) {
   })
 
   app.whenReady().then(() => {
-    const dataDir = app.getPath('userData')
-    mkdirSync(dataDir, { recursive: true })
-    db = new AppDatabase(join(dataDir, 'visslm-agent.db'), join(dataDir, 'assets'))
-    protocol.handle('visslm-preview', async (request) => {
+    const systemVersion = process.platform === 'win32' ? process.getSystemVersion() : ''
+    if (process.platform === 'win32' && isUnsupportedWindowsVersion(systemVersion)) {
+      const message = unsupportedWindowsMessage(systemVersion)
+      console.error(`[startup] ${message}`)
+      dialog.showErrorBox('VISSLM Agent 无法启动', message)
+      app.quit()
+      return
+    }
+
+    // Paint a native startup page before synchronous database migrations.  A
+    // large legacy asset store can otherwise keep the process busy with no
+    // visible window for several minutes.
+    createWindow({ loadRenderer: false })
+    setTimeout(() => {
+      if (isQuitting || !mainWindow || mainWindow.isDestroyed()) return
+      try {
+      const dataDir = app.getPath('userData')
+      mkdirSync(dataDir, { recursive: true })
+      db = new AppDatabase(join(dataDir, 'visslm-agent.db'), join(dataDir, 'assets'))
+      protocol.handle('visslm-preview', async (request) => {
       try {
         prunePreviewFiles()
         const token = new URL(request.url).hostname.trim()
@@ -1776,7 +2261,7 @@ if (!hasSingleInstanceLock) {
         return new Response('Not Found', { status: 404 })
       }
     })
-    protocol.handle('visslm-asset', async (request) => {
+      protocol.handle('visslm-asset', async (request) => {
       try {
         const url = new URL(request.url)
         const sha256 = url.hostname.trim().toLowerCase()
@@ -1799,48 +2284,69 @@ if (!hasSingleInstanceLock) {
         return new Response('Not Found', { status: 404 })
       }
     })
-    recordIndexLock = new AsyncMutex()
-    settings = new SettingsService(db)
-    requirementSemanticizationService = new RequirementSemanticizationService(
+      recordIndexLock = new AsyncMutex()
+      settings = new SettingsService(db)
+      requirementSemanticizationService = new RequirementSemanticizationService(
       db,
       () => settings.getModelCredentials(),
       (progress) => mainWindow?.webContents.send('requirements:semanticization-progress', progress)
     )
-    knowledgeService = new KnowledgeService(
+      knowledgeService = new KnowledgeService(
       db,
       (progress) => mainWindow?.webContents.send('knowledge:progress', progress),
       recordIndexLock
     )
-    projectManagementService = new ProjectManagementService(
+      projectManagementService = new ProjectManagementService(
       db,
       knowledgeService,
       () => settings.getModelCredentials(),
       (progress) => mainWindow?.webContents.send('project:progress', progress),
       () => settings.getAll().projectMatching
     )
-    recordMaintenanceService = new RecordMaintenanceService(
+      recordMaintenanceService = new RecordMaintenanceService(
       db,
       knowledgeService,
       recordIndexLock,
       (snapshot) => mainWindow?.webContents.send('data:maintenance-progress', snapshot),
       () => projectManagementService.markMatchesStale()
     )
-    syncService = new SyncService(
+      syncService = new SyncService(
       db,
       () => new VisslmClient(settings.getPlatformCredentials()),
       (progress: SyncProgress) => mainWindow?.webContents.send('sync:progress', progress)
     )
-    pushService = new PushService(
+      pushService = new PushService(
       db,
       () => new VisslmClient(settings.getPlatformCredentials())
     )
-    registerIpc()
-    createWindow()
-    void initializeUpdateManager()
+      registerIpc()
+      backendReady = true
+      loadRendererPage()
+      void initializeUpdateManager()
 
-    app.on('activate', () => {
-      if (BrowserWindow.getAllWindows().length === 0) createWindow()
-    })
+      app.on('activate', () => {
+        if (BrowserWindow.getAllWindows().length === 0) {
+          createWindow(backendReady ? {} : { loadRenderer: false })
+        }
+      })
+    } catch (error) {
+      const message = updateErrorMessage(error)
+      console.error(`[startup] ${message}`, error)
+      dialog.showErrorBox(
+        'VISSLM Agent 启动失败',
+        `应用初始化失败：${message}\n\n请重启应用；如果问题持续，请保留此错误信息。`
+      )
+      app.quit()
+      }
+    }, 100)
+  }).catch((error: unknown) => {
+    const message = updateErrorMessage(error)
+    console.error(`[startup] ${message}`, error)
+    dialog.showErrorBox(
+      'VISSLM Agent 启动失败',
+      `应用窗口无法创建：${message}\n\n请重启应用；如果问题持续，请保留此错误信息。`
+    )
+    app.quit()
   })
 
   app.on('window-all-closed', () => {

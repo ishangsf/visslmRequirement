@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { AppDatabase } from '../src/main/database'
-import type { ChatMessage } from '../src/shared/types'
+import type { ChatContextRef, ChatMessage } from '../src/shared/types'
 
 const root = mkdtempSync(join(tmpdir(), 'visslm-chat-sessions-'))
 const db = new AppDatabase(join(root, 'chat.db'), join(root, 'assets'))
@@ -15,11 +15,35 @@ const message = (id: string, role: ChatMessage['role'], content: string): ChatMe
   createdAt: new Date().toISOString()
 })
 
+const contextRefs: ChatContextRef[] = [
+  { kind: 'record', id: 'uid-1', itemId: 'REQ-1', label: '记录一' },
+  { kind: 'dataView', id: 'view-1', label: '查询结果', total: 120, fields: ['Status'] }
+]
+
+const largeDataView = {
+  id: 'view-large',
+  title: '大数据视图',
+  description: 'x'.repeat(3_000),
+  total: 10_000,
+  fields: ['HugeField'],
+  groups: [{
+    name: '全部',
+    count: 10_000,
+    rows: Array.from({ length: 300 }, (_value, index) => ({
+      uid: `uid-${index}`,
+      name: `记录 ${index}`,
+      nodeType: 'Requirement',
+      itemId: `REQ-${index}`,
+      values: { HugeField: 'y'.repeat(2_000) }
+    }))
+  }]
+}
+
 try {
   const sessionId = 'chat-session-upsert-smoke'
   const firstMessages = [
     message('user-1', 'user', 'First question'),
-    message('assistant-1', 'assistant', 'First answer')
+    { ...message('assistant-1', 'assistant', 'First answer'), contextRefs, dataViews: [largeDataView] }
   ]
   const secondMessages = [
     ...firstMessages,
@@ -37,6 +61,12 @@ try {
   assert.equal(sessions[0]?.id, sessionId)
   assert.equal(sessions[0]?.messageCount, 4)
   assert.equal(db.getChatSession(sessionId)?.messages.length, 4)
+  assert.deepEqual(db.getChatSession(sessionId)?.messages[1]?.contextRefs, contextRefs)
+  const persistedView = db.getChatSession(sessionId)?.messages[1]?.dataViews?.[0]
+  assert.ok(persistedView)
+  assert.ok((persistedView.description?.length ?? 0) <= 1_000)
+  assert.ok((persistedView.groups[0]?.rows.length ?? 0) <= 100)
+  assert.ok(String(persistedView.groups[0]?.rows[0]?.values.HugeField ?? '').length <= 512)
 
   console.log(JSON.stringify({ ok: true, historyRecords: sessions.length, messageCount: sessions[0]?.messageCount }))
 } finally {

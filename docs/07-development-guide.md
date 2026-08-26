@@ -24,7 +24,7 @@
 
 | 项目 | 当前实现/要求 | 代码依据 |
 | --- | --- | --- |
-| 操作系统 | Windows x64 是 README 和 electron-builder 的目标 | `README.md`、`package.json` `win.target` |
+| 操作系统 | Windows 10 或更高版本（x64）；Electron 23 起不再支持 Windows 7/8/8.1 | `README.md`、`package.json` `win.target`、主进程启动兼容性检查 |
 | Node.js | README 建议 Node.js 24，实际运行时还必须兼容 Electron 43 的 `node:sqlite` | `README.md`、`package.json`；最低版本未在 `engines` 中锁定 |
 | 包管理器 | npm，仓库包含 `package-lock.json` | 根目录文件 |
 | 本地模型 | 可选；默认 Ollama 地址和模型由 `src/main/settings.ts` 提供 | `src/main/settings.ts:17-18,35-44` |

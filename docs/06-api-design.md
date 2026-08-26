@@ -22,7 +22,7 @@ React 页面 -> window.visslm -> preload/index.ts -> ipcRenderer.invoke(channel)
 | 权限 | 没有用户登录、RBAC 或 IPC caller 身份校验；本机打开应用的用户可调用已暴露方法。功能开关只控制导航显示和进入页面 |
 | 成功返回 | 由 `shared/types.ts`、`shared/project-types.ts`、`shared/dashboard.ts` 定义的对象；操作类接口通常返回 `{ok, message}` 或 `Promise` rejection |
 | 失败返回 | 没有统一 machine-readable error envelope。部分流程返回 `ok:false`，参数、数据库、网络和模型错误直接抛出 `Error`，renderer 以 `catch`/Ant Design message 展示 |
-| 脱敏 | VISSLM URL 查询中的 `ApiToken` 在 trace/log 中替换为 `******`；设置返回只返回 `hasToken/hasApiKey`，不返回秘密值 |
+| 脱敏 | VISSLM URL 查询中的 `ApiToken` 在 trace/log 中替换为 `******`；设置返回只返回 `hasToken/hasUploadPassword/hasApiKey`，不返回秘密值 |
 | 事件 | `window:maximized-changed`、`sync:progress`、`knowledge:progress`、`project:progress`、`agent:event` 使用 IPC event，不是 `invoke` 请求 |
 | 请求规模 | 记录、日志、文档、项目需求和任务查询由各自 query 的 page/pageSize 控制；部分限制在 service/DB 内 clamp |
 
@@ -39,7 +39,7 @@ React 页面 -> window.visslm -> preload/index.ts -> ipcRenderer.invoke(channel)
 | API-IPC-003 | `window:close` / `closeWindow` | 无 | `Promise<void>` | `WindowTitleBar`；`index.ts:129` / BrowserWindow；无表 |
 | API-IPC-004 | `window:is-maximized` / `isWindowMaximized` | 无 | `Promise<boolean>` | `WindowTitleBar`；`index.ts:130` / BrowserWindow；无表 |
 | API-IPC-005 | `settings:get` / `getSettings` | 无 | `AppSettings`；配置损坏时导航/同步配置回退默认值 | `AppShell`、`SettingsPage`：`App.tsx:3910,3371-3855`；`index.ts:132` / `SettingsService.getAll`；`settings` |
-| API-IPC-006 | `settings:save-platform` / `savePlatformSettings` | `PlatformSettingsInput {baseUrl, username, token?}` | `AppSettings`；safeStorage 不可用时 rejection | `SettingsPage`；`index.ts:133-135` / `SettingsService.savePlatform`；`settings` |
+| API-IPC-006 | `settings:save-platform` / `savePlatformSettings` | `PlatformSettingsInput {baseUrl, username, token?, uploadPassword?}` | `AppSettings`；返回仅含 `hasToken/hasUploadPassword`，safeStorage 不可用时 rejection | `SettingsPage`；`index.ts:133-135` / `SettingsService.savePlatform`；`settings` |
 | API-IPC-007 | `settings:save-model` / `saveModelSettings` | `ModelSettings`；online 时 apiKey 可选且仅非空时更新 | `AppSettings`；未保存 API Key 不会被清空是当前实现行为 | `SettingsPage`；`index.ts:136-138` / `SettingsService.saveModel`；`settings` |
 | API-IPC-008 | `settings:save-features` / `saveFeatureSettings` | `FeatureModuleSettings` | `AppSettings`；键由固定 feature key 集合写入 | `SettingsPage`；`index.ts:139-141` / `SettingsService.saveFeatures`；`settings` |
 | API-IPC-009 | `settings:save-navigation-order` / `saveNavigationOrder` | `FeatureNavigationOrder` | `AppSettings`；未知/重复键被归一化，版本不匹配回默认 | `SettingsPage`；`index.ts:142-144` / `SettingsService.saveNavigationOrder`；`settings` |
@@ -98,8 +98,8 @@ React 页面 -> window.visslm -> preload/index.ts -> ipcRenderer.invoke(channel)
 
 | 编号 | IPC channel / preload 方法 | 请求参数 | 响应与错误 | 调用页面；Handler / Service / 表 |
 | --- | --- | --- | --- | --- |
-| API-IPC-044 | `push:preview` / `previewPush` | `PushConfig {recordUids,nodeType,projectId,componentId?,parentId?,insertAfterId?,insertBeforeId?,fieldMappings?}` | `PushResult`，`preview:true`，每条 request 显示脱敏参数和“未发送 POST”响应 | `PushPage`：`App.tsx:2920`；`index.ts:841` / `PushService.preview`；`records` |
-| API-IPC-045 | `push:start` / `startPush` | 同 `PushConfig`；目标 field key、重复映射和保留字段会校验 | `PushResult`，逐条统计图片总数、上传/复用/失败；每条记录先完成全部 `UploadRichImg` 上传，再替换令牌并创建 `/rest/items`；图片失败时不创建记录，单条失败继续处理其他记录 | `PushPage`：`App.tsx:2955`；`index.ts` / `PushService.push -> VisslmClient.uploadRichImage/createItem`；`records`,`push_asset_uploads`,`push_logs` |
+| API-IPC-044 | `push:preview` / `previewPush` | `PushConfig {recordUids,nodeType,projectId,componentId?,parentId?,insertAfterId?,insertBeforeId?,fieldMappings?}`；显式传入 `fieldMappings` 时按映射表 allow-list 构造 body | `PushResult`，`preview:true`，每条 request 显示脱敏参数和“未发送 POST”响应；未出现在映射表中的本地属性不会进入 body | `PushPage`：`App.tsx:2920`；`index.ts:841` / `PushService.preview`；`records` |
+| API-IPC-045 | `push:start` / `startPush` | 同 `PushConfig`；源/目标 field key、重复映射和保留字段会校验 | `PushResult`，逐条统计图片总数、上传/本次记录内复用/失败；显式映射只发送映射内容；每次推送都先登录并用 `JSESSIONID` 调用 `UploadRichImg`，用返回路径替换正文令牌后再创建 `/rest/items`；原始平台路径与历史上传缓存均不能跳过本次上传；图片失败时不创建记录，单条失败继续处理其他记录 | `PushPage`：`App.tsx:2955`；`index.ts` / `PushService.push -> VisslmClient.uploadRichImage/createItem`；`records`,`push_logs` |
 | API-IPC-046 | `push:logs` / `listPushLogs` | `page?:number,pageSize?:number` | `PushLogPage`；日志 body/response 可能含业务敏感数据 | `PushPage`：`App.tsx:2843`；`index.ts:843-845` / DB；`push_logs` |
 
 ### 2.6 知识库
@@ -194,12 +194,19 @@ React 页面 -> window.visslm -> preload/index.ts -> ipcRenderer.invoke(channel)
 | --- | --- | --- | --- | --- |
 | API-EXT-001 | `GET {baseUrl}/rest/application/Version` | 平台连接测试 | 查询含 `user`、`ApiToken`；返回版本值或 `AlmResponse` | `src/main/visslm.ts:241-258` |
 | API-EXT-002 | `GET {baseUrl}/rest/application/DBVersion` | 平台数据库版本测试 | 同上 | `src/main/visslm.ts:241-250` |
-| API-EXT-003 | `GET {baseUrl}/rest/items` | 采集和预览数据 | 无 filters 时使用 `q._valm_NodeType`；有 filters 时构造 `VSearch`；`ReturnProperty` 强制包含基础字段；响应使用 `propList` | `src/main/visslm.ts:271-349` |
+| API-EXT-003 | `GET {baseUrl}/rest/items` | 采集和预览数据 | 无 filters 时使用 `q._valm_NodeType`；有 filters 时构造 `VSearch`；`ReturnProperty` 强制包含基础字段和 `system.userPropertyKeys`；响应使用 `propList` | `src/main/visslm.ts:271-349,1717-1775` |
+| API-EXT-003A | `GET {baseUrl}/ssf/user/getUserByName` | 将采集结果中的用户属性登录名解析为显示名 | 先使用 API Token 查询；若仅收到 HTTP 200 且正文明确是 `Login/LogOn` 页面，才切换网页登录会话并用 Cookie 重试 | `src/main/visslm.ts:1662-1715` |
 | API-EXT-004 | `GET {baseUrl}/rest/items/id/{id}/attachment` | 获取记录附件 | `id` URL encode；响应 `propList`，失败时按空附件处理 | `src/main/visslm.ts:260-269` |
 | API-EXT-005 | `GET {sourceUrl}` | 下载远程图片 | 30 秒 timeout；响应转 Buffer 和 MIME；失败不阻断整次同步 | `src/main/visslm.ts:452-499,827-877` |
 | API-EXT-006 | `POST {baseUrl}/rest/items` | 将本地记录推送回平台 | `Content-Type: application/json; charset=utf-8`；查询含 nodeType/projectId 等位置参数；body 删除 `_valm_Uid/_valm_ItemID/_valm_NodeType`；响应解析 remote UID | `src/main/visslm.ts:188-239,511-670` |
 
 VISSLM 请求统一使用 `AbortSignal.timeout(30_000)`。GET/POST 业务错误既可能是非 2xx，也可能是 JSON 中 `ErrorCode != 0`；POST 使用 `VisslmRequestError(httpStatus,response)` 保留状态和响应供日志写入。Token 只在真实请求 URL 中使用，在 trace 和日志参数中替换为 `******`，见 `src/main/visslm.ts:161-219,226-231`。
+
+#### 用户显示名解析与双鉴权
+
+`system.userPropertyKeys` 会被强制加入每次采集的 `ReturnProperty`。对每个非空用户属性值，客户端先以 API Token 调用 `/ssf/user/getUserByName`；字符串按英文/中文逗号、英文/中文分号拆分，逐段 trim 并忽略空片段，数组元素按原顺序递归处理。同一登录名的并发请求会合并，缓存也按登录名去重；成功结果（包括合法 JSON 中没有显示名的空结果）会缓存。若平台错误地以 HTTP 200 返回明确的 `Login/LogOn` HTML，客户端才使用加密保存的平台登录密码，依次调用 `/User/LogOn` 和 `/User/UPLogOn` 建立 `JSESSIONID`，再用 Cookie 重试同一用户查询。
+
+HTTP 500、损坏 JSON 和普通 HTML 不会触发会话兜底。缺少或错误的平台登录密码、登录失败或 Cookie 会话失败会使采集失败，并返回脱敏且可操作的错误；不会静默跳过显示名查询。合法 JSON 未提供显示名时缓存空值。重新采集在获得显示名后可回填 `${key}_text`；属性值为对象且含 `key` 时回填对象内的 `key_text`。写回保持输入形态：多值 string 用英文逗号连接为 string，数组写回数组，对象的 `key` 按同一规则写入 `key_text`；顺序、重复项及其位置保持不变。平台登录密码同时用于这套用户显示名网页登录兜底和富文本图片上传；API Token 与平台登录密码均由操作系统安全存储加密，renderer 不读取秘密值。
 
 ### 4.2 模型服务
 
@@ -266,6 +273,14 @@ const preview = await window.visslm.previewPush({
 ```
 
 预览只构造 body，不发送 POST，也不写 `push_logs`；真实调用 `startPush` 按记录串行执行并逐条写日志，见 `src/main/visslm.ts:517-670`。
+
+数据推送页面首次加载时会读取第一条记录的原始属性并生成同名映射；映射和表单配置以 `visslm:push-config-draft:v1` 保存在本地，切换导航后重新进入仍会恢复。未配置映射时的旧版 IPC 调用继续沿用兼容行为。
+
+默认映射规则为：`Source` → `RequireBy`、`_valm_Description` → `UserStoryDescription`、`_valm_ItemID` → `AcceptCriteria`，其他可推送属性默认使用同名目标。`_valm_ItemID` 仅允许作为源属性，`_valm_Uid` 与 `_valm_NodeType` 不允许作为源属性；`_valm_Uid`、`_valm_NodeType`、`_valm_ItemID` 均不允许作为目标属性。显式传入映射时，消息体只包含映射目标属性，因此 `_valm_ItemID` 的原键不会进入消息体。
+
+图片上传使用独立的网页登录会话：先 `GET /User/LogOn` 获取初始 `JSESSIONID`，再按平台 V2 登录编码协议 `POST /User/UPLogOn`，随后用同一 Cookie 会话和配对的 `ckCsrfToken` 调用 `FileCenterImg/UploadRichImg`。平台登录密码通过操作系统安全存储加密，渲染层只读取 `hasUploadPassword`，日志不输出密码或 Cookie 值。上传响应明确为 LogOn 页面时允许重新登录后重试一次；超时、普通 HTTP 错误或无法解析的响应不重放非幂等 POST。
+
+无论采集时的原图来自 `FileCenterImg/Index/...`、带部署基路径的内网地址还是历史上传缓存，每次推送都必须实际上传。同一条记录正文内相同 SHA 的图片仅在当前推送中上传一次，并复用这一次的返回路径。JPEG 校验允许 EOI 后最多 64 KiB 的平台尾随数据，但仍拒绝缺失 EOI、超限尾随和伪装 HTML。
 
 平台的查询、附件下载和范围预览属于幂等 GET，客户端对超时、网络失败及 408/425/429/5xx 最多重试 3 次并使用退避；`startPush` 的创建记录和图片上传是非幂等 POST，在平台提供幂等键前不自动重放。
 

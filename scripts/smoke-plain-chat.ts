@@ -62,7 +62,7 @@ assert.deepEqual(
   ]),
   ['4101', '4095', '4085']
 )
-assert.equal(resolveAutoChatRoute('你好'), 'plain')
+assert.equal(resolveAutoChatRoute('你好'), 'general')
 assert.equal(resolveAutoChatRoute('当前数据有多少条记录？'), 'general')
 
 let directPrompt = ''

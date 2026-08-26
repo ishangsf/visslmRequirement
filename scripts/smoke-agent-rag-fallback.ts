@@ -26,9 +26,13 @@ const main = async () => {
       normalizedText: '性能优化需求：响应时间需要降低。'
     })
 
+    let knowledgeCallCount = 0
     const knowledge = {
       modelVersion: 'test-model',
-      search: async () => []
+      search: async () => {
+        knowledgeCallCount += 1
+        return []
+      }
     } as unknown as KnowledgeService
     const progressStages: string[] = []
     const agent = new OllamaAgent(db, {
@@ -41,8 +45,26 @@ const main = async () => {
         message: {
           role: 'assistant' as const,
           content: JSON.stringify({
+            sourceMode: 'records',
+            needsClarification: false,
             intent: 'search_content',
             explanation: '查找性能相关记录',
+            searchTerms: ['性能'],
+            searchMode: 'any',
+            filters: [],
+            fields: [],
+            limit: 10
+          })
+        }
+      },
+      {
+        message: {
+          role: 'assistant' as const,
+          content: JSON.stringify({
+            sourceMode: 'records',
+            needsClarification: false,
+            intent: 'search_content',
+            explanation: '按数据中心字段目录查找性能相关记录',
             searchTerms: ['性能'],
             searchMode: 'any',
             filters: [],
@@ -70,11 +92,12 @@ const main = async () => {
     })
 
     const result = await agent.ask({ question: '请查找性能相关记录' })
-    assert(modelCallCount === 2, 'RAG miss should fall back to the structured planner')
-    assert(result.answer.includes('性能优化需求'), 'fallback answer should include the matched data-center record')
-    assert(result.dataViews.length === 1, 'fallback should expose a structured data view')
-    assert(result.sources.some((source) => source.uid === 'record-performance-1'), 'fallback should expose the record source')
-    for (const stage of ['route', 'retrieve', 'plan', 'query', 'verify']) {
+    assert(modelCallCount === 3, 'records mode should classify, plan, then answer')
+    assert(knowledgeCallCount === 0, 'records mode must not probe knowledge before planning')
+    assert(result.answer.includes('性能优化需求'), 'structured answer should include the matched data-center record')
+    assert(result.dataViews.length === 1, 'structured answer should expose a data view')
+    assert(result.sources.some((source) => source.uid === 'record-performance-1'), 'structured answer should expose the record source')
+    for (const stage of ['route', 'plan', 'query', 'verify']) {
       assert(progressStages.includes(stage), `agent progress should include ${stage}`)
     }
     console.log(JSON.stringify({ ok: true, progressStages }))

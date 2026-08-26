@@ -187,10 +187,11 @@ flowchart LR
 
 ### 8.1 外部认证
 
-- VISSLM 使用用户名 + API Token，并在请求 URL 查询参数中加入用户信息和 token 相关认证参数，具体协议封装在 `VisslmClient`；
+- VISSLM REST 接口使用用户名 + API Token；采集配置了用户属性 Key 时，对非空属性值先调用 `/ssf/user/getUserByName` 查询用户显示名。部分平台会对该 API Token 请求以 HTTP 200 返回 `Login/LogOn` HTML；只有明确识别为登录页时，才使用平台登录密码通过 `/User/LogOn` + `/User/UPLogOn` 建立 `JSESSIONID`，再以 Cookie 重试相同查询。富文本图片上传也使用这套网页登录会话，并携带配对的 `ckCsrfToken`；
+- 相同登录名的显示名请求在客户端内去重并缓存；合法 JSON 未返回显示名时缓存为空。HTTP 500、损坏 JSON 或普通 HTML 不触发会话兜底；缺少/错误密码或会话建立失败会使采集失败，并返回不包含凭据和上游正文的可操作错误，不静默成功。API Token 与平台登录密码均由操作系统安全存储加密，界面只返回是否已配置，不回显秘密值；
 - Ollama 本地服务不需要 API Key；
 - 在线模型使用 Bearer 或 Anthropic `x-api-key` 头；
-- Token/API Key 在 settings 表保存为 safeStorage 密文，应用返回 `hasToken/hasApiKey`。
+- Token、平台登录密码和 API Key 在 settings 表保存为 safeStorage 密文，应用仅返回 `hasToken/hasUploadPassword/hasApiKey`。
 
 ### 8.2 应用授权
 
@@ -244,6 +245,8 @@ sequenceDiagram
 ### 11.1 VISSLM
 
 `VisslmClient` 对平台查询、附件下载、范围预览和 `/alm/rest/items` POST 做封装。响应解析、正文规范化、图片 URL 扫描、过滤器比较、分页递归和请求日志由 `visslm.ts` 完成。查询、下载和预览等幂等 GET 现在对超时、网络失败及 408/425/429/5xx 使用有限次数的指数退避重试；创建记录和图片上传仍不自动重试，因为平台正式接口尚未声明幂等键契约。
+
+`system.userPropertyKeys` 会在采集查询中强制并入 `ReturnProperty`。同步解析每个非空用户属性时，先使用 API Token 查询 `/ssf/user/getUserByName`，必要时按 8.1 的网页登录会话规则重试；成功得到的显示名可在重新采集时回填 `${key}_text`，对象属性回填对象内的 `key_text`。
 
 ### 11.2 模型服务
 

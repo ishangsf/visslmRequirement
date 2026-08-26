@@ -58,12 +58,14 @@ export interface PlatformSettings {
   baseUrl: string
   username: string
   hasToken: boolean
+  hasUploadPassword: boolean
 }
 
 export interface PlatformSettingsInput {
   baseUrl: string
   username: string
   token?: string
+  uploadPassword?: string
 }
 
 export interface SystemSettings {
@@ -358,6 +360,13 @@ export interface ImageAsset {
   dataUri?: string
 }
 
+export interface RecordImagePage {
+  page: number
+  pageSize: number
+  total: number
+  images: ImageAsset[]
+}
+
 export interface RecordImageReference {
   id: string
   recordUid: string
@@ -382,6 +391,12 @@ export interface RecordQuery {
   releaseText?: string
   semanticStatus?: RequirementSemanticizationStatus
 }
+
+/** Asset-center filters allowed when exporting the complete filtered result. */
+export type RecordExportQuery = Pick<
+  RecordQuery,
+  'search' | 'projectId' | 'nodeType' | 'releaseText' | 'semanticStatus'
+>
 
 export type RequirementSemanticizationStatus = 'pending' | 'processing' | 'ready' | 'failed'
 
@@ -671,6 +686,7 @@ export interface PushConfig {
   parentId?: string
   insertAfterId?: string
   insertBeforeId?: string
+  /** When supplied (including []), only mapped source values are sent in the body. */
   fieldMappings?: PushFieldMapping[]
 }
 
@@ -878,13 +894,45 @@ export interface ChatMessage {
   dashboard?: DashboardSpec
   dashboardVersion?: number
   expertId?: ExpertId
+  contextRefs?: ChatContextRef[]
+  contextStats?: ChatContextStats
+  /** Persisted Auto-mode control decision for follow-up display and audit. */
+  assistantIntent?: AssistantIntentDecision
+  /** Persisted structured execution facts for this assistant turn. */
+  taskTrace?: AssistantTaskTrace
   contextOutcome?: 'success' | 'failed' | 'undone'
+}
+
+/** Lightweight references that let a follow-up resolve prior evidence on demand. */
+export interface ChatContextRef {
+  kind: 'record' | 'dataView' | 'dashboard'
+  id: string
+  label?: string
+  itemId?: string
+  total?: number
+  version?: number
+  fields?: string[]
+}
+
+export interface ChatContextStats {
+  budgetTokens: number
+  evidenceBudgetTokens: number
+  evidenceUsedTokens: number
+  requestedCount: number
+  requestOmittedCount: number
+  resolvedCount: number
+  missingCount: number
+  detailIncludedCount: number
+  detailOmittedCount: number
+  detailOmittedFields: number
+  recoveryHint?: string
 }
 
 export interface ChatHistoryTurn {
   role: 'user' | 'assistant'
   content: string
   outcome?: 'success' | 'failed' | 'undone'
+  contextRefs?: ChatContextRef[]
 }
 
 export interface ChatSessionSummary {
@@ -1050,6 +1098,8 @@ export interface ChatDataGroup {
   name: string
   count: number
   rows: ChatDataRow[]
+  /** UID snapshot for this group; kept separate from the view-wide index. */
+  recordUids?: string[]
 }
 
 export interface ChatDataView {
@@ -1057,9 +1107,84 @@ export interface ChatDataView {
   title: string
   description: string
   total: number
+  /** Number of rows actually included in the payload; defaults to total for legacy views. */
+  loadedRows?: number
+  isPreview?: boolean
   fields: string[]
   fieldLabels?: Record<string, string>
   groups: ChatDataGroup[]
+  /** Server-side paging key for large record-backed views. */
+  recordUids?: string[]
+}
+
+export interface ChatDataViewPage {
+  page: number
+  pageSize: number
+  total: number
+  rows: ChatDataRow[]
+}
+
+/**
+ * The single, source-aware decision produced before an Auto chat request is
+ * allowed to touch a database, knowledge index, or specialist skill.
+ * Keeping this contract in shared types lets the main process and IPC tests
+ * validate the same bounded decision shape.
+ */
+export type AssistantIntentTaskType =
+  | 'conversation'
+  | 'record_query'
+  | 'knowledge_qa'
+  | 'mixed_analysis'
+  | 'visualization'
+  | 'requirement_matching'
+
+export type AssistantIntentSourceMode = 'conversation' | 'records' | 'knowledge' | 'mixed'
+
+export type AssistantIntentResultMode =
+  | 'answer'
+  | 'list'
+  | 'grouped_list'
+  | 'table'
+  | 'dashboard'
+
+export interface AssistantIntentDecision {
+  taskType: AssistantIntentTaskType
+  skillId: ExpertId
+  sourceMode: AssistantIntentSourceMode
+  resolvedQuestion: string
+  resultMode: AssistantIntentResultMode
+  /** Entities explicitly grounded in the current question or user history. */
+  groupEntities: string[]
+  needsClarification: boolean
+  clarificationQuestion?: string
+  reason: string
+}
+
+/** Actual execution agents are separate from the UI-facing expert mentions. */
+export type AssistantExecutionAgentId =
+  | 'conversation'
+  | 'data-center'
+  | 'knowledge-base'
+  | 'requirement-analysis'
+  | 'visualization'
+
+export type AssistantTaskTraceStatus = 'completed' | 'clarification' | 'failed'
+
+export interface AssistantTaskTrace {
+  runId: string
+  status: AssistantTaskTraceStatus
+  primaryAgent: AssistantExecutionAgentId
+  invokedAgents: AssistantExecutionAgentId[]
+  taskType: AssistantIntentTaskType
+  sourceMode: AssistantIntentSourceMode
+  resultMode: AssistantIntentResultMode
+  startedAt: string
+  completedAt: string
+  clarificationQuestion?: string
+  error?: {
+    code: string
+    message: string
+  }
 }
 
 export interface ChatRequest {
@@ -1084,12 +1209,28 @@ export interface ChatRequest {
     dashboard: DashboardSpec
   }
   history?: ChatHistoryTurn[]
+  /** Validated Auto-mode intent; direct Ollama callers may omit it. */
+  assistantIntent?: AssistantIntentDecision
 }
 
 export interface ChatResponse {
   answer: string
   sources: ChatSource[]
   dataViews: ChatDataView[]
+  /** The planner stopped safely and is asking the user to disambiguate scope/source/fields. */
+  needsClarification?: boolean
+  clarificationQuestion?: string
+  /** Validated control decision selected before any Auto-mode evidence access. */
+  assistantIntent?: AssistantIntentDecision
+  taskTrace?: AssistantTaskTrace
+  contextRefs?: ChatContextRef[]
+  /**
+   * Optional diagnostics for bounded/compacted model context.  The field is
+   * intentionally additive so older agents and persisted chat messages remain
+   * compatible while the renderer can explain omitted evidence and offer a
+   * narrower follow-up query.
+   */
+  contextStats?: ChatContextStats
   expertId?: ExpertId
   dashboard?: DashboardSpec
   dashboardChange?: DashboardAiChangeSummary
@@ -1122,6 +1263,13 @@ export interface AppApi {
   listRecordReleaseValues(): Promise<RecordReleaseValue[]>
   listRecordUids(query: Omit<RecordQuery, 'page' | 'pageSize'>): Promise<string[]>
   getRecord(uid: string): Promise<RecordDetail | null>
+  getRecordForChat(uid: string): Promise<RecordDetail | null>
+  getRecordImagePage(uid: string, page: number, pageSize: number): Promise<RecordImagePage>
+  getChatDataViewPage(
+    view: Pick<ChatDataView, 'recordUids' | 'fields'>,
+    page: number,
+    pageSize: number
+  ): Promise<ChatDataViewPage>
   previewRecordMaintenance(input: Pick<RecordMaintenanceStartInput, 'scope' | 'recordUids'>): Promise<RecordMaintenancePreview>
   startRecordMaintenance(input: RecordMaintenanceStartInput): Promise<RecordMaintenanceTaskSnapshot>
   getRecordMaintenanceTask(): Promise<RecordMaintenanceTaskSnapshot | null>
@@ -1177,7 +1325,7 @@ export interface AppApi {
   listDataImportRuns(limit?: number): Promise<DataImportRunSnapshot[]>
   getDataImportRun(id: string): Promise<DataImportRunSnapshot | null>
   resumeDataImportRun(id: string): Promise<DataImportResult>
-  exportData(): Promise<DataExportResult>
+  exportData(query?: RecordExportQuery): Promise<DataExportResult>
   deleteData(uids?: string[]): Promise<DataDeleteResult>
   previewPush(config: PushConfig): Promise<PushResult>
   startPush(config: PushConfig): Promise<PushResult>
