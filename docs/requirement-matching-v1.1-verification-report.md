@@ -50,7 +50,7 @@
 
 `npm run benchmark:requirement-matching -- --records 5000 --iterations 3 --warmup 1 --report-only`
 
-结果：5000 条记录、4999 条当前索引；召回阶段 P50 `68.96 ms`、P95 `72.90 ms`，命令退出 0。该结果只覆盖 Dense、FTS5/BM25 与 RRF，不包含 Cross-Encoder 或解释模型。
+合并后的最新结果：5000 条记录、4999 条当前索引；召回阶段 P50 `33.58 ms`、P95 `33.71 ms`，命令退出 0。该结果只覆盖 Dense、FTS5/BM25 与 RRF，不包含 Cross-Encoder 或解释模型。
 
 ## 已知风险与发布条件
 
