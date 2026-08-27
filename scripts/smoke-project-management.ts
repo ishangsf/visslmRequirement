@@ -12,6 +12,9 @@ import {
 import type { KnowledgeRecordMatch, KnowledgeService } from '../src/main/knowledge'
 import type { ProjectAnalysisProgress, ProjectRequirement } from '../src/shared/project-types'
 import { normalizeProjectRequirementText } from '../src/shared/project-requirement-utils'
+import { buildRequirementSourceView } from '../src/main/requirements/requirement-match-card'
+import { RequirementMatchingCore } from '../src/main/requirements/requirement-matching-core'
+import { hashProjectRequirementSnapshot } from '../src/main/requirements/requirement-match-run-service'
 
 const directory = mkdtempSync(join(tmpdir(), 'visslm-project-management-'))
 const db = new AppDatabase(join(directory, 'projects.db'), join(directory, 'assets'))
@@ -338,6 +341,36 @@ try {
       return semanticCandidates
     }
   } as unknown as KnowledgeService
+  const matchingCore = new RequirementMatchingCore({
+    retriever: {
+      async retrieve(base) {
+        semanticMatchQueries.push(base.matchingText)
+        return semanticCandidates.flatMap((match) => {
+          const record = db.getRecord(match.recordUid, false)
+          if (!record) return []
+          return [{
+            record,
+            card: buildRequirementSourceView(record),
+            denseScore: match.score,
+            lexicalScore: 0,
+            retrievalScore: match.score,
+            snippet: match.snippet
+          }]
+        })
+      }
+    },
+    reranker: {
+      modelId: 'project-smoke-reranker',
+      async rerank(_base, candidates) {
+        return candidates.map((candidate) => ({
+          recordUid: candidate.record.uid,
+          score: candidate.denseScore
+        }))
+      }
+    },
+    async exactBusinessHashCandidates() { return [] },
+    candidateEligible() { return true }
+  })
   const service = new ProjectManagementService(
     db,
     fakeKnowledge,
@@ -347,7 +380,10 @@ try {
       baseUrl: 'http://127.0.0.1:1',
       model: 'smoke',
       thinking: false
-    })
+    }),
+    undefined,
+    undefined,
+    matchingCore
   )
   const originalFetch = globalThis.fetch
   const extractBatch = (service as unknown as {
@@ -538,6 +574,8 @@ try {
   assert.equal(normalizedRequirement.title, '支持按订单号查询订单详情')
   const initialRequirementPage = db.listProjectRequirements({ projectId: project.id, page: 1, pageSize: 20 })
   assert.equal(initialRequirementPage.rows[0]?.status, 'unmarked')
+  const requirementBeforeSemanticMatching = db.getProjectRequirement('smoke-requirement-1')
+  assert(requirementBeforeSemanticMatching)
   semanticCandidates = [
     {
       recordUid: 'smoke-record-2',
@@ -575,10 +613,22 @@ try {
   } finally {
     globalThis.fetch = originalMatchingFetch
   }
-  const automaticallyLinkedAssets = db.listProjectAssets(project.id)
-  assert.equal(automaticallyLinkedAssets.find((item) => item.recordUid === 'smoke-record-2')?.requirements.some((item) => item.requirementId === 'smoke-requirement-1'), true)
-  assert.equal(automaticallyLinkedAssets.find((item) => item.recordUid === 'smoke-record-1')?.requirements.some((item) => item.requirementId === 'smoke-requirement-1'), false)
-  assert.equal(db.unlinkProjectAsset(project.id, 'smoke-record-2').ok, true)
+  const assetsAfterSemanticMatching = db.listProjectAssets(project.id)
+  assert.equal(assetsAfterSemanticMatching.some((item) => item.recordUid === 'smoke-record-2'), false)
+  assert.equal(assetsAfterSemanticMatching.find((item) => item.recordUid === 'smoke-record-1')?.requirements.some((item) => item.requirementId === 'smoke-requirement-1'), false)
+  const requirementAfterSemanticMatching = db.getProjectRequirement('smoke-requirement-1')
+  assert.equal(requirementAfterSemanticMatching?.status, requirementBeforeSemanticMatching.status)
+  assert.equal(requirementAfterSemanticMatching?.statusSource, requirementBeforeSemanticMatching.statusSource)
+  const automaticLegacyMatches = db.listLegacyProjectRequirementMatches({ requirementId: 'smoke-requirement-1', page: 1, pageSize: 20 })
+  assert.equal(automaticLegacyMatches.total, 0, 'new matching runs must not write the legacy replacement table')
+  const latestRun = db.getLatestCompatibleRequirementMatchRun({
+    requirementId: 'smoke-requirement-1',
+    requirementSnapshotHash: hashProjectRequirementSnapshot(requirementAfterSemanticMatching!)
+  })
+  assert(latestRun)
+  const automaticMatches = db.listRequirementMatchCandidates({ runId: latestRun.id, page: 1, pageSize: 20 })
+  assert.equal(automaticMatches.total, 1, 'hard-conflict candidates must be excluded from the default suggestion list')
+  assert.equal(automaticMatches.rows[0]?.recordUid, 'smoke-record-1')
   db.replaceRequirementMatches('smoke-requirement-1', [
     {
       recordUid: 'smoke-record-1',
@@ -614,16 +664,17 @@ try {
   assert.equal(toNegotiateRequirements.rows[0]?.id, 'smoke-requirement-2')
   db.updateProjectRequirementStatus('smoke-requirement-2', 'to_develop')
 
-  const matchPage = db.listProjectRequirementMatches({ requirementId: 'smoke-requirement-1', page: 1, pageSize: 1 })
+  const matchPage = db.listLegacyProjectRequirementMatches({ requirementId: 'smoke-requirement-1', page: 1, pageSize: 1 })
   assert.equal(matchPage.total, 2)
   assert.equal(matchPage.rows[0]?.recordUid, 'smoke-record-1')
   assert.equal(matchPage.rows[0]?.finalScore, 95)
-  const thresholdMatchPage = db.listProjectRequirementMatches({ requirementId: 'smoke-requirement-1', page: 1, pageSize: 20, minScore: 40 })
+  const thresholdMatchPage = db.listLegacyProjectRequirementMatches({ requirementId: 'smoke-requirement-1', page: 1, pageSize: 20, minScore: 40 })
   assert.equal(thresholdMatchPage.total, 1)
   assert.equal(thresholdMatchPage.rows[0]?.recordUid, 'smoke-record-1')
-  const serviceMatchPage = service.listMatches({ requirementId: 'smoke-requirement-1', page: 1, pageSize: 20 })
+  const serviceMatchPage = service.listMatches({ requirementId: 'smoke-requirement-1', runId: latestRun.id, page: 1, pageSize: 20 })
   assert.equal(serviceMatchPage.total, 1)
-  assert.equal(serviceMatchPage.rows[0]?.finalScore, 95)
+  assert.equal(serviceMatchPage.rows[0]?.finalRank, 1)
+  assert.equal(typeof serviceMatchPage.rows[0]?.rankingScore, 'number')
   const linkedAssetWithRequirement = db.linkProjectAsset(project.id, 'smoke-record-1', 'smoke-requirement-1')
   assert(linkedAssetWithRequirement)
   assert.equal(linkedAssetWithRequirement.requirements[0]?.requirementId, 'smoke-requirement-1')
@@ -632,7 +683,7 @@ try {
   const linkedAssetWithSecondRequirement = db.linkProjectAsset(project.id, 'smoke-record-1', 'smoke-requirement-2')
   assert(linkedAssetWithSecondRequirement)
   assert.equal(linkedAssetWithSecondRequirement.requirements.length, 2)
-  const linkedMatchPage = db.listProjectRequirementMatches({ requirementId: 'smoke-requirement-1', page: 1, pageSize: 20 })
+  const linkedMatchPage = db.listLegacyProjectRequirementMatches({ requirementId: 'smoke-requirement-1', page: 1, pageSize: 20 })
   assert.equal(linkedMatchPage.rows[0]?.assetLinked, true)
   assert.equal(linkedMatchPage.rows[0]?.requirementLinked, true)
   const unlinkedRequirementAsset = db.unlinkProjectAssetRequirement(project.id, 'smoke-record-1', 'smoke-requirement-1')
@@ -640,7 +691,7 @@ try {
   assert.equal(db.listProjectAssets(project.id).some((item) => item.recordUid === 'smoke-record-1'), false)
   const availableAssetRecordsAfterUnlink = db.listRecords({ page: 1, pageSize: 20, excludeProjectAssetProjectId: project.id })
   assert.equal(availableAssetRecordsAfterUnlink.rows.some((row) => row.uid === 'smoke-record-1'), true)
-  const unlinkedMatchPage = db.listProjectRequirementMatches({ requirementId: 'smoke-requirement-1', page: 1, pageSize: 20 })
+  const unlinkedMatchPage = db.listLegacyProjectRequirementMatches({ requirementId: 'smoke-requirement-1', page: 1, pageSize: 20 })
   assert.equal(unlinkedMatchPage.rows[0]?.assetLinked, false)
   assert.equal(unlinkedMatchPage.rows[0]?.requirementLinked, false)
   const relinkedRequirementAsset = db.linkProjectAsset(project.id, 'smoke-record-1', 'smoke-requirement-1')
@@ -657,7 +708,7 @@ try {
 
   const deleteRequirementResult = db.deleteProjectRequirement('smoke-requirement-1')
   assert.equal(deleteRequirementResult.ok, true)
-  assert.equal(db.listProjectRequirementMatches({ requirementId: 'smoke-requirement-1', page: 1, pageSize: 20 }).total, 0)
+  assert.equal(db.listLegacyProjectRequirementMatches({ requirementId: 'smoke-requirement-1', page: 1, pageSize: 20 }).total, 0)
   assert.equal(db.listProjectAssets(project.id).find((asset) => asset.recordUid === 'smoke-record-1')?.requirements.length, 1)
   assert.equal(db.listProjectAssets(project.id).find((asset) => asset.recordUid === 'smoke-record-1')?.requirements[0]?.requirementId, 'smoke-requirement-2')
   assert.equal(db.getProjectTask(planTask.id)?.requirements.length, 0)
@@ -812,10 +863,9 @@ try {
   assert.equal(matchedDraftProject.lifecycle, 'draft')
   assert.equal(matchedDraftProject.matchStatus, 'ready')
   const semanticQuery = semanticMatchQueries.at(-1) ?? ''
-  assert.match(semanticQuery, /业务模块：订单管理/)
-  assert.match(semanticQuery, /需求标题：订单明细导出/)
-  assert.match(semanticQuery, /需求描述：系统应允许业务人员按时间范围筛选订单，并导出包含商品与金额的明细文件。/)
-  assert.match(semanticQuery, /补充信息词：订单导出、时间范围/)
+  assert.match(semanticQuery, /明确模块：订单管理/)
+  assert.match(semanticQuery, /名称：订单明细导出/)
+  assert.match(semanticQuery, /描述：系统应允许业务人员按时间范围筛选订单，并导出包含商品与金额的明细文件。/)
 
   const matchCallCountBeforeConfirm = semanticMatchQueries.length
   const confirmedDraftProject = service.confirmProject(draftProject.id)

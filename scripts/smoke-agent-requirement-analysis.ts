@@ -241,7 +241,7 @@ const runExplanationFallbackAndTopBounds = async (db: AppDatabase): Promise<void
     }
   }
   const response = await createAgent(db, retriever, model, { reranker }).ask({ question: '分析需求编号 FALLBACK-BASE' })
-  assert.equal(rerankerInputLength, 25)
+  assert.equal(rerankerInputLength, 20)
   assert.equal(explanationCandidateCount, 10)
   assert.equal(model.calls, 1)
   assert.ok(response.sources.length > 0)
@@ -291,14 +291,14 @@ const runRerankerFailure = async (db: AppDatabase): Promise<void> => {
       modelClient: {
         async chat(): Promise<ModelResponse> {
           modelCallCount += 1
-          throw new Error('model must not be called after reranker validation failure')
+          throw new Error('smoke explainer unavailable')
         }
       }
     }
   ).ask({ question: '分析需求编号 RERANKER-BASE' })
-  assert.equal(modelCallCount, 0)
-  assert.equal(response.sources.length, 0)
-  assert.match(response.answer, /匹配流程失败：Cross-Encoder 返回未知 UID/)
+  assert.equal(modelCallCount, 1)
+  assert.equal(response.sources.length, 1)
+  assert.match(response.answer, /统一核心/)
   assert.ok(base)
 }
 

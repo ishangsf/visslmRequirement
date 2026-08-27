@@ -78,6 +78,16 @@ import {
 } from './context-budget'
 import { sanitizeChatMessageContent } from '../shared/chat-message-format'
 import { buildRequirementBusinessText } from './requirements/requirement-match-card'
+import { hashRequirementBusinessText } from './requirements/requirement-business-normalization'
+import type {
+  PersistedRequirementMatchCandidate,
+  RequirementMatchCandidatePage,
+  RequirementMatchCandidateResult,
+  RequirementMatchDegradationCode,
+  RequirementMatchRun,
+  RequirementMatchRunCompatibilityQuery,
+  RequirementMatchRunCreateInput
+} from './requirements/requirement-match-domain'
 import type {
   ManagedProject,
   ManagedProjectInput,
@@ -89,6 +99,7 @@ import type {
   OrganizationPersonPage,
   ProjectAnalysisLogEntry,
   ProjectAsset,
+  ProjectAssetLinkSource,
   ProjectAnalysisProgress,
   ProjectCostEntry,
   ProjectCostEntryInput,
@@ -104,7 +115,8 @@ import type {
   ProjectRequirementCategory,
   ProjectRequirementInput,
   ProjectRequirementMergeInput,
-  ProjectRequirementMatch,
+  LegacyProjectRequirementMatch,
+  ProjectRequirementMatchCandidate,
   ProjectRequirementMatchPage,
   ProjectRequirementMatchQuery,
   ProjectRequirementPage,
@@ -503,7 +515,9 @@ export interface RequirementLexicalMatch {
 }
 
 const REQUIREMENT_BUSINESS_INDEX_MIGRATION_KEY = 'migration:requirement-business-index'
-const REQUIREMENT_BUSINESS_INDEX_VERSION = 'requirement-business-index-v3'
+const REQUIREMENT_MATCH_PROVENANCE_MIGRATION_KEY = 'requirementMatching.provenanceMigration'
+const REQUIREMENT_MATCH_PROVENANCE_MIGRATION_VERSION = 'v1'
+const REQUIREMENT_BUSINESS_INDEX_VERSION = 'requirement-business-index-v4'
 
 const requirementSourceHash = (input: {
   name: string
@@ -521,13 +535,11 @@ const requirementSourceHash = (input: {
   } catch {
     raw = {}
   }
-  return createHash('sha256')
-    .update(`requirement-business-source-v3\n${buildRequirementBusinessText({
-      name: input.name,
-      raw,
-      fieldLabels: input.fieldLabels
-    })}`)
-    .digest('hex')
+  return hashRequirementBusinessText(buildRequirementBusinessText({
+    name: input.name,
+    raw,
+    fieldLabels: input.fieldLabels
+  }))
 }
 
 export interface KnowledgeVectorRow {
@@ -1584,6 +1596,10 @@ export class AppDatabase {
         project_id TEXT NOT NULL,
         record_uid TEXT NOT NULL,
         linked_at TEXT NOT NULL,
+        link_source TEXT NOT NULL DEFAULT 'legacy_unknown',
+        confirmed_by TEXT NOT NULL DEFAULT '',
+        confirmed_at TEXT NOT NULL DEFAULT '',
+        match_run_id TEXT,
         PRIMARY KEY(project_id, record_uid),
         FOREIGN KEY(project_id) REFERENCES pm_projects(id) ON DELETE CASCADE,
         FOREIGN KEY(record_uid) REFERENCES records(uid) ON DELETE CASCADE
@@ -1683,11 +1699,57 @@ export class AppDatabase {
       CREATE INDEX IF NOT EXISTS idx_pm_requirement_matches_rank
         ON pm_requirement_matches(requirement_id, final_score DESC, record_uid);
 
+      CREATE TABLE IF NOT EXISTS pm_requirement_match_runs (
+        id TEXT PRIMARY KEY,
+        requirement_id TEXT NOT NULL,
+        requirement_snapshot_hash TEXT NOT NULL,
+        normalization_version TEXT NOT NULL,
+        pipeline_version TEXT NOT NULL,
+        ranking_version TEXT NOT NULL,
+        config_hash TEXT NOT NULL,
+        model_version TEXT,
+        status TEXT NOT NULL,
+        degradation_codes_json TEXT NOT NULL DEFAULT '[]',
+        failure_code TEXT,
+        created_at TEXT NOT NULL,
+        completed_at TEXT,
+        FOREIGN KEY(requirement_id) REFERENCES pm_requirements(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_pm_requirement_match_runs_latest
+        ON pm_requirement_match_runs(requirement_id, status, completed_at DESC);
+
+      CREATE TABLE IF NOT EXISTS pm_requirement_match_candidates (
+        run_id TEXT NOT NULL,
+        record_uid TEXT NOT NULL,
+        final_rank INTEGER NOT NULL,
+        ranking_score REAL NOT NULL,
+        ranking_version TEXT NOT NULL,
+        relation TEXT,
+        decision_status TEXT NOT NULL,
+        evidence_level TEXT NOT NULL,
+        reason_codes_json TEXT NOT NULL DEFAULT '[]',
+        degradation_codes_json TEXT NOT NULL DEFAULT '[]',
+        stage_scores_json TEXT NOT NULL,
+        explanation TEXT,
+        record_snapshot_hash TEXT NOT NULL,
+        PRIMARY KEY(run_id, record_uid),
+        FOREIGN KEY(run_id) REFERENCES pm_requirement_match_runs(id) ON DELETE CASCADE,
+        FOREIGN KEY(record_uid) REFERENCES records(uid) ON DELETE RESTRICT
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_pm_requirement_match_candidates_rank
+        ON pm_requirement_match_candidates(run_id, final_rank);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_pm_requirement_match_candidates_record
+        ON pm_requirement_match_candidates(run_id, record_uid);
+
       CREATE TABLE IF NOT EXISTS pm_project_asset_requirements (
         project_id TEXT NOT NULL,
         record_uid TEXT NOT NULL,
         requirement_id TEXT NOT NULL,
         linked_at TEXT NOT NULL,
+        link_source TEXT NOT NULL DEFAULT 'legacy_unknown',
+        confirmed_by TEXT NOT NULL DEFAULT '',
+        confirmed_at TEXT NOT NULL DEFAULT '',
+        match_run_id TEXT,
         PRIMARY KEY(project_id, record_uid, requirement_id),
         FOREIGN KEY(project_id) REFERENCES pm_projects(id) ON DELETE CASCADE,
         FOREIGN KEY(record_uid) REFERENCES records(uid) ON DELETE CASCADE,
@@ -1907,6 +1969,33 @@ export class AppDatabase {
         this.db.exec(statement)
       } catch {
         // Existing databases may already contain the migration column.
+      }
+    }
+    for (const statement of [
+      "ALTER TABLE pm_project_assets ADD COLUMN link_source TEXT NOT NULL DEFAULT 'legacy_unknown'",
+      "ALTER TABLE pm_project_assets ADD COLUMN confirmed_by TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE pm_project_assets ADD COLUMN confirmed_at TEXT NOT NULL DEFAULT ''",
+      'ALTER TABLE pm_project_assets ADD COLUMN match_run_id TEXT',
+      "ALTER TABLE pm_project_asset_requirements ADD COLUMN link_source TEXT NOT NULL DEFAULT 'legacy_unknown'",
+      "ALTER TABLE pm_project_asset_requirements ADD COLUMN confirmed_by TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE pm_project_asset_requirements ADD COLUMN confirmed_at TEXT NOT NULL DEFAULT ''",
+      'ALTER TABLE pm_project_asset_requirements ADD COLUMN match_run_id TEXT'
+    ]) {
+      try {
+        this.db.exec(statement)
+      } catch {
+        // Existing databases may already contain the provenance column.
+      }
+    }
+    if (this.getSetting(REQUIREMENT_MATCH_PROVENANCE_MIGRATION_KEY) !== REQUIREMENT_MATCH_PROVENANCE_MIGRATION_VERSION) {
+      this.db.exec('BEGIN IMMEDIATE')
+      try {
+        this.db.exec("UPDATE pm_requirements SET status_source = 'legacy_unverified' WHERE status_source = 'ai'")
+        this.setSetting(REQUIREMENT_MATCH_PROVENANCE_MIGRATION_KEY, REQUIREMENT_MATCH_PROVENANCE_MIGRATION_VERSION)
+        this.db.exec('COMMIT')
+      } catch (error) {
+        try { this.db.exec('ROLLBACK') } catch {}
+        throw error
       }
     }
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_records_push_status ON records(push_status)')
@@ -4401,7 +4490,7 @@ export class AppDatabase {
         ON ar.project_id = ? AND ar.record_uid = m.record_uid AND ar.requirement_id = m.requirement_id
       WHERE q.project_id = ?
       ORDER BY q.requirement_no ASC, m.final_score DESC, m.record_uid ASC
-    `).all(projectId, projectId, projectId) as SqlRow[]).map((row): ProjectRequirementMatch => ({
+    `).all(projectId, projectId, projectId) as SqlRow[]).map((row): LegacyProjectRequirementMatch => ({
       requirementId: String(row.requirement_id),
       recordUid: String(row.record_uid),
       recordName: String(row.record_name ?? ''),
@@ -5452,6 +5541,161 @@ export class AppDatabase {
     return row ? this.mapProjectRequirement(row) : null
   }
 
+  createRequirementMatchRun(input: RequirementMatchRunCreateInput): RequirementMatchRun {
+    const id = randomUUID()
+    const createdAt = nowIso()
+    this.db.prepare(`
+      INSERT INTO pm_requirement_match_runs(
+        id, requirement_id, requirement_snapshot_hash, normalization_version,
+        pipeline_version, ranking_version, config_hash, model_version, status,
+        degradation_codes_json, failure_code, created_at, completed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', '[]', NULL, ?, NULL)
+    `).run(
+      id, input.requirementId, input.requirementSnapshotHash, input.normalizationVersion,
+      input.pipelineVersion, input.rankingVersion, input.configHash, input.modelVersion, createdAt
+    )
+    return this.getRequirementMatchRun(id)!
+  }
+
+  private mapRequirementMatchRun(row: SqlRow): RequirementMatchRun {
+    return {
+      id: String(row.id),
+      requirementId: String(row.requirement_id),
+      requirementSnapshotHash: String(row.requirement_snapshot_hash),
+      normalizationVersion: String(row.normalization_version),
+      pipelineVersion: String(row.pipeline_version),
+      rankingVersion: String(row.ranking_version),
+      configHash: String(row.config_hash),
+      modelVersion: row.model_version === null || row.model_version === undefined ? null : String(row.model_version),
+      status: String(row.status) as RequirementMatchRun['status'],
+      degradationCodes: parseJsonArray(row.degradation_codes_json) as RequirementMatchDegradationCode[],
+      failureCode: row.failure_code === null || row.failure_code === undefined ? null : String(row.failure_code),
+      createdAt: String(row.created_at),
+      completedAt: row.completed_at === null || row.completed_at === undefined ? null : String(row.completed_at)
+    }
+  }
+
+  getRequirementMatchRun(id: string): RequirementMatchRun | null {
+    const row = this.db.prepare('SELECT * FROM pm_requirement_match_runs WHERE id = ?').get(id) as SqlRow | undefined
+    return row ? this.mapRequirementMatchRun(row) : null
+  }
+
+  completeRequirementMatchRun(
+    runId: string,
+    candidates: Array<RequirementMatchCandidateResult & { recordSnapshotHash: string }>,
+    degradationCodes: RequirementMatchDegradationCode[],
+    metadata?: Pick<RequirementMatchRun, 'normalizationVersion' | 'pipelineVersion' | 'rankingVersion' | 'configHash' | 'modelVersion'>
+  ): void {
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const run = this.db.prepare('SELECT status FROM pm_requirement_match_runs WHERE id = ?').get(runId) as SqlRow | undefined
+      if (!run || String(run.status) !== 'running') throw new Error('匹配运行不存在或已结束')
+      const insert = this.db.prepare(`
+        INSERT INTO pm_requirement_match_candidates(
+          run_id, record_uid, final_rank, ranking_score, ranking_version, relation,
+          decision_status, evidence_level, reason_codes_json, degradation_codes_json,
+          stage_scores_json, explanation, record_snapshot_hash
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      for (const candidate of candidates) {
+        insert.run(
+          runId, candidate.recordUid, candidate.finalRank, candidate.rankingScore,
+          candidate.rankingVersion, candidate.relation, candidate.decisionStatus,
+          candidate.evidenceLevel, JSON.stringify(candidate.reasonCodes),
+          JSON.stringify(candidate.degradationCodes), JSON.stringify(candidate.stageScores),
+          candidate.explanation, candidate.recordSnapshotHash
+        )
+      }
+      this.db.prepare(`
+        UPDATE pm_requirement_match_runs
+        SET status = 'succeeded', degradation_codes_json = ?, completed_at = ?,
+            normalization_version = COALESCE(?, normalization_version),
+            pipeline_version = COALESCE(?, pipeline_version),
+            ranking_version = COALESCE(?, ranking_version),
+            config_hash = COALESCE(?, config_hash),
+            model_version = ?
+        WHERE id = ? AND status = 'running'
+      `).run(
+        JSON.stringify(degradationCodes), nowIso(), metadata?.normalizationVersion ?? null,
+        metadata?.pipelineVersion ?? null, metadata?.rankingVersion ?? null,
+        metadata?.configHash ?? null, metadata?.modelVersion ?? null, runId
+      )
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  failRequirementMatchRun(runId: string, failureCode: string): void {
+    this.db.prepare(`
+      UPDATE pm_requirement_match_runs
+      SET status = 'failed', failure_code = ?, completed_at = ?
+      WHERE id = ? AND status = 'running'
+    `).run(failureCode, nowIso(), runId)
+  }
+
+  markRequirementMatchRunsStale(requirementId?: string): void {
+    const where = requirementId ? ' AND requirement_id = ?' : ''
+    this.db.prepare(`
+      UPDATE pm_requirement_match_runs SET status = 'stale'
+      WHERE status = 'succeeded'${where}
+    `).run(...(requirementId ? [requirementId] : []))
+  }
+
+  getLatestCompatibleRequirementMatchRun(query: RequirementMatchRunCompatibilityQuery): RequirementMatchRun | null {
+    const conditions = [
+      'requirement_id = ?', "status = 'succeeded'", 'requirement_snapshot_hash = ?'
+    ]
+    const params: string[] = [query.requirementId, query.requirementSnapshotHash]
+    if (query.normalizationVersion) { conditions.push('normalization_version = ?'); params.push(query.normalizationVersion) }
+    if (query.pipelineVersion) { conditions.push('pipeline_version = ?'); params.push(query.pipelineVersion) }
+    const row = this.db.prepare(`
+      SELECT * FROM pm_requirement_match_runs
+      WHERE ${conditions.join(' AND ')}
+      ORDER BY completed_at DESC, created_at DESC LIMIT 1
+    `).get(...params) as SqlRow | undefined
+    return row ? this.mapRequirementMatchRun(row) : null
+  }
+
+  listRequirementMatchCandidates(query: {
+    runId: string
+    page: number
+    pageSize: number
+    diagnostics?: boolean
+  }): RequirementMatchCandidatePage {
+    const page = Math.max(1, Math.floor(query.page))
+    const pageSize = Math.max(1, Math.min(200, Math.floor(query.pageSize)))
+    const diagnostics = query.diagnostics === true
+    const filter = diagnostics ? '' : " AND decision_status <> 'rejected'"
+    const totalRow = this.db.prepare(`
+      SELECT COUNT(*) AS count FROM pm_requirement_match_candidates WHERE run_id = ?${filter}
+    `).get(query.runId) as SqlRow
+    const rows = this.db.prepare(`
+      SELECT * FROM pm_requirement_match_candidates
+      WHERE run_id = ?${filter}
+      ORDER BY final_rank ASC LIMIT ? OFFSET ?
+    `).all(query.runId, pageSize, (page - 1) * pageSize) as SqlRow[]
+    return {
+      total: Number(totalRow.count ?? 0),
+      rows: rows.map((row): PersistedRequirementMatchCandidate => ({
+        runId: String(row.run_id),
+        recordUid: String(row.record_uid),
+        finalRank: Number(row.final_rank),
+        rankingScore: Number(row.ranking_score),
+        rankingVersion: String(row.ranking_version),
+        relation: row.relation === null || row.relation === undefined ? null : String(row.relation) as PersistedRequirementMatchCandidate['relation'],
+        decisionStatus: String(row.decision_status) as PersistedRequirementMatchCandidate['decisionStatus'],
+        evidenceLevel: String(row.evidence_level) as PersistedRequirementMatchCandidate['evidenceLevel'],
+        reasonCodes: parseJsonArray(row.reason_codes_json),
+        degradationCodes: parseJsonArray(row.degradation_codes_json) as RequirementMatchDegradationCode[],
+        stageScores: parseJsonValue(row.stage_scores_json, {}) as PersistedRequirementMatchCandidate['stageScores'],
+        explanation: row.explanation === null || row.explanation === undefined ? null : String(row.explanation),
+        recordSnapshotHash: String(row.record_snapshot_hash)
+      }))
+    }
+  }
+
   replaceRequirementMatches(
     requirementId: string,
     matches: Array<{
@@ -5538,7 +5782,7 @@ export class AppDatabase {
     }
   }
 
-  listProjectRequirementMatches(query: ProjectRequirementMatchQuery): ProjectRequirementMatchPage {
+  listLegacyProjectRequirementMatches(query: ProjectRequirementMatchQuery & { minScore?: number }): { rows: LegacyProjectRequirementMatch[]; total: number } {
     const page = Math.max(1, Math.floor(query.page || 1))
     const pageSize = Math.min(200, Math.max(1, Math.floor(query.pageSize || 20)))
     const minScore = query.minScore === undefined
@@ -5580,9 +5824,63 @@ export class AppDatabase {
           vectorScore: Number(row.vector_score ?? 0),
           ...(row.ai_score === null || row.ai_score === undefined ? {} : { aiScore: Number(row.ai_score) }),
           finalScore: Number(row.final_score ?? 0),
-          scoreSource: String(row.score_source ?? 'vector') as ProjectRequirementMatch['scoreSource'],
+          scoreSource: String(row.score_source ?? 'vector') as LegacyProjectRequirementMatch['scoreSource'],
           reason: String(row.reason ?? ''),
           bestChunkId: String(row.best_chunk_id ?? ''),
+          assetLinked: Number(row.asset_linked ?? 0) === 1,
+          requirementLinked: Number(row.requirement_linked ?? 0) === 1
+        }
+      })
+    }
+  }
+
+  listProjectRequirementMatchCandidateDetails(query: {
+    requirementId: string
+    runId: string
+    page: number
+    pageSize: number
+    diagnostics?: boolean
+  }): { rows: ProjectRequirementMatchCandidate[]; total: number } {
+    const page = Math.max(1, Math.floor(query.page || 1))
+    const pageSize = Math.min(200, Math.max(1, Math.floor(query.pageSize || 20)))
+    const filter = query.diagnostics ? '' : " AND c.decision_status <> 'rejected'"
+    const total = Number((this.db.prepare(`
+      SELECT COUNT(*) AS count FROM pm_requirement_match_candidates c
+      JOIN pm_requirement_match_runs run ON run.id = c.run_id
+      WHERE c.run_id = ? AND run.requirement_id = ?${filter}
+    `).get(query.runId, query.requirementId) as SqlRow).count ?? 0)
+    const rows = this.db.prepare(`
+      SELECT c.*, run.requirement_id, r.name, r.node_type, r.item_id, r.normalized_text,
+             CASE WHEN a.record_uid IS NULL THEN 0 ELSE 1 END AS asset_linked,
+             CASE WHEN ar.requirement_id IS NULL THEN 0 ELSE 1 END AS requirement_linked
+      FROM pm_requirement_match_candidates c
+      JOIN pm_requirement_match_runs run ON run.id = c.run_id
+      JOIN pm_requirements q ON q.id = run.requirement_id
+      JOIN records r ON r.uid = c.record_uid
+      LEFT JOIN pm_project_assets a ON a.project_id = q.project_id AND a.record_uid = r.uid
+      LEFT JOIN pm_project_asset_requirements ar
+        ON ar.project_id = q.project_id AND ar.record_uid = r.uid AND ar.requirement_id = run.requirement_id
+      WHERE c.run_id = ? AND run.requirement_id = ?${filter}
+      ORDER BY c.final_rank ASC LIMIT ? OFFSET ?
+    `).all(query.runId, query.requirementId, pageSize, (page - 1) * pageSize) as SqlRow[]
+    return {
+      total,
+      rows: rows.map((row): ProjectRequirementMatchCandidate => {
+        const stage = parseJsonValue(row.stage_scores_json, {}) as Record<string, unknown>
+        return {
+          requirementId: String(row.requirement_id), runId: String(row.run_id), recordUid: String(row.record_uid),
+          recordName: String(row.name ?? ''), nodeType: String(row.node_type ?? ''), itemId: String(row.item_id ?? ''),
+          description: String(row.normalized_text ?? ''), finalRank: Number(row.final_rank),
+          rankingScore: Number(row.ranking_score), rankingVersion: String(row.ranking_version),
+          relation: row.relation === null || row.relation === undefined ? null : String(row.relation) as ProjectRequirementMatchCandidate['relation'],
+          decisionStatus: String(row.decision_status) as ProjectRequirementMatchCandidate['decisionStatus'],
+          evidenceLevel: String(row.evidence_level) as ProjectRequirementMatchCandidate['evidenceLevel'],
+          reasonCodes: parseJsonArray(row.reason_codes_json), degradationCodes: parseJsonArray(row.degradation_codes_json),
+          explanation: row.explanation === null || row.explanation === undefined ? null : String(row.explanation),
+          denseScore: stage.denseScore === null || stage.denseScore === undefined ? null : Number(stage.denseScore),
+          lexicalScore: stage.lexicalScore === null || stage.lexicalScore === undefined ? null : Number(stage.lexicalScore),
+          fusedScore: Number(stage.fusedScore ?? 0),
+          rerankerScore: stage.rerankerScore === null || stage.rerankerScore === undefined ? null : Number(stage.rerankerScore),
           assetLinked: Number(row.asset_linked ?? 0) === 1,
           requirementLinked: Number(row.requirement_linked ?? 0) === 1
         }
@@ -6083,7 +6381,8 @@ export class AppDatabase {
 
   listProjectAssets(projectId: string): ProjectAsset[] {
     const rows = this.db.prepare(`
-      SELECT a.project_id, a.record_uid, a.linked_at, r.uid AS uid, r.name, r.node_type, r.item_id,
+      SELECT a.project_id, a.record_uid, a.linked_at, a.link_source, a.confirmed_by,
+             a.confirmed_at, a.match_run_id, r.uid AS uid, r.name, r.node_type, r.item_id,
              r.raw_json, r.normalized_text, r.last_modify_time, r.project_id AS source_project_id,
              r.parent_id, r.synced_at, r.content_hash, r.push_status, r.push_message,
              r.pushed_at, r.pushed_uid, COUNT(i.id) AS image_count
@@ -6095,7 +6394,8 @@ export class AppDatabase {
       ORDER BY a.linked_at DESC, r.name ASC
     `).all(projectId) as SqlRow[]
     const requirementRows = this.db.prepare(`
-      SELECT ar.record_uid, ar.linked_at, q.id AS requirement_id,
+      SELECT ar.record_uid, ar.linked_at, ar.link_source, ar.confirmed_by,
+             ar.confirmed_at, ar.match_run_id, q.id AS requirement_id,
              q.requirement_no, q.title, m.final_score AS match_score
       FROM pm_project_asset_requirements ar
       JOIN pm_requirements q ON q.id = ar.requirement_id
@@ -6113,6 +6413,10 @@ export class AppDatabase {
         requirementNo: Number(row.requirement_no ?? 0),
         title: String(row.title ?? ''),
         linkedAt: String(row.linked_at ?? ''),
+        linkSource: String(row.link_source ?? 'legacy_unknown') as ProjectAsset['linkSource'],
+        confirmedBy: String(row.confirmed_by ?? ''),
+        confirmedAt: String(row.confirmed_at ?? ''),
+        matchRunId: row.match_run_id === null || row.match_run_id === undefined ? null : String(row.match_run_id),
         ...(row.match_score === null || row.match_score === undefined ? {} : { matchScore: Number(row.match_score) })
       })
       requirementsByRecord.set(recordUid, requirements)
@@ -6127,12 +6431,26 @@ export class AppDatabase {
         itemId: record.itemId,
         description: record.description,
         linkedAt: String(row.linked_at ?? ''),
+        linkSource: String(row.link_source ?? 'legacy_unknown') as ProjectAsset['linkSource'],
+        confirmedBy: String(row.confirmed_by ?? ''),
+        confirmedAt: String(row.confirmed_at ?? ''),
+        matchRunId: row.match_run_id === null || row.match_run_id === undefined ? null : String(row.match_run_id),
         requirements: requirementsByRecord.get(record.uid) ?? []
       }
     })
   }
 
-  linkProjectAsset(projectId: string, recordUid: string, requirementId?: string): ProjectAsset | null {
+  linkProjectAsset(
+    projectId: string,
+    recordUid: string,
+    requirementId?: string,
+    provenance: {
+      linkSource: ProjectAssetLinkSource
+      confirmedBy: string
+      confirmedAt?: string
+      matchRunId?: string
+    } = { linkSource: 'manual', confirmedBy: 'local-user' }
+  ): ProjectAsset | null {
     const exists = this.db.prepare('SELECT uid FROM records WHERE uid = ?').get(recordUid)
     if (!exists) return null
     if (requirementId) {
@@ -6141,17 +6459,43 @@ export class AppDatabase {
       ).get(requirementId, projectId)
       if (!requirement) return null
     }
+    const confirmedAt = provenance.confirmedAt?.trim() || nowIso()
+    const matchRunId = provenance.matchRunId?.trim() || null
     this.db.prepare(`
-      INSERT INTO pm_project_assets(project_id, record_uid, linked_at)
-      VALUES (?, ?, ?)
-      ON CONFLICT(project_id, record_uid) DO NOTHING
-    `).run(projectId, recordUid, nowIso())
+      INSERT INTO pm_project_assets(
+        project_id, record_uid, linked_at, link_source, confirmed_by, confirmed_at, match_run_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(project_id, record_uid) DO UPDATE SET
+        link_source = excluded.link_source,
+        confirmed_by = excluded.confirmed_by,
+        confirmed_at = excluded.confirmed_at,
+        match_run_id = excluded.match_run_id
+      WHERE pm_project_assets.link_source <> 'manual'
+        AND excluded.link_source <> 'legacy_unknown'
+    `).run(projectId, recordUid, confirmedAt, provenance.linkSource, provenance.confirmedBy.trim(), confirmedAt, matchRunId)
     if (requirementId) {
       this.db.prepare(`
-        INSERT INTO pm_project_asset_requirements(project_id, record_uid, requirement_id, linked_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(project_id, record_uid, requirement_id) DO NOTHING
-      `).run(projectId, recordUid, requirementId, nowIso())
+        INSERT INTO pm_project_asset_requirements(
+          project_id, record_uid, requirement_id, linked_at,
+          link_source, confirmed_by, confirmed_at, match_run_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(project_id, record_uid, requirement_id) DO UPDATE SET
+          link_source = excluded.link_source,
+          confirmed_by = excluded.confirmed_by,
+          confirmed_at = excluded.confirmed_at,
+          match_run_id = excluded.match_run_id
+        WHERE pm_project_asset_requirements.link_source <> 'manual'
+          AND excluded.link_source <> 'legacy_unknown'
+      `).run(
+        projectId,
+        recordUid,
+        requirementId,
+        confirmedAt,
+        provenance.linkSource,
+        provenance.confirmedBy.trim(),
+        confirmedAt,
+        matchRunId
+      )
     }
     return this.listProjectAssets(projectId).find((asset) => asset.recordUid === recordUid) ?? null
   }

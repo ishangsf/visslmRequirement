@@ -1,4 +1,7 @@
+import type { ProjectRequirement } from '../../shared/project-types'
 import type { RecordDetail } from '../../shared/types'
+import type { RequirementBusinessFacts } from './requirement-match-domain'
+import { extractRequirementBusinessFacts } from './requirement-business-normalization'
 
 /**
  * The source view used by requirement matching.
@@ -16,6 +19,7 @@ export interface RequirementMatchCard {
   evidence: string
   matchingText: string
   lexicalTerms: string[]
+  businessFacts: RequirementBusinessFacts
 }
 
 const NAMED_ENTITIES: Record<string, string> = {
@@ -247,7 +251,37 @@ export const buildRequirementSourceView = (record: RecordDetail): RequirementMat
     matchingText: evidence,
     lexicalTerms: requirementLexicalTermsOf([
       sourceTitle, sourceDescription, requirementType, productDomain, module
-    ])
+    ]),
+    businessFacts: extractRequirementBusinessFacts([sourceDescription, sourceTitle].filter(Boolean).join('\n'))
+  }
+}
+
+/** Build the same matching contract for a project requirement. */
+export const buildProjectRequirementMatchCard = (
+  requirement: ProjectRequirement
+): RequirementMatchCard => {
+  const sourceTitle = toRequirementPlainText(requirement.title)
+  const sourceDescription = removeRequirementNoise(toRequirementPlainText(requirement.content))
+  const requirementType = toRequirementPlainText(requirement.category)
+  const module = toRequirementPlainText(requirement.module)
+  const evidence = [
+    sourceTitle ? `名称：${sourceTitle}` : '',
+    requirementType ? `明确需求类型：${requirementType}` : '',
+    module ? `明确模块：${module}` : '',
+    sourceDescription ? `描述：${sourceDescription}` : ''
+  ].filter(Boolean).join('\n')
+  return {
+    requirementType,
+    productDomain: '',
+    module,
+    sourceTitle,
+    sourceDescription,
+    evidence,
+    matchingText: evidence,
+    lexicalTerms: requirementLexicalTermsOf([
+      sourceTitle, sourceDescription, requirementType, module, ...(requirement.keyInfoTerms ?? [])
+    ]),
+    businessFacts: extractRequirementBusinessFacts([sourceDescription, sourceTitle].filter(Boolean).join('\n'))
   }
 }
 

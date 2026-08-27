@@ -269,3 +269,6 @@
 ## 代码依据索引
 
 模块共用证据：`docs/01-code-mapping.md` 的 IPC/服务/表映射；`docs/05-database-design.md` 的表结构；`docs/06-api-design.md` 的调用契约；具体实现见上述模块条目列出的文件和行区间。
+# 需求匹配统一核心 v1.1
+
+项目管理和需求分析 Agent 共享 `RequirementMatchingCore.match()`。流水线固定为 Top50 混合召回（含精确哈希补召）、Top20 本地重排、确定性硬规则与版本化排序、Top10 可选解释。解释器只生成证据说明，不能修改排名、分数或确认状态。Cross-Encoder 不可用时切换独立的 fallback 排序版本。

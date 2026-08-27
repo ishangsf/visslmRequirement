@@ -46,6 +46,14 @@ import { normalizeProjectRequirementText } from '../shared/project-requirement-u
 import { AppDatabase } from './database'
 import { KnowledgeService, type KnowledgeRecordMatch } from './knowledge'
 import { ModelClient } from './model-client'
+import { buildProjectRequirementMatchCard } from './requirements/requirement-match-card'
+import type { RequirementMatchingCore } from './requirements/requirement-matching-core'
+import { createRequirementMatchingCore } from './requirements/requirement-matching-runtime'
+import { projectRequirementMatchProjection } from './requirements/requirement-match-adapters'
+import { hashProjectRequirementSnapshot, RequirementMatchRunService } from './requirements/requirement-match-run-service'
+import { resolveRequirementMatchingRollout } from './requirements/requirement-matching-rollout'
+import { REQUIREMENT_NORMALIZATION_VERSION } from './requirements/requirement-business-normalization'
+import { REQUIREMENT_MATCH_PIPELINE_VERSION } from './requirements/requirement-matching-core'
 
 const supportedAgreementExtensions = new Set(['.docx', '.pdf', '.xlsx', '.xls', '.txt'])
 // Keep local-model requests small enough that a slow CPU model can finish
@@ -60,7 +68,6 @@ const requirementCategories = new Set<ProjectRequirementCategory>([
   'functional', 'interface', 'data', 'performance', 'security',
   'deployment', 'operations', 'acceptance', 'business'
 ])
-const projectRequirementAutoLinkScoreThreshold = 80
 
 interface ExtractedProject {
   projectName?: string
@@ -352,14 +359,19 @@ interface MatchReview {
 
 export class ProjectManagementService {
   private readonly runningProjectIds = new Set<string>()
+  private readonly matchingCore: RequirementMatchingCore
+  private readonly requirementMatchRuns: RequirementMatchRunService
 
   constructor(
     private readonly db: AppDatabase,
     private readonly knowledge: KnowledgeService,
     private readonly modelSettings: () => ModelSettings,
     private readonly progress?: (progress: ProjectAnalysisProgress) => void,
-    private readonly projectMatchingSettings: () => ProjectMatchingSettings = () => DEFAULT_PROJECT_MATCHING_SETTINGS
+    private readonly projectMatchingSettings: () => ProjectMatchingSettings = () => DEFAULT_PROJECT_MATCHING_SETTINGS,
+    matchingCore?: RequirementMatchingCore
   ) {
+    this.matchingCore = matchingCore ?? createRequirementMatchingCore(db, knowledge, modelSettings)
+    this.requirementMatchRuns = new RequirementMatchRunService(db, this.matchingCore)
     this.db.reconcileInterruptedProjectAnalysis()
   }
 
@@ -381,6 +393,7 @@ export class ProjectManagementService {
 
   markMatchesStale(): void {
     this.db.markManagedProjectMatchesStale()
+    this.requirementMatchRuns.markStaleForRecordChange()
   }
 
   createProject(input: ManagedProjectInput): ManagedProject {
@@ -639,10 +652,37 @@ export class ProjectManagementService {
   }
 
   listMatches(query: ProjectRequirementMatchQuery): ProjectRequirementMatchPage {
-    return this.db.listProjectRequirementMatches({
-      ...query,
-      minScore: normalizeProjectMatchScore(this.projectMatchingSettings().minScore)
-    })
+    if (resolveRequirementMatchingRollout(this.projectMatchingSettings().rolloutMode).primaryReadPath !== 'v1_1' && !query.runId) {
+      return { run: null, rows: [], total: 0 }
+    }
+    const requirement = this.db.getProjectRequirement(query.requirementId)
+    if (!requirement) return { run: null, rows: [], total: 0 }
+    const run = query.runId
+      ? this.db.getRequirementMatchRun(query.runId)
+      : this.db.getLatestCompatibleRequirementMatchRun({
+          requirementId: requirement.id,
+          requirementSnapshotHash: hashProjectRequirementSnapshot(requirement),
+          normalizationVersion: REQUIREMENT_NORMALIZATION_VERSION,
+          pipelineVersion: REQUIREMENT_MATCH_PIPELINE_VERSION
+        })
+    if (!run || run.requirementId !== requirement.id || !['succeeded', 'stale'].includes(run.status)) {
+      return { run: null, rows: [], total: 0 }
+    }
+    const page = this.db.listProjectRequirementMatchCandidateDetails({ ...query, runId: run.id })
+    return {
+      run: {
+        id: run.id,
+        requirementId: run.requirementId,
+        normalizationVersion: run.normalizationVersion,
+        pipelineVersion: run.pipelineVersion,
+        rankingVersion: run.rankingVersion,
+        configHash: run.configHash,
+        modelVersion: run.modelVersion,
+        degradationCodes: run.degradationCodes,
+        completedAt: run.completedAt ?? ''
+      },
+      ...page
+    }
   }
 
   listCostEntries(projectId: string): ProjectCostEntry[] {
@@ -760,7 +800,10 @@ export class ProjectManagementService {
         throw new Error('需求条目不存在或不属于当前项目')
       }
     }
-    return this.db.linkProjectAsset(projectId, recordUid, normalizedRequirementId)
+    return this.db.linkProjectAsset(projectId, recordUid, normalizedRequirementId, {
+      linkSource: 'manual',
+      confirmedBy: 'local-user'
+    })
   }
 
   unlinkAsset(projectId: string, recordUid: string): { ok: boolean; message: string } {
@@ -1758,40 +1801,17 @@ export class ProjectManagementService {
   }
 
   private async matchSingleRequirement(requirement: ProjectRequirement): Promise<void> {
-    const matchingQuery = this.buildRequirementMatchQuery(requirement)
-    const vectorMatches = await this.knowledge.rankRecordMatches(matchingQuery)
-    const reviewed = await this.reviewMatches(requirement, vectorMatches.slice(0, 20))
-    const reviewByRecord = new Map(
-      (reviewed.matches ?? [])
-        .filter((item) => item.recordUid)
-        .map((item) => [String(item.recordUid), item])
-    )
-    const matches = vectorMatches.map((match) => {
-      const review = reviewByRecord.get(match.recordUid)
-      const aiScore = review?.score === undefined ? undefined : this.clampScore(review.score)
-      return {
-        recordUid: match.recordUid,
-        vectorScore: this.clampScore(match.score),
-        ...(aiScore === undefined ? {} : { aiScore }),
-        finalScore: aiScore ?? this.clampScore(match.score),
-        scoreSource: aiScore === undefined ? 'vector' as const : 'ai' as const,
-        reason: review?.reason?.trim() ?? '',
-        bestChunkId: match.chunkId
-      }
+    const rollout = resolveRequirementMatchingRollout(this.projectMatchingSettings().rolloutMode)
+    if (!rollout.newPipelinePersisted) return
+    const { runId } = await this.requirementMatchRuns.start({
+      requirementId: requirement.id,
+      explanationPolicy: {
+        mode: this.modelSettings().source === 'local' ? 'local' : 'online',
+        allowExternalProcessing: false
+      },
+      explainTopN: 10
     })
-    this.db.replaceRequirementMatches(requirement.id, matches)
-    this.db.linkRequirementMatchesAboveScore(requirement.id, projectRequirementAutoLinkScoreThreshold)
-    const highestMatchScore = matches.reduce((value, item) => Math.max(value, item.finalScore), 0)
-    const scoreThreshold = projectRequirementAutoLinkScoreThreshold
-    const aiStatus: ProjectRequirementStatus = reviewed.status === 'satisfied' && highestMatchScore >= scoreThreshold
-      ? 'satisfied'
-      : 'unmarked'
-    const aiReason = aiStatus === 'satisfied'
-      ? reviewed.reason?.trim() || `最高匹配度 ${highestMatchScore.toFixed(1)}%，AI 初判为已满足`
-      : highestMatchScore > 0
-        ? `最高匹配度 ${highestMatchScore.toFixed(1)}% 未达到已满足阈值 ${scoreThreshold}%，待人工标记`
-        : reviewed.reason?.trim() || '当前没有足够匹配依据，待人工标记'
-    this.db.updateProjectRequirementAiStatus(requirement.id, aiStatus, aiReason)
+    await this.requirementMatchRuns.execute(runId)
   }
 
   private buildRequirementMatchQuery(requirement: ProjectRequirement): string {

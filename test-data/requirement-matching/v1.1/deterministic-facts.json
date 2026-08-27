@@ -1,0 +1,15 @@
+{
+  "version": "requirement-business-v1",
+  "seed": "查询订单详情",
+  "cases": [
+    "exact_duplicate",
+    "format_only",
+    "action_conflict",
+    "object_conflict",
+    "negation_conflict",
+    "constraint_conflict",
+    "missing_required_field",
+    "irrelevant_padding"
+  ],
+  "claimLimit": "These fixtures verify deterministic safety properties, not open-domain semantic accuracy."
+}

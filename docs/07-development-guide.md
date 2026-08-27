@@ -275,3 +275,6 @@ npm run package
 - `scripts/prepare-local-resources.mjs`：embedding/OCR 资源准备和 manifest。
 - `scripts/smoke-*.ts/.mjs`：领域、知识库、Dashboard、项目管理和 UI 回归。
 - `agents.md`：持续开发和 UI 验收约束。
+# 需求匹配开发与验收 v1.1
+
+修改归一化、硬规则、排序权重、模型或候选过滤时必须升级对应版本并运行 `test:requirement-matching-metamorphic`、`test:requirement-matching-gates`、运行仓储/服务/IPC 回归、项目管理与 Agent smoke。性能发布闸门必须在包含真实本地 Cross-Encoder 资源的指定目标硬件上记录并核验基线；合成或 fallback 结果不能替代该门禁。

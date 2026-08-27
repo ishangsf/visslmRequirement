@@ -2,7 +2,8 @@ export type ManagedProjectLifecycle = 'draft' | 'active'
 export type ProjectAnalysisStatus = 'idle' | 'processing' | 'ready' | 'failed'
 export type ProjectMatchStatus = 'idle' | 'processing' | 'ready' | 'stale' | 'failed'
 export type ProjectRequirementStatus = 'unmarked' | 'satisfied' | 'to_develop' | 'to_negotiate'
-export type ProjectRequirementStatusSource = 'ai' | 'manual'
+export type ProjectRequirementStatusSource = 'ai' | 'manual' | 'system_rule' | 'legacy_unverified'
+export type ProjectAssetLinkSource = 'manual' | 'exact_business_hash' | 'legacy_unknown'
 export type ProjectRequirementKeyInfoTermsSource = 'ai' | 'manual'
 export type ProjectRequirementCategory =
   | 'functional'
@@ -225,6 +226,10 @@ export interface ProjectAssetRequirement {
   requirementNo: number
   title: string
   linkedAt: string
+  linkSource: ProjectAssetLinkSource
+  confirmedBy: string
+  confirmedAt: string
+  matchRunId: string | null
   matchScore?: number
 }
 
@@ -236,6 +241,10 @@ export interface ProjectAsset {
   itemId: string
   description: string
   linkedAt: string
+  linkSource: ProjectAssetLinkSource
+  confirmedBy: string
+  confirmedAt: string
+  matchRunId: string | null
   requirements: ProjectAssetRequirement[]
 }
 
@@ -273,7 +282,7 @@ export interface ProjectDataSnapshot {
   assets: ProjectAsset[]
   tasks: ProjectPlanTask[]
   requirements: ProjectRequirement[]
-  matches: ProjectRequirementMatch[]
+  matches: LegacyProjectRequirementMatch[]
 }
 
 export interface ProjectDataTransferResult {
@@ -369,7 +378,7 @@ export interface ProjectAgreementUploadOptions {
   allowExternalProcessing?: boolean
 }
 
-export interface ProjectRequirementMatch {
+export interface LegacyProjectRequirementMatch {
   requirementId: string
   recordUid: string
   recordName: string
@@ -387,15 +396,54 @@ export interface ProjectRequirementMatch {
 }
 
 export interface ProjectRequirementMatchPage {
-  rows: ProjectRequirementMatch[]
+  run: ProjectRequirementMatchRunSummary | null
+  rows: ProjectRequirementMatchCandidate[]
   total: number
 }
 
 export interface ProjectRequirementMatchQuery {
   requirementId: string
+  runId?: string
   page: number
   pageSize: number
-  minScore?: number
+  diagnostics?: boolean
+}
+
+export interface ProjectRequirementMatchRunSummary {
+  id: string
+  requirementId: string
+  normalizationVersion: string
+  pipelineVersion: string
+  rankingVersion: string
+  configHash: string
+  modelVersion: string | null
+  degradationCodes: string[]
+  completedAt: string
+}
+
+export interface ProjectRequirementMatchCandidate {
+  requirementId: string
+  runId: string
+  recordUid: string
+  recordName: string
+  nodeType: string
+  itemId: string
+  description: string
+  finalRank: number
+  rankingScore: number
+  rankingVersion: string
+  relation: 'duplicate' | 'highly_similar' | 'partial_overlap' | 'same_pattern' | 'topic_only' | 'unrelated' | null
+  decisionStatus: 'confirmed' | 'suggested' | 'ambiguous' | 'rejected'
+  evidenceLevel: 'exact_business_hash' | 'exact_normalized_text' | 'deterministic_rule' | 'model_supported' | 'retrieval_only'
+  reasonCodes: string[]
+  degradationCodes: string[]
+  explanation: string | null
+  denseScore: number | null
+  lexicalScore: number | null
+  fusedScore: number
+  rerankerScore: number | null
+  assetLinked: boolean
+  requirementLinked: boolean
 }
 
 export type ProjectAnalysisPhase =

@@ -159,7 +159,7 @@ const assertSourceOnlyCard = (
 ): void => {
   assert.deepEqual(candidate.card, buildRequirementSourceView(record))
   assert.deepEqual(Object.keys(candidate.card).sort(), [
-    'evidence', 'lexicalTerms', 'matchingText', 'module', 'productDomain',
+    'businessFacts', 'evidence', 'lexicalTerms', 'matchingText', 'module', 'productDomain',
     'requirementType', 'sourceDescription', 'sourceTitle'
   ].sort())
   assert.ok(candidate.card.evidence.includes(record.name))
@@ -266,8 +266,8 @@ const testCurrentIndexCandidateFlowsToReview = async (db: AppDatabase): Promise<
     projectId: 'project-mathtype',
     nodeType: 'Requirement',
     itemId: 'VISSLM-TSIS-79',
-    name: '数学公式在线编辑/MathType OLE',
-    description: '支持数学公式在线编辑，并支持编辑 MathType OLE 公式对象。',
+    name: '数学公式导入/MathType OLE',
+    description: '支持导入数学公式，并保留 MathType OLE 公式对象。',
     module: '公式编辑'
   })
   const unindexedCandidate = addRecord(db, {
@@ -315,7 +315,7 @@ const testCurrentIndexCandidateFlowsToReview = async (db: AppDatabase): Promise<
               recordUid: indexedCandidate.uid,
               relation: 'partial_overlap',
               similarities: ['都涉及 MathType 公式能力'],
-              differences: ['基准关注导入，候选关注在线编辑与 OLE 对象'],
+              differences: ['候选额外明确 MathType OLE 对象保留'],
               baseEvidence: payload.requirement?.evidenceSegments?.[0]?.id ?? 'B001',
               candidateEvidence: payload.candidates?.[0]?.evidenceSegments?.[0]?.id ?? 'C001'
             }]

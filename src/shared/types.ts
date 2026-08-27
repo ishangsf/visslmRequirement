@@ -119,11 +119,22 @@ export type FeatureNavigationOrder = FeatureModuleKey[]
 
 export interface ProjectMatchingSettings {
   minScore: number
+  rolloutMode: RequirementMatchingRolloutMode
 }
 
+export type RequirementMatchingRolloutMode = 'legacy_safe' | 'shadow' | 'v1_1'
+
 export const DEFAULT_PROJECT_MATCHING_SETTINGS: ProjectMatchingSettings = {
-  minScore: 40
+  minScore: 40,
+  rolloutMode: 'v1_1'
 }
+
+export const normalizeRequirementMatchingRolloutMode = (
+  value: unknown,
+  fallback: RequirementMatchingRolloutMode = 'legacy_safe'
+): RequirementMatchingRolloutMode => (
+  value === 'legacy_safe' || value === 'shadow' || value === 'v1_1' ? value : fallback
+)
 
 export const normalizeProjectMatchScore = (value: unknown): number => {
   if (value === null || value === undefined || value === '') {

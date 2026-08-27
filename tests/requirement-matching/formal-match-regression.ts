@@ -244,15 +244,15 @@ const testRerankerSortAndRawDuplicateDecision = async (): Promise<void> => {
       [fixture.nearDuplicate.uid, fixture.boundary.uid].sort()
     )
     const formal = formalRowsOf(response)
-    assert.deepEqual(formal.map((row) => row.uid), [fixture.nearDuplicate.uid])
+    assert.deepEqual(formal.map((row) => row.uid), [fixture.boundary.uid])
     const scoreDetails = JSON.parse(String(formal[0]?.values.scoreDetails)) as {
       decisionPath?: string
       confidenceBasis?: unknown
     }
-    assert.equal(scoreDetails.decisionPath, 'near_duplicate_text')
+    assert.equal(scoreDetails.decisionPath, 'deterministic_score')
     assert.ok(Array.isArray(scoreDetails.confidenceBasis))
-    assert.equal(formal[0]?.values.rerankerScore, '12.0%')
-    assert.ok(!formal.some((row) => row.uid === fixture.boundary.uid))
+    assert.equal(formal[0]?.values.rerankerScore, '99.0%')
+    assert.ok(!formal.some((row) => row.uid === fixture.nearDuplicate.uid))
     assert.ok(rowsOf(response).every((row) => !/<(?:p|strong|br)\b/i.test(String(row.values.description))))
     assert.doesNotMatch(response.answer, /<\/?(?:p|strong|br)\b/i)
   })
@@ -274,13 +274,13 @@ const testRawDuplicateSurvivesUnavailableReview = async (): Promise<void> => {
     ).ask({ question: 'Analyze requirement GENERIC-NEAR-BASE' })
 
     assert.equal(model.calls, 1)
-    assert.deepEqual(formalRowsOf(response).map((row) => row.uid), [fixture.nearDuplicate.uid])
+    assert.deepEqual(formalRowsOf(response).map((row) => row.uid), [fixture.boundary.uid])
     assert.equal(formalRowsOf(response)[0]?.values.relation, 'duplicate')
     const scoreDetails = JSON.parse(String(formalRowsOf(response)[0]?.values.scoreDetails)) as {
       decisionPath?: string
     }
-    assert.equal(scoreDetails.decisionPath, 'near_duplicate_text')
-    assert.ok(!formalRowsOf(response).some((row) => row.uid === fixture.boundary.uid))
+    assert.equal(scoreDetails.decisionPath, 'deterministic_score')
+    assert.ok(!formalRowsOf(response).some((row) => row.uid === fixture.nearDuplicate.uid))
   })
 }
 
@@ -347,7 +347,7 @@ const testSourceOnlyCleaningAndMetadataIsolation = async (): Promise<void> => {
     }
     assert.doesNotMatch(sourceOnly.evidence, /<[^>]+>/)
     assert.deepEqual(Object.keys(sourceOnly).sort(), [
-      'evidence', 'lexicalTerms', 'matchingText', 'module', 'productDomain',
+      'businessFacts', 'evidence', 'lexicalTerms', 'matchingText', 'module', 'productDomain',
       'requirementType', 'sourceDescription', 'sourceTitle'
     ].sort())
   })
