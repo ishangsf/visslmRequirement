@@ -9091,6 +9091,19 @@ body,
   font-size: 12px;
 }
 
+.project-requirement-status-source {
+  font-size: 12px;
+}
+
+.project-requirement-status-source.is-legacy {
+  width: fit-content;
+  padding: 2px 8px;
+  border: 1px solid color-mix(in srgb, var(--state-warning) 44%, var(--stroke));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--state-warning) 10%, var(--surface-soft));
+  color: var(--state-warning) !important;
+}
+
 .project-key-info-terms-editor .ant-space {
   justify-content: flex-end;
 }

@@ -1,4 +1,5 @@
 import WebSocket from 'ws'
+import { strict as assert } from 'node:assert'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
@@ -6,6 +7,8 @@ const projectPageSource = readFileSync(join(process.cwd(), 'src/renderer/src/pro
 const relationshipGraphSource = readFileSync(join(process.cwd(), 'src/renderer/src/project-management/ProjectRelationshipGraph.tsx'), 'utf8')
 const projectStylesSource = readFileSync(join(process.cwd(), 'src/renderer/src/styles.css'), 'utf8')
 const appSource = readFileSync(join(process.cwd(), 'src/renderer/src/App.tsx'), 'utf8')
+assert.match(projectPageSource, /legacy_unverified[\s\S]*历史 AI 结果待复核/)
+assert.match(projectPageSource, /system_rule[\s\S]*系统规则/)
 const detailTabsSource = projectPageSource.slice(projectPageSource.indexOf('project-detail-tabs'))
 const relationshipTabOrderContract = detailTabsSource.lastIndexOf("key: 'relationships'") > detailTabsSource.lastIndexOf("key: 'knowledge'")
 const analysisLogAlwaysVisibleContract = !projectPageSource.includes('analysisLogsExpanded')
@@ -79,6 +82,18 @@ const relationshipGraphContract = projectPageSource.includes("import { ProjectRe
   && projectStylesSource.includes('.project-relationship-flow-guide')
   && projectStylesSource.includes('.project-relationship-path-summary')
   && projectStylesSource.includes('.project-relationship-page.is-canvas-fullscreen')
+
+if (process.env.VISSLM_UI_STATIC_ONLY === '1') {
+  assert.equal(analysisLogAlwaysVisibleContract, true)
+  assert.equal(projectMatchingSettingsContract, true)
+  assert.equal(requirementStatusFilterContract, true)
+  assert.equal(linkedAssetListContract, true)
+  assert.equal(taskRequirementContract, true)
+  assert.equal(themedAppIconContract, true)
+  assert.equal(relationshipGraphContract, true)
+  console.log(JSON.stringify({ ok: true, mode: 'static', checks: ['project requirement status provenance'] }))
+  process.exit(0)
+}
 
 const cdpPort = process.env.VISSLM_CDP_PORT ?? '9223'
 const targets = await (await fetch(`http://127.0.0.1:${cdpPort}/json/list`)).json()

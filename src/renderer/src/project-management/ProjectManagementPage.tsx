@@ -93,7 +93,8 @@ import type {
   ProjectRequirementMatch,
   ProjectRequirementReviewStatus,
   ProjectRequirementSetSummary,
-  ProjectRequirementStatus
+  ProjectRequirementStatus,
+  ProjectRequirementStatusSource
 } from '../../../shared/project-types'
 import type { KnowledgeDocumentDetail, KnowledgeDocumentPreview, ModelSettings, RecordDetail, RecordRow } from '../../../shared/types'
 import { RichDescription } from '../RichDescription'
@@ -107,6 +108,13 @@ const requirementStatusMeta: Record<ProjectRequirementStatus, { label: string; c
   satisfied: { label: '已满足', color: 'success' },
   to_develop: { label: '待开发', color: 'processing' },
   to_negotiate: { label: '待协商', color: 'warning' }
+}
+
+const requirementStatusSourceLabel: Record<ProjectRequirementStatusSource, string> = {
+  manual: '人工标记',
+  system_rule: '系统规则',
+  legacy_unverified: '历史 AI 结果待复核',
+  ai: 'AI 初判'
 }
 
 const requirementCategoryMeta: Record<ProjectRequirementCategory, { label: string; color: string }> = {
@@ -3515,7 +3523,7 @@ function ProjectDetail({
                           render: (value: number, row: ProjectRequirement) => <Button type="link" className="project-score-button" onClick={() => setMatchRequirement(row)}>{value ? `${value.toFixed(1)}%` : '暂无结果'} <EyeOutlined /></Button>
                         }, {
                           title: '状态', dataIndex: 'status', width: 150,
-                          render: (value: ProjectRequirementStatus, row: ProjectRequirement) => <Space direction="vertical" size={2}><Select size="small" value={value} options={Object.entries(requirementStatusMeta).map(([key, item]) => ({ value: key, label: item.label }))} onChange={(next) => void updateRequirementStatus(row.id, next as ProjectRequirementStatus)} /><Text type="secondary">{row.statusSource === 'manual' ? '人工标记' : 'AI 初判'}</Text></Space>
+                          render: (value: ProjectRequirementStatus, row: ProjectRequirement) => <Space direction="vertical" size={2}><Select size="small" value={value} options={Object.entries(requirementStatusMeta).map(([key, item]) => ({ value: key, label: item.label }))} onChange={(next) => void updateRequirementStatus(row.id, next as ProjectRequirementStatus)} /><Text type="secondary" className={row.statusSource === 'legacy_unverified' ? 'project-requirement-status-source is-legacy' : 'project-requirement-status-source'}>{requirementStatusSourceLabel[row.statusSource]}</Text></Space>
                         }, { title: '匹配数据', dataIndex: 'matchCount', width: 100, render: (value: number) => `${value} 条` }] : []),
                         {
                           title: '操作', key: 'action', fixed: 'right', width: requirementSet ? 250 : 150,
