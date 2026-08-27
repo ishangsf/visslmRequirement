@@ -5582,7 +5582,8 @@ export class AppDatabase {
   completeRequirementMatchRun(
     runId: string,
     candidates: Array<RequirementMatchCandidateResult & { recordSnapshotHash: string }>,
-    degradationCodes: RequirementMatchDegradationCode[]
+    degradationCodes: RequirementMatchDegradationCode[],
+    metadata?: Pick<RequirementMatchRun, 'normalizationVersion' | 'pipelineVersion' | 'rankingVersion' | 'configHash' | 'modelVersion'>
   ): void {
     this.db.exec('BEGIN IMMEDIATE')
     try {
@@ -5606,9 +5607,18 @@ export class AppDatabase {
       }
       this.db.prepare(`
         UPDATE pm_requirement_match_runs
-        SET status = 'succeeded', degradation_codes_json = ?, completed_at = ?
+        SET status = 'succeeded', degradation_codes_json = ?, completed_at = ?,
+            normalization_version = COALESCE(?, normalization_version),
+            pipeline_version = COALESCE(?, pipeline_version),
+            ranking_version = COALESCE(?, ranking_version),
+            config_hash = COALESCE(?, config_hash),
+            model_version = ?
         WHERE id = ? AND status = 'running'
-      `).run(JSON.stringify(degradationCodes), nowIso(), runId)
+      `).run(
+        JSON.stringify(degradationCodes), nowIso(), metadata?.normalizationVersion ?? null,
+        metadata?.pipelineVersion ?? null, metadata?.rankingVersion ?? null,
+        metadata?.configHash ?? null, metadata?.modelVersion ?? null, runId
+      )
       this.db.exec('COMMIT')
     } catch (error) {
       this.db.exec('ROLLBACK')

@@ -50,6 +50,7 @@ import { buildProjectRequirementMatchCard } from './requirements/requirement-mat
 import type { RequirementMatchingCore } from './requirements/requirement-matching-core'
 import { createRequirementMatchingCore } from './requirements/requirement-matching-runtime'
 import { projectRequirementMatchProjection } from './requirements/requirement-match-adapters'
+import { RequirementMatchRunService } from './requirements/requirement-match-run-service'
 
 const supportedAgreementExtensions = new Set(['.docx', '.pdf', '.xlsx', '.xls', '.txt'])
 // Keep local-model requests small enough that a slow CPU model can finish
@@ -356,6 +357,7 @@ interface MatchReview {
 export class ProjectManagementService {
   private readonly runningProjectIds = new Set<string>()
   private readonly matchingCore: RequirementMatchingCore
+  private readonly requirementMatchRuns: RequirementMatchRunService
 
   constructor(
     private readonly db: AppDatabase,
@@ -366,6 +368,7 @@ export class ProjectManagementService {
     matchingCore?: RequirementMatchingCore
   ) {
     this.matchingCore = matchingCore ?? createRequirementMatchingCore(db, knowledge, modelSettings)
+    this.requirementMatchRuns = new RequirementMatchRunService(db, this.matchingCore)
     this.db.reconcileInterruptedProjectAnalysis()
   }
 
@@ -387,6 +390,7 @@ export class ProjectManagementService {
 
   markMatchesStale(): void {
     this.db.markManagedProjectMatchesStale()
+    this.requirementMatchRuns.markStaleForRecordChange()
   }
 
   createProject(input: ManagedProjectInput): ManagedProject {
@@ -1767,38 +1771,15 @@ export class ProjectManagementService {
   }
 
   private async matchSingleRequirement(requirement: ProjectRequirement): Promise<void> {
-    const base = buildProjectRequirementMatchCard(requirement)
-    const result = await this.matchingCore.match({
-      base,
-      excludedUids: new Set<string>(),
-      includeCurrentProjectRecords: false,
-      explainTopN: 10,
+    const { runId } = await this.requirementMatchRuns.start({
+      requirementId: requirement.id,
       explanationPolicy: {
         mode: this.modelSettings().source === 'local' ? 'local' : 'online',
         allowExternalProcessing: false
-      }
+      },
+      explainTopN: 10
     })
-    const candidateByUid = new Map(result.candidates.map((candidate) => [candidate.recordUid, candidate]))
-    const matches = projectRequirementMatchProjection(result)
-      .map((projected) => {
-        const candidate = candidateByUid.get(projected.recordUid)!
-        return {
-        recordUid: projected.recordUid,
-        vectorScore: candidate.stageScores.fusedScore,
-        finalScore: projected.rankingScore,
-        scoreSource: 'vector' as const,
-        reason: JSON.stringify({
-          rankingVersion: candidate.rankingVersion,
-          relation: candidate.relation,
-          decisionStatus: candidate.decisionStatus,
-          evidenceLevel: candidate.evidenceLevel,
-          reasonCodes: candidate.reasonCodes,
-          degradationCodes: candidate.degradationCodes,
-          explanation: candidate.explanation
-        }),
-        bestChunkId: ''
-      }})
-    this.db.replaceRequirementMatches(requirement.id, matches)
+    await this.requirementMatchRuns.execute(runId)
   }
 
   private buildRequirementMatchQuery(requirement: ProjectRequirement): string {

@@ -14,6 +14,7 @@ import type { ProjectAnalysisProgress, ProjectRequirement } from '../src/shared/
 import { normalizeProjectRequirementText } from '../src/shared/project-requirement-utils'
 import { buildRequirementSourceView } from '../src/main/requirements/requirement-match-card'
 import { RequirementMatchingCore } from '../src/main/requirements/requirement-matching-core'
+import { hashProjectRequirementSnapshot } from '../src/main/requirements/requirement-match-run-service'
 
 const directory = mkdtempSync(join(tmpdir(), 'visslm-project-management-'))
 const db = new AppDatabase(join(directory, 'projects.db'), join(directory, 'assets'))
@@ -618,7 +619,14 @@ try {
   const requirementAfterSemanticMatching = db.getProjectRequirement('smoke-requirement-1')
   assert.equal(requirementAfterSemanticMatching?.status, requirementBeforeSemanticMatching.status)
   assert.equal(requirementAfterSemanticMatching?.statusSource, requirementBeforeSemanticMatching.statusSource)
-  const automaticMatches = db.listProjectRequirementMatches({ requirementId: 'smoke-requirement-1', page: 1, pageSize: 20 })
+  const automaticLegacyMatches = db.listProjectRequirementMatches({ requirementId: 'smoke-requirement-1', page: 1, pageSize: 20 })
+  assert.equal(automaticLegacyMatches.total, 0, 'new matching runs must not write the legacy replacement table')
+  const latestRun = db.getLatestCompatibleRequirementMatchRun({
+    requirementId: 'smoke-requirement-1',
+    requirementSnapshotHash: hashProjectRequirementSnapshot(requirementAfterSemanticMatching!)
+  })
+  assert(latestRun)
+  const automaticMatches = db.listRequirementMatchCandidates({ runId: latestRun.id, page: 1, pageSize: 20 })
   assert.equal(automaticMatches.total, 1, 'hard-conflict candidates must be excluded from the default suggestion list')
   assert.equal(automaticMatches.rows[0]?.recordUid, 'smoke-record-1')
   db.replaceRequirementMatches('smoke-requirement-1', [
