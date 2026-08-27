@@ -52,6 +52,8 @@ import { createRequirementMatchingCore } from './requirements/requirement-matchi
 import { projectRequirementMatchProjection } from './requirements/requirement-match-adapters'
 import { hashProjectRequirementSnapshot, RequirementMatchRunService } from './requirements/requirement-match-run-service'
 import { resolveRequirementMatchingRollout } from './requirements/requirement-matching-rollout'
+import { REQUIREMENT_NORMALIZATION_VERSION } from './requirements/requirement-business-normalization'
+import { REQUIREMENT_MATCH_PIPELINE_VERSION } from './requirements/requirement-matching-core'
 
 const supportedAgreementExtensions = new Set(['.docx', '.pdf', '.xlsx', '.xls', '.txt'])
 // Keep local-model requests small enough that a slow CPU model can finish
@@ -659,7 +661,9 @@ export class ProjectManagementService {
       ? this.db.getRequirementMatchRun(query.runId)
       : this.db.getLatestCompatibleRequirementMatchRun({
           requirementId: requirement.id,
-          requirementSnapshotHash: hashProjectRequirementSnapshot(requirement)
+          requirementSnapshotHash: hashProjectRequirementSnapshot(requirement),
+          normalizationVersion: REQUIREMENT_NORMALIZATION_VERSION,
+          pipelineVersion: REQUIREMENT_MATCH_PIPELINE_VERSION
         })
     if (!run || run.requirementId !== requirement.id || !['succeeded', 'stale'].includes(run.status)) {
       return { run: null, rows: [], total: 0 }

@@ -131,7 +131,7 @@ const main = async (): Promise<void> => {
     for (let index = 0; index < options.warmup + options.iterations; index += 1) {
       const started = performance.now()
       const candidates = await retriever.retrieve(baseCard, new Set(['benchmark-0']))
-      if (candidates.some((candidate) => Object.keys(candidate.card).length !== 8)) {
+      if (candidates.some((candidate) => Object.keys(candidate.card).length !== 9)) {
         throw new Error('benchmark received an unexpected requirement source shape')
       }
       if (reranker) await reranker.rerank(baseCard, candidates)

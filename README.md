@@ -346,3 +346,10 @@ ollama pull qwen3:8b
 ## 许可与第三方资源
 
 仓库当前未提供独立的项目 LICENSE 文件。随应用准备的 `Xenova/bge-small-zh-v1.5` embedding 模型和 Tesseract 语言资源均带有 Apache-2.0 许可信息，具体来源、revision、文件哈希和许可记录会写入 `buildResources/models/manifest.json` 与 `buildResources/ocr/manifest.json`。
+# 需求历史匹配 v1.1
+
+项目需求会自动在当前可搜索的数据中心历史记录中执行 Dense/BM25 召回、RRF 融合、Cross-Encoder 重排和确定性策略判断，并按版本内的“综合匹配分”排序。该分数表示同一排序版本中的相对匹配程度，不是概率或业务准确率。
+
+匹配结果按不可变运行保存。默认读取与当前需求快照兼容的最新成功运行，历史运行可显式查询；需求或索引变化后旧运行会标记为 stale。只有合格的精确业务哈希可得到 `confirmed + duplicate`，其他结果均为建议、歧义或拒绝。语义分数不会自动关联项目资产，也不会自动把需求改为“已满足”。
+
+发布模式支持 `legacy_safe`、`shadow` 和 `v1_1`。回滚只切换安全读取路径，不恢复任何自动业务写入。当前自动化评测覆盖确定性事实、变形关系、重放一致性、精确重复 Recall@50、协议失败和零业务写入；它不使用人工评测集，也不宣称开放域业务语义准确率。

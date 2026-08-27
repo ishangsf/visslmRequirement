@@ -344,3 +344,6 @@ const preview = await window.visslm.previewPush({
 - `assistant-artifacts:list` / `assistant-artifacts:revert`：查询和撤销交付物。
 - `assistant-artifacts:export`：从有效交付物生成 DOCX、XLSX、PPTX 或 ZIP，并返回证据清单与哈希。
 - `assistant-runs:list` / `assistant-runs:stats`：返回运行历史和聚合质量指标。
+# 需求匹配 IPC v1.1
+
+`projects:matches` 保持通道名不变，查询参数为 `requirementId`、可选 `runId`、分页和可选诊断标志。响应为 `{ run, rows, total }`，候选按 `finalRank ASC` 返回，默认隐藏 `rejected`。渲染端 DTO 不再暴露 `finalScore`、`aiScore`、`vectorScore` 或 `scoreSource`。
