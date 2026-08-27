@@ -90,12 +90,15 @@ import type {
   ProjectRequirement,
   ProjectRequirementCategory,
   ProjectRequirementInput,
-  ProjectRequirementMatch,
+  ProjectRequirementMatchCandidate,
+  ProjectRequirementMatchRunSummary,
   ProjectRequirementReviewStatus,
   ProjectRequirementSetSummary,
   ProjectRequirementStatus,
   ProjectRequirementStatusSource
 } from '../../../shared/project-types'
+
+type ProjectRequirementMatch = ProjectRequirementMatchCandidate
 import type { KnowledgeDocumentDetail, KnowledgeDocumentPreview, ModelSettings, RecordDetail, RecordRow } from '../../../shared/types'
 import { RichDescription } from '../RichDescription'
 import { ResizableTable } from '../ResizableTable'
@@ -702,36 +705,44 @@ function ProjectStatus({ project }: { project: ManagedProject }): React.JSX.Elem
   )
 }
 
-type MatchTableColumnKey = 'record' | 'score' | 'reason' | 'asset'
+type MatchTableColumnKey = 'rank' | 'record' | 'score' | 'relation' | 'evidence' | 'asset'
 type MatchTableColumnWidths = Record<MatchTableColumnKey, number>
 
-const matchTableColumnStorageKey = 'visslm:project-match-table-column-widths:v2'
+const matchTableColumnStorageKey = 'project-requirement-match-runs:v1'
 const projectAppTableScrollY = 'min(560px, max(260px, calc(100vh - 300px)))'
 const projectCompactTableScrollY = 'min(360px, max(180px, calc(100vh - 420px)))'
 const projectDetailTableScrollY = 'min(440px, max(220px, calc(100vh - 500px)))'
-const projectMatchTableScrollY = 'min(390px, max(220px, calc(100vh - 520px)))'
+const projectMatchTableScrollY = 'clamp(280px, calc(100vh - 360px), 620px)'
 const matchTableColumnDefaults: MatchTableColumnWidths = {
+  rank: 72,
   record: 224,
   score: 112,
-  reason: 280,
+  relation: 150,
+  evidence: 300,
   asset: 180
 }
 const matchTableColumnMinWidths: MatchTableColumnWidths = {
+  rank: 64,
   record: 180,
   score: 96,
-  reason: 220,
+  relation: 130,
+  evidence: 220,
   asset: 144
 }
 const matchTableColumnMaxWidths: MatchTableColumnWidths = {
+  rank: 100,
   record: 420,
   score: 180,
-  reason: 480,
+  relation: 260,
+  evidence: 520,
   asset: 300
 }
 const matchTableColumnLabels: Record<MatchTableColumnKey, string> = {
+  rank: '排名',
   record: '数据中心数据',
-  score: '匹配度',
-  reason: '匹配说明',
+  score: '综合匹配分',
+  relation: '关系与决策',
+  evidence: '匹配证据',
   asset: '项目资产'
 }
 
@@ -969,6 +980,7 @@ function MatchDrawer({
   progress: ProjectAnalysisProgress | null
 }): React.JSX.Element {
   const [matches, setMatches] = useState<ProjectRequirementMatch[]>([])
+  const [matchRun, setMatchRun] = useState<ProjectRequirementMatchRunSummary | null>(null)
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(20)
@@ -994,18 +1006,19 @@ function MatchDrawer({
         pageSize
       })
       setMatches(result.rows)
+      setMatchRun(result.run)
       setTotal(result.total)
     } finally {
       setLoading(false)
     }
-  }, [matchScoreThreshold, page, pageSize, requirement])
+  }, [page, pageSize, requirement])
 
   useEffect(() => {
     if (!open) return
     setPage(1)
     setEditingKeyInfoTerms(false)
     setKeyInfoTermsDraft(requirement?.keyInfoTerms ?? [])
-  }, [matchScoreThreshold, open, requirement?.id])
+  }, [open, requirement?.id])
 
   useEffect(() => {
     setMatchingTaskId(null)
@@ -1135,6 +1148,11 @@ function MatchDrawer({
 
   const matchColumns = useMemo<TableColumnsType<ProjectRequirementMatch>>(() => [
     {
+      title: '排名', key: 'rank', dataIndex: 'finalRank', width: columnWidths.rank,
+      onHeaderCell: () => ({ width: columnWidths.rank, columnKey: 'rank', minWidth: matchTableColumnMinWidths.rank, maxWidth: matchTableColumnMaxWidths.rank, onResize: (width: number) => resizeColumn('rank', width), onResizeEnd: (width: number) => commitColumnResize('rank', width) } as ResizableHeaderCellProps),
+      render: (value: number) => <strong className="project-match-rank">#{value}</strong>
+    },
+    {
       title: '数据中心数据',
       key: 'record',
       width: columnWidths.record,
@@ -1156,8 +1174,8 @@ function MatchDrawer({
       )
     },
     {
-      title: '匹配度',
-      dataIndex: 'finalScore',
+      title: '综合匹配分',
+      dataIndex: 'rankingScore',
       width: columnWidths.score,
       sorter: false,
       onHeaderCell: () => ({
@@ -1168,28 +1186,21 @@ function MatchDrawer({
         onResize: (width: number) => resizeColumn('score', width),
         onResizeEnd: (width: number) => commitColumnResize('score', width)
       } as ResizableHeaderCellProps),
-      render: (value: number, row) => (
-        <div className="project-score-cell">
-          <strong>{value.toFixed(1)}%</strong>
-          <Tag color={row.scoreSource === 'ai' ? 'purple' : 'default'}>
-            {row.scoreSource === 'ai' ? 'AI复核' : '向量'}
-          </Tag>
-        </div>
-      )
+      render: (value: number, row) => <Tooltip title={`当前算法版本内的相对匹配程度，不代表统计概率。排序版本：${row.rankingVersion}`}><strong>{value.toFixed(1)}</strong></Tooltip>
     },
     {
-      title: '匹配说明',
-      dataIndex: 'reason',
-      width: columnWidths.reason,
+      title: '关系与决策', key: 'relation', width: columnWidths.relation,
       onHeaderCell: () => ({
-        width: columnWidths.reason,
-        columnKey: 'reason',
-        minWidth: matchTableColumnMinWidths.reason,
-        maxWidth: matchTableColumnMaxWidths.reason,
-        onResize: (width: number) => resizeColumn('reason', width),
-        onResizeEnd: (width: number) => commitColumnResize('reason', width)
+        width: columnWidths.relation, columnKey: 'relation', minWidth: matchTableColumnMinWidths.relation,
+        maxWidth: matchTableColumnMaxWidths.relation, onResize: (width: number) => resizeColumn('relation', width),
+        onResizeEnd: (width: number) => commitColumnResize('relation', width)
       } as ResizableHeaderCellProps),
-      render: (value: string) => value ? <span className="project-match-reason">{value}</span> : <Text type="secondary">暂无 AI 说明</Text>
+      render: (_value, row) => <Space direction="vertical" size={4}><Tag color={row.decisionStatus === 'confirmed' ? 'success' : row.decisionStatus === 'ambiguous' ? 'warning' : 'purple'}>{row.decisionStatus}</Tag><Text type="secondary">{row.relation ?? '待判定'}</Text></Space>
+    },
+    {
+      title: '匹配证据', key: 'evidence', width: columnWidths.evidence,
+      onHeaderCell: () => ({ width: columnWidths.evidence, columnKey: 'evidence', minWidth: matchTableColumnMinWidths.evidence, maxWidth: matchTableColumnMaxWidths.evidence, onResize: (width: number) => resizeColumn('evidence', width), onResizeEnd: (width: number) => commitColumnResize('evidence', width) } as ResizableHeaderCellProps),
+      render: (_value, row) => <div className="project-match-evidence"><span>{row.explanation || row.reasonCodes.join('、') || '确定性排序候选'}</span>{row.degradationCodes.length > 0 && <Tag color="warning">{row.degradationCodes.join('、')}</Tag>}</div>
     },
     {
       title: '项目资产',
@@ -1236,13 +1247,17 @@ function MatchDrawer({
             <Text strong>{requirement.title}</Text>
             <Paragraph ellipsis={{ rows: 3, expandable: true }}>{requirement.content}</Paragraph>
             <Space wrap>
-              <Tag>最高匹配度 {requirement.highestMatchScore.toFixed(1)}%</Tag>
-              <Tag>匹配度 &gt; {matchScoreThreshold}%</Tag>
               <Tag>{total} 条数据</Tag>
               {requirement.module && <Tag>{requirement.module}</Tag>}
               {requirement.sourceLocation && <Tag>{requirement.sourceLocation}</Tag>}
             </Space>
           </Card>
+          {matchRun ? (
+            <section className="project-match-run-banner" aria-label="匹配运行信息">
+              <div><Text strong>排序版本 {matchRun.rankingVersion}</Text><Text type="secondary">完成于 {matchRun.completedAt || '—'} · 当前算法版本内的相对匹配程度，不代表统计概率</Text></div>
+              {matchRun.degradationCodes.length > 0 && <Tag color="warning">降级：{matchRun.degradationCodes.join('、')}</Tag>}
+            </section>
+          ) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无与当前需求版本兼容的匹配运行" />}
           <Card
             size="small"
             className="project-key-info-terms-card"

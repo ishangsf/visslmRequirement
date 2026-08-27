@@ -3,8 +3,10 @@ import type {
   ProjectDataSnapshot,
   ProjectDocumentSnapshot,
   ProjectRequirement,
-  ProjectRequirementMatch
+  LegacyProjectRequirementMatch
 } from '../shared/project-types'
+
+type ProjectRequirementMatch = LegacyProjectRequirementMatch
 
 type ExcelCell = string | number | boolean
 

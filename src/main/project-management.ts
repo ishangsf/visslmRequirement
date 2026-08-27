@@ -50,7 +50,7 @@ import { buildProjectRequirementMatchCard } from './requirements/requirement-mat
 import type { RequirementMatchingCore } from './requirements/requirement-matching-core'
 import { createRequirementMatchingCore } from './requirements/requirement-matching-runtime'
 import { projectRequirementMatchProjection } from './requirements/requirement-match-adapters'
-import { RequirementMatchRunService } from './requirements/requirement-match-run-service'
+import { hashProjectRequirementSnapshot, RequirementMatchRunService } from './requirements/requirement-match-run-service'
 
 const supportedAgreementExtensions = new Set(['.docx', '.pdf', '.xlsx', '.xls', '.txt'])
 // Keep local-model requests small enough that a slow CPU model can finish
@@ -649,10 +649,32 @@ export class ProjectManagementService {
   }
 
   listMatches(query: ProjectRequirementMatchQuery): ProjectRequirementMatchPage {
-    return this.db.listProjectRequirementMatches({
-      ...query,
-      minScore: normalizeProjectMatchScore(this.projectMatchingSettings().minScore)
-    })
+    const requirement = this.db.getProjectRequirement(query.requirementId)
+    if (!requirement) return { run: null, rows: [], total: 0 }
+    const run = query.runId
+      ? this.db.getRequirementMatchRun(query.runId)
+      : this.db.getLatestCompatibleRequirementMatchRun({
+          requirementId: requirement.id,
+          requirementSnapshotHash: hashProjectRequirementSnapshot(requirement)
+        })
+    if (!run || run.requirementId !== requirement.id || !['succeeded', 'stale'].includes(run.status)) {
+      return { run: null, rows: [], total: 0 }
+    }
+    const page = this.db.listProjectRequirementMatchCandidateDetails({ ...query, runId: run.id })
+    return {
+      run: {
+        id: run.id,
+        requirementId: run.requirementId,
+        normalizationVersion: run.normalizationVersion,
+        pipelineVersion: run.pipelineVersion,
+        rankingVersion: run.rankingVersion,
+        configHash: run.configHash,
+        modelVersion: run.modelVersion,
+        degradationCodes: run.degradationCodes,
+        completedAt: run.completedAt ?? ''
+      },
+      ...page
+    }
   }
 
   listCostEntries(projectId: string): ProjectCostEntry[] {

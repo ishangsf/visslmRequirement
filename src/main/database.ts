@@ -115,7 +115,8 @@ import type {
   ProjectRequirementCategory,
   ProjectRequirementInput,
   ProjectRequirementMergeInput,
-  ProjectRequirementMatch,
+  LegacyProjectRequirementMatch,
+  ProjectRequirementMatchCandidate,
   ProjectRequirementMatchPage,
   ProjectRequirementMatchQuery,
   ProjectRequirementPage,
@@ -4489,7 +4490,7 @@ export class AppDatabase {
         ON ar.project_id = ? AND ar.record_uid = m.record_uid AND ar.requirement_id = m.requirement_id
       WHERE q.project_id = ?
       ORDER BY q.requirement_no ASC, m.final_score DESC, m.record_uid ASC
-    `).all(projectId, projectId, projectId) as SqlRow[]).map((row): ProjectRequirementMatch => ({
+    `).all(projectId, projectId, projectId) as SqlRow[]).map((row): LegacyProjectRequirementMatch => ({
       requirementId: String(row.requirement_id),
       recordUid: String(row.record_uid),
       recordName: String(row.record_name ?? ''),
@@ -5781,7 +5782,7 @@ export class AppDatabase {
     }
   }
 
-  listProjectRequirementMatches(query: ProjectRequirementMatchQuery): ProjectRequirementMatchPage {
+  listLegacyProjectRequirementMatches(query: ProjectRequirementMatchQuery & { minScore?: number }): { rows: LegacyProjectRequirementMatch[]; total: number } {
     const page = Math.max(1, Math.floor(query.page || 1))
     const pageSize = Math.min(200, Math.max(1, Math.floor(query.pageSize || 20)))
     const minScore = query.minScore === undefined
@@ -5823,9 +5824,63 @@ export class AppDatabase {
           vectorScore: Number(row.vector_score ?? 0),
           ...(row.ai_score === null || row.ai_score === undefined ? {} : { aiScore: Number(row.ai_score) }),
           finalScore: Number(row.final_score ?? 0),
-          scoreSource: String(row.score_source ?? 'vector') as ProjectRequirementMatch['scoreSource'],
+          scoreSource: String(row.score_source ?? 'vector') as LegacyProjectRequirementMatch['scoreSource'],
           reason: String(row.reason ?? ''),
           bestChunkId: String(row.best_chunk_id ?? ''),
+          assetLinked: Number(row.asset_linked ?? 0) === 1,
+          requirementLinked: Number(row.requirement_linked ?? 0) === 1
+        }
+      })
+    }
+  }
+
+  listProjectRequirementMatchCandidateDetails(query: {
+    requirementId: string
+    runId: string
+    page: number
+    pageSize: number
+    diagnostics?: boolean
+  }): { rows: ProjectRequirementMatchCandidate[]; total: number } {
+    const page = Math.max(1, Math.floor(query.page || 1))
+    const pageSize = Math.min(200, Math.max(1, Math.floor(query.pageSize || 20)))
+    const filter = query.diagnostics ? '' : " AND c.decision_status <> 'rejected'"
+    const total = Number((this.db.prepare(`
+      SELECT COUNT(*) AS count FROM pm_requirement_match_candidates c
+      JOIN pm_requirement_match_runs run ON run.id = c.run_id
+      WHERE c.run_id = ? AND run.requirement_id = ?${filter}
+    `).get(query.runId, query.requirementId) as SqlRow).count ?? 0)
+    const rows = this.db.prepare(`
+      SELECT c.*, run.requirement_id, r.name, r.node_type, r.item_id, r.normalized_text,
+             CASE WHEN a.record_uid IS NULL THEN 0 ELSE 1 END AS asset_linked,
+             CASE WHEN ar.requirement_id IS NULL THEN 0 ELSE 1 END AS requirement_linked
+      FROM pm_requirement_match_candidates c
+      JOIN pm_requirement_match_runs run ON run.id = c.run_id
+      JOIN pm_requirements q ON q.id = run.requirement_id
+      JOIN records r ON r.uid = c.record_uid
+      LEFT JOIN pm_project_assets a ON a.project_id = q.project_id AND a.record_uid = r.uid
+      LEFT JOIN pm_project_asset_requirements ar
+        ON ar.project_id = q.project_id AND ar.record_uid = r.uid AND ar.requirement_id = run.requirement_id
+      WHERE c.run_id = ? AND run.requirement_id = ?${filter}
+      ORDER BY c.final_rank ASC LIMIT ? OFFSET ?
+    `).all(query.runId, query.requirementId, pageSize, (page - 1) * pageSize) as SqlRow[]
+    return {
+      total,
+      rows: rows.map((row): ProjectRequirementMatchCandidate => {
+        const stage = parseJsonValue(row.stage_scores_json, {}) as Record<string, unknown>
+        return {
+          requirementId: String(row.requirement_id), runId: String(row.run_id), recordUid: String(row.record_uid),
+          recordName: String(row.name ?? ''), nodeType: String(row.node_type ?? ''), itemId: String(row.item_id ?? ''),
+          description: String(row.normalized_text ?? ''), finalRank: Number(row.final_rank),
+          rankingScore: Number(row.ranking_score), rankingVersion: String(row.ranking_version),
+          relation: row.relation === null || row.relation === undefined ? null : String(row.relation) as ProjectRequirementMatchCandidate['relation'],
+          decisionStatus: String(row.decision_status) as ProjectRequirementMatchCandidate['decisionStatus'],
+          evidenceLevel: String(row.evidence_level) as ProjectRequirementMatchCandidate['evidenceLevel'],
+          reasonCodes: parseJsonArray(row.reason_codes_json), degradationCodes: parseJsonArray(row.degradation_codes_json),
+          explanation: row.explanation === null || row.explanation === undefined ? null : String(row.explanation),
+          denseScore: stage.denseScore === null || stage.denseScore === undefined ? null : Number(stage.denseScore),
+          lexicalScore: stage.lexicalScore === null || stage.lexicalScore === undefined ? null : Number(stage.lexicalScore),
+          fusedScore: Number(stage.fusedScore ?? 0),
+          rerankerScore: stage.rerankerScore === null || stage.rerankerScore === undefined ? null : Number(stage.rerankerScore),
           assetLinked: Number(row.asset_linked ?? 0) === 1,
           requirementLinked: Number(row.requirement_linked ?? 0) === 1
         }

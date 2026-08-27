@@ -56,7 +56,7 @@ try {
   await service.execute(first.runId)
   assert.equal(db.getRequirementMatchRun(first.runId)?.status, 'succeeded')
   assert.equal(db.listRequirementMatchCandidates({ runId: first.runId, page: 1, pageSize: 20 }).total, 1)
-  assert.equal(db.listProjectRequirementMatches({ requirementId: 'requirement-service', page: 1, pageSize: 20 }).total, 0)
+  assert.equal(db.listLegacyProjectRequirementMatches({ requirementId: 'requirement-service', page: 1, pageSize: 20 }).total, 0)
   assert.equal(db.listProjectAssets(project.id).length, 0)
 
   mutateDuringRun = true
