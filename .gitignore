@@ -13,3 +13,4 @@ Thumbs.db
 $appData/
 .$appData/
 tmp/
+.worktrees/
