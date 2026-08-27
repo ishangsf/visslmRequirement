@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { randomUUID } from 'node:crypto'
-import type { CancelAgentRunResult } from '../../shared/types'
+import type { CancelAgentRunResult, RequirementSemanticizationModelUsage } from '../../shared/types'
 
 /** A renderer-owned object that can notify us when its IPC endpoint is gone. */
 export interface AssistantRunOwner {
@@ -13,6 +13,14 @@ export interface AssistantRunOwner {
 export interface AssistantRunContext {
   runId: string
   signal: AbortSignal
+  /** Mutable, process-local telemetry shared by all model calls in this run. */
+  usage?: AssistantRunUsage
+}
+
+export interface AssistantRunUsage {
+  inputTokenCount?: number
+  outputTokenCount?: number
+  completionDurationMs?: number
 }
 
 export interface AssistantRunRegistration {
@@ -71,6 +79,38 @@ export const runWithAssistantRunContext = <T>(
   context: AssistantRunContext,
   callback: () => T
 ): T => contextStorage.run(context, callback)
+
+const nonNegativeFiniteNumber = (value: unknown): number | undefined => (
+  typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
+)
+
+/**
+ * Add one completed ModelClient response to the active assistant run.
+ * Keeping this at the ALS boundary means capability probes and other model
+ * calls outside an assistant run never leak into run history, while nested
+ * agent calls inside one run are all included exactly once by ModelClient.chat.
+ */
+export const recordAssistantRunUsage = (usage?: RequirementSemanticizationModelUsage): void => {
+  const context = getAssistantRunContext()
+  if (!context || !usage) return
+
+  const inputTokenCount = nonNegativeFiniteNumber(usage.promptTokens)
+  const outputTokenCount = nonNegativeFiniteNumber(usage.completionTokens)
+  const completionDurationMs = nonNegativeFiniteNumber(usage.completionDurationMs)
+  if (inputTokenCount === undefined && outputTokenCount === undefined && completionDurationMs === undefined) return
+
+  const current = context.usage ?? (context.usage = {})
+  if (inputTokenCount !== undefined) current.inputTokenCount = (current.inputTokenCount ?? 0) + inputTokenCount
+  if (outputTokenCount !== undefined) current.outputTokenCount = (current.outputTokenCount ?? 0) + outputTokenCount
+  if (completionDurationMs !== undefined) {
+    current.completionDurationMs = (current.completionDurationMs ?? 0) + completionDurationMs
+  }
+}
+
+export const getAssistantRunUsage = (context?: AssistantRunContext): AssistantRunUsage | undefined => {
+  const usage = (context ?? getAssistantRunContext())?.usage
+  return usage ? { ...usage } : undefined
+}
 
 /** Throw only for the explicit assistant run signal, never for ordinary timeouts. */
 export const throwIfAssistantRunCancelled = (): void => {

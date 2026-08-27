@@ -15,10 +15,16 @@ export {
 export type PushFormValues = Omit<PushConfig, 'recordUids' | 'fieldMappings'>
 
 export type PushConfigDraft = {
-  version: 1
+  version: 2
   formValues: Partial<PushFormValues>
   fieldMappings: PushFieldMapping[]
   mappingInitialized: boolean
+  /**
+   * v1 generated mappings used source names as their targets. Keep this bit
+   * until the first record is available so the renderer can verify and
+   * rebuild only an untouched generated mapping set.
+   */
+  mappingMigrationPending?: boolean
   selectedRowKeys: string[]
   search: string
   releaseText?: string
@@ -26,7 +32,8 @@ export type PushConfigDraft = {
   pageSize: number
 }
 
-export const pushConfigDraftStorageKey = 'visslm:push-config-draft:v1'
+export const pushConfigDraftStorageKey = 'visslm:push-config-draft:v2'
+export const legacyPushConfigDraftStorageKey = 'visslm:push-config-draft:v1'
 
 const pushFormValueKeys = [
   'nodeType',
@@ -41,8 +48,29 @@ const isRecordObject = (value: unknown): value is Record<string, unknown> => (
   Boolean(value) && typeof value === 'object' && !Array.isArray(value)
 )
 
+const legacyDefaultMappingIdPattern = /^push-default-mapping-\d+-(.+)$/
+
+const isLegacyGeneratedDefaultMapping = (mapping: PushFieldMapping): boolean => {
+  const match = mapping.id.match(legacyDefaultMappingIdPattern)
+  return Boolean(match?.[1]) &&
+    match?.[1] === mapping.sourceField &&
+    mapping.sourceField === mapping.targetField
+}
+
 export const parsePushConfigDraft = (parsed: unknown): PushConfigDraft | null => {
-  if (!isRecordObject(parsed) || parsed.version !== 1) return null
+  if (!isRecordObject(parsed) || (parsed.version !== 1 && parsed.version !== 2)) return null
+  // A version marker without any persisted draft state is not a recoverable
+  // draft. Keep malformed v2 values from masking a valid v1 fallback.
+  if (parsed.version === 2 && ![
+    'formValues',
+    'fieldMappings',
+    'mappingInitialized',
+    'selectedRowKeys',
+    'search',
+    'releaseText',
+    'page',
+    'pageSize'
+  ].some((key) => Object.prototype.hasOwnProperty.call(parsed, key))) return null
 
   const formValues: Partial<PushFormValues> = {}
   if (isRecordObject(parsed.formValues)) {
@@ -84,13 +112,21 @@ export const parsePushConfigDraft = (parsed: unknown): PushConfigDraft | null =>
   const pageSize = typeof parsed.pageSize === 'number' && Number.isFinite(parsed.pageSize)
     ? Math.min(100, Math.max(10, Math.floor(parsed.pageSize)))
     : 20
+  const mappingInitialized = parsed.mappingInitialized === true || fieldMappings.length > 0
+  const hasLegacyDefaultMappingShape = fieldMappings.length > 0 &&
+    fieldMappings.every(isLegacyGeneratedDefaultMapping)
+  const mappingMigrationPending = (
+    hasLegacyDefaultMappingShape &&
+    (parsed.mappingMigrationPending === true || parsed.version === 1)
+  )
   return {
-    version: 1,
+    version: 2,
     formValues,
     fieldMappings,
     // Keep an explicit initialization marker even when every old mapping row
     // was forbidden, otherwise navigation would silently repopulate the table.
-    mappingInitialized: parsed.mappingInitialized === true || fieldMappings.length > 0,
+    mappingInitialized,
+    ...(mappingMigrationPending && fieldMappings.length > 0 ? { mappingMigrationPending: true } : {}),
     selectedRowKeys,
     search: typeof parsed.search === 'string' ? parsed.search : '',
     ...(typeof parsed.releaseText === 'string' ? { releaseText: parsed.releaseText } : {}),
@@ -123,36 +159,42 @@ export const buildDefaultPushFieldMappings = (
     }))
 }
 
-const legacyForbiddenSourceFields: ReadonlySet<string> = new Set([
-  '_valm_Uid',
-  '_valm_NodeType',
-  '_valm_ItemID'
-])
-
 export const isLegacyDefaultPushFieldMappings = (
   mappings: PushFieldMapping[],
-  raw: Record<string, unknown>
+  _raw: Record<string, unknown>
 ): boolean => {
-  const legacySourceFields = Object.keys(raw).filter((field) => (
-    !legacyForbiddenSourceFields.has(field) && pushMappingIdentifierPattern.test(field)
-  ))
-  return mappings.length > 0 &&
-    mappings.length === legacySourceFields.length &&
-    mappings.every((mapping, index) => (
-      mapping.sourceField === legacySourceFields[index] &&
-      mapping.targetField === legacySourceFields[index]
-    ))
+  // Generated IDs contain the original source field. This identifies an
+  // untouched v1 default set even when the current first record has a
+  // different field shape, while rejecting user edits to either side.
+  return mappings.length > 0 && mappings.every(isLegacyGeneratedDefaultMapping)
 }
 
 export const readPushConfigDraft = (): PushConfigDraft | null => {
   if (typeof window === 'undefined') return null
-  try {
-    const stored = window.localStorage.getItem(pushConfigDraftStorageKey)
-    if (!stored) return null
-    return parsePushConfigDraft(JSON.parse(stored) as unknown)
-  } catch {
-    return null
+  const readAt = (key: string): PushConfigDraft | null => {
+    try {
+      const stored = window.localStorage.getItem(key)
+      if (!stored) return null
+      return parsePushConfigDraft(JSON.parse(stored) as unknown)
+    } catch {
+      return null
+    }
   }
+
+  const currentDraft = readAt(pushConfigDraftStorageKey)
+  if (currentDraft) return currentDraft
+
+  // Keep v1 untouched for rollback/recovery, but materialize the normalized
+  // v2 copy as soon as it can be read. The renderer will finish any
+  // first-record mapping migration after the record data is available.
+  const legacyDraft = readAt(legacyPushConfigDraftStorageKey)
+  if (!legacyDraft) return null
+  try {
+    window.localStorage.setItem(pushConfigDraftStorageKey, JSON.stringify(legacyDraft))
+  } catch {
+    // The push page remains usable when browser storage is unavailable or full.
+  }
+  return legacyDraft
 }
 
 export const writePushConfigDraft = (draft: PushConfigDraft): void => {

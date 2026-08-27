@@ -75,6 +75,350 @@ export interface CoarseVectorCandidate {
   coarse: Float32Array
 }
 
+type KnowledgeLexicalTermKind =
+  | 'word'
+  | 'compact-word'
+  | 'cjk-unigram'
+  | 'cjk-bigram'
+  | 'cjk-trigram'
+
+export interface KnowledgeLexicalTerm {
+  term: string
+  weight: number
+  kind: KnowledgeLexicalTermKind
+}
+
+/**
+ * A small, language-agnostic lexical representation used alongside dense
+ * retrieval.  Han text is represented by overlapping n-grams because a
+ * contiguous Chinese sentence is not a useful word boundary.  Non-Han
+ * letters and numbers retain word boundaries, with a compact form for text
+ * where PDF/OCR extraction inserted spaces inside an identifier.
+ */
+export interface KnowledgeLexicalProfile {
+  normalized: string
+  terms: readonly KnowledgeLexicalTerm[]
+  cjkRuns: readonly string[]
+  totalWeight: number
+  phraseWeight: number
+}
+
+const knowledgeHanPattern = /\p{Script=Han}/u
+const knowledgeWordPattern = /[\p{L}\p{N}]/u
+const knowledgeHanWhitespacePattern = /(\p{Script=Han})\s+(?=\p{Script=Han})/gu
+const KNOWLEDGE_CJK_UNIGRAM_WEIGHT = 0.14
+const KNOWLEDGE_CJK_BIGRAM_WEIGHT = 0.9
+const KNOWLEDGE_CJK_TRIGRAM_WEIGHT = 1.2
+const KNOWLEDGE_WORD_WEIGHT = 1.35
+const KNOWLEDGE_COMPACT_WORD_WEIGHT = 1
+const KNOWLEDGE_MAX_COMPACT_WORD_LENGTH = 64
+
+const isKnowledgeHan = (value: string): boolean => knowledgeHanPattern.test(value)
+
+const isKnowledgeWordCharacter = (value: string): boolean => knowledgeWordPattern.test(value)
+
+/**
+ * Normalize equivalent user/document text before lexical matching.  NFKC
+ * handles full-width forms, while removing whitespace between Han characters
+ * handles PDF/OCR output that puts one space between every CJK glyph.  Word
+ * boundaries outside Han text remain intact and are handled by the feature
+ * extractor below.
+ */
+export const normalizeKnowledgeLexicalText = (value: string): string => {
+  let normalized = value.normalize('NFKC').toLowerCase().replace(/\s+/gu, ' ').trim()
+  let compacted = normalized
+  do {
+    normalized = compacted
+    compacted = normalized.replace(knowledgeHanWhitespacePattern, '$1')
+  } while (compacted !== normalized)
+  return compacted
+}
+
+interface KnowledgeLexicalFeatureData {
+  normalized: string
+  features: Map<string, KnowledgeLexicalTerm>
+  cjkRuns: string[]
+}
+
+const addKnowledgeLexicalFeature = (
+  features: Map<string, KnowledgeLexicalTerm>,
+  term: string,
+  weight: number,
+  kind: KnowledgeLexicalTermKind
+): void => {
+  if (!term) return
+  const existing = features.get(term)
+  // Keep the strongest interpretation when a compact word happens to equal a
+  // regular word or an n-gram occurs in more than one overlapping window.
+  if (!existing || weight > existing.weight) features.set(term, { term, weight, kind })
+}
+
+const buildKnowledgeLexicalFeatureData = (value: string): KnowledgeLexicalFeatureData => {
+  const normalized = normalizeKnowledgeLexicalText(value)
+  const features = new Map<string, KnowledgeLexicalTerm>()
+  const cjkRuns: string[] = []
+  let wordToken = ''
+  let wordSequence: string[] = []
+  let cjkRun = ''
+
+  const flushWordSequence = (): void => {
+    if (wordSequence.length > 1) {
+      const compact = wordSequence.join('')
+      if (compact.length <= KNOWLEDGE_MAX_COMPACT_WORD_LENGTH) {
+        addKnowledgeLexicalFeature(features, compact, KNOWLEDGE_COMPACT_WORD_WEIGHT, 'compact-word')
+      }
+    }
+    wordSequence = []
+  }
+
+  const flushWordToken = (): void => {
+    if (!wordToken) return
+    const components = wordToken.match(/[\p{L}]+|\p{N}+/gu) ?? [wordToken]
+    if (components.length > 1) {
+      addKnowledgeLexicalFeature(features, wordToken, KNOWLEDGE_COMPACT_WORD_WEIGHT, 'compact-word')
+      for (const component of components) {
+        addKnowledgeLexicalFeature(features, component, KNOWLEDGE_WORD_WEIGHT, 'word')
+      }
+    } else {
+      addKnowledgeLexicalFeature(features, wordToken, KNOWLEDGE_WORD_WEIGHT, 'word')
+    }
+    wordSequence.push(wordToken)
+    wordToken = ''
+  }
+
+  const flushCjkRun = (): void => {
+    if (!cjkRun) return
+    const characters = Array.from(cjkRun)
+    cjkRuns.push(cjkRun)
+    for (const character of characters) {
+      addKnowledgeLexicalFeature(features, character, KNOWLEDGE_CJK_UNIGRAM_WEIGHT, 'cjk-unigram')
+    }
+    for (let ngramLength = 2; ngramLength <= Math.min(3, characters.length); ngramLength += 1) {
+      const weight = ngramLength === 2
+        ? KNOWLEDGE_CJK_BIGRAM_WEIGHT
+        : KNOWLEDGE_CJK_TRIGRAM_WEIGHT
+      const kind = ngramLength === 2 ? 'cjk-bigram' as const : 'cjk-trigram' as const
+      for (let index = 0; index + ngramLength <= characters.length; index += 1) {
+        addKnowledgeLexicalFeature(
+          features,
+          characters.slice(index, index + ngramLength).join(''),
+          weight,
+          kind
+        )
+      }
+    }
+    cjkRun = ''
+  }
+
+  const flushAll = (): void => {
+    flushWordToken()
+    flushWordSequence()
+    flushCjkRun()
+  }
+
+  for (const character of normalized) {
+    if (isKnowledgeHan(character)) {
+      flushWordToken()
+      flushWordSequence()
+      cjkRun += character
+      continue
+    }
+    if (isKnowledgeWordCharacter(character)) {
+      flushCjkRun()
+      wordToken += character
+      continue
+    }
+    if (/\s/u.test(character)) {
+      flushCjkRun()
+      // Whitespace separates ordinary words but is deliberately retained in
+      // wordSequence so "GJB 5000B" also yields the compact identifier.
+      flushWordToken()
+      continue
+    }
+    flushCjkRun()
+    flushWordToken()
+    flushWordSequence()
+  }
+  flushAll()
+  return { normalized, features, cjkRuns }
+}
+
+export const buildKnowledgeLexicalProfile = (value: string): KnowledgeLexicalProfile => {
+  const data = buildKnowledgeLexicalFeatureData(value)
+  const terms = [...data.features.values()]
+  const totalWeight = terms.reduce((sum, item) => sum + item.weight, 0)
+  const phraseWeight = terms
+    .filter((item) => item.kind === 'cjk-bigram' || item.kind === 'cjk-trigram')
+    .reduce((sum, item) => sum + item.weight, 0)
+  return {
+    normalized: data.normalized,
+    terms,
+    cjkRuns: data.cjkRuns,
+    totalWeight,
+    phraseWeight
+  }
+}
+
+const scoreKnowledgeLexicalFeatures = (
+  query: KnowledgeLexicalProfile,
+  documentFeatures: ReadonlySet<string>
+): number => {
+  if (!query.terms.length || query.totalWeight <= 0) return 0
+  let matchedWeight = 0
+  let matchedPhraseWeight = 0
+  for (const item of query.terms) {
+    if (!documentFeatures.has(item.term)) continue
+    matchedWeight += item.weight
+    if (item.kind === 'cjk-bigram' || item.kind === 'cjk-trigram') {
+      matchedPhraseWeight += item.weight
+    }
+  }
+  const weightedCoverage = matchedWeight / query.totalWeight
+  if (!query.phraseWeight) return Math.max(0, Math.min(1, weightedCoverage))
+
+  // A long matching CJK span is stronger evidence than a bag of isolated
+  // characters.  This also makes a relevant paragraph resilient to an added
+  // identifier or natural-language question suffix that is absent in it.
+  let cjkRunLength = 0
+  let cjkRunMatchLength = 0
+  for (const run of query.cjkRuns) {
+    const characters = Array.from(run)
+    if (!characters.length) continue
+    cjkRunLength += characters.length
+    let current = documentFeatures.has(characters[0]) ? 1 : 0
+    let longest = current
+    for (let index = 1; index < characters.length; index += 1) {
+      if (documentFeatures.has(`${characters[index - 1]}${characters[index]}`)) {
+        current += 1
+      } else {
+        current = documentFeatures.has(characters[index]) ? 1 : 0
+      }
+      if (current > longest) longest = current
+    }
+    cjkRunMatchLength += longest
+  }
+  const phraseCoverage = matchedPhraseWeight / query.phraseWeight
+  const spanCoverage = cjkRunLength ? cjkRunMatchLength / cjkRunLength : phraseCoverage
+  return Math.max(0, Math.min(1,
+    weightedCoverage * 0.55 + phraseCoverage * 0.25 + spanCoverage * 0.2
+  ))
+}
+
+/**
+ * Score literal relevance in [0, 1].  The overload accepts either profiles
+ * (for repeated scoring during retrieval) or raw strings (for small callers
+ * and deterministic tests).
+ */
+export const scoreKnowledgeLexicalRelevance = (
+  query: KnowledgeLexicalProfile | string,
+  document: KnowledgeLexicalProfile | string
+): number => {
+  const queryProfile = typeof query === 'string' ? buildKnowledgeLexicalProfile(query) : query
+  if (typeof document === 'string') {
+    const documentProfile = buildKnowledgeLexicalFeatureData(document)
+    return scoreKnowledgeLexicalFeatures(queryProfile, new Set<string>(documentProfile.features.keys()))
+  }
+  return scoreKnowledgeLexicalFeatures(
+    queryProfile,
+    new Set<string>(document.terms.map((item) => item.term))
+  )
+}
+
+const selectTopScoredCandidates = <T>(
+  candidates: readonly T[],
+  requestedLimit: number,
+  scoreOf: (candidate: T, index: number) => number
+): T[] => {
+  const safeLimit = Number.isFinite(requestedLimit)
+    ? Math.max(1, Math.trunc(requestedLimit))
+    : candidates.length
+  if (candidates.length <= safeLimit) return [...candidates]
+
+  type ScoredCandidate = { row: T; score: number; index: number }
+  const heap: ScoredCandidate[] = []
+  const isWorse = (left: ScoredCandidate, right: ScoredCandidate): boolean => (
+    left.score < right.score || (left.score === right.score && left.index > right.index)
+  )
+  const siftUp = (index: number): void => {
+    let current = index
+    while (current > 0) {
+      const parent = Math.floor((current - 1) / 2)
+      if (!isWorse(heap[current], heap[parent])) break
+      ;[heap[current], heap[parent]] = [heap[parent], heap[current]]
+      current = parent
+    }
+  }
+  const siftDown = (index: number): void => {
+    let current = index
+    while (true) {
+      const left = current * 2 + 1
+      const right = left + 1
+      let smallest = current
+      if (left < heap.length && isWorse(heap[left], heap[smallest])) smallest = left
+      if (right < heap.length && isWorse(heap[right], heap[smallest])) smallest = right
+      if (smallest === current) break
+      ;[heap[current], heap[smallest]] = [heap[smallest], heap[current]]
+      current = smallest
+    }
+  }
+
+  for (let index = 0; index < candidates.length; index += 1) {
+    const rawScore = scoreOf(candidates[index], index)
+    const scored = {
+      row: candidates[index],
+      score: Number.isFinite(rawScore) ? rawScore : 0,
+      index
+    }
+    if (heap.length < safeLimit) {
+      heap.push(scored)
+      siftUp(heap.length - 1)
+    } else if (isWorse(heap[0], scored)) {
+      heap[0] = scored
+      siftDown(0)
+    }
+  }
+  return heap
+    .sort((left, right) => right.score - left.score || left.index - right.index)
+    .map(({ row }) => row)
+}
+
+const knowledgeHybridShortlistLimit = (candidateCount: number, requestedLimit: number): number => {
+  if (candidateCount <= VECTOR_PREFILTER_THRESHOLD) return candidateCount
+  const safeLimit = Number.isFinite(requestedLimit)
+    ? Math.max(1, Math.trunc(requestedLimit))
+    : VECTOR_PREFILTER_MAX_CANDIDATES
+  return Math.min(
+    candidateCount,
+    Math.max(256, Math.min(VECTOR_PREFILTER_MAX_CANDIDATES, safeLimit * 16))
+  )
+}
+
+const buildKnowledgeLexicalScores = <T>(
+  query: KnowledgeLexicalProfile,
+  candidates: readonly T[],
+  contentOf: (candidate: T) => string
+): Map<T, number> => {
+  const scores = new Map<T, number>()
+  for (const candidate of candidates) {
+    const document = buildKnowledgeLexicalFeatureData(contentOf(candidate))
+    scores.set(candidate, scoreKnowledgeLexicalFeatures(query, new Set<string>(document.features.keys())))
+  }
+  return scores
+}
+
+const mergeKnowledgeCandidates = <T>(...groups: readonly T[][]): T[] => {
+  const seen = new Set<T>()
+  const merged: T[] = []
+  for (const group of groups) {
+    for (const candidate of group) {
+      if (seen.has(candidate)) continue
+      seen.add(candidate)
+      merged.push(candidate)
+    }
+  }
+  return merged
+}
+
 export const buildCoarseVector = (vector: Float32Array): Float32Array => {
   const coarse = new Float32Array(Math.ceil(vector.length / VECTOR_COARSE_STEP))
   for (let index = 0, coarseIndex = 0; index < vector.length; index += VECTOR_COARSE_STEP, coarseIndex += 1) {
@@ -1053,7 +1397,7 @@ export class KnowledgeService {
     await this.waitForIndexReady()
     await this.embeddings.prepare()
     if (!this.embeddings.available) return []
-    const cacheKey = `${this.modelVersion}:${sourceType}:${safeLimit}:${query.replace(/\s+/g, ' ').toLocaleLowerCase()}`
+    const cacheKey = `${this.modelVersion}:${sourceType}:${safeLimit}:${normalizeKnowledgeLexicalText(query)}`
     const cached = this.searchResultCache.get(cacheKey)
     if (cached && Date.now() - cached.createdAt <= SEARCH_RESULT_CACHE_TTL_MS) {
       return cached.result
@@ -1068,13 +1412,27 @@ export class KnowledgeService {
       this.rememberSearchResult(cacheKey, [])
       return []
     }
-    const candidates = prefilterVectorCandidates(queryVector, allCandidates, safeLimit)
+    const queryLexicalProfile = buildKnowledgeLexicalProfile(query)
+    const lexicalScores = buildKnowledgeLexicalScores(
+      queryLexicalProfile,
+      allCandidates,
+      (candidate) => candidate.chunk.content
+    )
+    const vectorCandidates = prefilterVectorCandidates(queryVector, allCandidates, safeLimit)
+    const lexicalCandidates = selectTopScoredCandidates(
+      allCandidates,
+      knowledgeHybridShortlistLimit(allCandidates.length, safeLimit),
+      (candidate) => lexicalScores.get(candidate) ?? 0
+    )
+    // Large indexes must retain both dense and literal evidence.  A pure
+    // vector prefilter can discard an exact CJK/topic hit before hybrid
+    // scoring gets a chance to see it.
+    const candidates = mergeKnowledgeCandidates(vectorCandidates, lexicalCandidates)
     const queryNorm = this.vectorNorm(queryVector)
-    const terms = new Set((query.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).filter((term) => term.length > 1))
-    const ranked = candidates.map(({ chunk, vector, norm }) => {
+    const ranked = candidates.map((candidate) => {
+      const { chunk, vector, norm } = candidate
       const cosine = this.cosine(queryVector, vector, norm, queryNorm)
-      const haystack = chunk.content.toLocaleLowerCase()
-      const lexical = [...terms].filter((term) => haystack.includes(term)).length / Math.max(terms.size, 1)
+      const lexical = lexicalScores.get(candidate) ?? 0
       const score = cosine * 0.75 + lexical * 0.25
       const source: ChatSource = chunk.sourceType === 'document'
         ? {
@@ -1136,23 +1494,31 @@ export class KnowledgeService {
     if (!this.embeddings.available) return []
     const [queryVector] = await this.embeddings.embedMany([query])
     const allCandidates = this.vectorRowsForSearch()
-    const candidates = queryVector
-      ? prefilterVectorCandidates(queryVector, allCandidates
-        .filter(({ chunk }) => chunk.sourceType === 'record' && Boolean(chunk.recordUid)), limit)
+      .filter(({ chunk }) => chunk.sourceType === 'record' && Boolean(chunk.recordUid))
+    const queryLexicalProfile = buildKnowledgeLexicalProfile(query)
+    const lexicalScores = buildKnowledgeLexicalScores(
+      queryLexicalProfile,
+      allCandidates,
+      (candidate) => candidate.chunk.content
+    )
+    const vectorCandidates = queryVector
+      ? prefilterVectorCandidates(queryVector, allCandidates, limit)
       : []
+    const lexicalCandidates = selectTopScoredCandidates(
+      allCandidates,
+      knowledgeHybridShortlistLimit(allCandidates.length, limit),
+      (candidate) => lexicalScores.get(candidate) ?? 0
+    )
+    const candidates = mergeKnowledgeCandidates(vectorCandidates, lexicalCandidates)
     if (!queryVector || !candidates.length) return []
     const queryNorm = this.vectorNorm(queryVector)
 
-    const terms = new Set(
-      (query.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [])
-        .filter((term) => term.length > 1)
-    )
     const bestByRecord = new Map<string, KnowledgeRecordMatch>()
-    for (const { chunk, vector, norm } of candidates) {
+    for (const candidate of candidates) {
+      const { chunk, vector, norm } = candidate
       const recordUid = chunk.recordUid as string
       const cosine = Math.max(0, this.cosine(queryVector, vector, norm, queryNorm))
-      const haystack = chunk.content.toLocaleLowerCase()
-      const lexical = [...terms].filter((term) => haystack.includes(term)).length / Math.max(terms.size, 1)
+      const lexical = lexicalScores.get(candidate) ?? 0
       // Full-requirement semantics drive recall; literal overlap is only a small supporting signal.
       const score = Math.max(0, Math.min(1, cosine * 0.85 + lexical * 0.15)) * 100
       const existing = bestByRecord.get(recordUid)

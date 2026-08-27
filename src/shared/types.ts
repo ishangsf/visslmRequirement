@@ -608,6 +608,17 @@ export interface RequirementSemanticizationRecentItem {
   durationMs?: number
 }
 
+/** A currently in-flight record shown alongside the legacy single-focus fields. */
+export interface RequirementSemanticizationActiveRecord {
+  uid: string
+  itemId: string
+  name: string
+  /** Stable one-based position in the accepted candidate list. */
+  index: number
+  stage: RequirementSemanticizationStage
+  startedAt: string
+}
+
 export interface RequirementSemanticizationTaskSnapshot {
   jobId: string
   status: RequirementSemanticizationTaskStatus
@@ -626,6 +637,15 @@ export interface RequirementSemanticizationTaskSnapshot {
   /** Defaults to true for snapshots created before this field existed. */
   deepThinking?: boolean
   qualityMode?: RequirementSemanticizationQualityMode
+  /** Provider-aware bounded worker-pool size selected for this task. */
+  maxConcurrency?: number
+  /** Number of records currently claimed and in flight. */
+  activeCount?: number
+  activeRecords?: RequirementSemanticizationActiveRecord[]
+  /** Monotonic task metrics; omitted by older snapshots. */
+  elapsedMs?: number
+  recordsPerMinute?: number
+  estimatedRemainingMs?: number
   /** Structured audit result only; model hidden reasoning is never included. */
   analysisTrace?: RequirementSemanticizationAnalysisTrace
 }
@@ -1097,7 +1117,7 @@ export interface KnowledgeDocumentPreview {
   contentUrl?: string
   contentByteSize?: number
   contentBase64?: string
-  renderFormat?: 'docx' | 'pdf'
+  renderFormat?: 'docx' | 'pdf' | 'xlsx' | 'text'
   errorMessage?: string
 }
 
@@ -1463,6 +1483,12 @@ export interface AssistantRunHistory {
   startedAt: string
   completedAt: string
   durationMs: number
+  /** Total prompt/input tokens reported by model calls in this run. */
+  inputTokenCount?: number
+  /** Total completion/output tokens reported by model calls in this run. */
+  outputTokenCount?: number
+  /** Output tokens per second, derived from model completion or run duration. */
+  tokensPerSecond?: number
   stages: Array<{ stage: string; message: string; at: string }>
   toolCallCount: number
   matchedCount: number

@@ -125,7 +125,7 @@ const checks = await evaluate(`(async () => {
   const knowledgeTab = [...document.querySelectorAll('.asset-center-tabs .ant-tabs-tab')]
     .find((item) => item.textContent?.includes('知识库'))
   knowledgeTab?.click()
-  await waitForActiveTab('知识库')
+  const knowledgeActiveTab = Boolean(await waitForActiveTab('知识库'))
   const knowledgePage = Boolean(await waitForVisible('.knowledge-page'))
   const uploadButton = Boolean(document.querySelector('.knowledge-toolbar button'))
   const metrics = document.querySelectorAll('.knowledge-metric-grid .ant-card').length
@@ -135,7 +135,7 @@ const checks = await evaluate(`(async () => {
   const dataTab = [...document.querySelectorAll('.asset-center-tabs .ant-tabs-tab')]
     .find((item) => item.textContent?.includes('数据中心'))
   dataTab?.click()
-  await waitForActiveTab('数据中心')
+  const dataActiveTab = Boolean(await waitForActiveTab('数据中心'))
   const dataPageRestored = Boolean(await waitForVisible('.asset-center-page .data-workbench-card'))
 
   const maintenanceEntry = [...document.querySelectorAll('.asset-center-page .page-toolbar button')]
@@ -272,11 +272,13 @@ const checks = await evaluate(`(async () => {
     assetCenterHasNoTaskOperations,
     taskApi,
     selectableRows,
+    knowledgeActiveTab,
     knowledgePage,
     uploadButton,
     metrics,
     filters,
     table,
+    dataActiveTab,
     dataPageRestored,
     semanticizationMenu,
     semanticizationPage: Boolean(semanticizationPage),
@@ -371,7 +373,7 @@ if (!checks.assetMenu || !checks.assetCenter || !checks.dataPage || !checks.sema
     !checks.semanticResultBeforeAuditGrid || !checks.semanticResultNoOverlap || !checks.auditNoOverlap ||
     checks.auditGridAutoRows !== 'max-content' || !checks.actualAuditNoOverlap || !checks.selectableRows ||
     !checks.knowledgePage || !checks.uploadButton || !checks.filters || !checks.table ||
-    !checks.dataPageRestored) {
+    !checks.knowledgeActiveTab || !checks.dataActiveTab || !checks.dataPageRestored) {
   throw new Error(`Asset center and semanticization UI smoke failed: ${JSON.stringify(checks)}`)
 }
 

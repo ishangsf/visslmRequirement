@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os'
 import { AppDatabase } from '../src/main/database'
 import {
   restoreLegacyAssistantMarkdown,
-  sanitizeChatMessageContent
+  sanitizeChatMessageContent,
+  stripRedundantAssistantCitationSections
 } from '../src/shared/chat-message-format'
 import type { ChatContextRef, ChatMessage } from '../src/shared/types'
 
@@ -72,6 +73,34 @@ try {
     restoreLegacyAssistantMarkdown('查询结果 ### 姚稳（2 条） 1. 第一条需求 2. 第二条需求 3. 第三条需求'),
     '查询结果\n\n### 姚稳（2 条）\n1. 第一条需求\n2. 第二条需求\n3. 第三条需求',
     'legacy flattened answers must recover heading and list boundaries'
+  )
+  const duplicatedCitationAnswer = [
+    '这是有证据支持的正文结论。',
+    '',
+    '> 来源：',
+    '> [规范文档 · 第 3 页](#knowledge-document=doc-1&chunk=chunk-1)',
+    '',
+    '依据：[规范文档 · 第 3 页](#knowledge-document=doc-1&chunk=chunk-1)'
+  ].join('\n')
+  assert.equal(
+    stripRedundantAssistantCitationSections(duplicatedCitationAnswer, true),
+    '这是有证据支持的正文结论。',
+    'structured sources must replace repeated standalone 来源/依据 Markdown sections'
+  )
+  assert.equal(
+    stripRedundantAssistantCitationSections('结论依据：标准第 3 条。', true),
+    '结论依据：标准第 3 条。',
+    'ordinary prose containing 依据 must remain visible'
+  )
+  const citationBeforeMoreProse = [
+    '第一段结论。',
+    '来源：[规范文档](#knowledge-document=doc-1&chunk=chunk-1)',
+    '后续仍有业务分析。'
+  ].join('\n')
+  assert.equal(
+    stripRedundantAssistantCitationSections(citationBeforeMoreProse, true),
+    citationBeforeMoreProse,
+    'a citation section must not hide business prose that follows it'
   )
 
   db.saveChatSession({ id: sessionId, title: 'First question', messages: firstMessages })

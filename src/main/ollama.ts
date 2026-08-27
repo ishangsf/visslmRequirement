@@ -22,6 +22,7 @@ import type {
   DataCenterQueryPlan
 } from './assistant/agents/data-center-agent'
 import type { DataScope } from '../shared/query-spec'
+import { stripRedundantAssistantCitationSections } from '../shared/chat-message-format'
 import type { ConfirmedAssistantPlan } from './assistant/execution-plan'
 import { KnowledgeBaseAgent } from './assistant/agents/knowledge-base-agent'
 import {
@@ -41,6 +42,82 @@ import {
 type AgentStatusEvent = Extract<AgentEvent, { type: 'status' }>
 
 const MODEL_TOOL_FIELD_LIMIT = 512
+
+/**
+ * Knowledge citations are renderer-intercepted local fragments.  The
+ * fragment deliberately carries only the two opaque identifiers needed to
+ * locate a chunk; the visible Markdown label is always a document name/file
+ * name plus its human-readable location.  Never use ChatSource.uid as the
+ * visible citation for a document.
+ */
+const knowledgeCitationFragmentPrefix = '#knowledge-document='
+
+const safeCitationIdentifier = (value: unknown): string | undefined => {
+  const candidate = typeof value === 'string' ? value.trim() : ''
+  if (!candidate || candidate.length > 300 || /[\u0000-\u001f\u007f]/u.test(candidate)) return undefined
+  return candidate
+}
+
+const encodeCitationIdentifier = (value: string): string => encodeURIComponent(value)
+  .replace(/[!'()*]/gu, (character) => `%${character.codePointAt(0)!.toString(16).toUpperCase()}`)
+
+const citationLabelPart = (value: unknown, fallback: string): string => {
+  const text = sanitizeContextText(value, 240).replace(/[\r\n]+/gu, ' ').trim() || fallback
+  // Keep labels simple so the validator remains idempotent even when a file
+  // name contains Markdown punctuation; links are never built from raw text.
+  return text.replace(/[\\[\]()`]/gu, ' ').replace(/\s{2,}/gu, ' ').trim() || fallback
+}
+
+const genericCitationLocationPattern = /^(?:文档正文|正文|文档内容|正文内容|内容|默认位置|采集记录|(?:分块|chunk)[\s:：#-]*\d+(?:\s*[/／]\s*\d+)?)$/iu
+
+const citationLocationFor = (source: ChatSource): string | undefined => {
+  const pageNumber = Number(source.pageNumber)
+  if (Number.isFinite(pageNumber) && pageNumber >= 1) {
+    return `第 ${Math.trunc(pageNumber)} 页`
+  }
+  const sheetName = citationLabelPart(source.sheetName, '')
+  if (sheetName) return `工作表「${sheetName}」`
+  const location = citationLabelPart(source.location, '')
+  if (location && !genericCitationLocationPattern.test(location)) return location
+
+  const snippet = sanitizeContextText(source.snippet, 240)
+  if (!snippet) return undefined
+  const snippetCharacters = Array.from(snippet)
+  const preview = snippetCharacters.slice(0, 24).join('')
+  return `正文「${preview}${snippetCharacters.length > 24 ? '…' : ''}」`
+}
+
+const knowledgeCitationHref = (source: ChatSource): string | undefined => {
+  if (source.sourceType !== 'document') return undefined
+  const documentId = safeCitationIdentifier(source.documentId)
+  const chunkId = safeCitationIdentifier(source.chunkId)
+  if (!documentId || !chunkId) return undefined
+  return `${knowledgeCitationFragmentPrefix}${encodeCitationIdentifier(documentId)}&chunk=${encodeCitationIdentifier(chunkId)}`
+}
+
+const knowledgeCitationMarkdown = (source: ChatSource): string | undefined => {
+  const href = knowledgeCitationHref(source)
+  if (!href) return undefined
+  const name = citationLabelPart(source.fileName || source.name, '知识库文档')
+  const location = citationLocationFor(source)
+  // A chunk-specific link without a human-readable location is not a
+  // complete provenance marker.  Keep malformed legacy sources fail-closed.
+  if (!location) return undefined
+  return `[${name} · ${location}](${href})`
+}
+
+const sourceIdentity = (source: ChatSource): string => {
+  if (source.sourceType === 'document') {
+    // A document can produce many chunks while retaining the same document
+    // UID.  Prefer the document/chunk pair so every evidence block remains
+    // independently addressable; fall back only for malformed legacy data.
+    const documentId = safeCitationIdentifier(source.documentId)
+    const chunkId = safeCitationIdentifier(source.chunkId)
+    if (documentId && chunkId) return `document:${documentId}:${chunkId}`
+    return `document-uid:${source.uid}`
+  }
+  return `record:${source.uid}`
+}
 
 type QuestionPlanIntent = DataCenterQueryPlan['intent']
 type QuestionPlanSourceMode = DataCenterQueryPlan['sourceMode']
@@ -927,7 +1004,7 @@ export class OllamaAgent {
     const sources = new Map<string, ChatSource>()
     if (recordExecution) this.collectSources(recordExecution.result, sources)
     for (const hit of knowledgeExecution?.hits ?? []) {
-      this.collectSources({ source: hit.source }, sources)
+      this.collectSources({ source: this.knowledgeSourceForHit(hit) }, sources)
     }
     const hasRecordEvidence = recordExecution
       ? this.dataCenterAgent.hasEvidence(recordExecution.toolName, recordExecution.result)
@@ -968,11 +1045,24 @@ export class OllamaAgent {
     const queryResult = recordExecution
       ? this.compactModelResult(recordExecution.result)
       : undefined
-    const knowledgeEvidence = knowledgeExecution?.hits.map((hit) => ({
-      source: hit.source,
-      citation: `[UID:${hit.source.uid}]`,
-      content: sanitizeContextText(hit.chunk.content, 1_800)
-    }))
+    const knowledgeEvidence = knowledgeExecution?.hits.map((hit) => {
+      const source = this.knowledgeSourceForHit(hit)
+      const citation = knowledgeCitationMarkdown(source)
+      return {
+        // Do not send uid/itemId/documentId/chunkId as model-visible fields.
+        // The complete local citation is enough for the model to reproduce a
+        // safe link, while the final validator still checks it against the
+        // trusted source collection.
+        source: {
+          sourceType: 'document' as const,
+          name: citationLabelPart(source.fileName || source.name, '知识库文档'),
+          ...(source.fileName ? { fileName: citationLabelPart(source.fileName, '') } : {}),
+          ...(source.location ? { location: citationLabelPart(source.location, '') } : {})
+        },
+        ...(citation ? { citation } : {}),
+        content: sanitizeContextText(hit.chunk.content, 1_800)
+      }
+    })
     const response = await this.callModel({
       messages: [
         {
@@ -982,7 +1072,9 @@ export class OllamaAgent {
             '先核对问题、计划和证据来源是否一致，再给出结论。',
             '记录统计必须使用 matchedCount 或工具返回的明确计数，不能使用 totalScanned 代替命中数；禁止估算。',
             '记录证据的 sourceType=record，知识库文档证据的 sourceType=document；两者不能互换。',
-            '引用记录或文档时必须使用证据中的 source.uid 写成 [UID:实际UID]，不能使用 itemId、序号或未提供的 UID。',
+            '引用记录时才可使用证据中的 source.uid 写成 [UID:实际UID]，且只能使用已提供的记录 UID。',
+            '需要把引用贴近具体结论时，可使用 evidence 中提供的完整 Markdown citation（文档名/文件名 + location 链接）；禁止输出 UID、documentId、chunkId、序号或其他内部标识。',
+            '不要单独输出“来源”或“依据”清单，应用会在回答下方统一展示可核验的回答依据。',
             '如果 mixed 计划中有来源缺失，明确指出缺失来源，并只回答现有来源能支持的部分。',
             '如果结果为空，明确说明本轮查询条件下未命中，不得编造。',
             '列表类问题只概述命中数量并列出记录名称，不要输出 HTML、JSON、流程日志或内部索引。',
@@ -1065,27 +1157,122 @@ export class OllamaAgent {
   }
 
   private ensureVerifiableCitations(answer: string, sources: ChatSource[]): string {
-    let normalized = answer
-    for (const source of sources) {
-      if (source.itemId && source.uid && source.itemId !== source.uid) {
-        normalized = normalized.replaceAll(`[UID:${source.itemId}]`, `[UID:${source.uid}]`)
+    const boundedSources = sources
+      .filter((source) => typeof source.uid === 'string' && source.uid.trim())
+      .slice(0, 20)
+    const documentSources = boundedSources.filter((source) => source.sourceType === 'document')
+    const citationsByHref = new Map<string, { source: ChatSource; markdown: string }>()
+    for (const source of documentSources) {
+      const href = knowledgeCitationHref(source)
+      const markdown = knowledgeCitationMarkdown(source)
+      if (href && markdown) citationsByHref.set(href, { source, markdown })
+    }
+    const documentIdentityCandidates = new Map<string, ChatSource[]>()
+    for (const source of documentSources) {
+      // Keep each document chunk distinct.  A document UID alone is not a
+      // safe citation key because several chunks intentionally share it.
+      for (const identity of [source.uid, source.itemId, source.documentId, source.chunkId]) {
+        const normalizedIdentity = safeCitationIdentifier(identity)
+        if (!normalizedIdentity) continue
+        const candidates = documentIdentityCandidates.get(normalizedIdentity) ?? []
+        if (!candidates.includes(source)) candidates.push(source)
+        documentIdentityCandidates.set(normalizedIdentity, candidates)
       }
     }
-    const validUids = new Set(sources.map((source) => source.uid).filter(Boolean))
-    let hasCitation = false
-    normalized = normalized.replace(/\[UID:([^\]]+)\]/g, (full, rawUid: string) => {
-      const uid = rawUid.trim()
-      if (!validUids.has(uid)) return ''
-      hasCitation = true
-      return `[UID:${uid}]`
-    }).trim()
-    if (sources.length && !hasCitation) {
-      const references = sources.slice(0, 8).map((source) => `[UID:${source.uid}]`).join('、')
-      normalized = `${normalized}\n\n依据：${references}`.trim()
+    const sourceByDocumentIdentity = new Map<string, ChatSource>()
+    for (const [identity, candidates] of documentIdentityCandidates) {
+      // Only an identity that resolves to exactly one chunk may be used to
+      // upgrade a legacy [UID:...] token.  Ambiguous document-level IDs are
+      // removed and replaced by the complete, chunk-specific references.
+      if (candidates.length === 1 && candidates[0]) {
+        sourceByDocumentIdentity.set(identity, candidates[0])
+      }
     }
-    return normalized || (sources.length
-      ? `依据：${sources.slice(0, 8).map((source) => `[UID:${source.uid}]`).join('、')}`
-      : '模型没有生成可验证的回答。')
+    const validRecordUids = new Set(
+      boundedSources
+        .filter((source) => source.sourceType !== 'document')
+        .map((source) => source.uid.trim())
+        .filter(Boolean)
+    )
+    let normalized = String(answer ?? '')
+
+    // Convert legacy document citations before validating Markdown links.  A
+    // source identity is accepted only when it maps to the exact trusted
+    // document/chunk source; otherwise the legacy token is removed.
+    normalized = normalized.replace(/\[UID:([^\]]+)\]/gu, (full, rawUid: string) => {
+      const uid = rawUid.trim()
+      const documentSource = sourceByDocumentIdentity.get(uid)
+      if (documentSource) return knowledgeCitationMarkdown(documentSource) ?? ''
+      if (!validRecordUids.has(uid)) return ''
+      return `[UID:${uid}]`
+    })
+
+    // A model may echo a document UID outside the legacy citation wrapper.
+    // Remove the exact opaque token before links are canonicalized; generated
+    // local fragments do not contain the `document:<uid>` token, so this does
+    // not alter the safe href we add below.
+    for (const source of documentSources) {
+      const uid = source.uid.trim()
+      if (uid) normalized = normalized.replaceAll(uid, '')
+    }
+
+    // Canonicalize known local citation links (including labels supplied by a
+    // model) and drop unknown local fragments.  This keeps the renderer's
+    // interception surface closed to the current trusted evidence set.
+    normalized = normalized.replace(/\[([^\]]*)\]\((#[^)]+)\)/gu, (full, _label: string, href: string) => {
+      if (!href.startsWith(knowledgeCitationFragmentPrefix)) return full
+      return citationsByHref.get(href)?.markdown ?? ''
+    })
+
+    // Some models still emit a numbered citation even after being instructed
+    // to copy the complete citation.  Resolve it only against the bounded,
+    // ordered document evidence; an unknown number is left as ordinary text
+    // rather than being allowed to select an arbitrary source.
+    normalized = normalized.replace(/\[(\d{1,2})\]/gu, (full, rawIndex: string) => {
+      const source = documentSources[Number(rawIndex) - 1]
+      return source ? knowledgeCitationMarkdown(source) ?? '' : full
+    }).trim()
+
+    const usedHrefs = new Set<string>()
+    for (const match of normalized.matchAll(/\]\((#[^)]+)\)/gu)) {
+      const href = match[1]
+      if (href?.startsWith(knowledgeCitationFragmentPrefix)) usedHrefs.add(href)
+    }
+    const usedRecordUids = new Set<string>()
+    for (const match of normalized.matchAll(/\[UID:([^\]]+)\]/gu)) {
+      if (match[1]) usedRecordUids.add(match[1].trim())
+    }
+    const references = boundedSources
+      .filter((source) => {
+        if (source.sourceType === 'document') {
+          const href = knowledgeCitationHref(source)
+          return Boolean(href && !usedHrefs.has(href))
+        }
+        return !usedRecordUids.has(source.uid.trim())
+      })
+      .map((source) => source.sourceType === 'document'
+        ? knowledgeCitationMarkdown(source)
+        : `[UID:${source.uid.trim()}]`)
+      .filter((reference): reference is string => Boolean(reference))
+      .slice(0, 8)
+    normalized = stripRedundantAssistantCitationSections(normalized, boundedSources.length > 0)
+
+    const hasSafeCitation = usedHrefs.size > 0 || usedRecordUids.size > 0 || references.length > 0
+    // Evidence without a usable citation must not be presented as a verified
+    // answer.  This also prevents malformed legacy document sources (missing
+    // documentId/chunkId/location) from falling through with model prose.
+    if (normalized && (!boundedSources.length || hasSafeCitation)) return normalized
+    const fallbackReferences = boundedSources
+      .slice(0, 8)
+      .map((source) => source.sourceType === 'document'
+        ? knowledgeCitationMarkdown(source)
+        : `[UID:${source.uid.trim()}]`)
+      .filter((reference): reference is string => Boolean(reference))
+    return fallbackReferences.length
+      ? '已找到可核验来源，请展开回答下方的“回答依据”查看。'
+      : boundedSources.length
+        ? '本次回答没有可核验的安全来源引用，未生成猜测性回答。'
+        : '模型没有生成可验证的回答。'
   }
 
   private async callModel(input: {
@@ -1113,10 +1300,30 @@ export class OllamaAgent {
       const obj = value as Record<string, unknown>
       if (obj.source && typeof obj.source === 'object') {
         const source = obj.source as ChatSource
-        if (source.uid) sources.set(source.uid, source)
+        if (source.uid) sources.set(sourceIdentity(source), source)
       }
       Object.values(obj).forEach(visit)
     }
     visit(input)
+  }
+
+  private knowledgeSourceForHit(
+    hit: KnowledgePlanExecution['hits'][number]
+  ): ChatSource {
+    const source = hit.source
+    if (source.sourceType !== 'document') return source
+    // Older adapters populated chunk metadata but returned a source object
+    // without documentId/chunkId.  Merge the trusted chunk identity before
+    // collecting or citing it; never collapse chunks by document UID.
+    return {
+      ...source,
+      documentId: source.documentId ?? hit.chunk.documentId,
+      chunkId: source.chunkId ?? hit.chunk.id,
+      fileName: source.fileName ?? hit.chunk.sourceName,
+      location: source.location ?? hit.chunk.location,
+      pageNumber: source.pageNumber ?? hit.chunk.pageNumber,
+      sheetName: source.sheetName ?? hit.chunk.sheetName,
+      snippet: source.snippet ?? hit.chunk.content.slice(0, 320)
+    }
   }
 }

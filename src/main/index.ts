@@ -9,7 +9,7 @@ import {
   unlinkSync,
   writeFileSync
 } from 'node:fs'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Readable } from 'node:stream'
 import { promisify } from 'node:util'
@@ -99,6 +99,7 @@ import {
 } from './assistant/task-trace'
 import {
   AssistantRunRegistry,
+  getAssistantRunUsage,
   isAssistantRunCancellation,
   runWithAssistantRunContext
 } from './assistant/run-controller'
@@ -175,13 +176,44 @@ let isQuitting = false
 let legacyDataImportRunning = false
 const expertRouter = new ExpertRouter()
 const maxKnowledgeDocumentPreviewBytes = 50 * 1024 * 1024
-const sourcePreviewExtensions = new Set(['.docx', '.pdf'])
+const sourcePreviewExtensions = new Set(['.docx', '.pdf', '.xlsx', '.xls', '.txt'])
+const sourcePreviewMimeTypes: Record<string, string> = {
+  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.pdf': 'application/pdf',
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.xls': 'application/vnd.ms-excel',
+  '.txt': 'text/plain'
+}
+const sourcePreviewRenderFormats: Record<string, NonNullable<KnowledgeDocumentPreview['renderFormat']>> = {
+  '.docx': 'docx',
+  '.pdf': 'pdf',
+  '.xlsx': 'xlsx',
+  '.xls': 'xlsx',
+  '.txt': 'text'
+}
 const execFileAsync = promisify(execFile)
 const previewUrlTtlMs = 5 * 60 * 1000
 const maxPreviewUrls = 32
 const previewFiles = new Map<string, { filePath: string; byteSize: number; mimeType: string; expiresAt: number }>()
 const assistantRunRegistry = new AssistantRunRegistry()
 const assistantPlanConfirmation = new AssistantPlanConfirmationController()
+const explicitArtifactMentionPattern = /@交付物专家(?=$|[\s，,。！？!?：:；;])/u
+const isolatedE2EMode = !app.isPackaged && process.env.VISSLM_E2E_ALLOW_MULTI_INSTANCE === '1'
+const isolatedE2EKnowledgeFiles = (() => {
+  if (!isolatedE2EMode) return []
+  const singleFile = process.env.VISSLM_E2E_KNOWLEDGE_FILE?.trim()
+  if (singleFile && isAbsolute(singleFile)) return [singleFile]
+  try {
+    const parsed = JSON.parse(process.env.VISSLM_E2E_KNOWLEDGE_FILES ?? '[]') as unknown
+    if (!Array.isArray(parsed)) return []
+    return parsed
+      .filter((value): value is string => typeof value === 'string')
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0 && isAbsolute(value))
+  } catch {
+    return []
+  }
+})()
 
 const planValidationMetadata = (
   summary: AssistantExecutionSummary,
@@ -1007,6 +1039,10 @@ const registerIpc = (): void => {
     )
   )
   ipcMain.handle('agent:ask', async (ipcEvent, request: ChatRequest) => {
+    // Preserve the renderer's original text before any auto-intent recovery
+    // or mention stripping. Artifact generation is gated against this
+    // immutable value at the final dispatch boundary below.
+    const originalUserQuestion = String(request?.question ?? '')
     const registration = assistantRunRegistry.register(ipcEvent.sender, request?.runId)
     const runStartedAt = new Date().toISOString()
     const runStages: AssistantRunHistory['stages'] = []
@@ -1328,6 +1364,26 @@ const registerIpc = (): void => {
         }
       : request
     const route = expertRouter.route(routedRequest)
+    const artifactRouteRequested = assistantIntent?.taskType === 'artifact_generation' || route.expert.id === 'artifact'
+    if (artifactRouteRequested && !explicitArtifactMentionPattern.test(originalUserQuestion)) {
+      const message = '交付物生成必须由用户在原始问题中显式输入 @交付物专家；本次未生成交付物。'
+      // Clear any renderer/model decision before attaching the safe response,
+      // so neither the response intent nor its trace can claim an artifact
+      // execution happened.
+      assistantIntent = undefined
+      selectedTraceContext = fallbackTraceContext
+      return attachAssistantIntent({
+        answer: message,
+        sources: [],
+        dataViews: [],
+        needsClarification: true,
+        clarificationQuestion: message,
+        expertId: 'general'
+      }, {
+        status: 'clarification',
+        invokedAgents: []
+      }, fallbackTraceContext)
+    }
     selectedTraceContext = assistantIntent
       ? traceContextForResponse()
       : route.expert.id === 'visualization'
@@ -1825,6 +1881,18 @@ const registerIpc = (): void => {
           error: { code: 'AGENT_RUN_FAILED', message: '助手任务在返回响应前失败' }
         }
         const toolStageNames = new Set(['inspect', 'scan', 'retrieve', 'query', 'tool', 'execute'])
+        const durationMs = Math.max(0, Date.parse(completedAt) - Date.parse(runStartedAt))
+        const usage = getAssistantRunUsage(registration.context)
+        const inputTokenCount = usage?.inputTokenCount
+        const outputTokenCount = usage?.outputTokenCount
+        const rateDurationMs = usage?.completionDurationMs !== undefined && usage.completionDurationMs > 0
+          ? usage.completionDurationMs
+          : durationMs > 0
+            ? durationMs
+            : undefined
+        const tokensPerSecond = outputTokenCount !== undefined && rateDurationMs !== undefined
+          ? outputTokenCount / (rateDurationMs / 1_000)
+          : undefined
         const history: AssistantRunHistory = {
           runId: registration.runId,
           ...(request.conversationId ? { conversationId: request.conversationId } : {}),
@@ -1836,7 +1904,12 @@ const registerIpc = (): void => {
           invokedAgents: [...taskContext.invokedAgents],
           startedAt: runStartedAt,
           completedAt,
-          durationMs: Math.max(0, Date.parse(completedAt) - Date.parse(runStartedAt)),
+          durationMs,
+          ...(inputTokenCount !== undefined ? { inputTokenCount } : {}),
+          ...(outputTokenCount !== undefined ? { outputTokenCount } : {}),
+          ...(tokensPerSecond !== undefined && Number.isFinite(tokensPerSecond) && tokensPerSecond >= 0
+            ? { tokensPerSecond }
+            : {}),
           stages: runStages.slice(0, 100),
           toolCallCount: runStages.filter((stage) => toolStageNames.has(stage.stage.trim().toLocaleLowerCase())).length,
           matchedCount: completedResponse?.dataViews.reduce((sum, view) => sum + view.total, 0) ?? 0,
@@ -2347,15 +2420,16 @@ const registerIpc = (): void => {
   ipcMain.handle('knowledge:document-preview', async (_event, id: string): Promise<KnowledgeDocumentPreview | null> => {
     const document = db.getKnowledgeDocument(id)
     if (!document) return null
-    if (!sourcePreviewExtensions.has(document.extension)) return { document }
+    const extension = document.extension.trim().toLocaleLowerCase()
+    if (!sourcePreviewExtensions.has(extension)) return { document }
     try {
       const stats = statSync(document.filePath)
-      if (!stats.isFile()) return { document, errorMessage: '用户上传的源文件不可用，请重新上传协议附件' }
-      if (stats.size === 0) return { document, errorMessage: '用户上传的源文件为空，请重新上传协议附件' }
+      if (!stats.isFile()) return { document, errorMessage: '知识库源文件不可用，请重新上传知识库文档' }
+      if (stats.size === 0) return { document, errorMessage: '知识库源文件为空，请重新上传知识库文档' }
       if (stats.size > maxKnowledgeDocumentPreviewBytes) {
-        return { document, errorMessage: '源文件超过 50 MB，暂不支持在线预览' }
+        return { document, errorMessage: '知识库源文件超过 50 MB，暂不支持在线预览' }
       }
-      if (document.extension === '.docx') {
+      if (extension === '.docx') {
         const wordRenderedPdf = await renderDocxSourceWithWord(document)
         if (wordRenderedPdf) {
           const preview = createPreviewUrl(wordRenderedPdf, 'application/pdf')
@@ -2377,18 +2451,26 @@ const registerIpc = (): void => {
           renderFormat: 'docx'
         }
       }
-      const preview = createPreviewUrl(document.filePath, 'application/pdf')
+      const mimeType = sourcePreviewMimeTypes[extension]
+      const renderFormat = sourcePreviewRenderFormats[extension]
+      if (!mimeType || !renderFormat) {
+        return { document, errorMessage: '该文档格式暂不支持在线预览' }
+      }
+      const preview = createPreviewUrl(document.filePath, mimeType)
       return {
         document,
         contentUrl: preview.url,
         contentByteSize: preview.byteSize,
-        renderFormat: 'pdf'
+        renderFormat
       }
     } catch {
-      return { document, errorMessage: '用户上传的源文件不可用，请重新上传协议附件' }
+      return { document, errorMessage: '知识库源文件不可用，请重新上传知识库文档' }
     }
   })
   ipcMain.handle('knowledge:upload', async () => {
+    if (isolatedE2EKnowledgeFiles.length) {
+      return knowledgeService.processFiles(isolatedE2EKnowledgeFiles)
+    }
     const result = await dialog.showOpenDialog(mainWindow!, {
       title: '上传知识库文档',
       properties: ['openFile', 'multiSelections'],
@@ -2636,7 +2718,11 @@ const registerIpc = (): void => {
   )
 }
 
-const hasSingleInstanceLock = app.requestSingleInstanceLock()
+// Visual smoke tests run an unpackaged build against an isolated user-data
+// directory while the installed application may remain open.  Keep the
+// production single-instance guarantee, but allow that explicit test-only
+// process to coexist without interrupting the user's active app.
+const hasSingleInstanceLock = isolatedE2EMode || app.requestSingleInstanceLock()
 
 if (!hasSingleInstanceLock) {
   app.quit()

@@ -36,6 +36,9 @@ type Tracker = {
   maxInFlight: number
 }
 
+type SemanticReasoningEffort = 'none' | 'low' | 'medium'
+type SemanticModelChatInput = ModelChatInput & { reasoningEffort?: SemanticReasoningEffort }
+
 const upsert = (db: AppDatabase, uid: string) => {
   db.upsertRecord({
     uid, projectId: 'semantic-adaptive-regression', nodeType: 'Requirement', itemId: uid.toUpperCase(),
@@ -89,10 +92,20 @@ const payloadOf = (input: ModelChatInput): Payload => {
   return payload
 }
 
-const assertRequest = (input: ModelChatInput, quality: 'standard' | 'strict'): void => {
+const assertRequest = (input: ModelChatInput, quality: 'standard' | 'strict', payload?: Payload): void => {
   assert.equal(input.stream, false, 'structured semantic calls must not stream')
   assert.equal(input.think, quality === 'strict')
   assert.equal(input.forceThinking, quality === 'strict')
+  const expectedEffort: SemanticReasoningEffort = payload?.task?.startsWith('repair_')
+    ? 'low'
+    : payload?.analysisPass === 'adjudication'
+      ? 'medium'
+      : quality === 'strict' ? 'low' : 'none'
+  assert.equal(
+    (input as SemanticModelChatInput).reasoningEffort,
+    expectedEffort,
+    `${payload?.analysisPass ?? 'initial'} must use reasoning effort ${expectedEffort}`
+  )
   assert.equal(input.temperature, 0)
   assert.equal(input.timeoutMs, REQUIREMENT_SEMANTIC_MODEL_TIMEOUT_MS)
   assert.ok(Number.isInteger(input.numCtx) && (input.numCtx ?? 0) >= 4096 && (input.numCtx ?? 0) <= 24576)
@@ -123,7 +136,7 @@ const trackerFor = (
       calls.push(input)
       const payload = payloadOf(input)
       payloads.push(payload)
-      assertRequest(input, input.think ? 'strict' : 'standard')
+      assertRequest(input, input.think ? 'strict' : 'standard', payload)
       inFlight += 1
       maxInFlight = Math.max(maxInFlight, inFlight)
       let result: ModelResponse
@@ -233,7 +246,7 @@ const createDeferredModel = (): {
     chat(input) {
       calls.push(input)
       const payload = payloadOf(input)
-      assertRequest(input, input.think ? 'strict' : 'standard')
+      assertRequest(input, input.think ? 'strict' : 'standard', payload)
       const response = responseFor(payload.recordUid!, payload.sourceText!)
       if (automatic) return Promise.resolve(response)
       return new Promise<ModelResponse>((resolve) => pending.push(() => resolve(response)))
@@ -350,14 +363,14 @@ const testStrictRouting = async (): Promise<void> => {
       const tracker = trackerFor((_input, payload) => {
         if (payload.analysisPass === 'adjudication') {
           assert.ok(payload.divergentFields)
-          assert.ok(Object.hasOwn(payload.divergentFields, 'functionalObject'))
+          assert.ok(Object.hasOwn(payload.divergentFields, 'action'))
           return responseFor(payload.recordUid!, payload.sourceText!, {
-            functionalObject: { value: '订单详情', confidence: 0.98, evidence: '订单详情查询' }
+            action: { value: 'add_capability', confidence: 0.98, evidence: '查询' }
           })
         }
         return responseFor(payload.recordUid!, payload.sourceText!, divergent && payload.analysisPass === 'independent'
           ? modelFieldsFor(payload.sourceText!, {
-            functionalObject: { value: '订单信息', confidence: 0.82, evidence: '订单详情查询' }
+            action: { value: 'change_flow', confidence: 0.82, evidence: '查询' }
           })
           : modelFieldsFor(payload.sourceText!))
       })
@@ -365,12 +378,54 @@ const testStrictRouting = async (): Promise<void> => {
       service.start({ recordUids: [record.uid], qualityMode: 'strict' })
       const task = await waitFor(service, 'completed')
       assert.equal(task.succeeded, 1)
-      assert.equal(tracker.maxInFlight, 2, 'strict initial and independent calls must run concurrently')
+      assert.equal(tracker.maxInFlight, 1, 'local/Ollama strict initial and independent calls must be serial')
       assert.equal(tracker.payloads.filter((item) => item.analysisPass === 'initial').length, 1)
       assert.equal(tracker.payloads.filter((item) => item.analysisPass === 'independent').length, 1)
       assert.equal(tracker.payloads.filter((item) => item.analysisPass === 'adjudication').length, divergent ? 1 : 0)
       assert.equal(tracker.calls.length, divergent ? 3 : 2,
         divergent ? 'divergence adds one adjudication call' : 'stable agreement skips adjudication')
+    })
+  }
+}
+
+const testStrictTextNormalization = async (): Promise<void> => {
+  const equivalentVariants: Array<{
+    name: string
+    initial: Partial<Record<string, Assessment>>
+    independent: Partial<Record<string, Assessment>>
+  }> = [
+    {
+      name: 'case-only',
+      initial: { functionalObject: { value: 'Order Details', confidence: 0.96, evidence: '订单详情查询' } },
+      independent: { functionalObject: { value: 'order details', confidence: 0.96, evidence: '订单详情查询' } }
+    },
+    {
+      name: 'whitespace-only',
+      initial: { functionalObject: { value: '订单详情 查询', confidence: 0.96, evidence: '订单详情查询' } },
+      independent: { functionalObject: { value: '订单详情查询', confidence: 0.96, evidence: '订单详情查询' } }
+    },
+    {
+      name: 'wording-only',
+      initial: { behavior: { value: '用户按订单编号查询并查看订单详情', confidence: 0.96, evidence: '用户可以按订单编号查询并查看订单详情' } },
+      independent: { behavior: { value: '用户按订单编号查询和查看订单详情', confidence: 0.96, evidence: '用户可以按订单编号查询并查看订单详情' } }
+    }
+  ]
+
+  for (const variant of equivalentVariants) {
+    await withDb(`strict-equivalent-${variant.name}`, async (db) => {
+      const record = upsert(db, `strict-equivalent-${variant.name}`)
+      const tracker = trackerFor((_input, payload) => responseFor(
+        payload.recordUid!,
+        payload.sourceText!,
+        modelFieldsFor(payload.sourceText!, payload.analysisPass === 'initial' ? variant.initial : variant.independent)
+      ))
+      const service = serviceFor(db, tracker)
+      service.start({ recordUids: [record.uid], qualityMode: 'strict' })
+      const task = await waitFor(service, 'completed')
+      assert.equal(task.succeeded, 1)
+      assert.equal(tracker.calls.length, 2, `${variant.name} must not trigger adjudication`)
+      assert.equal(tracker.maxInFlight, 1)
+      assert.equal(tracker.payloads.filter((payload) => payload.analysisPass === 'adjudication').length, 0)
     })
   }
 }
@@ -382,6 +437,7 @@ const main = async (): Promise<void> => {
   await testStandardHealthy()
   await testStandardRepairAndFailClosed()
   await testStrictRouting()
+  await testStrictTextNormalization()
   console.log('semantic-card-adaptive-regression: ok')
 }
 

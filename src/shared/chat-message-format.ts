@@ -2,6 +2,11 @@ const controlCharacterPattern = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/
 const inlineHeadingPattern = /(?:^|\s)(#{2,4})\s+(?=\S)/gu
 const inlineNumberedItemPattern = /(?:^|\s)(\d{1,3}[.、])\s+(?=\S)/gu
 const inlineBulletItemPattern = /(?:^|\s)([-*])\s+(?=\S)/gu
+const standaloneCitationSectionPattern = /(?:^|\n)[ \t]*(?:>[ \t]*)?(?:#{1,6}[ \t]+)?(?:来源|依据)[：:][ \t]*(?=$|\n|\[)/gu
+const verifiableCitationTokenPattern = /#knowledge-document=|\[UID:[^\]]+\]/u
+const knowledgeCitationMarkdownPattern = /\[[^\]\n]+\]\(#knowledge-document=[^)\n]+\)/gu
+const recordCitationPattern = /\[UID:[^\]\n]+\]/gu
+const citationSectionScaffoldingPattern = /(?:来源|依据)[：:]?|[\s>#*`、,，.。;；:：|\\-]/gu
 
 /**
  * Keep user-visible chat formatting intact while removing control characters
@@ -44,4 +49,30 @@ export const restoreLegacyAssistantMarkdown = (value: string): string => {
   }
 
   return restored.trim()
+}
+
+/**
+ * Completed assistant turns already expose their trusted records/documents in
+ * the structured “回答依据” list. Remove only a trailing standalone Markdown
+ * 来源/依据 section that repeats those same machine-verifiable citations.
+ * Ordinary prose such as “依据标准第 3 条” is intentionally left untouched.
+ */
+export const stripRedundantAssistantCitationSections = (
+  value: string,
+  hasStructuredSources: boolean
+): string => {
+  if (!value || !hasStructuredSources) return value
+
+  for (const match of value.matchAll(standaloneCitationSectionPattern)) {
+    const start = match.index ?? 0
+    const tail = value.slice(start)
+    if (!verifiableCitationTokenPattern.test(tail)) continue
+    const nonCitationText = tail
+      .replace(knowledgeCitationMarkdownPattern, '')
+      .replace(recordCitationPattern, '')
+      .replace(citationSectionScaffoldingPattern, '')
+    if (nonCitationText) continue
+    return value.slice(0, start).trimEnd()
+  }
+  return value
 }

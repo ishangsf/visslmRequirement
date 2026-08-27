@@ -64,6 +64,7 @@ import {
   Layout,
   Menu,
   Modal,
+  Pagination,
   Progress,
   Row,
   Select,
@@ -110,7 +111,10 @@ import type {
   FieldProfileRole,
   FieldSensitivity
 } from '../../shared/query-spec'
-import { restoreLegacyAssistantMarkdown } from '../../shared/chat-message-format'
+import {
+  restoreLegacyAssistantMarkdown,
+  stripRedundantAssistantCitationSections
+} from '../../shared/chat-message-format'
 import { deriveAssistantWorkspaceReadiness } from '../../shared/assistant-readiness'
 import type { AgentEvent, AgentMatchProgress, AgentProgress, AssistantExecutionSummary, ExpertId } from '../../shared/expert-types'
 import {
@@ -151,6 +155,8 @@ import type {
   FeatureModuleSettings,
   KnowledgeDocument,
   KnowledgeDocumentDetail,
+  KnowledgeDocumentPreview,
+  KnowledgeChunk,
   KnowledgeIndexProgress,
   KnowledgeStats,
   ModelCapabilityEvidence,
@@ -206,6 +212,7 @@ const DashboardStudio = lazy(() => import('./dashboard/DashboardStudio').then(({
 const ProjectManagementPage = lazy(() => import('./project-management/ProjectManagementPage').then(({ ProjectManagementPage: Component }) => ({ default: Component })))
 const ReactECharts = lazy(() => import('./components/LightweightECharts').then(({ LightweightECharts: Component }) => ({ default: Component })))
 const ReactMarkdown = lazy(() => import('react-markdown'))
+const KnowledgeDocumentPreviewer = lazy(() => import('./knowledge/KnowledgeDocumentPreviewer').then(({ KnowledgeDocumentPreviewer: Component }) => ({ default: Component })))
 
 type PageKey = 'dashboard' | 'visualization' | 'projects' | 'data' | 'semanticization' | 'chat' | 'sync' | 'push' | 'settings'
 type AppProps = {
@@ -424,14 +431,123 @@ type ChatSourceSummary = {
   documents: number
 }
 
-const chatSourceSummaryOf = (sources: ChatMessage['sources']): ChatSourceSummary =>
-  (sources ?? []).reduce<ChatSourceSummary>((summary, source) => {
+const chatSourceSummaryOf = (sources: ChatMessage['sources']): ChatSourceSummary => {
+  const documentIds = new Set<string>()
+  let documentsWithoutId = 0
+  let records = 0
+  for (const source of sources ?? []) {
     // Legacy persisted sources omitted sourceType and were always data-center
     // records. Treat them as records so an old session never loses its count.
-    if (source.sourceType === 'document') summary.documents += 1
-    else summary.records += 1
-    return summary
-  }, { records: 0, documents: 0 })
+    if (source.sourceType !== 'document') {
+      records += 1
+      continue
+    }
+    // Several retrieved chunks may belong to one document. Count the document
+    // once in the summary while leaving each chunk visible in the source list.
+    const documentId = source.documentId?.trim()
+    if (documentId) documentIds.add(documentId)
+    else documentsWithoutId += 1
+  }
+  return {
+    records,
+    documents: documentIds.size + documentsWithoutId
+  }
+}
+
+const assistantMessageMarkdownOf = (message: ChatMessage): string =>
+  stripRedundantAssistantCitationSections(
+    restoreLegacyAssistantMarkdown(message.content),
+    Boolean(message.sources?.length)
+  )
+
+type KnowledgeCitationTarget = {
+  documentId: string
+  chunkId?: string
+}
+
+const knowledgeCitationTargetOf = (href?: string): KnowledgeCitationTarget | null => {
+  const normalizedHref = href?.trim()
+  if (!normalizedHref?.startsWith('#')) return null
+  try {
+    const params = new URLSearchParams(normalizedHref.slice(1))
+    if (!params.has('knowledge-document')) return null
+    const documentId = params.get('knowledge-document')?.trim()
+    if (!documentId) return null
+    const chunkId = params.get('chunk')?.trim()
+    return chunkId ? { documentId, chunkId } : { documentId }
+  } catch {
+    return null
+  }
+}
+
+const knowledgeSourceLocationLabelOf = (source: NonNullable<ChatMessage['sources']>[number]): string => {
+  if (typeof source.pageNumber === 'number' && Number.isFinite(source.pageNumber) && source.pageNumber > 0) {
+    return `第${source.pageNumber}页`
+  }
+  const sheetName = source.sheetName?.trim()
+  if (sheetName) return `工作表「${sheetName}」`
+  const location = source.location?.trim()
+  if (location && !/^(?:文档)?正文(?:内容)?$|^(?:分块|chunk)(?:\s*[#：:.-]?\s*\d+)?$/i.test(location)) return location
+  const snippet = source.snippet?.trim().replace(/\s+/g, ' ')
+  if (snippet) {
+    const shortened = snippet.length > 44 ? `${snippet.slice(0, 44)}…` : snippet
+    return `正文「${shortened}」`
+  }
+  return '引用位置'
+}
+
+type AssistantMarkdownLinkProps = React.ComponentPropsWithoutRef<'a'> & {
+  node?: unknown
+}
+
+const safeMarkdownHrefOf = (href?: string): string | undefined => {
+  const normalizedHref = href?.trim()
+  if (!normalizedHref) return undefined
+  // ReactMarkdown already applies its URL transform; keep an explicit allow
+  // list here so custom rendering never turns model output into an executable
+  // javascript/data/vbscript URL.
+  if (/[\u0000-\u001F\u007F]/.test(normalizedHref)) return undefined
+  if (/^[a-z][a-z\d+.-]*:/i.test(normalizedHref) && !/^(?:https?:|mailto:|tel):/i.test(normalizedHref)) {
+    return undefined
+  }
+  return normalizedHref
+}
+
+const renderAssistantMarkdownLink = (
+  { href, children, node: _node, ...props }: AssistantMarkdownLinkProps,
+  openKnowledgeDetail: (documentId: string, chunkId?: string) => Promise<void>
+): React.JSX.Element => {
+  const citation = knowledgeCitationTargetOf(href)
+  if (citation) {
+    return (
+      <button
+        type="button"
+        className="chat-knowledge-citation-link"
+        title="打开知识库引用"
+        aria-label="打开知识库引用"
+        onClick={() => void openKnowledgeDetail(citation.documentId, citation.chunkId)}
+      >
+        {children}
+      </button>
+    )
+  }
+
+  const safeHref = safeMarkdownHrefOf(href)
+  if (!safeHref) {
+    return <span className="chat-markdown-link-blocked">{children}</span>
+  }
+  const isExternal = /^(?:https?:|\/\/)/i.test(safeHref)
+  return (
+    <a
+      {...props}
+      href={safeHref}
+      target={isExternal ? '_blank' : props.target}
+      rel={isExternal ? 'noreferrer noopener' : props.rel}
+    >
+      {children}
+    </a>
+  )
+}
 
 const appTableScrollY = 'min(560px, max(260px, calc(100vh - 300px)))'
 const compactTableScrollY = 'min(360px, max(180px, calc(100vh - 420px)))'
@@ -1897,7 +2013,7 @@ const semanticTaskModeLabelOf = (mode: SemanticTaskMode): string => (
 const semanticTaskModeDescriptionOf = (mode: SemanticTaskMode): string => (
   mode === 'standard'
     ? '标准模式：单次结构化提取，校验失败才定向修复'
-    : '严格模式：独立复核，仅分歧/低置信时裁决'
+    : '严格模式：启用深度思考，独立复核，仅分歧/低置信时裁决'
 )
 
 const semanticTaskActiveStatuses: SemanticizationTaskStatus[] = [
@@ -1916,7 +2032,7 @@ const readSemanticDeepThinking = (): boolean => {
     const raw = window.localStorage.getItem(semanticTaskThinkingStorageKey)
     return raw === null ? false : raw !== 'false'
   } catch {
-    return true
+    return false
   }
 }
 
@@ -1934,6 +2050,12 @@ const semanticTaskCurrentUid = (task: SemanticizationTaskSnapshot | null): strin
 }
 
 const semanticTaskCurrentName = (task: SemanticizationTaskSnapshot | null): string => {
+  if (task) {
+    const activeCount = semanticTaskActiveCountOf(task)
+    if (activeCount !== undefined && activeCount > 1) {
+      return `${semanticTaskFocusNameOf(task)} 等 ${activeCount} 条`
+    }
+  }
   if (task?.currentRecord) return task.currentRecord.name || task.currentRecord.itemId
   if (task?.status === 'paused') return '等待恢复任务'
   if (task?.status === 'completed' || task?.status === 'stopped') return '无正在处理的记录'
@@ -1943,6 +2065,82 @@ const semanticTaskCurrentName = (task: SemanticizationTaskSnapshot | null): stri
 const semanticTaskCurrentIndex = (task: SemanticizationTaskSnapshot): number => {
   if (task.currentRecord) return task.currentRecord.index
   return Math.min(task.total || 1, task.completed + 1)
+}
+
+const semanticTaskFiniteNumberOf = (value: number | undefined): number | undefined => (
+  typeof value === 'number' && Number.isFinite(value) ? value : undefined
+)
+
+const semanticTaskPositiveIntegerOf = (value: number | undefined): number | undefined => {
+  const finite = semanticTaskFiniteNumberOf(value)
+  return finite !== undefined && finite > 0 ? Math.floor(finite) : undefined
+}
+
+const semanticTaskActiveCountOf = (task: SemanticizationTaskSnapshot): number | undefined => {
+  const activeCount = semanticTaskFiniteNumberOf(task.activeCount)
+  if (activeCount !== undefined && activeCount >= 0) return Math.floor(activeCount)
+  return Array.isArray(task.activeRecords) ? task.activeRecords.length : undefined
+}
+
+const semanticTaskConcurrencyLimitOf = (task: SemanticizationTaskSnapshot): number | undefined => (
+  semanticTaskPositiveIntegerOf(task.maxConcurrency)
+)
+
+const semanticTaskFocusNameOf = (task: SemanticizationTaskSnapshot): string => (
+  task.currentRecord?.name
+    || task.currentRecord?.itemId
+    || task.activeRecords?.[0]?.name
+    || task.activeRecords?.[0]?.itemId
+    || '当前记录'
+)
+
+const semanticTaskCurrentIndexLabelOf = (task: SemanticizationTaskSnapshot): string => {
+  const activeCount = semanticTaskActiveCountOf(task)
+  if (activeCount !== undefined && activeCount > 1) {
+    const maxConcurrency = semanticTaskConcurrencyLimitOf(task)
+    return maxConcurrency !== undefined
+      ? `并行 ${activeCount} / ${maxConcurrency}`
+      : `并行 ${activeCount}`
+  }
+  return task.total > 0 ? `${semanticTaskCurrentIndex(task)} / ${task.total}` : '—'
+}
+
+const semanticTaskThroughputLabelOf = (value: number | undefined): string => {
+  const throughput = semanticTaskFiniteNumberOf(value)
+  return throughput !== undefined && throughput >= 0.1
+    ? `${throughput.toFixed(1)} 条/分`
+    : '计算中'
+}
+
+const semanticTaskEtaLabelOf = (value: number | undefined): string => {
+  const remainingMs = semanticTaskFiniteNumberOf(value)
+  if (remainingMs === undefined || remainingMs < 0) return '计算中'
+  if (remainingMs < 60_000) return `约${Math.max(0, Math.round(remainingMs / 1_000))}秒`
+  const minutes = remainingMs / 60_000
+  if (minutes < 60) return `约${Math.max(1, Math.round(minutes))}分钟`
+  const hours = remainingMs / 3_600_000
+  const hourLabel = hours < 10
+    ? hours.toFixed(1).replace(/\.0$/u, '')
+    : String(Math.round(hours))
+  return `约${hourLabel}小时`
+}
+
+const semanticTaskExecutionPolicyHint = '在线模型自动并发处理，本地模型保持单路保护'
+
+const semanticTaskDisplayMessageOf = (task: SemanticizationTaskSnapshot): string => {
+  const rawMessage = task.message?.trim()
+  const hasLegacySequentialCopy = Boolean(rawMessage && /逐条|按记录/u.test(rawMessage))
+  const baseMessage = !rawMessage || hasLegacySequentialCopy
+    ? '任务将按所选质量模式自适应处理'
+    : rawMessage
+  const activeCount = semanticTaskActiveCountOf(task)
+  const activePrefix = activeCount !== undefined && activeCount > 1
+    ? `并行处理中 ${activeCount} 条 · `
+    : ''
+  const policySuffix = task.status === 'queued' || task.total === 0 || hasLegacySequentialCopy
+    ? `；${semanticTaskExecutionPolicyHint}`
+    : ''
+  return `${activePrefix}${baseMessage}${policySuffix}`
 }
 
 type RequirementMatchProgress = AgentMatchProgress
@@ -2194,6 +2392,108 @@ const auditNumberOf = (value: unknown): number | undefined => {
   const number = typeof value === 'number' ? value : Number(value)
   return Number.isFinite(number) ? number : undefined
 }
+
+const semanticAuditTraceSignatureOf = (
+  task: Pick<SemanticizationTaskSnapshot, 'analysisTrace'>
+): string => {
+  const trace = task.analysisTrace
+  if (!trace) return ''
+  const events = Array.isArray(trace.events) ? trace.events : []
+  const lastEvent = events.length ? events[events.length - 1] : undefined
+  const stageSignature = semanticAuditStageDefinitions
+    .map(({ key }) => {
+      if (key === 'queued') return ''
+      const stage = trace.stages?.[key]
+      return [
+        key,
+        stage?.status ?? '',
+        stage?.attempts ?? '',
+        stage?.startedAt ?? '',
+        stage?.completedAt ?? '',
+        stage?.summary ?? '',
+        Object.keys(stage?.fields ?? {}).length
+      ].join(':')
+    })
+    .join('|')
+  return JSON.stringify([
+    trace.recordUid,
+    trace.outcome ?? '',
+    trace.completedAt ?? '',
+    events.length,
+    lastEvent?.id ?? '',
+    lastEvent?.timestamp ?? '',
+    lastEvent?.kind ?? '',
+    stageSignature
+  ])
+}
+
+const semanticAuditTaskSignatureOf = (
+  task: SemanticizationTaskSnapshot,
+  traceSignature = semanticAuditTraceSignatureOf(task)
+): string => JSON.stringify([
+  task.jobId,
+  task.status,
+  task.currentStage,
+  task.total,
+  task.succeeded,
+  task.failed,
+  task.message,
+  task.deepThinking,
+  task.qualityMode,
+  task.currentRecord?.uid ?? '',
+  task.currentRecord?.index ?? '',
+  (Array.isArray(task.recentItems) ? task.recentItems : []).map((item) => [
+    item.uid,
+    item.itemId,
+    item.name,
+    item.status,
+    item.error ?? '',
+    item.durationMs ?? ''
+  ]),
+  traceSignature
+])
+
+const semanticTaskSnapshotSignatureOf = (
+  snapshot: SemanticizationTaskSnapshot
+): string => JSON.stringify([
+  snapshot.jobId,
+  snapshot.status,
+  snapshot.currentStage,
+  snapshot.total,
+  snapshot.available,
+  snapshot.completed,
+  snapshot.succeeded,
+  snapshot.failed,
+  snapshot.remaining,
+  snapshot.startedAt,
+  snapshot.updatedAt,
+  snapshot.message,
+  snapshot.deepThinking,
+  snapshot.qualityMode,
+  snapshot.maxConcurrency,
+  snapshot.activeCount,
+  snapshot.elapsedMs,
+  snapshot.recordsPerMinute,
+  snapshot.estimatedRemainingMs,
+  snapshot.currentRecord,
+  (Array.isArray(snapshot.activeRecords) ? snapshot.activeRecords : []).map((record) => [
+    record.uid,
+    record.itemId,
+    record.name,
+    record.index,
+    record.stage,
+    record.startedAt
+  ]),
+  (Array.isArray(snapshot.recentItems) ? snapshot.recentItems : []).map((item) => [
+    item.uid,
+    item.itemId,
+    item.name,
+    item.status,
+    item.error ?? '',
+    item.durationMs ?? ''
+  ]),
+  semanticAuditTraceSignatureOf(snapshot)
+])
 
 const plainAuditText = (value: unknown): string => auditTextOf(value)
   .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, ' ')
@@ -2550,16 +2850,32 @@ const persistedSemanticAuditTask = (detail: RecordDetail): SemanticizationTaskSn
   }
 }
 
-function SemanticAuditPanel({
-  task,
-  records = [],
-  history = []
-}: {
+type SemanticAuditPanelProps = {
   task: SemanticizationTaskSnapshot
   records?: RecordRow[]
   history?: SemanticAuditEventView[]
-}): React.JSX.Element {
-  const view = buildSemanticAuditView(task, records, history)
+}
+
+const semanticAuditPanelPropsEqual = (
+  previous: SemanticAuditPanelProps,
+  next: SemanticAuditPanelProps
+): boolean => (
+  semanticAuditTaskSignatureOf(previous.task) === semanticAuditTaskSignatureOf(next.task) &&
+  previous.records === next.records &&
+  previous.history === next.history
+)
+
+const SemanticAuditPanel = React.memo(function SemanticAuditPanel({
+  task,
+  records = [],
+  history = []
+}: SemanticAuditPanelProps): React.JSX.Element {
+  const traceSignature = semanticAuditTraceSignatureOf(task)
+  const taskSignature = semanticAuditTaskSignatureOf(task, traceSignature)
+  const view = useMemo(
+    () => buildSemanticAuditView(task, records, history),
+    [history, records, taskSignature, traceSignature]
+  )
   const taskMode = semanticTaskModeOf(task)
   const adjudicationStage = view.timeline.find((stage) => stage.key === 'adjudication')
   const hasSemanticResult = view.finalFields.length > 0 || Boolean(view.finalSummary)
@@ -2683,7 +2999,7 @@ function SemanticAuditPanel({
       </div>
     </section>
   )
-}
+}, semanticAuditPanelPropsEqual)
 
 const featureNavigationItems: Array<{
   key: Exclude<PageKey, 'settings'>
@@ -2844,6 +3160,23 @@ const formatDate = (value?: string): string => {
   if (!value) return '—'
   const date = new Date(value)
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString('zh-CN')
+}
+
+type AssistantRunHistoryWithTokenMetrics = AssistantRunHistory & {
+  inputTokenCount?: number
+  outputTokenCount?: number
+  tokensPerSecond?: number
+}
+
+const formatDurationSeconds = (milliseconds?: number): string => {
+  if (typeof milliseconds !== 'number' || !Number.isFinite(milliseconds)) return '—'
+  const seconds = Math.round((milliseconds / 1000) * 10) / 10
+  return `${new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 1 }).format(seconds)} 秒`
+}
+
+const formatRunMetric = (value: number | undefined, maximumFractionDigits = 0): string => {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '—'
+  return new Intl.NumberFormat('zh-CN', { maximumFractionDigits }).format(value)
 }
 
 const recordMaintenanceOperationLabels: Record<RecordMaintenanceOperation, string> = {
@@ -5040,6 +5373,8 @@ function SemanticizationPage({
   const [semanticDeepThinking, setSemanticDeepThinking] = useState<boolean>(() => readSemanticDeepThinking())
   const [semanticControlPending, setSemanticControlPending] = useState<SemanticizationControlAction | null>(null)
   const [semanticAuditHistory, setSemanticAuditHistory] = useState<SemanticAuditEventView[]>([])
+  const semanticTaskSnapshotSignatureRef = useRef<string | null>(null)
+  const semanticTerminalRefreshJobRef = useRef<string | null>(null)
 
   const semanticTaskIsActive = Boolean(
     semanticTask && semanticTaskActiveStatuses.includes(semanticTask.status)
@@ -5078,7 +5413,8 @@ function SemanticizationPage({
 
   const updateRecordsFromSemanticTask = useCallback((snapshot: SemanticizationTaskSnapshot): void => {
     const updates = new Map<string, { status: RequirementSemanticizationStatus; error: string }>()
-    snapshot.recentItems.forEach((item) => {
+    const recentItems = Array.isArray(snapshot.recentItems) ? snapshot.recentItems : []
+    recentItems.forEach((item) => {
       const uid = item.uid.trim()
       if (!uid) return
       updates.set(uid, item.status === 'failed'
@@ -5090,29 +5426,45 @@ function SemanticizationPage({
       updates.set(currentUid, { status: 'processing', error: '' })
     }
     if (!updates.size) return
-    setRecords((current) => current.map((record) => {
-      const update = updates.get(record.uid)
-      if (!update) return record
-      return {
-        ...record,
-        semanticStatus: update.status,
-        semanticStatusReason: update.status === 'processing'
+    setRecords((current) => {
+      let changed = false
+      const next = current.map((record) => {
+        const update = updates.get(record.uid)
+        if (!update) return record
+        const semanticStatusReason: RecordRow['semanticStatusReason'] = update.status === 'processing'
           ? 'processing'
           : update.status === 'ready'
             ? 'ready'
-            : 'failed',
-        semanticError: update.error
-      }
-    }))
+            : 'failed'
+        if (record.semanticStatus === update.status &&
+          record.semanticStatusReason === semanticStatusReason &&
+          (record.semanticError ?? '') === update.error) {
+          return record
+        }
+        changed = true
+        return {
+          ...record,
+          semanticStatus: update.status,
+          semanticStatusReason,
+          semanticError: update.error
+        }
+      })
+      return changed ? next : current
+    })
   }, [])
 
-  const applySemanticTaskSnapshot = useCallback((snapshot: SemanticizationTaskSnapshot): void => {
+  const applySemanticTaskSnapshot = useCallback((snapshot: SemanticizationTaskSnapshot): boolean => {
+    const signature = semanticTaskSnapshotSignatureOf(snapshot)
+    if (semanticTaskSnapshotSignatureRef.current === signature) return false
+    semanticTaskSnapshotSignatureRef.current = signature
     setSemanticTask(snapshot)
-    const messageText = snapshot.message || '任务状态已更新'
+    const messageText = semanticTaskDisplayMessageOf(snapshot)
     const isRetry = /重试|retry/i.test(messageText)
     const isValidation = snapshot.currentStage === 'persisting' || /校验|验证|valid/i.test(messageText)
+    const traceEvents = Array.isArray(snapshot.analysisTrace?.events) ? snapshot.analysisTrace.events : []
+    const lastTraceEvent = traceEvents.length ? traceEvents[traceEvents.length - 1] : undefined
     const event: SemanticAuditEventView = {
-      id: `${snapshot.jobId}-${snapshot.updatedAt}-${snapshot.currentStage}-${messageText}`,
+      id: `${snapshot.jobId}-${lastTraceEvent?.id ?? `${snapshot.status}-${snapshot.currentStage}`}-${messageText}`,
       kind: isRetry ? 'retry' : isValidation ? 'validation' : 'stage',
       status: snapshot.status === 'completed'
         ? 'success'
@@ -5131,12 +5483,14 @@ function SemanticizationPage({
       ? current
       : [...current, event].slice(-32))
     updateRecordsFromSemanticTask(snapshot)
+    return true
   }, [updateRecordsFromSemanticTask])
 
   const hydrateSemanticTask = useCallback(async (): Promise<void> => {
     try {
       const snapshot = await window.visslm.getRequirementSemanticizationTask()
       if (snapshot === null) {
+        semanticTaskSnapshotSignatureRef.current = null
         setSemanticTask(null)
         return
       }
@@ -5151,12 +5505,13 @@ function SemanticizationPage({
   }, [hydrateSemanticTask, refreshKey])
 
   useEffect(() => window.visslm.onRequirementSemanticizationProgress((snapshot) => {
-    applySemanticTaskSnapshot(snapshot)
-    if (snapshot.status === 'completed' || snapshot.status === 'stopped') {
+    const applied = applySemanticTaskSnapshot(snapshot)
+    if (applied && (snapshot.status === 'completed' || snapshot.status === 'stopped') &&
+      semanticTerminalRefreshJobRef.current !== snapshot.jobId) {
+      semanticTerminalRefreshJobRef.current = snapshot.jobId
       void load()
-      onDataChanged()
     }
-  }), [applySemanticTaskSnapshot, load, onDataChanged])
+  }), [applySemanticTaskSnapshot, load])
 
   const startSemanticization = async (
     input: SemanticizationStartInput,
@@ -5185,7 +5540,7 @@ function SemanticizationPage({
       })
       if (result.accepted > 0) {
         const timestamp = new Date().toISOString()
-        setSemanticTask({
+        const optimisticTask: SemanticizationTaskSnapshot = {
           jobId: result.jobId,
           status: 'queued',
           currentStage: 'queued',
@@ -5197,11 +5552,13 @@ function SemanticizationPage({
           remaining: result.accepted,
           startedAt: timestamp,
           updatedAt: timestamp,
-          message: `已提交 ${result.accepted} 条记录，任务将按所选模式自适应处理`,
+          message: `已提交 ${result.accepted} 条记录；${semanticTaskExecutionPolicyHint}，任务将按所选质量模式自适应处理`,
           recentItems: [],
           deepThinking: semanticDeepThinking,
           qualityMode: semanticDeepThinking ? 'strict' : 'standard'
-        })
+        }
+        semanticTaskSnapshotSignatureRef.current = semanticTaskSnapshotSignatureOf(optimisticTask)
+        setSemanticTask(optimisticTask)
         message.success(`已提交 ${result.accepted} 条记录进行 AI 语义化`)
       } else if (result.skipped > 0) {
         message.info(`没有新的任务，已跳过 ${result.skipped} 条记录`)
@@ -5229,7 +5586,7 @@ function SemanticizationPage({
       if (next) applySemanticTaskSnapshot(next)
       if (action === 'pause') message.info('已请求暂停，当前 AI 阶段完成后生效')
       if (action === 'resume') message.success('已恢复语义化任务')
-      if (action === 'stop') message.info('已请求停止，当前 AI 阶段完成后安全退出')
+      if (action === 'stop') message.info('已请求停止，正在取消在途 AI 请求并安全退出')
     } catch (error) {
       message.error(error instanceof Error ? error.message : String(error))
     } finally {
@@ -5260,6 +5617,14 @@ function SemanticizationPage({
   const taskCanStop = Boolean(
     semanticTask && semanticTaskActiveStatuses.includes(semanticTask.status) && semanticTask.status !== 'stopping'
   )
+  const detailAuditTask = useMemo(
+    () => detail ? persistedSemanticAuditTask(detail) : null,
+    [detail]
+  )
+  const detailAuditRecords = useMemo(
+    () => detail ? [detail] : [],
+    [detail]
+  )
 
   return (
     <div className="semanticization-page page-stack">
@@ -5267,7 +5632,7 @@ function SemanticizationPage({
           <div className="semanticization-card-heading">
             <div>
               <Text strong>任务配置与数据范围</Text>
-              <Text type="secondary">批量任务会自动处理当前全部未就绪记录，并根据所选模式自适应执行；模型能力由系统配置提供。</Text>
+              <Text type="secondary">批量任务会自动处理当前全部未就绪记录；在线模型自动并发处理，本地模型保持单路保护，并根据所选质量模式自适应执行。</Text>
             </div>
             <Button icon={<SettingOutlined />} onClick={onOpenSettings}>模型设置</Button>
           </div>
@@ -5335,7 +5700,7 @@ function SemanticizationPage({
               </span>
             </div>
             <Text type="secondary" className="asset-semantic-task-message" aria-live="polite">
-              {semanticTask.message || '任务将按所选模式自适应处理'}
+              {semanticTaskDisplayMessageOf(semanticTask)}
             </Text>
           </div>
           <div className="asset-semantic-task-controls">
@@ -5346,8 +5711,16 @@ function SemanticizationPage({
             </div>
           </div>
           <div className="asset-semantic-task-current">
-            <div><span className="asset-semantic-task-label">当前记录</span><strong title={semanticTaskCurrentName(semanticTask)}>{semanticTaskCurrentName(semanticTask)}</strong><span className="asset-semantic-task-index">{semanticTask.total > 0 ? `${semanticTaskCurrentIndex(semanticTask)} / ${semanticTask.total}` : '—'}</span></div>
-            <div><span className="asset-semantic-task-label">当前阶段</span><strong>{semanticTaskStageLabels[semanticTask.currentStage]} · {semanticTaskModeLabelOf(semanticTaskModeOf(semanticTask))}</strong></div>
+            <div><span className="asset-semantic-task-label">当前记录</span><strong title={semanticTaskCurrentName(semanticTask)}>{semanticTaskCurrentName(semanticTask)}</strong><span className="asset-semantic-task-index">{semanticTaskCurrentIndexLabelOf(semanticTask)}</span></div>
+            <div>
+              <div className="asset-semantic-task-stage-copy">
+                <span className="asset-semantic-task-label">当前阶段</span>
+                <strong>{semanticTaskStageLabels[semanticTask.currentStage]} · {semanticTaskModeLabelOf(semanticTaskModeOf(semanticTask))}</strong>
+              </div>
+              <span className="asset-semantic-task-performance" aria-label={`吞吐 ${semanticTaskThroughputLabelOf(semanticTask.recordsPerMinute)}，预计剩余 ${semanticTaskEtaLabelOf(semanticTask.estimatedRemainingMs)}`}>
+                吞吐 {semanticTaskThroughputLabelOf(semanticTask.recordsPerMinute)} · ETA {semanticTaskEtaLabelOf(semanticTask.estimatedRemainingMs)}
+              </span>
+            </div>
           </div>
           <Tooltip title={`已完成 ${semanticTask.completed} / ${semanticTask.total} 条`}>
             <Progress percent={taskPercent} showInfo={false} status={semanticTask.status === 'completed' ? semanticTask.failed > 0 ? 'exception' : 'success' : semanticTask.status === 'stopped' ? 'exception' : 'active'} aria-label={`任务进度 ${taskPercent}%`} />
@@ -5357,19 +5730,21 @@ function SemanticizationPage({
             <span className="is-success"><strong>{semanticTask.succeeded}</strong><small>成功</small></span>
             <span className="is-error"><strong>{semanticTask.failed}</strong><small>失败</small></span>
             <span><strong>{semanticTask.remaining}</strong><small>剩余</small></span>
-            <span><strong>{semanticTask.available}</strong><small>可用</small></span>
+            {semanticTaskConcurrencyLimitOf(semanticTask) !== undefined
+              ? <span><strong>{semanticTaskConcurrencyLimitOf(semanticTask)}</strong><small>并行</small></span>
+              : <span><strong>{semanticTask.available}</strong><small>可用</small></span>}
           </div>
           <div className="asset-semantic-task-recent">
             <div className="asset-semantic-task-recent-heading"><span>最近记录结果</span><Text type="secondary">按最新进度更新</Text></div>
-            {semanticTask.recentItems.length ? <ul>{semanticTask.recentItems.map((item, index) => {
+            {semanticTask.recentItems.length ? <ul>{semanticTask.recentItems.map((item) => {
               const failed = item.status === 'failed'
-              return <li key={`${item.uid}-${index}`}><span className={`asset-semantic-recent-status ${failed ? 'is-error' : 'is-success'}`}>{failed ? <ExclamationCircleOutlined /> : <CheckCircleOutlined />}{failed ? '失败' : '成功'}</span><span className="asset-semantic-recent-name" title={item.name || item.itemId || item.uid}>{item.name || item.itemId || item.uid}</span>{typeof item.durationMs === 'number' && <span className="asset-semantic-recent-duration">{(item.durationMs / 1000).toFixed(1)} 秒</span>}{item.error && <span className="asset-semantic-recent-message" title={item.error}>{item.error}</span>}</li>
-            })}</ul> : <span className="asset-semantic-task-empty">任务完成一条记录后，这里会显示结果和错误信息。</span>}
+              return <li key={item.uid}><span className={`asset-semantic-recent-status ${failed ? 'is-error' : 'is-success'}`}>{failed ? <ExclamationCircleOutlined /> : <CheckCircleOutlined />}{failed ? '失败' : '成功'}</span><span className="asset-semantic-recent-name" title={item.name || item.itemId || item.uid}>{item.name || item.itemId || item.uid}</span>{typeof item.durationMs === 'number' && <span className="asset-semantic-recent-duration">{(item.durationMs / 1000).toFixed(1)} 秒</span>}{item.error && <span className="asset-semantic-recent-message" title={item.error}>{item.error}</span>}</li>
+            })}</ul> : <span className="asset-semantic-task-empty">任务完成记录后，这里会显示结果和错误信息。</span>}
           </div>
           <SemanticAuditPanel task={semanticTask} records={records} history={semanticAuditHistory} />
         </div>
       ) : (
-        <Card className="semanticization-empty-task-card"><Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="尚未启动语义化任务；请从下方选择数据范围。" /></Card>
+        <Card className="semanticization-empty-task-card"><Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={`尚未启动语义化任务；${semanticTaskExecutionPolicyHint}。请从下方选择数据范围。`} /></Card>
       )}
 
       <Card className="data-workbench-card semanticization-records-card">
@@ -5424,8 +5799,8 @@ function SemanticizationPage({
             <Descriptions.Item label="最后更新">{formatDate(detail.semanticUpdatedAt || detail.lastModifyTime)}</Descriptions.Item>
           </Descriptions>
           <Divider titlePlacement="start">AI 分析审计轨迹</Divider>
-          {detail.semanticAnalysisTrace
-            ? <SemanticAuditPanel task={persistedSemanticAuditTask(detail)!} records={[detail]} />
+          {detailAuditTask
+            ? <SemanticAuditPanel task={detailAuditTask} records={detailAuditRecords} />
             : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="当前记录尚无语义化审计轨迹" />}
           <Divider titlePlacement="start">语义化原文</Divider>
           <RichDescription html={detail.description} images={[]} />
@@ -5447,6 +5822,19 @@ const knowledgeFileIcon = (extension: string): React.JSX.Element => {
   if (extension === '.docx') return <FileWordOutlined />
   if (extension === '.xlsx' || extension === '.xls') return <FileExcelOutlined />
   return <FileTextOutlined />
+}
+
+const genericKnowledgeChunkLocationPattern = /^(?:文档)?正文(?:内容)?$|^(?:分块|chunk)(?:\s*[#：:.-]?\s*\d+)?$/i
+
+const knowledgeChunkLocationLabelOf = (chunk: KnowledgeChunk): string => {
+  if (typeof chunk.pageNumber === 'number' && Number.isFinite(chunk.pageNumber) && chunk.pageNumber > 0) {
+    return `第${chunk.pageNumber}页`
+  }
+  const sheetName = chunk.sheetName?.trim()
+  if (sheetName) return `工作表「${sheetName}」`
+  const location = chunk.location?.trim()
+  if (location && !genericKnowledgeChunkLocationPattern.test(location)) return location
+  return '正文位置'
 }
 
 const formatBytes = (bytes: number): string => {
@@ -5471,8 +5859,15 @@ function KnowledgeBasePage({ refreshKey }: { refreshKey: number }): React.JSX.El
   const [tag, setTag] = useState('')
   const [progress, setProgress] = useState<KnowledgeIndexProgress | null>(null)
   const [detail, setDetail] = useState<KnowledgeDocumentDetail | null>(null)
+  const [detailOpen, setDetailOpen] = useState(false)
   const [detailLoading, setDetailLoading] = useState(false)
+  const [detailPreview, setDetailPreview] = useState<KnowledgeDocumentPreview | null>(null)
+  const [detailPreviewError, setDetailPreviewError] = useState<string | null>(null)
+  const [detailTab, setDetailTab] = useState<'preview' | 'index'>('preview')
+  const [chunkSearch, setChunkSearch] = useState('')
+  const [chunkPage, setChunkPage] = useState(1)
   const [tagDraft, setTagDraft] = useState('')
+  const detailRequestRef = useRef(0)
 
   const load = useCallback(async (): Promise<void> => {
     setLoading(true)
@@ -5519,14 +5914,55 @@ function KnowledgeBasePage({ refreshKey }: { refreshKey: number }): React.JSX.El
   }
 
   const openDetail = async (id: string): Promise<void> => {
+    const requestId = detailRequestRef.current + 1
+    detailRequestRef.current = requestId
+    setDetailOpen(true)
     setDetailLoading(true)
+    setDetail(null)
+    setDetailPreview(null)
+    setDetailPreviewError(null)
+    setDetailTab('preview')
+    setChunkSearch('')
+    setChunkPage(1)
+    setTagDraft('')
     try {
-      const result = await window.visslm.getKnowledgeDocument(id)
+      const [detailResult, previewResult] = await Promise.allSettled([
+        window.visslm.getKnowledgeDocument(id),
+        window.visslm.getKnowledgeDocumentPreview(id)
+      ])
+      if (requestId !== detailRequestRef.current) return
+      const preview = previewResult.status === 'fulfilled' ? previewResult.value : null
+      const result = preview?.document ?? (detailResult.status === 'fulfilled' ? detailResult.value : null)
       setDetail(result)
+      setDetailPreview(preview)
       setTagDraft(result?.tags.join(', ') ?? '')
+      if (preview?.errorMessage) {
+        setDetailPreviewError(preview.errorMessage)
+      } else if (!preview) {
+        const previewFailure = previewResult.status === 'rejected'
+          ? previewResult.reason instanceof Error ? previewResult.reason.message : String(previewResult.reason)
+          : '原始文档预览内容不可用'
+        setDetailPreviewError(result
+          ? `在线预览暂不可用，已显示索引正文（${previewFailure}）`
+          : `知识库文档加载失败：${previewFailure}`)
+      }
+      if (!result) message.warning('知识库文档不存在或已被删除')
     } finally {
-      setDetailLoading(false)
+      if (requestId === detailRequestRef.current) setDetailLoading(false)
     }
+  }
+
+  const closeDetail = (): void => {
+    detailRequestRef.current += 1
+    setDetailOpen(false)
+    setDetailLoading(false)
+    setDetail(null)
+    setDetailPreview(null)
+    setDetailPreviewError(null)
+    setDetailTab('preview')
+    setChunkSearch('')
+    setChunkPage(1)
+    setTagDraft('')
   }
 
   const retry = async (id: string): Promise<void> => {
@@ -5549,7 +5985,7 @@ function KnowledgeBasePage({ refreshKey }: { refreshKey: number }): React.JSX.El
       onOk: async () => {
         const result = await window.visslm.deleteKnowledgeDocument(document.id)
         result.ok ? message.success(result.message) : message.error(result.message)
-        if (detail?.id === document.id) setDetail(null)
+        if (detail?.id === document.id) closeDetail()
         await load()
       }
     })
@@ -5583,10 +6019,30 @@ function KnowledgeBasePage({ refreshKey }: { refreshKey: number }): React.JSX.El
     )
     if (result) {
       setDetail({ ...detail, tags: result.tags, updatedAt: result.updatedAt })
+      setDetailPreview((current) => current && current.document.id === detail.id
+        ? { ...current, document: { ...current.document, tags: result.tags, updatedAt: result.updatedAt } }
+        : current)
       message.success('标签已保存')
       await load()
     }
   }
+
+  const filteredDetailChunks = useMemo(() => {
+    const chunks = detail?.chunks ?? []
+    const keyword = chunkSearch.trim().toLocaleLowerCase()
+    if (!keyword) return chunks
+    return chunks.filter((chunk) => [
+      chunk.content,
+      chunk.location,
+      chunk.sheetName,
+      typeof chunk.pageNumber === 'number' ? `第${chunk.pageNumber}页` : ''
+    ].some((value) => value?.toLocaleLowerCase().includes(keyword)))
+  }, [chunkSearch, detail])
+  const chunkPageSize = 20
+  const pagedDetailChunks = useMemo(() => {
+    const start = (chunkPage - 1) * chunkPageSize
+    return filteredDetailChunks.slice(start, start + chunkPageSize)
+  }, [chunkPage, filteredDetailChunks])
 
   return (
     <div className="knowledge-page page-stack">
@@ -5725,6 +6181,7 @@ function KnowledgeBasePage({ refreshKey }: { refreshKey: number }): React.JSX.El
       </Card>
       <Drawer
         className="knowledge-detail-drawer"
+        rootClassName="knowledge-detail-preview-drawer"
         title={detail ? (
           <div className="drawer-context-title">
             <BulbOutlined />
@@ -5732,39 +6189,129 @@ function KnowledgeBasePage({ refreshKey }: { refreshKey: number }): React.JSX.El
             <strong title={detail.fileName}>{detail.fileName}</strong>
           </div>
         ) : '知识库文档'}
-        size={720}
-        open={Boolean(detail)}
-        onClose={() => setDetail(null)}
+        size={960}
+        open={detailOpen}
+        onClose={closeDetail}
+        destroyOnHidden
       >
-        <Spin spinning={detailLoading}>
-          {detail && (
-            <div className="knowledge-detail-stack">
-              <Descriptions bordered size="small" column={2}>
-                <Descriptions.Item label="格式">{detail.extension.toUpperCase()}</Descriptions.Item>
-                <Descriptions.Item label="大小">{formatBytes(detail.byteSize)}</Descriptions.Item>
-                <Descriptions.Item label="状态"><Tag color={knowledgeStatusMeta[detail.status].color}>{knowledgeStatusMeta[detail.status].label}</Tag></Descriptions.Item>
-                <Descriptions.Item label="页数/工作表">{detail.pageCount || '-'}</Descriptions.Item>
-                <Descriptions.Item label="SHA-256" span={2}><Text copyable ellipsis>{detail.sha256}</Text></Descriptions.Item>
-              </Descriptions>
-              {detail.errorMessage && <Alert type="error" showIcon title={detail.errorMessage} />}
-              <div className="knowledge-tag-editor">
-                <Text strong>标签</Text>
-                <Input value={tagDraft} onChange={(event) => setTagDraft(event.target.value)} placeholder="用逗号分隔多个标签" />
-                <Button onClick={() => void saveTags()}>保存标签</Button>
-              </div>
-              <Divider titlePlacement="start">分块预览（{detail.chunks.length}）</Divider>
-              <div className="knowledge-chunk-list">
-                {detail.chunks.slice(0, 30).map((chunk) => (
-                  <div className="knowledge-chunk-item" key={chunk.id}>
-                    <div className="knowledge-chunk-meta"><Tag>{chunk.location || `分块 ${chunk.chunkIndex + 1}`}</Tag><Text type="secondary">#{chunk.chunkIndex + 1}</Text></div>
-                    <Paragraph ellipsis={{ rows: 4, expandable: true }}>{chunk.content}</Paragraph>
-                  </div>
-                ))}
-              </div>
-              {detail.chunks.length > 30 && <Text type="secondary">仅预览前 30 个分块</Text>}
+        {detailLoading && !detail && (
+          <div className="knowledge-document-preview__loading" role="status" aria-live="polite">
+            <Spin size="small" />
+            <Text type="secondary">正在读取知识库文档…</Text>
+          </div>
+        )}
+        {!detailLoading && !detail && detailPreviewError && (
+          <Alert type="error" showIcon title="知识库文档加载失败" description={detailPreviewError} />
+        )}
+        {detail && (
+          <div className="knowledge-detail-stack">
+            <Descriptions bordered size="small" column={{ xs: 1, sm: 2 }}>
+              <Descriptions.Item label="格式">{detail.extension.toUpperCase()}</Descriptions.Item>
+              <Descriptions.Item label="大小">{formatBytes(detail.byteSize)}</Descriptions.Item>
+              <Descriptions.Item label="状态"><Tag color={knowledgeStatusMeta[detail.status].color}>{knowledgeStatusMeta[detail.status].label}</Tag></Descriptions.Item>
+              <Descriptions.Item label="页数/工作表">{detail.pageCount || '-'}</Descriptions.Item>
+              <Descriptions.Item label="SHA-256" span={2}><Text copyable ellipsis>{detail.sha256}</Text></Descriptions.Item>
+            </Descriptions>
+            {detail.errorMessage && <Alert type="error" showIcon title={detail.errorMessage} />}
+            <div className="knowledge-tag-editor">
+              <Text strong>标签</Text>
+              <Input value={tagDraft} onChange={(event) => setTagDraft(event.target.value)} placeholder="用逗号分隔多个标签" />
+              <Button onClick={() => void saveTags()}>保存标签</Button>
             </div>
-          )}
-        </Spin>
+            <Tabs
+              className="knowledge-detail-tabs"
+              animated={false}
+              activeKey={detailTab}
+              onChange={(key) => setDetailTab(key === 'index' ? 'index' : 'preview')}
+              items={[
+                {
+                  key: 'preview',
+                  label: '在线预览',
+                  children: (
+                    <div className="knowledge-detail-preview-surface">
+                      <Suspense
+                        fallback={(
+                          <div className="knowledge-document-preview__loading" role="status" aria-live="polite">
+                            <Spin size="small" />
+                            <Text type="secondary">正在加载预览模块…</Text>
+                          </div>
+                        )}
+                      >
+                        <KnowledgeDocumentPreviewer
+                          preview={detailPreview}
+                          fallbackDocument={detail}
+                          loading={detailLoading}
+                          error={detailPreviewError}
+                          showHeader={false}
+                        />
+                      </Suspense>
+                    </div>
+                  )
+                },
+                {
+                  key: 'index',
+                  label: `解析与索引（${detail.chunks.length}）`,
+                  children: (
+                    <section className="knowledge-detail-index-panel" aria-label="文档解析与索引信息">
+                      <Descriptions className="knowledge-index-summary" bordered size="small" column={{ xs: 1, sm: 2 }}>
+                        <Descriptions.Item label="解析状态">
+                          <Tag color={knowledgeStatusMeta[detail.status].color}>{knowledgeStatusMeta[detail.status].label}</Tag>
+                        </Descriptions.Item>
+                        <Descriptions.Item label="索引分块">{detail.chunkCount} 个</Descriptions.Item>
+                        <Descriptions.Item label="页数/工作表">{detail.pageCount || '-'}</Descriptions.Item>
+                        <Descriptions.Item label="向量模型"><Text ellipsis title={detail.modelVersion}>{detail.modelVersion || '-'}</Text></Descriptions.Item>
+                        <Descriptions.Item label="处理完成">{detail.processedAt ? formatDate(detail.processedAt) : '-'}</Descriptions.Item>
+                        <Descriptions.Item label="最后更新">{formatDate(detail.updatedAt)}</Descriptions.Item>
+                      </Descriptions>
+                      <div className="knowledge-index-toolbar">
+                        <Input.Search
+                          allowClear
+                          value={chunkSearch}
+                          prefix={<SearchOutlined />}
+                          placeholder="搜索页码、工作表、位置或正文"
+                          onChange={(event) => { setChunkSearch(event.target.value); setChunkPage(1) }}
+                          style={{ width: 360 }}
+                        />
+                        <Text type="secondary">找到 {filteredDetailChunks.length} 个分块</Text>
+                      </div>
+                      {pagedDetailChunks.length ? (
+                        <div className="knowledge-index-chunk-list">
+                          {pagedDetailChunks.map((chunk) => (
+                            <article className="knowledge-index-chunk-card" key={chunk.id}>
+                              <div className="knowledge-index-chunk-heading">
+                                <Space size={8} wrap>
+                                  <Tag color="purple">{knowledgeChunkLocationLabelOf(chunk)}</Tag>
+                                  <Text strong>索引分块 {chunk.chunkIndex + 1}</Text>
+                                </Space>
+                                <Text type="secondary">字符 {chunk.charStart}–{chunk.charEnd}</Text>
+                              </div>
+                              <Paragraph className="knowledge-index-chunk-content" ellipsis={{ rows: 6, expandable: true }}>
+                                {chunk.content || '当前分块没有文本内容'}
+                              </Paragraph>
+                            </article>
+                          ))}
+                        </div>
+                      ) : (
+                        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="没有匹配的索引分块" />
+                      )}
+                      {filteredDetailChunks.length > chunkPageSize && (
+                        <Pagination
+                          className="knowledge-index-pagination"
+                          current={chunkPage}
+                          pageSize={chunkPageSize}
+                          total={filteredDetailChunks.length}
+                          showSizeChanger={false}
+                          showTotal={(count) => `共 ${count} 个分块`}
+                          onChange={setChunkPage}
+                        />
+                      )}
+                    </section>
+                  )
+                }
+              ]}
+            />
+          </div>
+        )}
       </Drawer>
     </div>
   )
@@ -5824,6 +6371,12 @@ function ChatPage({
   const [activeRecordDetail, setActiveRecordDetail] = useState<RecordDetail | null>(null)
   const [recordDetailModalOpen, setRecordDetailModalOpen] = useState(false)
   const [activeKnowledgeDetail, setActiveKnowledgeDetail] = useState<KnowledgeDocumentDetail | null>(null)
+  const [activeKnowledgePreview, setActiveKnowledgePreview] = useState<KnowledgeDocumentPreview | null>(null)
+  const [activeKnowledgeChunkId, setActiveKnowledgeChunkId] = useState<string | null>(null)
+  const [knowledgePreviewOpen, setKnowledgePreviewOpen] = useState(false)
+  const [knowledgePreviewLoading, setKnowledgePreviewLoading] = useState(false)
+  const [knowledgePreviewError, setKnowledgePreviewError] = useState<string | null>(null)
+  const knowledgePreviewRequestRef = useRef(0)
   const [recordDetailLoading, setRecordDetailLoading] = useState(false)
   const [recordImagePage, setRecordImagePage] = useState<RecordImagePage | null>(null)
   const [recordImagesLoading, setRecordImagesLoading] = useState(false)
@@ -6090,6 +6643,16 @@ function ChatPage({
     }
   }
 
+  const closeKnowledgePreview = (): void => {
+    knowledgePreviewRequestRef.current += 1
+    setKnowledgePreviewOpen(false)
+    setKnowledgePreviewLoading(false)
+    setKnowledgePreviewError(null)
+    setActiveKnowledgePreview(null)
+    setActiveKnowledgeDetail(null)
+    setActiveKnowledgeChunkId(null)
+  }
+
   const closeDataView = (): void => {
     dataViewPageRequestRef.current += 1
     setDataViewPageLoading(false)
@@ -6099,7 +6662,7 @@ function ChatPage({
     setDataViewPageSize(20)
     setActiveRecordDetail(null)
     setRecordDetailModalOpen(false)
-    setActiveKnowledgeDetail(null)
+    closeKnowledgePreview()
     setRecordDetailLoading(false)
     setRecordImagePage(null)
     setRecordImagesLoading(false)
@@ -6560,16 +7123,60 @@ function ChatPage({
     }
   }
 
-  const openKnowledgeDetail = async (documentId: string): Promise<void> => {
+  const openKnowledgeDetail = async (documentId: string, chunkId?: string): Promise<void> => {
+    const normalizedDocumentId = documentId.trim()
+    const normalizedChunkId = chunkId?.trim() || undefined
+    if (!normalizedDocumentId) {
+      message.warning('该知识文档依据缺少文档标识，暂时无法打开详情')
+      return
+    }
+    const requestId = knowledgePreviewRequestRef.current + 1
+    knowledgePreviewRequestRef.current = requestId
+    setKnowledgePreviewOpen(true)
+    setKnowledgePreviewLoading(true)
+    setKnowledgePreviewError(null)
+    setActiveKnowledgePreview(null)
+    setActiveKnowledgeDetail(null)
+    setActiveKnowledgeChunkId(normalizedChunkId ?? null)
     try {
-      const detail = await window.visslm.getKnowledgeDocument(documentId)
+      const preview = await window.visslm.getKnowledgeDocumentPreview(normalizedDocumentId)
+      if (requestId !== knowledgePreviewRequestRef.current) return
+      if (preview) {
+        setActiveKnowledgePreview(preview)
+        setActiveKnowledgeDetail(preview.document)
+        if (preview.errorMessage) setKnowledgePreviewError(preview.errorMessage)
+        return
+      }
+      const detail = await window.visslm.getKnowledgeDocument(normalizedDocumentId)
+      if (requestId !== knowledgePreviewRequestRef.current) return
       if (detail) {
         setActiveKnowledgeDetail(detail)
+        setKnowledgePreviewError('原始文档预览不可用，当前仅能查看索引正文')
       } else {
+        setKnowledgePreviewError('回答依据对应的知识文档不存在或已被删除')
         message.warning('回答依据对应的知识文档不存在或已被删除')
       }
     } catch (error) {
-      message.error(`知识文档详情加载失败：${error instanceof Error ? error.message : String(error)}`)
+      if (requestId !== knowledgePreviewRequestRef.current) return
+      const previewError = error instanceof Error ? error.message : String(error)
+      try {
+        const detail = await window.visslm.getKnowledgeDocument(normalizedDocumentId)
+        if (requestId !== knowledgePreviewRequestRef.current) return
+        if (detail) {
+          setActiveKnowledgeDetail(detail)
+          setKnowledgePreviewError(`原始文档预览不可用，已显示索引正文（${previewError}）`)
+        } else {
+          setKnowledgePreviewError(`知识文档详情加载失败：${previewError}`)
+          message.error(`知识文档详情加载失败：${previewError}`)
+        }
+      } catch (fallbackError) {
+        if (requestId !== knowledgePreviewRequestRef.current) return
+        const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError)
+        setKnowledgePreviewError(`知识文档详情加载失败：${previewError}；索引回退也失败：${fallbackMessage}`)
+        message.error(`知识文档详情加载失败：${previewError}`)
+      }
+    } finally {
+      if (requestId === knowledgePreviewRequestRef.current) setKnowledgePreviewLoading(false)
     }
   }
 
@@ -6954,37 +7561,6 @@ function ChatPage({
     delivery_draft: '文件交付草稿'
   })[type]
 
-  const previewArtifact = async (
-    type: AssistantArtifactType,
-    assistantMessage: ChatMessage,
-    userQuestion: string
-  ): Promise<void> => {
-    if (!assistantMessage.evidenceBlocks?.length) {
-      message.warning('当前回答没有可核验 EvidenceBlock，不能创建交付物')
-      return
-    }
-    try {
-      const preview = await window.visslm.previewAssistantArtifact({
-        type,
-        conversationId,
-        messageId: assistantMessage.id,
-        title: `${artifactTypeLabel(type)} · ${userQuestion}`.slice(0, 120),
-        question: userQuestion,
-        answer: assistantMessage.content,
-        executionSummary: assistantMessage.executionSummary,
-        evidenceBlocks: assistantMessage.evidenceBlocks,
-        dataViews: assistantMessage.dataViews ?? [],
-        sources: assistantMessage.sources ?? [],
-        outputFormat: artifactExportFormat
-      })
-      setArtifactPreview(preview)
-      setArtifactGenerationStatus('idle')
-      setArtifactGenerationMessage('')
-    } catch (error) {
-      message.error(`无法生成交付物预览：${error instanceof Error ? error.message : String(error)}`)
-    }
-  }
-
   const commitArtifact = async (): Promise<void> => {
     if (!artifactPreview || artifactSaving) return
     setArtifactSaving(true)
@@ -7218,6 +7794,10 @@ function ChatPage({
           : messages.length
             ? '可继续提问'
             : '准备就绪'
+
+  const assistantMarkdownComponents = {
+    a: (props: AssistantMarkdownLinkProps) => renderAssistantMarkdownLink(props, openKnowledgeDetail)
+  }
 
   return (
     <div className={`chat-page chat-workspace-v2 ${historyCollapsed ? 'history-collapsed' : ''} ${historyMobileOpen ? 'history-mobile-open' : ''} ${userNearBottom ? 'user-near-bottom' : 'user-browsing'}`}>
@@ -7540,8 +8120,11 @@ function ChatPage({
                     <div className="message-body">
                       {message.role === 'assistant' ? (
                         <div className="chat-markdown">
-                          <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                            {restoreLegacyAssistantMarkdown(message.content)}
+                          <ReactMarkdown
+                            remarkPlugins={[remarkGfm]}
+                            components={assistantMarkdownComponents}
+                          >
+                            {assistantMessageMarkdownOf(message)}
                           </ReactMarkdown>
                         </div>
                       ) : (
@@ -7642,7 +8225,7 @@ function ChatPage({
                             size="small"
                             icon={<CopyOutlined />}
                             aria-label="复制回答"
-                            onClick={() => void copyAnswer(message.content)}
+                            onClick={() => void copyAnswer(assistantMessageMarkdownOf(message))}
                           />
                         </Tooltip>
                         {message.retryQuestion && (
@@ -7664,30 +8247,6 @@ function ChatPage({
                         )}
                       </div>
                     )}
-                    {message.role === 'assistant' && message.contextOutcome === 'success' && message.evidenceBlocks?.length ? (
-                      <div className="chat-artifact-actions" aria-label="创建受控交付物">
-                        <span>基于已验证证据创建</span>
-                        {([
-                          ['analysis_snapshot', '分析快照'],
-                          ['saved_filter', '保存筛选视图'],
-                          ['report_draft', '报告草稿'],
-                          ['delivery_draft', '文件交付草稿']
-                        ] as const).map(([type, label]) => (
-                          <Button
-                            key={type}
-                            size="small"
-                            disabled={loading}
-                            onClick={() => void previewArtifact(
-                              type,
-                              message,
-                              [...messages.slice(0, messageIndex)].reverse().find((item) => item.role === 'user')?.content ?? message.content
-                            )}
-                          >
-                            {label}
-                          </Button>
-                        ))}
-                      </div>
-                    ) : null}
                     {message.dashboard ? (
                       <div className="chat-data-action">
                         <Button
@@ -7754,8 +8313,8 @@ function ChatPage({
                         </section>
                       ) : null}
                       {message.role === 'assistant' && message.sources?.length ? (
-                        <div className="source-list">
-                          <div className="source-list-title">
+                        <details className="source-list">
+                          <summary className="source-list-title">
                             <BulbOutlined />
                             <Text strong>回答依据</Text>
                             <div
@@ -7782,12 +8341,19 @@ function ChatPage({
                                 </span>
                               )}
                             </div>
-                          </div>
+                            <span className="source-list-action" aria-hidden="true">
+                              <span className="source-list-action-open">查看列表</span>
+                              <span className="source-list-action-close">收起列表</span>
+                              <DownOutlined />
+                            </span>
+                          </summary>
                           <div className="source-chips">
                             {message.sources.map((source, index) => {
                               const sourceIsDocument = source.sourceType === 'document'
                               const sourceTypeLabel = sourceIsDocument ? '知识文档' : '数据记录'
-                              const sourceLocation = source.location || source.fileName || source.nodeType || '来源详情'
+                              const sourceLocation = sourceIsDocument
+                                ? knowledgeSourceLocationLabelOf(source)
+                                : source.location || source.fileName || source.nodeType || '来源详情'
                               const snippet = source.snippet?.trim()
                               return (
                                 <Button
@@ -7798,7 +8364,7 @@ function ChatPage({
                                   data-source-type={sourceIsDocument ? 'document' : 'record'}
                                   onClick={() => {
                                     if (sourceIsDocument) {
-                                      if (source.documentId) void openKnowledgeDetail(source.documentId)
+                                      if (source.documentId) void openKnowledgeDetail(source.documentId, source.chunkId)
                                       else notify.warning('该知识文档依据缺少文档标识，暂时无法打开详情')
                                       return
                                     }
@@ -7817,14 +8383,14 @@ function ChatPage({
                                     <small>
                                       <span className="source-chip-type">{sourceTypeLabel}</span>
                                       <span className="source-chip-location"> · {sourceLocation}</span>
-                                      {snippet ? ` · 原文片段：${snippet.slice(0, 80)}` : ''}
+                                      {snippet && !sourceIsDocument ? ` · 原文片段：${snippet.slice(0, 80)}` : ''}
                                     </small>
                                   </span>
                                 </Button>
                               )
                             })}
                           </div>
-                        </div>
+                        </details>
                       ) : null}
                   </div>
                 </div>
@@ -8011,7 +8577,10 @@ function ChatPage({
                     >
                       <div className="message-body">
                         <div className="chat-markdown">
-                          <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                           <ReactMarkdown
+                             remarkPlugins={[remarkGfm]}
+                             components={assistantMarkdownComponents}
+                           >
                             {restoreLegacyAssistantMarkdown(activeStreamingAnswer.content)}
                           </ReactMarkdown>
                         </div>
@@ -8308,57 +8877,68 @@ function ChatPage({
               <Statistic title="运行总数" value={assistantRunStats.total} />
               <Statistic title="完成" value={assistantRunStats.completed} />
               <Statistic title="失败" value={assistantRunStats.failed} />
-              <Statistic title="平均耗时" value={assistantRunStats.averageDurationMs} suffix="ms" />
+              <Statistic title="平均耗时" value={formatDurationSeconds(assistantRunStats.averageDurationMs)} />
               <Statistic title="工具阶段" value={assistantRunStats.totalToolCalls} />
               <Statistic title="累计命中" value={assistantRunStats.totalMatchedCount} />
             </div>
           )}
-          <ResizableTable<AssistantRunHistory>
-            tableKey="assistant-run-history"
+          <ResizableTable<AssistantRunHistoryWithTokenMetrics>
+            tableKey="assistant-run-history-v2"
             rowKey="runId"
             dataSource={assistantRunHistory}
             loading={runHistoryLoading}
             pagination={{ pageSize: 20, showSizeChanger: true }}
-            scroll={{ x: 1350, y: 'min(540px, max(260px, calc(100vh - 360px)))' }}
+            scroll={{ x: 1700, y: 'min(540px, max(260px, calc(100vh - 360px)))' }}
             columns={[
-              { title: '状态', dataIndex: 'status', width: 110, render: (status: AssistantRunHistory['status']) => <Tag color={status === 'completed' ? 'success' : status === 'failed' ? 'error' : status === 'clarification' ? 'warning' : 'default'}>{({ completed: '完成', failed: '失败', cancelled: '已取消', clarification: '待澄清' } as const)[status]}</Tag> },
-              { title: '任务 / 来源', key: 'task', width: 210, render: (_value, run) => `${run.taskType} · ${run.sourceMode}` },
-              { title: '主 Agent', dataIndex: 'primaryAgent', width: 150 },
-              { title: '耗时', dataIndex: 'durationMs', width: 110, render: (value: number) => `${value} ms` },
+              { title: '状态', dataIndex: 'status', width: 100, render: (status: AssistantRunHistory['status']) => <Tag color={status === 'completed' ? 'success' : status === 'failed' ? 'error' : status === 'clarification' ? 'warning' : 'default'}>{({ completed: '完成', failed: '失败', cancelled: '已取消', clarification: '待澄清' } as const)[status]}</Tag> },
+              { title: '任务 / 来源', key: 'task', width: 200, render: (_value, run) => `${run.taskType} · ${run.sourceMode}` },
+              { title: '主 Agent', dataIndex: 'primaryAgent', width: 140 },
+              { title: '耗时', dataIndex: 'durationMs', width: 110, align: 'right', render: (value: number) => formatDurationSeconds(value) },
+              { title: '输入 Token', dataIndex: 'inputTokenCount', width: 120, align: 'right', render: (value: number | undefined) => formatRunMetric(value) },
+              { title: '输出 Token', dataIndex: 'outputTokenCount', width: 120, align: 'right', render: (value: number | undefined) => formatRunMetric(value) },
+              { title: 'Tokens/s', dataIndex: 'tokensPerSecond', width: 110, align: 'right', render: (value: number | undefined) => formatRunMetric(value, 1) },
               { title: '工具阶段', dataIndex: 'toolCallCount', width: 100 },
               { title: '命中数', dataIndex: 'matchedCount', width: 90 },
-              { title: '记录 / 文档依据', key: 'evidence', width: 150, render: (_value, run) => `${run.recordEvidenceCount} / ${run.documentEvidenceCount}` },
-              { title: '失败阶段', dataIndex: 'failedStage', width: 130, render: (value: string) => value || '—' },
-              { title: '完成时间', dataIndex: 'completedAt', width: 180, render: formatDate },
-              { title: 'Run ID', dataIndex: 'runId', width: 190, ellipsis: true }
+              { title: '记录 / 文档依据', key: 'evidence', width: 140, render: (_value, run) => `${run.recordEvidenceCount} / ${run.documentEvidenceCount}` },
+              { title: '失败阶段', dataIndex: 'failedStage', width: 120, render: (value: string) => value || '—' },
+              { title: '完成时间', dataIndex: 'completedAt', width: 170, render: formatDate },
+              { title: 'Run ID', dataIndex: 'runId', width: 180, ellipsis: true }
             ]}
           />
         </div>
       </Drawer>
       <Drawer
-        title={activeKnowledgeDetail?.fileName ?? '知识库文档'}
-        size={720}
-        open={Boolean(activeKnowledgeDetail)}
-        onClose={() => setActiveKnowledgeDetail(null)}
-      >
-        {activeKnowledgeDetail && (
-          <div className="knowledge-detail-stack">
-            <Descriptions bordered size="small" column={2}>
-              <Descriptions.Item label="格式">{activeKnowledgeDetail.extension.toUpperCase()}</Descriptions.Item>
-              <Descriptions.Item label="分块">{activeKnowledgeDetail.chunkCount}</Descriptions.Item>
-              <Descriptions.Item label="标签" span={2}>
-                {activeKnowledgeDetail.tags.length ? activeKnowledgeDetail.tags.map((tag) => <Tag key={tag}>{tag}</Tag>) : '未设置'}
-              </Descriptions.Item>
-            </Descriptions>
-            <Divider titlePlacement="start">匹配分块</Divider>
-            {activeKnowledgeDetail.chunks.slice(0, 20).map((chunk) => (
-              <div className="knowledge-chunk-item" key={chunk.id}>
-                <div className="knowledge-chunk-meta"><Tag>{chunk.location || `分块 ${chunk.chunkIndex + 1}`}</Tag></div>
-                <Paragraph>{chunk.content}</Paragraph>
-              </div>
-            ))}
+        className="knowledge-document-preview-drawer-panel"
+        rootClassName="knowledge-document-preview-drawer"
+        title={(
+          <div className="knowledge-document-preview-drawer-title">
+            <FileTextOutlined aria-hidden="true" />
+            <span title={activeKnowledgePreview?.document.fileName ?? activeKnowledgeDetail?.fileName ?? '知识库文档'}>
+              知识库文档 · {activeKnowledgePreview?.document.fileName ?? activeKnowledgeDetail?.fileName ?? '预览'}
+            </span>
           </div>
         )}
+        size={720}
+        open={knowledgePreviewOpen}
+        onClose={closeKnowledgePreview}
+        destroyOnHidden
+      >
+        <Suspense
+          fallback={(
+            <div className="knowledge-document-preview__loading" role="status" aria-live="polite">
+              <Spin size="small" />
+              <Text type="secondary">正在加载预览模块…</Text>
+            </div>
+          )}
+        >
+          <KnowledgeDocumentPreviewer
+            preview={activeKnowledgePreview}
+            fallbackDocument={activeKnowledgeDetail}
+            targetChunkId={activeKnowledgeChunkId}
+            loading={knowledgePreviewLoading}
+            error={knowledgePreviewError}
+          />
+        </Suspense>
       </Drawer>
       <Modal
         className="chat-data-modal"
@@ -9421,6 +10001,7 @@ function PushPage({
   }))
   const [fieldMappings, setFieldMappings] = useState<PushFieldMapping[]>(() => storedDraft?.fieldMappings ?? [])
   const mappingInitializedRef = useRef(storedDraft?.mappingInitialized ?? false)
+  const mappingMigrationPendingRef = useRef(storedDraft?.mappingMigrationPending ?? false)
   const [records, setRecords] = useState<RecordRow[]>([])
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(storedDraft?.page ?? 1)
@@ -9442,10 +10023,11 @@ function PushPage({
 
   useEffect(() => {
     const draft: PushConfigDraft = {
-      version: 1,
+      version: 2,
       formValues,
       fieldMappings,
       mappingInitialized: mappingInitializedRef.current,
+      ...(mappingMigrationPendingRef.current ? { mappingMigrationPending: true } : {}),
       selectedRowKeys,
       search,
       ...(releaseText !== undefined ? { releaseText } : {}),
@@ -9511,6 +10093,7 @@ function PushPage({
   useEffect(() => {
     const initializingDefaults = !mappingInitializedRef.current
     const inspectingLegacyDefaults = !initializingDefaults &&
+      mappingMigrationPendingRef.current &&
       fieldMappings.length > 0 &&
       fieldMappings.every((mapping) => mapping.sourceField === mapping.targetField)
     if ((!initializingDefaults && !inspectingLegacyDefaults) || !firstMappingRecordUid) return
@@ -9526,6 +10109,7 @@ function PushPage({
         const raw = isRecordObject(detail.raw) ? detail.raw : {}
         if (inspectingLegacyDefaults && !isLegacyDefaultPushFieldMappings(fieldMappings, raw)) return
         mappingInitializedRef.current = true
+        mappingMigrationPendingRef.current = false
         setFieldMappings(buildDefaultPushFieldMappings(raw))
         setResult(null)
       })
@@ -9622,6 +10206,7 @@ function PushPage({
 
   const addFieldMapping = (): void => {
     mappingInitializedRef.current = true
+    mappingMigrationPendingRef.current = false
     setFieldMappings((current) => [
       ...current,
       { id: crypto.randomUUID(), sourceField: '', targetField: '' }
@@ -9634,6 +10219,7 @@ function PushPage({
     patch: Partial<PushFieldMapping>
   ): void => {
     mappingInitializedRef.current = true
+    mappingMigrationPendingRef.current = false
     setFieldMappings((current) =>
       current.map((mapping) => mapping.id === id ? { ...mapping, ...patch } : mapping)
     )
@@ -9642,6 +10228,7 @@ function PushPage({
 
   const removeFieldMapping = (id: string): void => {
     mappingInitializedRef.current = true
+    mappingMigrationPendingRef.current = false
     setFieldMappings((current) => current.filter((mapping) => mapping.id !== id))
     setResult(null)
   }
@@ -10587,6 +11174,9 @@ function SettingsPage({
   const [matchingForm] = Form.useForm<ProjectMatchingSettings>()
   const [modelSource, setModelSource] = useState<ModelSource>('local')
   const [modelProvider, setModelProvider] = useState<ModelProvider>('ollama')
+  const [onlineModelUnlocked, setOnlineModelUnlocked] = useState(false)
+  const onlineModelUnlockedRef = useRef(false)
+  const localModelClickCountRef = useRef(0)
   const modelDraftsRef = useRef<Partial<Record<ModelSource, ModelSettings>>>({})
   const [featureSettings, setFeatureSettings] = useState<FeatureModuleSettings>(
     DEFAULT_FEATURE_MODULE_SETTINGS
@@ -10650,14 +11240,32 @@ function SettingsPage({
     }
     if (settingsTab === 'model') {
       modelDraftsRef.current = {}
-      modelForm.setFieldsValue({ ...settings.model, apiKey: '' })
+      const nextModelSource: ModelSource = !onlineModelUnlockedRef.current && settings.model.source === 'online'
+        ? 'local'
+        : settings.model.source
+      const savedModelProfile = settings.modelProfiles?.[nextModelSource]
+        ?? (settings.model.source === nextModelSource ? settings.model : undefined)
+      const fallbackModelProfile: ModelSettings = {
+        source: 'local',
+        provider: 'ollama',
+        baseUrl: 'http://127.0.0.1:11434',
+        model: 'qwen3:8b',
+        thinking: false
+      }
+      modelForm.setFieldsValue({
+        ...(savedModelProfile ?? fallbackModelProfile),
+        apiKey: ''
+      })
+      setModelSource(nextModelSource)
+      setModelProvider(savedModelProfile?.provider ?? fallbackModelProfile.provider)
+    } else {
+      setModelSource(!onlineModelUnlockedRef.current && settings.model.source === 'online' ? 'local' : settings.model.source)
+      setModelProvider(settings.model.provider)
     }
     if (settingsTab === 'general') {
       systemForm.setFieldsValue(settings.system)
       matchingForm.setFieldsValue(settings.projectMatching)
     }
-    setModelSource(settings.model.source)
-    setModelProvider(settings.model.provider)
     setFeatureSettings({ ...DEFAULT_FEATURE_MODULE_SETTINGS, ...settings.features })
     setNavigationOrder(normalizeFeatureNavigationOrder(settings.navigationOrder))
   }, [settings, settingsTab, platformForm, systemForm, modelForm, matchingForm])
@@ -10906,6 +11514,7 @@ function SettingsPage({
 
   const changeModelSource = (source: string | number): void => {
     if (source !== 'local' && source !== 'online') return
+    if (source === 'online' && !onlineModelUnlockedRef.current) return
     setDisplayedModelCapabilityReport(null)
     const currentValues = modelForm.getFieldsValue(true) as ModelSettings
     modelDraftsRef.current[modelSource] = {
@@ -10940,6 +11549,31 @@ function SettingsPage({
       thinking: target.thinking,
       apiKey: source === 'online' ? (target as ModelSettings).apiKey ?? '' : undefined
     })
+  }
+
+  const handleModelSourceClick = (event: React.MouseEvent<HTMLDivElement>): void => {
+    const target = event.target
+    if (!(target instanceof Element)) return
+    // Activating a label also dispatches a synthetic click from its radio input.
+    // Count only the originating label click so one user click cannot count twice.
+    if (target.closest('input')) return
+    const clickedSource = target
+      .closest('label')
+      ?.querySelector<HTMLElement>('[data-model-source]')
+      ?.dataset.modelSource
+    if (clickedSource !== 'local') {
+      localModelClickCountRef.current = 0
+      return
+    }
+    if (onlineModelUnlockedRef.current) return
+    const nextClickCount = localModelClickCountRef.current + 1
+    if (nextClickCount >= 5) {
+      onlineModelUnlockedRef.current = true
+      localModelClickCountRef.current = 0
+      setOnlineModelUnlocked(true)
+      return
+    }
+    localModelClickCountRef.current = nextClickCount
   }
 
   const changeOnlineProvider = (provider: ModelProvider): void => {
@@ -11029,9 +11663,12 @@ function SettingsPage({
                       <Segmented
                         value={modelSource}
                         options={[
-                          { label: '本地大模型', value: 'local' },
-                          { label: '在线大模型', value: 'online' }
+                          { label: <span data-model-source="local">本地大模型</span>, value: 'local' },
+                          ...(onlineModelUnlocked
+                            ? [{ label: <span data-model-source="online">在线大模型</span>, value: 'online' as const }]
+                            : [])
                         ]}
+                        onClick={handleModelSourceClick}
                         onChange={changeModelSource}
                       />
                     )}
@@ -11703,6 +12340,7 @@ function AppShell({ themeMode, onThemeModeChange }: AppProps): React.JSX.Element
     chatConversationId,
     chatDataScope,
     chatDataScopeSummary,
+    assetCenterTab,
     generatedDashboard,
     generatedDashboardVersion,
     modelOnline,

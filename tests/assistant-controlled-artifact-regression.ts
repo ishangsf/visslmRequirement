@@ -102,9 +102,13 @@ assert.match(mainSource, /assistant-artifacts:preview/)
 assert.match(mainSource, /assistant-artifacts:commit/)
 assert.match(preloadSource, /previewAssistantArtifact/)
 assert.match(artifactPanelSource, /确认后才会生成文件并写入本地导出目录/)
-assert.match(rendererSource, /分析快照/)
-assert.match(rendererSource, /保存筛选视图/)
-assert.match(rendererSource, /报告草稿/)
-checks.push('three controlled artifact entry points use preview-confirm IPC rather than direct model writes')
+assert.doesNotMatch(
+  rendererSource,
+  /message\.role === 'assistant' && message\.contextOutcome === 'success' && message\.evidenceBlocks\?\.length \?/,
+  'ordinary evidence answers must not render a proactive artifact action area'
+)
+assert.match(rendererSource, /@交付物专家(?:\\s|\$)/)
+assert.match(rendererSource, /response\.artifactPreview/)
+checks.push('controlled artifacts use preview-confirm IPC and remain opt-in through the explicit @交付物专家 entrypoint')
 
 console.log(JSON.stringify({ ok: true, checks }, null, 2))

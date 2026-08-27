@@ -54,27 +54,28 @@ strict：initial + 独立 independent（同记录并行）
 
 以下是本轮代码已经落地、可以作为当前 PRD/验收基线的行为（行号以当前工作树为准）：
 
-- `src/main/requirements/semanticization-service.ts:278-281` 将未指定质量模式默认到 `standard`，并把旧 `deepThinking=true` 兼容映射为 `strict`；`:451-469` 为 standard 健康路径执行一次结构化抽取，仅在核心字段低置信时做定向修复；`:470-516` 为 strict 并行执行不互相读取结论的 `initial`/`independent`，仅在分歧或低置信时调用 `adjudication`，否则合并已验证结果。
-- `src/main/requirements/semanticization-service.ts:64-67`、`:718-733`、`:1107-1121` 将 `requirementType`、`productDomain`、`module` 等已知字段由服务端注入，模型不再承担这些字段的语义生成；`:135-187` 仍以严格 JSON Schema、逐字 `evidence` 文本、UID、置信度、枚举和核心字段作为输出校验边界。
-- `src/main/requirements/semanticization-service.ts:49-62` 设置单次模型请求 15 分钟安全上限并收紧 standard/strict 阶段预算和重试预算；`:119-121` 将结构校验限制为一次定向修复尝试，失败仍关闭为 `failed`。
-- `src/main/requirements/semanticization-service.ts:1088-1094` 保留内存/IPC 的完整事件流，但只在阶段开始/完成、模型错误、分歧等有意义边界持久化 trace；最终成功/失败路径仍保存可回看的结构化轨迹。质量模式与 trace/task 类型见 `src/shared/types.ts:474-496`、`:558-586`、`:611-630`。
+- `src/main/requirements/semanticization-service.ts:316-327` 将未指定质量模式默认到 `standard`，并把旧 `deepThinking=true` 兼容映射为 `strict`；`:551-568` 为 standard 健康路径执行一次结构化抽取，仅在核心字段低置信时做定向修复；`:569-608` 为 strict 并行执行不互相读取结论的 `initial`/`independent`，仅在分歧或低置信时调用 `adjudication`，否则合并已验证结果。
+- `src/main/requirements/semanticization-service.ts:78-81`、`:162-175`、`:835-849` 将 `requirementType`、`productDomain`、`module` 等已知字段由服务端注入，模型不再承担这些字段的语义生成；`:177-225`、`:1310-1363` 仍以严格 JSON Schema、逐字 `evidence` 文本、UID、置信度、枚举和核心字段作为输出校验边界。
+- `src/main/requirements/semanticization-service.ts:62-75` 设置单次模型请求 15 分钟安全上限并收紧 standard/strict 阶段预算和重试预算；`:146-148` 将结构校验限制为一次定向修复尝试，失败仍关闭为 `failed`。
+- `src/main/requirements/semanticization-service.ts:1407-1483` 为任务快照同步 `activeRecords`、`activeCount`、`maxConcurrency`、`elapsedMs`、`recordsPerMinute`、`estimatedRemainingMs`，普通进度 IPC 以 250ms 合并发送，阶段和终态即时发送；`:1220-1226` 保留内存/IPC 的完整事件流，但只在阶段边界、模型错误、分歧等有意义边界持久化 trace。质量模式、并发和快照类型见 `src/shared/types.ts:474-496`、`:611-650`。
 
 本轮明确未实现、不得在需求或验收中写成已交付的能力：
 
-- **跨记录有界并发**：`semanticization-service.ts:411-412` 仍按候选顺序逐条处理；strict 仅在同一记录内并行 `initial`/`independent`。
-- **持久化 job manifest/恢复**：任务与候选仍由 `semanticization-service.ts:250-253`、`:331-332` 的服务进程内存持有，没有持久化 job/item、租约、进程重启恢复或崩溃续跑契约。
-- **证据 ID 化**：当前 schema 仍要求模型返回逐字 `evidence` 文本（`:135-143`）；`evidenceIds` 预切分/服务端解引用只是后续方案。
-- **完整指标平台**：当前 trace 仅保留安全的结构化模型使用量（`src/shared/types.ts:513-521`）和阶段事件，没有 records/min、队列、路由命中率等完整聚合与监控平台。
+- **持久化 job manifest/租约/进程重启恢复**：worker pool 的任务候选与快照仍由 `semanticization-service.ts:293-299`、`:382-405` 的服务进程内存持有，没有持久化 job/item、租约、重启恢复或崩溃续跑契约。
+- **证据 ID 化**：当前 schema 仍要求模型返回逐字 `evidence` 文本（`:177-185`）；`evidenceIds` 预切分/服务端解引用只是后续方案。
+- **自适应 429/AIMD**：当前只按 provider/qualityMode 选择固定并发上限（`:83-94`），尚未根据 429、限流头、超时率或配额动态升降 worker 数。
+- **完整指标平台**：当前快照已有基础 `recordsPerMinute`/ETA 等运行指标，trace 也有阶段事件和安全的结构化模型使用量，但没有完整 records/min 聚合、队列、路由命中率、错误分桶和告警聚合平台。
 
-因此，本轮交付重点是“正确性约束保留、调用拓扑自适应、预算/重试收紧”；持久化队列、跨记录并发、证据 ID 和指标平台继续列入后续阶段。上述优化前基线中的固定三阶段、四次重试等描述只用于解释历史瓶颈，不应再作为当前实现断言。
+因此，本轮交付重点是“正确性约束保留、调用拓扑自适应、有界并发、预算/重试收紧”；持久化队列、租约/恢复、证据 ID、自适应 429/AIMD 和完整指标平台继续列入后续阶段。上述优化前基线中的固定三阶段、四次重试等描述只用于解释历史瓶颈，不应再作为当前实现断言。
 
 ### 1.2 本轮验收命令
 
-文档/代码集成后的最小验收集如下；命令只验证已实现契约，不把后续并发、job 恢复、证据 ID 或完整指标平台当作本轮通过条件：
+文档/代码集成后的最小验收集如下；命令验证已实现的路由、有界并发和审计边界，不把后续 job 恢复、证据 ID、自适应限流或完整指标平台当作本轮通过条件：
 
 ```powershell
 npm run typecheck
 npm run test:requirement-semanticization
+npx tsx ./tests/requirement-matching/semantic-card-concurrency-regression.ts
 npm run smoke:agent-requirement-analysis
 npm run smoke:agent-similarity
 npm run smoke:project-management
@@ -82,7 +83,7 @@ npm run build
 git diff --check -- docs/requirement-matching-target.md docs/AI语义化性能优化调研与实施方案.md
 ```
 
-`test:requirement-semanticization` 应报告 standard 健康/定向修复、strict 初步/独立复核/条件裁决的调用次数，`think`/质量模式快照，严格 Schema/UID/逐字证据/置信度/枚举校验，失败关闭、暂停/停止边界、trace 持久化和已知字段服务端注入。真实吞吐、P50/P95、跨记录并发和重启恢复基准需等后续实现专用 harness 后再设为门禁；本轮只能报告现有可观测字段，不能虚构完整指标平台。
+语义化回归应报告 standard 健康/定向修复、strict 初步/独立复核/条件裁决的调用次数，`think`/质量模式快照，严格 Schema/UID/逐字证据/置信度/枚举校验，provider-aware worker 上限（online standard 4、online strict 2、local/Ollama 1）、strict 同记录双调用的总上限 4、每记录 execution context 隔离、失败隔离、暂停/停止屏障、250ms 进度节流/阶段终态即时发送、trace 持久化和已知字段服务端注入。真实 P50/P95、429 自适应、job 重启恢复、evidence ID 和完整指标平台需等后续实现专用 harness 后再设为门禁；本轮只能报告现有快照与 trace 字段，不能虚构完整指标平台。
 
 ## 2. 优化前基线与仍存在的瓶颈
 
@@ -90,30 +91,31 @@ git diff --check -- docs/requirement-matching-target.md docs/AI语义化性能�
 
 ### 2.1 产品约束曾直接禁止并行和快速路径
 
-优化前的 `docs/requirement-matching-target.md` 曾要求所有记录固定完成 `initial + independent + adjudication`，并把记录级串行写成不可妥协条件。本轮已改为：standard 健康路径一次抽取、失败/核心字段低置信才定向修复；strict 初步与独立复核并行，分歧/低置信才裁决。当前目标文档仍明确跨记录按候选顺序处理，跨记录有界并发留在后续阶段。
+优化前的 `docs/requirement-matching-target.md` 曾要求所有记录固定完成 `initial + independent + adjudication`，并把记录级单通道处理写成不可妥协条件。本轮已改为：standard 健康路径一次抽取、失败/核心字段低置信才定向修复；strict 初步与独立复核并行，分歧/低置信才裁决，并通过 provider-aware 有界 worker pool 处理多条记录。当前目标文档不再把单通道处理写成硬约束：非 Ollama 在线 provider 的 standard 最大记录并发 4、strict 最大 2，local/Ollama 最大 1；strict 每记录双调用使同时模型调用最多 4。
 
-因此，线程池、数据库或 UI 不能替代已经完成的路由调整；后续若要获得批量吞吐数量级改善，还必须另行实现有界并发、背压和持久化 job manifest，但这些不属于本轮交付。
+因此，线程池的固定有界实现与路由调整已完成；后续仍需另行实现持久化 job manifest、租约/恢复、背压和自适应限流，才能支撑更大批量与动态配额，但这些不属于本轮交付。
 
 ### 2.2 后端当前按质量模式选择模型调用拓扑
 
 `src/main/requirements/semanticization-service.ts` 当前证据：
 
-- 第 411–412 行仍按候选顺序逐条处理记录，跨记录没有有界并发；
-- 第 451–469 行 standard 只执行 `initial`，核心字段低置信时才调用一次定向修复；
-- 第 470–516 行 strict 对 source-only 原文并行执行 `initial`/`independent`，只在分歧或低置信时进入 `adjudication`；
-- 第 849–980 行将结构校验尝试限制为两次（初次输出 + 一次定向修复），不是优化前的每阶段最多四次。
+- 第 83–94 行按 source/provider/qualityMode 选择固定上限：在线 standard 4、在线 strict 2、local/Ollama 1；第 454–508 行以 worker pool 领取候选并等待 worker 收敛；
+- 第 510–643 行为每条记录维护独立 execution context，并在单条失败时只更新该记录；
+- 第 551–568 行 standard 只执行 `initial`，核心字段低置信时才调用一次定向修复；
+- 第 569–608 行 strict 对 source-only 原文并行执行 `initial`/`independent`，只在分歧或低置信时进入 `adjudication`；在线 strict 最多两个 active records、四个同时模型请求；
+- 第 977–1108 行将结构校验尝试限制为两次（初次输出 + 一次定向修复），不是优化前的每阶段最多四次。
 
-本轮因此已消除“健康记录无条件第三次裁决”的约束，但跨记录串行仍是当前实现边界。strict 的同记录并行不能误读为批量任务已支持跨记录并发。
+本轮因此已消除健康记录无条件第三次裁决和全局单 worker 拓扑的约束；strict 的同记录并行与跨记录 worker 上限分别受两层边界保护。
 
 ### 2.3 推理与输出预算远大于结构化抽取需要
 
 当前服务中：
 
-- 第 51–57 行阶段预算已收紧为：initial `deep/standard=2400/1200`、independent `2200/1200`、adjudication `2000/1200` Token；
-- 第 59–62 行定向重试预算按失败字段数缩放，最高 2,400 Token；
-- 第 202–210 行上下文按提示词和输出预算动态计算，上限 24,576、下限 4,096；
-- 第 49 行每个模型请求最长等待 15 分钟；
-- 第 859–874 行仅 strict 发送 `think/forceThinking=true`，standard 使用关闭思考的标准路由。
+- 第 65–70 行阶段预算已收紧为：initial `deep/standard=2400/1200`、independent `2200/1200`、adjudication `2000/1200` Token；
+- 第 73–75 行定向重试预算按失败字段数缩放，最高 2,400 Token；
+- 第 244–252 行上下文按提示词和输出预算动态计算，上限 24,576、下限 4,096；
+- 第 62–63 行每个模型请求最长等待 15 分钟；
+- 第 993–1002 行仅 strict 发送 `think/forceThinking=true`，standard 使用关闭思考的标准路由。
 
 最终对象只有 15 个语义字段、置信度、证据和摘要。大多数短需求不需要数千个可见输出 Token，更不应默认在所有阶段使用高成本推理。对推理模型而言，`max_completion_tokens` 还会覆盖隐藏推理 Token，过大的预算和固定 reasoning 会进一步放大尾延迟。
 
@@ -121,7 +123,7 @@ git diff --check -- docs/requirement-matching-target.md docs/AI语义化性能�
 
 ### 2.4 模型重复生成服务端已经知道的字段
 
-`requirementType`、`productDomain`、`module` 已从数据中心明确字段读取。本轮第 64–67、647–649、718–733、1107–1121 行已将它们从模型语义字段中移除并由服务端注入，保留原始字段事实，不再要求模型重复生成。该项是本轮已落地的成本与一致性优化，不应再写成待实现建议。
+`requirementType`、`productDomain`、`module` 已从数据中心明确字段读取。本轮 `src/main/requirements/semanticization-service.ts` 的 known-field 定义、固定 system prompt、`enforceKnownFields` 和模型输出合并逻辑已将它们从模型语义字段中移除并由服务端注入，保留原始字段事实，不再要求模型重复生成。该项是本轮已落地的成本与一致性优化，不应再写成待实现建议。
 
 ### 2.5 让模型复制原文证据，制造了可避免的重试
 
@@ -153,11 +155,11 @@ git diff --check -- docs/requirement-matching-target.md docs/AI语义化性能�
 
 ### 2.7 使用流式模式却没有消费可见增量
 
-本轮语义化请求已在 `src/main/requirements/semanticization-service.ts:865-874` 使用 `stream: false`，UI 只展示阶段事件而不展示结构化输出的逐 Token 增量。对这种短结构化响应，非流式模式可减少协议解析和中途错误处理复杂度；后续仍应按供应商能力验证，而不能把流式状态写成当前语义化契约。
+本轮语义化请求已在 `src/main/requirements/semanticization-service.ts:993-1002` 使用 `stream: false`，UI 只展示阶段事件而不展示结构化输出的逐 Token 增量。对这种短结构化响应，非流式模式可减少协议解析和中途错误处理复杂度；后续仍应按供应商能力验证，而不能把流式状态写成当前语义化契约。
 
 ### 2.8 任务并发和运行态只存在于单进程内存
 
-任务候选和当前任务快照仍存放在 `RequirementSemanticizationService` 内存中，语义卡片表保存记录状态和分析轨迹。`all_unready` 还会一次读取并保留全部候选，任务内存随记录数线性增长。当前设计因此只能启动一个活动任务，也没有持久化 job item、游标、租约、重试时间和 worker 状态；本轮不交付安全的跨记录有限并发、超大批量流式入队或进程重启恢复。
+任务候选和当前任务快照仍存放在 `RequirementSemanticizationService` 内存中，语义卡片表保存记录状态和分析轨迹。`all_unready` 还会一次读取并保留全部候选，任务内存随记录数线性增长；当前 worker pool 已实现安全的跨记录有界并发，但仍没有持久化 job item、游标、租约、重试时间和 worker 状态，因此本轮不交付超大批量流式入队或进程重启恢复。
 
 此外，当前任务类型仍只有 `completed`，循环结束即使有失败记录也以完成状态结束；后续可增加 `completed_with_errors` 或等价 outcome，避免把“队列已经跑完”和“全部成功”混为一谈，但这不是本轮已交付状态。
 
@@ -169,17 +171,17 @@ selected 模式会针对每个 UID 依次读取完整记录、内容 hash、语�
 
 ### 2.10 审计轨迹存在全量 JSON/IPC 写放大
 
-优化前健康记录每个 `stage_started`、`validation_passed`、`stage_completed` 都会克隆完整 task/trace 并覆盖 `analysis_trace_json`，产生明显写放大。当前实现已改为保留内存/IPC 完整事件流，只在阶段开始/完成、模型错误、分歧等有意义边界持久化（`semanticization-service.ts:1088-1094`），失败/成功终态另行 flush；完整指标平台仍未实现。
+优化前健康记录每个 `stage_started`、`validation_passed`、`stage_completed` 都会克隆完整 task/trace 并覆盖 `analysis_trace_json`，产生明显写放大。当前实现已改为保留内存/IPC 完整事件流，只在阶段开始/完成、模型错误、分歧等有意义边界持久化（`semanticization-service.ts:1204-1228`），失败/成功终态另行 flush；完整指标平台仍未实现。
 
 模型很慢时这不是首因，但新架构把模型耗时降下来后会限制吞吐。推荐 append-only event + 阶段 snapshot，或至少合并普通进度写、在 retry/fail/stop/complete 强制 flush。
 
 ### 2.11 测试把低效实现写成了正确性契约
 
-优化前的 `tests/requirement-matching/semantic-card-analyzer-regression.ts` 曾把固定三次调用、无条件裁决、流式请求和串行步骤写成测试契约。当前验收应改为断言 standard/strict 路由的结果与边界：健康 standard 不调用独立复核，strict 只在分歧/低置信时裁决；所有路径都验证 Schema、UID、证据、置信度、枚举和失败关闭。测试还需要报告调用数、预算、重试、缓存和 trace，但本轮尚无完整指标平台或跨记录并发门禁。
+优化前的 `tests/requirement-matching/semantic-card-analyzer-regression.ts` 曾把固定三次调用、无条件裁决、流式请求和串行步骤写成测试契约。当前验收应改为断言 standard/strict 路由的结果与边界：健康 standard 不调用独立复核，strict 只在分歧/低置信时裁决；所有路径都验证 Schema、UID、证据、置信度、枚举和失败关闭。新增 `tests/requirement-matching/semantic-card-concurrency-regression.ts` 覆盖 provider-aware worker 上限、严格模式双调用上界、上下文隔离、失败隔离、暂停/停止屏障和运行快照；完整指标平台仍未交付。
 
 ## 3. 后续目标架构与未交付优化
 
-本节区分“本轮已经落地的 standard/strict 路由”与后续工程方案。凡涉及 `backfill`、跨记录有界并发、持久化 job/item、证据 ID 或完整指标平台，均是后续设计，不代表当前代码已经具备。
+本节区分“本轮已经落地的 standard/strict 路由与有界 worker pool”与后续工程方案。凡涉及 `backfill`、持久化 job/item/租约、证据 ID、自适应 429/AIMD 或完整指标平台，均是后续设计，不代表当前代码已经具备。
 
 ### 3.1 质量路由而不是固定三阶段
 
@@ -203,7 +205,7 @@ pending
           -> strong_review (最多 1 次) -------> ready / failed
 ```
 
-严格模式不应继续串行运行两个独立分析。两轮都只依赖原文，可并行启动；只有分歧字段或低质量字段进入裁决。一致且通过程序校验的结果直接合并。
+严格模式不应继续串行运行两个独立分析。两轮都只依赖原文，可并行启动；只有分歧字段或低质量字段进入裁决。一致且通过程序校验的结果直接合并。当前服务已按此规则实现；standard/strict 的跨记录 worker 上限见第 3.5 节。
 
 ### 3.2 风险门控必须使用可验证信号
 
@@ -222,7 +224,7 @@ pending
 
 ### 3.3 缩短 schema 与生成（本轮已落地项与后续项）
 
-首版建议：
+当前已落地与后续建议：
 
 - 从模型输出移除 `recordUid` 之外可由请求上下文可靠关联的冗余字段；若保留 UID，用它做错配保护；
 - 三个明确原始字段的模型生成已由本轮服务端移除并注入；
@@ -233,6 +235,8 @@ pending
 - 温度使用 0 或供应商允许的最低值；
 - 短结构化响应默认非流式；
 - 本地 `num_ctx` 使用“实际提示 Token + 输出预算 + 20% 安全余量”的最小可用档位，不固定至少 8K。
+
+`src/main/requirements/semanticization-service.ts:162-175` 为 `initial`/`independent` 复用字节一致的固定 system prompt；记录原文、`analysisPass`、`reviewerMode` 和 `knownFields` 放在 user payload（`:751-775`），既保留每条记录的事实边界，也为供应商前缀缓存创造稳定前缀。该 prompt 布局是本轮已落地契约。
 
 输出预算必须通过基准数据确定，不能只把 4,800 机械改成一个未经验证的常量。
 
@@ -259,33 +263,34 @@ type ModelCapabilities = {
 - OpenAI-compatible：启动时做一次结构化输出能力探测，不支持 strict schema 时优先使用严格工具调用；仍不支持时才使用 JSON object + 一次本地校验；
 - 本地集中部署：当历史回填规模较大且硬件允许时，可评估 vLLM 的连续批处理、结构化输出和 automatic prefix caching；桌面单机不应强制引入该运维复杂度。
 
-### 3.5 有限并发、背压与持久队列
+### 3.5 有界并发（本轮已落地）与持久队列/自适应限流（后续）
 
-新增 `semanticization_jobs` 和 `semanticization_job_items`，每条 item 保存：
+本轮已实现 provider-aware 的有界 worker pool：非 Ollama 在线 provider 的 standard 最大记录并发为 4、strict 最大记录并发为 2；local 或 Ollama 最大为 1。strict 每条记录的 `initial` 与 `independent` 并行，因此在线 strict 的同时模型调用上界为 4。每条记录使用独立 execution context；单条失败隔离，不取消其他 worker。暂停会阻止领取新记录并等待所有在途记录到达安全屏障，停止会等待 worker 收敛并释放未完成记录；普通进度 IPC 250ms 节流，阶段和终态即时发送。
+
+本轮未实现以下持久化队列能力；后续若新增 `semanticization_jobs` 和 `semanticization_job_items`，每条 item 可保存：
 
 - job、record UID、content hash、policy/model/schema signature；
 - 状态、优先级、attempt、route、next retry time；
 - worker lease、heartbeat、开始/完成时间；
 - 各阶段 Token、耗时、错误码和最终结果引用。
 
-worker 通过原子 claim 获取 item，写入必须检查 hash/signature 仍匹配。并发策略：
+后续持久化 worker 应通过原子 claim 获取 item，写入必须检查 hash/signature 仍匹配。当前并发策略：
 
-- 在线 API 默认并发 4，根据 429、限流头、超时率和账户配额自适应到 1–8；
-- Ollama 默认并发 1。只有确认模型完全驻留且有足够 RAM/VRAM 时才尝试 2；官方说明同一模型的并行请求会按并行数放大上下文内存；
+- 在线非 Ollama provider：standard 固定上限 4、strict 固定上限 2；strict 同记录双请求使同时模型调用最多 4。当前不根据 429、限流头、超时率或账户配额动态调整；自适应 AIMD 属于后续；
+- local/Ollama 固定上限 1；本轮不因显存/RAM 自动提高并行；
 - vLLM 等服务使用服务端连续批处理，客户端仍设置有界 in-flight；
-- pause 停止领取新 item；graceful stop 等待当前调用结束；immediate cancel 使用 AbortSignal 取消当前请求并丢弃半成品；
-- 模型请求在 stopping/cancelling 后以 timeout/rejection 结束时，必须优先把当前 item 释放为 pending/cancelled，不能走普通错误路径误标 failed；
-- 429/503/网络瞬断采用指数退避加抖动，schema/证据失败只做一次定向修复，不做相同请求重放。
+- pause 停止领取新记录并等待在途 execution context 到达安全屏障；stop 等待 worker 收敛并释放未完成记录，当前请求不强杀；立即取消/AbortSignal 仍是后续能力；
+- 429/503/网络瞬断的自适应退避和 AIMD 尚未实现；schema/证据失败当前只做一次定向修复，不做相同请求重放。
 
-全量任务在逻辑上仍覆盖启动时的全部未就绪记录，但实现上应分页建立 manifest 或边扫描边入队，只保留 `O(worker + prefetch)` 的活跃内存。任务提交 ACK 的 P95 应不超过 2 秒，不能因为同步扫描和反序列化全部卡片而阻塞 UI。
+全量任务在逻辑上仍覆盖启动时的全部未就绪记录，但当前仍一次收集候选并保存在内存；分页建立持久 manifest、边扫描边入队、`O(worker + prefetch)` 活跃内存和任务提交 ACK 优化属于后续阶段。
 
 ### 3.6 缓存、去重与签名
 
-保留当前 `contentHash + analyzerVersion + modelSignature` 缓存原则，并做三项修正：
+保留当前 `contentHash + analyzerVersion + modelSignature` 缓存原则。当前签名已包含 `analyzerVersion`、`policyVersion`、schema、provider、model、配置思考参数和结构化输出模式；任务级 `qualityMode` 是路由，不应被误写成全局卡片缓存身份，路由策略变化应升级 `policyVersion`：
 
-1. 签名必须加入 `policyVersion`、`schemaVersion`、prompt version、reasoning effort 和结构化输出模式；
-2. 当前 `requirementSemanticModelSignature()` 固定写入 `thinking: true`，会让关闭深度思考生成的卡片与开启模式共享签名，应修复；
-3. 增加同一批次的 `semanticSourceHash` single-flight：完全相同的业务原文和明确字段只发起一次模型调用，其余等待并复用已验证模板。
+1. 若 prompt/schema/reasoning/结构化输出策略发生兼容性变化，应更新 policy/schema 版本；
+2. 当前不把任务 qualityMode 强行加入卡片缓存身份，避免同一已验证卡片因 route 选择重复生成；
+3. 增加同一批次的 `semanticSourceHash` single-flight：完全相同的业务原文和明确字段只发起一次模型调用，其余等待并复用已验证模板（后续）。
 
 不建议首期做“按字段增量复用”。原文局部变化可能改变多个字段语义，错误复用的质量风险高于节省收益。
 
@@ -300,7 +305,7 @@ worker 通过原子 claim 获取 item，写入必须检查 hash/signature 仍匹
 - `strong_review_started/completed`；
 - `persisted`、`cancelled`、`failed`。
 
-把 trace event 追加到事件表，或在阶段边界事务化写入；不要每次都序列化并覆盖整份不断增长的 JSON。UI 进度事件节流到平均不超过 2 次/秒，任务快照从持久化 job/item 汇总，可在应用重启后恢复。
+当前 trace 在阶段开始/完成、模型错误、分歧和终态等边界持久化，内存/IPC 仍保留完整结构化事件；后续可追加事件表或阶段 snapshot，避免整份 JSON 写放大。UI 普通进度当前按 250ms 节流，阶段/终态即时发送；任务快照目前来自内存 worker pool，持久化 job/item 汇总和应用重启恢复尚未实现。
 
 ## 4. 不同方案的取舍
 
@@ -314,13 +319,13 @@ worker 通过原子 claim 获取 item，写入必须检查 hash/signature 仍匹
 | 更换本地 vLLM 服务 | 单条未必大幅下降 | 连续批处理下高 | 运维与 GPU 门槛 | 服务器部署可选，桌面端非首期 |
 | 微调/蒸馏小模型 | 高 | 高 | 需要高质量标注与持续评估 | 数据积累后的第三阶段 |
 
-如果业务暂时坚持“每条三阶段不可变”，最低限度应执行：
+如果仍需兼容旧的“每条三阶段不可变”调用方，以下只是过渡兼容方案，不是当前默认路由：
 
 1. `initial` 与 `independent` 并行；
-2. 只有存在分歧/低质量字段时调用 `adjudication`（若这一条也不能改，则仍会保留固定第三次调用）；
-3. 记录级在线并发 2–4；
-4. 证据 ID、确定字段服务端合并、严格结构化输出、缩短预算；
-5. 本地 Ollama 先确认 VRAM，再开启并行，避免上下文内存放大导致反而变慢或 OOM。
+2. 只有存在分歧/低质量字段时调用 `adjudication`（若外部调用方仍强制第三次调用，应单独评估成本）；
+3. 使用本轮已落地的 provider-aware 记录并发上限：online standard 4、online strict 2、local/Ollama 1；
+4. 确定字段服务端合并、严格结构化输出、缩短预算；证据 ID 仍是后续方案；
+5. 本地 Ollama 保持单路，避免上下文内存放大导致退化或 OOM。
 
 ## 5. 观测与性能基准
 
@@ -337,7 +342,7 @@ worker 通过原子 claim 获取 item，写入必须检查 hash/signature 仍匹
 - 429、5xx、timeout、cancel、provider request ID；
 - 吞吐（records/min）、in-flight、队列深度和 ETA。
 
-当前 trace 已有部分 Token 和时长字段，但缺少聚合与性能门禁，不能仅依赖 UI 中“单条秒数”。
+当前任务快照已提供 active records、并发上限、elapsed、records/min 和 ETA，trace 也有部分 Token 和时长字段；但仍缺少完整聚合、错误分桶、限流自适应和性能门禁，不能仅依赖 UI 中“单条秒数”。
 
 现有 `smoke-performance-regressions` 主要覆盖数据库事务、快照、通用任务取消和知识库缓存；`benchmark-requirement-matching` 测的是召回/重排而非语义卡片 AI 生成。两者都不能充当语义化端到端性能门，必须新增专用 harness，至少覆盖 1、10、100、500 条任务、冷热缓存、短中长文本、repair/timeout/length、暂停/恢复/停止和最大 in-flight。
 
@@ -359,7 +364,7 @@ worker 通过原子 claim 获取 item，写入必须检查 hash/signature 仍匹
 质量门：
 
 - JSON/schema 通过率 `>= 99.5%`；
-- 证据 ID 解析成功率 100%，不受原文支持的最终 evidence 为 0；
+- 当前逐字 evidence 通过率 100%，不受原文支持的最终 evidence 为 0；证据 ID 解析门槛待后续 evidence ID 化实现后启用；
 - action macro-F1、核心对象/行为 F1 相对当前三阶段基线下降不超过 1 个百分点；
 - downstream matching 的 Recall@20/NDCG@10/正式关系准确率不得显著下降；
 - 内容、模型、策略或 schema 变化后缓存 100% 正确失效；
@@ -367,50 +372,51 @@ worker 通过原子 claim 获取 item，写入必须检查 hash/signature 仍匹
 
 性能门：
 
-- 任务提交 ACK P95 `<= 2s`，任务活跃内存保持 `O(worker + prefetch)`；
+- 任务提交 ACK P95 `<= 2s`（待专用基准验证），当前候选仍一次收集并保存在内存；`O(worker + prefetch)` 需后续持久 manifest/流式入队后再验收；
 - 标准模式平均调用数 `<= 1.30`、P95 `<= 2`；
 - fast-path `>= 80%`，强模型升级率建议 `< 15%`；
 - 在线模型短记录 P50/P95 `<= 20/60s`；
 - 同一硬件本地模型短记录 P50/P95 `<= 45/120s`；
 - 33 条在线并发 4 批量 `<= 10min`，且无数据错配；
-- 暂停后不再领取新 item；立即停止在 2 秒内进入 cancelling，当前请求中断或明确报告供应商不支持；
-- 崩溃重启后 processing 租约过期并恢复为可重试，不产生重复 ready 或跨 UID 写入。
+- 暂停后不再领取新记录，等待在途 context 到达屏障；停止等待 worker 收敛并释放未完成记录，当前请求不强杀；
+- 429/AIMD、自适应退避以及崩溃重启后 processing 租约恢复尚未实现，列入后续验收，不得作为本轮已交付能力。
 
 所有目标按提供者和模型分桶，不能把在线 API、本地 CPU 和不同 GPU 的数据混成一个平均值。
 
 ## 6. 分阶段实施计划
 
-### 阶段 0：先建立可测基线（1–2 天）
+### 阶段 0：先建立可测基线（历史基线）
 
 1. 新增语义化真实基准脚本，不调用生产写库；
 2. 汇总现有 trace 中的时长、Token、调用次数和校验错误；
-3. 固化 50–100 条初始黄金集，跑当前三阶段作为基线；
+3. 固化 50–100 条初始黄金集，跑优化前固定三阶段作为历史基线；
 4. UI 增加 records/min、ETA、平均调用数和升级率，不展示未校准“百分比准确率”。
 
 退出条件：能够回答时间花在排队、输入、推理、可见输出、重试还是持久化。
 
-### 阶段 1：低风险快速收益（3–5 天）
+### 阶段 1：低风险快速收益（部分已落地，剩余为后续）
 
 1. Anthropic 接入真正的 `output_config.format`；兼容端点增加 capability probe；
-2. 改为证据 ID；确定字段不再要求模型生成；
-3. 短结构化调用默认非流式；
-4. 以基准数据收紧 `numPredict/numCtx/reasoning effort/timeout`；
-5. schema 修复最多 1 次，只重做失败字段；
-6. 修正模型签名中的实际 reasoning/policy/schema；
-7. 把静态 prompt/schema 放在前、动态记录放在后，并接入供应商 prompt cache 统计。
+2. 确定字段不再要求模型生成、由服务端注入（已落地）；证据 ID 仍为后续；
+3. 短结构化调用默认非流式（已落地）；
+4. 收紧 `numPredict/numCtx/reasoning effort/timeout`（standard/strict 预算与 15 分钟请求上限已落地，细粒度 reasoning 仍待校准）；
+5. schema 修复最多 1 次，只重做失败字段（已落地）；
+6. 当前签名包含 policy/schema/模型配置，qualityMode 作为任务路由而非强制缓存身份（已落地）；
+7. initial/independent 共用固定 system prompt，动态记录和 knownFields 放到 user payload（已落地）；供应商 prompt cache 统计仍为后续。
 
-退出条件：保持三阶段的情况下，单条 P50 至少下降 30%，schema 重试率低于 3%，质量门通过。
+退出条件：已落地项由路由/并发回归验证；单条 P50、重试率和质量 Pareto 仍需真实基准验证，不能用本轮静态代码证据代替。
 
-### 阶段 2：架构性优化（5–10 天）
+### 阶段 2：架构性优化（本轮已落地核心项；后续补齐持久化与自适应）
 
-1. 实现 `standard` 单次抽取 fast-path 与客观风险门；
-2. 只对失败字段做一次修复，高风险记录只升级一次强模型；
-3. 实现持久 job/item、租约、heartbeat、重试与恢复；
-4. 在线有限并发 4，自适应限流；Ollama 默认 1；
-5. 新审计事件替代固定三阶段 UI 文案；
-6. 灰度 shadow 比较新旧输出，不立即覆盖当前 ready 卡片。
+1. `standard` 单次抽取 fast-path 与核心字段低置信定向修复（已落地）；
+2. strict 初步/独立复核并行，仅分歧或低置信时裁决；失败字段只做一次定向修复（已落地）；
+3. provider-aware 有界 worker pool：online standard 4、online strict 2、local/Ollama 1；strict 同记录双调用的同时模型调用上界 4（已落地）；
+4. 每记录独立 execution context、单条失败隔离、暂停安全屏障、停止收敛、active snapshot 与 250ms 进度节流/阶段终态即时发送（已落地）；
+5. 固定 system prompt + 动态 user payload、已知字段服务端注入、收紧输出预算/重试和阶段边界 trace（已落地）；
+6. 持久 job/item、租约、heartbeat、重启恢复和自适应 429/AIMD（后续，未交付）；
+7. evidence ID、完整指标平台与 shadow 质量比较（后续，未交付或待专用平台）。
 
-退出条件：平均调用数 `<= 1.30`，吞吐提升至少 5 倍，核心质量相对基线不下降超过 1 个百分点。
+退出条件：本轮先通过 `semantic-card-concurrency-regression.ts` 等契约回归；平均调用数、吞吐提升和核心质量相对基线需真实数据验证，不能宣称已达标。
 
 ### 阶段 3：规模化与成本优化（后续）
 
@@ -425,21 +431,21 @@ worker 通过原子 claim 获取 item，写入必须检查 hash/signature 仍匹
 | 范围 | 文件 | 主要变化 |
 | --- | --- | --- |
 | 产品契约 | `docs/requirement-matching-target.md` | 固定三阶段/串行改为质量路由与 SLO |
-| 调度与分析 | `src/main/requirements/semanticization-service.ts` | fast-path、风险门、有限并发、证据 ID、重试策略 |
+| 调度与分析 | `src/main/requirements/semanticization-service.ts` | fast-path、风险门、有界 worker pool、上下文隔离、证据文本校验、重试策略 |
 | 供应商适配 | `src/main/model-client.ts` | 能力模型、Anthropic schema、reasoning effort、cache/usage、非流式 |
 | 持久化 | `src/main/database.ts` | job/item/lease/metrics/trace event 表与原子 claim |
 | 类型/IPC | `src/shared/types.ts`、`src/preload/index.ts`、`src/main/index.ts` | policy、route、指标、恢复和取消契约 |
 | UI | `src/renderer/src/App.tsx` | 质量模式、吞吐/ETA、升级原因、持久任务状态 |
-| 回归 | `tests/requirement-matching/semantic-card-analyzer-regression.ts` | 从固定调用步骤改为质量结果、路由和并发断言 |
+| 回归 | `tests/requirement-matching/semantic-card-analyzer-regression.ts`、`tests/requirement-matching/semantic-card-concurrency-regression.ts` | 从固定调用步骤改为质量结果、路由、并发上限和屏障断言 |
 | 基准 | 新增 `scripts/benchmark-semanticization.ts` | 真实/回放基准、质量与延迟报告 |
 
 ## 8. 关键风险与决策
 
-1. **必须先决定是否允许修改“三阶段/全串行”产品硬约束。** 不允许修改时只能获得有限改善。
+1. **固定三阶段/全串行硬约束的修改已完成。** 当前 standard/strict 路由和 provider-aware 有界 worker pool 已落地；后续只需决定是否扩展持久化队列、租约恢复和自适应限流。
 2. **不能用模型自报 confidence 直接决定跳过复核。** 路由阈值必须来自黄金集校准和可验证信号。
 3. **批量 API 不是交互加速器。** OpenAI Batch 当前完成窗口为 24 小时，适合低成本历史回填，不适合用户等待的当前任务。
 4. **本地并发不是越大越好。** Ollama 会随并行请求数放大上下文内存；显存不足时请求排队甚至退化。
-5. **模型/策略切换必须进入缓存签名。** 否则不同质量模式的卡片会被错误复用。
+5. **模型/策略版本必须进入缓存签名。** 当前 qualityMode 是任务级路由，不强行作为卡片缓存身份；若路由语义改变，应升级 `policyVersion`，避免策略变化时错误复用。
 6. **先 shadow，再替换。** 新路径至少对 10%–20% 记录同时运行旧基线并比较，连续通过质量门后再扩大。
 7. **数据合规需单独确认。** 在线 prompt caching 和异步 Batch 的数据处理/保留策略应按组织要求评审；不能仅因性能收益默认开启。
 8. **需要明确 `ready` 的质量资格。** 推荐只有通过统一硬校验与黄金集门槛的 `standard/strict` 结果可以 ready；未经完整校验的快速预览必须保存为 `provisional`，且不得参与正式匹配。

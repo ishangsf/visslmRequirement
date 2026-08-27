@@ -218,6 +218,31 @@ const nowIso = (): string => new Date().toISOString()
 const KNOWLEDGE_VECTOR_COARSE_STEP = 8
 const TASK_RETENTION_DAYS = 30
 
+const normalizeAssistantRunHistoryMetric = (value: unknown): number | undefined => (
+  typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
+)
+
+/** Keep older payloads readable while dropping malformed newly optional metrics. */
+const normalizeAssistantRunHistoryPayload = (value: unknown): AssistantRunHistory | undefined => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const record = value as Record<string, unknown>
+  const {
+    inputTokenCount: rawInputTokenCount,
+    outputTokenCount: rawOutputTokenCount,
+    tokensPerSecond: rawTokensPerSecond,
+    ...legacyFields
+  } = record
+  const inputTokenCount = normalizeAssistantRunHistoryMetric(rawInputTokenCount)
+  const outputTokenCount = normalizeAssistantRunHistoryMetric(rawOutputTokenCount)
+  const tokensPerSecond = normalizeAssistantRunHistoryMetric(rawTokensPerSecond)
+  return {
+    ...legacyFields,
+    ...(inputTokenCount === undefined ? {} : { inputTokenCount }),
+    ...(outputTokenCount === undefined ? {} : { outputTokenCount }),
+    ...(tokensPerSecond === undefined ? {} : { tokensPerSecond })
+  } as AssistantRunHistory
+}
+
 const buildKnowledgeCoarseVector = (vector: Float32Array): Float32Array => {
   const coarse = new Float32Array(Math.ceil(vector.length / KNOWLEDGE_VECTOR_COARSE_STEP))
   for (let index = 0, coarseIndex = 0; index < vector.length; index += KNOWLEDGE_VECTOR_COARSE_STEP, coarseIndex += 1) {
@@ -2931,7 +2956,8 @@ export class AppDatabase {
       ORDER BY completed_at DESC LIMIT ?
     `).all(safeLimit) as SqlRow[]).flatMap((row) => {
       try {
-        return [JSON.parse(String(row.payload_json)) as AssistantRunHistory]
+        const normalized = normalizeAssistantRunHistoryPayload(JSON.parse(String(row.payload_json)))
+        return normalized ? [normalized] : []
       } catch {
         return []
       }
@@ -3475,24 +3501,38 @@ export class AppDatabase {
       SELECT r.uid, r.item_id, r.name,
              ${requirementSemanticContentSql('r')} AS semantic_content_hash,
              s.status AS semantic_status, s.content_hash, s.analyzer_version,
-             s.model_signature, s.card_json
+             s.model_signature,
+             CASE
+               WHEN s.status = 'ready'
+                AND s.content_hash = ${requirementSemanticContentSql('r')}
+                AND s.analyzer_version = ?
+                AND s.model_signature = ?
+               THEN s.card_json
+               ELSE NULL
+             END AS card_json
       FROM records r
       LEFT JOIN requirement_semantic_cards s ON s.record_uid = r.uid
       WHERE s.record_uid IS NULL OR s.status <> 'processing'
       ORDER BY r.last_modify_time ASC, r.uid ASC
-    `).all() as SqlRow[]
+    `).all(input.analyzerVersion, input.modelSignature) as SqlRow[]
     const candidates = rows.flatMap((row): RequirementSemanticizationCandidate[] => {
-      let validCard = false
-      try {
-        validCard = isAiRequirementSemanticCard(JSON.parse(String(row.card_json ?? '')))
-      } catch {
-        validCard = false
-      }
       const contentHash = String(row.semantic_content_hash ?? '')
-      const validReady = String(row.semantic_status ?? '') === 'ready' && validCard &&
+      const metadataReady = String(row.semantic_status ?? '') === 'ready' &&
         String(row.content_hash ?? '') === contentHash &&
         String(row.analyzer_version ?? '') === input.analyzerVersion &&
         String(row.model_signature ?? '') === input.modelSignature
+      let validCard = false
+      // Most rows are pending, failed, or stale. Avoid parsing a potentially
+      // large card/trace payload unless its cheap metadata checks already say
+      // it could be a reusable ready card.
+      if (metadataReady) {
+        try {
+          validCard = isAiRequirementSemanticCard(JSON.parse(String(row.card_json ?? '')))
+        } catch {
+          validCard = false
+        }
+      }
+      const validReady = metadataReady && validCard
       return validReady ? [] : [{
         recordUid: String(row.uid),
         itemId: String(row.item_id ?? ''),
@@ -3513,14 +3553,16 @@ export class AppDatabase {
     modelSignature: string
     force?: boolean
   }): boolean {
-    const current = this.getRequirementSemanticCardState(input.recordUid)
-    const isValidReady = current?.status === 'ready' && current.card &&
-      current.contentHash === input.contentHash &&
-      current.analyzerVersion === input.analyzerVersion &&
-      current.modelSignature === input.modelSignature
-    if (current?.status === 'processing' || (!input.force && isValidReady)) return false
+    if (!input.force) {
+      const current = this.getRequirementSemanticCardState(input.recordUid)
+      const isValidReady = current?.status === 'ready' && current.card &&
+        current.contentHash === input.contentHash &&
+        current.analyzerVersion === input.analyzerVersion &&
+        current.modelSignature === input.modelSignature
+      if (isValidReady) return false
+    }
     const timestamp = nowIso()
-    this.db.prepare(`
+    const result = this.db.prepare(`
       INSERT INTO requirement_semantic_cards(
         record_uid, content_hash, analyzer_version, model_signature, status,
         card_json, error_message, started_at, completed_at, analysis_trace_json, created_at, updated_at
@@ -3532,25 +3574,47 @@ export class AppDatabase {
         status = 'processing', card_json = '', error_message = '',
         started_at = excluded.started_at, completed_at = '', analysis_trace_json = '{}',
         updated_at = excluded.updated_at
+      WHERE requirement_semantic_cards.status <> 'processing'
     `).run(
       input.recordUid, input.contentHash, input.analyzerVersion, input.modelSignature,
       timestamp, timestamp, timestamp
     )
-    return true
+    return result.changes > 0
   }
 
   completeRequirementSemanticCard(
     recordUid: string,
     card: RequirementSemanticCard,
-    analysisTrace: object = {}
-  ): void {
+    analysisTrace: object = {},
+    expected?: {
+      contentHash: string
+      analyzerVersion: string
+      modelSignature: string
+    }
+  ): boolean {
     const timestamp = nowIso()
-    this.db.prepare(`
+    const expectedWhere = expected
+      ? `
+        AND content_hash = ?
+        AND analyzer_version = ?
+        AND model_signature = ?
+        AND content_hash = (
+          SELECT ${requirementSemanticContentSql('r')}
+          FROM records r
+          WHERE r.uid = requirement_semantic_cards.record_uid
+        )
+      `
+      : ''
+    const result = this.db.prepare(`
       UPDATE requirement_semantic_cards
       SET status = 'ready', card_json = ?, analysis_trace_json = ?, error_message = '',
           completed_at = ?, updated_at = ?
-      WHERE record_uid = ? AND status = 'processing'
-    `).run(JSON.stringify(card), JSON.stringify(analysisTrace), timestamp, timestamp, recordUid)
+      WHERE record_uid = ? AND status = 'processing'${expectedWhere}
+    `).run(
+      JSON.stringify(card), JSON.stringify(analysisTrace), timestamp, timestamp, recordUid,
+      ...(expected ? [expected.contentHash, expected.analyzerVersion, expected.modelSignature] : [])
+    )
+    return result.changes > 0
   }
 
   updateRequirementSemanticCardTrace(

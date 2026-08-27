@@ -11,6 +11,7 @@ import {
   AssistantRunCancelledError,
   getAssistantRunContext,
   isAssistantRunCancellation,
+  recordAssistantRunUsage,
   throwIfAssistantRunCancelled
 } from './assistant/run-controller'
 
@@ -32,21 +33,49 @@ export interface ModelResponse {
   usage?: RequirementSemanticizationModelUsage
 }
 
+/**
+ * Optional provider-facing reasoning budget.  Existing think/forceThinking
+ * callers remain valid; when this field is omitted, providers keep their
+ * historical boolean-based behavior.
+ */
+export type ModelReasoningEffort = 'none' | 'low' | 'medium' | 'high' | 'xhigh'
+
+type ProviderReasoningEffort = Exclude<ModelReasoningEffort, 'xhigh'>
+
+// Keep the public route expressive while degrading xhigh to the highest
+// broadly supported provider value. Providers that do not expose a numeric
+// effort simply use the boolean thinking switch below.
+const providerReasoningEffort = (effort: ModelReasoningEffort): ProviderReasoningEffort =>
+  effort === 'xhigh' ? 'high' : effort
+
+export interface ModelChatRetryInfo {
+  attempt: number
+  maxAttempts: number
+  delayMs: number
+  status?: number
+  requestId?: string
+}
+
 export interface ModelChatInput {
   messages: ModelMessage[]
   tools?: unknown[]
   think?: boolean
   forceThinking?: boolean
+  reasoningEffort?: ModelReasoningEffort
   stream?: boolean
   numCtx?: number
   format?: 'json' | Record<string, unknown>
   temperature?: number
   numPredict?: number
   timeoutMs?: number
+  /** Opt-in transient transport retries. Defaults to 0 for legacy callers. */
+  maxTransportRetries?: number
   /** Optional direct caller signal; assistant runs also contribute their ALS signal. */
   signal?: AbortSignal
   /** Receives only visible final-answer text when this request is streamed. */
   onTextDelta?: (content: string) => void
+  /** Safe transport-retry telemetry; never receives response text or secrets. */
+  onRetry?: (info: ModelChatRetryInfo) => void
 }
 
 const trimBaseUrl = (value: string): string => value.replace(/\/+$/, '')
@@ -101,6 +130,165 @@ const requestSignal = (timeoutMs: number, callerSignal?: AbortSignal): ManagedRe
   }
 }
 
+export class ModelHttpError extends Error {
+  readonly status: number
+  readonly retryAfterMs: number | undefined
+  readonly requestId: string | undefined
+  /** Response text after secret masking and a hard length cap. */
+  readonly body: string
+  readonly retryable: boolean
+
+  constructor(
+    message: string,
+    details: {
+      status: number
+      retryAfterMs?: number
+      requestId?: string
+      body?: string
+    }
+  ) {
+    super(message)
+    this.name = 'ModelHttpError'
+    this.status = details.status
+    this.retryAfterMs = details.retryAfterMs
+    this.requestId = details.requestId
+    this.body = details.body ?? ''
+    this.retryable = details.status === 408 || details.status === 409 || details.status === 429 ||
+      (details.status >= 500 && details.status <= 599)
+  }
+}
+
+const modelErrorBodyLimit = 500
+
+const safeModelErrorBody = (value: string, apiKey?: string): string => {
+  let safe = value
+    .replace(/Bearer\s+[^\s]+/gi, 'Bearer [已隐藏]')
+    .replace(/(api[-_ ]?key|token|password|secret)\s*[:=]\s*[^\s,;]+/gi, '$1=[已隐藏]')
+    .trim()
+  const configuredApiKey = apiKey?.trim()
+  if (configuredApiKey) safe = safe.split(configuredApiKey).join('[已隐藏]')
+  return safe.slice(0, modelErrorBodyLimit)
+}
+
+const retryAfterMsFromHeader = (value: string | null): number | undefined => {
+  const normalized = value?.trim()
+  if (!normalized) return undefined
+  const seconds = Number(normalized)
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1_000)
+  const timestamp = Date.parse(normalized)
+  return Number.isFinite(timestamp) ? Math.max(0, timestamp - Date.now()) : undefined
+}
+
+type SemaphoreWaiter = {
+  resolve: (release: () => void) => void
+  reject: (reason: unknown) => void
+  signals: AbortSignal[]
+  cleanup: () => void
+  settled: boolean
+}
+
+/**
+ * A process-local, cancellation-aware semaphore shared by all ModelClient
+ * instances that point at the same provider endpoint. It bounds both normal
+ * calls and capability probes without holding a slot while a queued call is
+ * paused or cancelled.
+ */
+class ModelRequestSemaphore {
+  private active = 0
+  private readonly queue: SemaphoreWaiter[] = []
+
+  constructor(private readonly limit: number) {}
+
+  acquire(signals: readonly AbortSignal[]): Promise<() => void> {
+    const uniqueSignals = [...new Set(signals)]
+    const alreadyAborted = uniqueSignals.find((signal) => signal.aborted)
+    if (alreadyAborted) return Promise.reject(alreadyAborted.reason ?? new DOMException('请求已取消', 'AbortError'))
+    if (this.active < this.limit) {
+      this.active += 1
+      return Promise.resolve(this.releaseHandle())
+    }
+    return new Promise<() => void>((resolve, reject) => {
+      const waiter: SemaphoreWaiter = {
+        resolve,
+        reject,
+        signals: uniqueSignals,
+        cleanup: () => undefined,
+        settled: false
+      }
+      const remove = (): void => {
+        const index = this.queue.indexOf(waiter)
+        if (index >= 0) this.queue.splice(index, 1)
+      }
+      const abort = (signal: AbortSignal): void => {
+        if (waiter.settled) return
+        waiter.settled = true
+        remove()
+        waiter.cleanup()
+        waiter.reject(signal.reason ?? new DOMException('请求已取消', 'AbortError'))
+        this.pump()
+      }
+      waiter.cleanup = (): void => waiter.signals.forEach((signal) => signal.removeEventListener('abort', () => abort(signal)))
+      // Keep the exact listener per signal so cleanup can remove it reliably.
+      const listeners = uniqueSignals.map((signal) => {
+        const listener = (): void => abort(signal)
+        signal.addEventListener('abort', listener, { once: true })
+        return { signal, listener }
+      })
+      waiter.cleanup = (): void => listeners.forEach(({ signal, listener }) => signal.removeEventListener('abort', listener))
+      this.queue.push(waiter)
+      this.pump()
+    })
+  }
+
+  private releaseHandle(): () => void {
+    let released = false
+    return (): void => {
+      if (released) return
+      released = true
+      this.active = Math.max(0, this.active - 1)
+      this.pump()
+    }
+  }
+
+  private pump(): void {
+    while (this.active < this.limit && this.queue.length) {
+      const waiter = this.queue.shift()!
+      if (waiter.settled) continue
+      const aborted = waiter.signals.find((signal) => signal.aborted)
+      if (aborted) {
+        waiter.settled = true
+        waiter.cleanup()
+        waiter.reject(aborted.reason ?? new DOMException('请求已取消', 'AbortError'))
+        continue
+      }
+      waiter.settled = true
+      waiter.cleanup()
+      this.active += 1
+      waiter.resolve(this.releaseHandle())
+    }
+  }
+}
+
+const modelRequestSemaphores = new Map<string, ModelRequestSemaphore>()
+
+const modelRequestSemaphoreFor = (settings: Pick<ModelSettings, 'source' | 'provider' | 'baseUrl'>): ModelRequestSemaphore => {
+  const key = `${settings.source}\u0000${settings.provider}\u0000${trimBaseUrl(settings.baseUrl)}`
+  const existing = modelRequestSemaphores.get(key)
+  if (existing) return existing
+  // Project agreement extraction already has a tested two-request local
+  // pipeline. Keep that endpoint-wide contract while semanticization itself
+  // remains single-flight through its worker/stage routing.
+  const limit = settings.source === 'local' || settings.provider === 'ollama' ? 2 : 4
+  const semaphore = new ModelRequestSemaphore(limit)
+  modelRequestSemaphores.set(key, semaphore)
+  return semaphore
+}
+
+const cancellationSignals = (callerSignal?: AbortSignal): AbortSignal[] => {
+  const runSignal = getAssistantRunContext()?.signal
+  return [callerSignal, runSignal].filter((signal, index, values): signal is AbortSignal => Boolean(signal) && values.indexOf(signal) === index)
+}
+
 const throwIfRunWasCancelled = (error: unknown): void => {
   const context = getAssistantRunContext()
   if (context?.signal.aborted) throw new AssistantRunCancelledError(context.runId)
@@ -142,6 +330,84 @@ const errorMessages = (error: unknown): string[] => {
     current = errorCause(current)
   }
   return messages
+}
+
+const modelTransportRetryLimit = 2
+const modelTransportBackoffBaseMs = 250
+const modelTransportBackoffMaxMs = 8_000
+const modelRetryAfterLimitMs = 10_000
+
+const errorChain = (error: unknown): unknown[] => {
+  const chain: unknown[] = []
+  const visited = new Set<unknown>()
+  let current: unknown = error
+  while (current !== undefined && current !== null && !visited.has(current)) {
+    visited.add(current)
+    chain.push(current)
+    current = errorCause(current)
+  }
+  return chain
+}
+
+const modelHttpErrorFrom = (error: unknown): ModelHttpError | undefined =>
+  errorChain(error).find((item): item is ModelHttpError => item instanceof ModelHttpError)
+
+const isTransientModelNetworkError = (error: unknown): boolean => errorChain(error).some((item) => {
+  if (item instanceof ModelHttpError) return false
+  if (!(item instanceof Error)) return false
+  const rawCode = (item as Error & { code?: unknown }).code
+  const code = typeof rawCode === 'string'
+    ? rawCode.toUpperCase()
+    : ''
+  if (['ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT',
+    'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_SOCKET'].includes(code)) return true
+  if (item.name === 'TimeoutError') return true
+  return /fetch failed|network|socket|connect|timed?\s*out|timeout|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT/i.test(item.message)
+})
+
+const isModelRequestCancelled = (error: unknown, input: ModelChatInput): boolean => (
+  Boolean(input.signal?.aborted) || Boolean(getAssistantRunContext()?.signal.aborted) || isAssistantRunCancellation(error)
+)
+
+const modelRetryDelayMs = (error: unknown, retryIndex: number): number => {
+  const retryAfterMs = modelHttpErrorFrom(error)?.retryAfterMs
+  const exponential = Math.min(
+    modelTransportBackoffMaxMs,
+    modelTransportBackoffBaseMs * 2 ** Math.max(0, retryIndex)
+  )
+  const jitter = Math.floor(Math.random() * Math.max(1, Math.min(250, Math.round(exponential * 0.25))))
+  const requested = retryAfterMs === undefined
+    ? exponential + jitter
+    : Math.max(exponential + jitter, Math.max(0, retryAfterMs))
+  return Math.min(modelRetryAfterLimitMs, requested)
+}
+
+const waitForModelRetry = (delayMs: number, signals: readonly AbortSignal[]): Promise<void> => {
+  const uniqueSignals = [...new Set(signals)]
+  const alreadyAborted = uniqueSignals.find((signal) => signal.aborted)
+  if (alreadyAborted) return Promise.reject(alreadyAborted.reason ?? new DOMException('请求已取消', 'AbortError'))
+  if (delayMs <= 0) return Promise.resolve()
+  return new Promise<void>((resolve, reject) => {
+    let settled = false
+    const cleanup = (): void => uniqueSignals.forEach((signal) => {
+      const listener = listeners.get(signal)
+      if (listener) signal.removeEventListener('abort', listener)
+    })
+    const finish = (callback: () => void): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      cleanup()
+      callback()
+    }
+    const listeners = new Map<AbortSignal, () => void>()
+    const timer = setTimeout(() => finish(resolve), delayMs)
+    uniqueSignals.forEach((signal) => {
+      const listener = (): void => finish(() => reject(signal.reason ?? new DOMException('请求已取消', 'AbortError')))
+      listeners.set(signal, listener)
+      signal.addEventListener('abort', listener, { once: true })
+    })
+  })
 }
 
 const ollamaConnectionError = (error: unknown): Error => {
@@ -196,8 +462,8 @@ const rawChatUsage = (value: unknown): RequirementSemanticizationModelUsage | un
   if (typeof value !== 'object' || value === null) return undefined
   const usage = value as Record<string, unknown>
   const normalized: RequirementSemanticizationModelUsage = {
-    promptTokens: finiteNumber(usage.input_tokens),
-    completionTokens: finiteNumber(usage.output_tokens)
+    promptTokens: finiteNumber(usage.prompt_tokens ?? usage.input_tokens),
+    completionTokens: finiteNumber(usage.completion_tokens ?? usage.output_tokens)
   }
   return Object.values(normalized).some((item) => item !== undefined) ? normalized : undefined
 }
@@ -958,16 +1224,61 @@ export class ModelClient {
   }
 
   async chat(input: ModelChatInput): Promise<ModelResponse> {
-    return this.settings.source === 'local'
-      ? this.chatOllama(input)
-      : this.usesRawChatResponses()
-        ? this.chatRawChatResponses(input)
-      : this.settings.provider === 'anthropic'
-        ? this.chatAnthropic(input)
-        : this.chatOpenAi(input)
+    const semaphore = modelRequestSemaphoreFor(this.settings)
+    const signals = cancellationSignals(input.signal)
+    const transportRetryLimit = Math.max(0, Math.min(
+      modelTransportRetryLimit,
+      Math.trunc(input.maxTransportRetries ?? 0)
+    ))
+    for (let retryIndex = 0; ; retryIndex += 1) {
+      try {
+        const release = await semaphore.acquire(signals)
+        try {
+          const response = await (this.settings.source === 'local'
+            ? this.chatOllama(input)
+            : this.usesRawChatResponses()
+              ? this.chatRawChatResponses(input)
+              : this.settings.provider === 'anthropic'
+                ? this.chatAnthropic(input)
+              : this.chatOpenAi(input))
+          recordAssistantRunUsage(response.usage)
+          return response
+        } finally {
+          release()
+        }
+      } catch (error) {
+        if (isModelRequestCancelled(error, input)) {
+          if (getAssistantRunContext()?.signal.aborted) throwIfRunWasCancelled(error)
+          throw input.signal?.reason ?? error
+        }
+        const httpError = modelHttpErrorFrom(error)
+        // An HTTP rejection happens before any streamed content is emitted and
+        // is safe to retry. A transport failure during an active stream may
+        // already have delivered visible deltas, so retrying it would duplicate
+        // assistant output. Semanticization is non-streaming and keeps the full
+        // transient-network retry path.
+        const retryable = httpError?.retryable ?? (!input.stream && isTransientModelNetworkError(error))
+        if (!retryable || retryIndex >= transportRetryLimit) throw error
+        const delayMs = modelRetryDelayMs(error, retryIndex)
+        try {
+          input.onRetry?.({
+            attempt: retryIndex + 2,
+            maxAttempts: transportRetryLimit + 1,
+            delayMs,
+            ...(httpError?.status !== undefined ? { status: httpError.status } : {}),
+            ...(httpError?.requestId ? { requestId: httpError.requestId } : {})
+          })
+        } catch {
+          // Retry telemetry must never turn a recoverable model response into
+          // a failed chat request.
+        }
+        await waitForModelRetry(delayMs, signals)
+      }
+    }
   }
 
   private resolveThinking(input: ModelChatInput): boolean {
+    if (input.reasoningEffort !== undefined) return input.reasoningEffort !== 'none'
     if (input.forceThinking !== undefined) return input.forceThinking
     // The online switch is a persisted model preference. Local Ollama keeps
     // the existing per-request override used by the agent's tool workflow.
@@ -1238,7 +1549,7 @@ export class ModelClient {
       return await this.readOllamaStream(response, request.signal, input.onTextDelta)
     } catch (error) {
       throwIfRunWasCancelled(error)
-      if (error instanceof OllamaProtocolError) throw error
+      if (error instanceof OllamaProtocolError || error instanceof ModelHttpError) throw error
       throw ollamaConnectionError(error)
     } finally {
       request.cleanup()
@@ -1340,6 +1651,7 @@ export class ModelClient {
   private async chatOpenAi(input: ModelChatInput): Promise<ModelResponse> {
     if (!this.settings.apiKey) throw new Error('未配置 API Key')
     const thinking = this.resolveThinking(input)
+    const reasoningEffort = input.reasoningEffort
     const reasoningModel = this.settings.provider === 'openai' && this.isOpenAiReasoningModel()
     const messages = input.messages.map((message) => ({
       role: message.role,
@@ -1372,7 +1684,7 @@ export class ModelClient {
               : { temperature: input.temperature ?? 0.1 }),
             max_tokens: input.numPredict ?? 2048
           }),
-      ...this.openAiThinkingParams(thinking),
+      ...this.openAiThinkingParams(thinking, reasoningEffort),
       ...(input.format
         ? {
             response_format:
@@ -1397,6 +1709,7 @@ export class ModelClient {
         return await readOpenAiStream(response, request.signal, input.onTextDelta)
       }
       const payload = (await response.json()) as {
+      usage?: Record<string, unknown>
       choices?: Array<{
         finish_reason?: string
         message?: {
@@ -1411,6 +1724,7 @@ export class ModelClient {
       }
       const choice = payload.choices?.[0]
       const reasoningContent = choice?.message?.reasoning_content
+      const usage = rawChatUsage(payload.usage)
       throwIfAssistantRunCancelled()
       const result: ModelResponse = {
       done_reason: choice?.finish_reason,
@@ -1432,7 +1746,8 @@ export class ModelClient {
               return [{ id: call.id, function: { name: call.function.name, arguments: args } }]
             })
           }
-        : undefined
+        : undefined,
+      ...(usage ? { usage } : {})
       }
       if (input.stream) {
         emitVisibleTextDelta(input.onTextDelta, request.signal, result.message?.content)
@@ -1449,6 +1764,7 @@ export class ModelClient {
   private async chatRawChatResponses(input: ModelChatInput): Promise<ModelResponse> {
     if (!this.settings.apiKey) throw new Error('未配置 API Key')
     const thinking = this.resolveThinking(input)
+    const reasoningEffort = input.reasoningEffort
     const format = rawChatTextFormat(input.format)
     const tools = rawChatTools(input.tools)
     const body: Record<string, unknown> = {
@@ -1459,7 +1775,7 @@ export class ModelClient {
       ...(format ? { text: { format } } : {}),
       // RawChat's Codex channel is backed by reasoning models.  Temperature
       // and Chat Completions-only token fields are intentionally omitted.
-      reasoning: { effort: thinking ? 'high' : 'none' },
+      reasoning: { effort: reasoningEffort ? providerReasoningEffort(reasoningEffort) : (thinking ? 'high' : 'none') },
       // Responses API requires at least 16 output tokens (including any
       // reasoning tokens counted against the budget).
       max_output_tokens: Math.max(16, Math.round(input.numPredict ?? 2048))
@@ -1605,7 +1921,7 @@ export class ModelClient {
             input_schema: tool.function.parameters
           }]
         : [])
-    const anthropicThinking = thinking ? this.anthropicThinkingParams() : {}
+    const anthropicThinking = thinking ? this.anthropicThinkingParams(input.reasoningEffort) : {}
     const anthropicOutputConfig = input.format && input.format !== 'json'
       ? {
           ...(asRecord(anthropicThinking.output_config) ?? {}),
@@ -1643,6 +1959,7 @@ export class ModelClient {
     }
     const payload = (await response.json()) as {
       stop_reason?: string
+      usage?: Record<string, unknown>
       content?: Array<{
         [key: string]: unknown
         type?: string
@@ -1653,6 +1970,7 @@ export class ModelClient {
       }>
     }
     throwIfAssistantRunCancelled()
+    const usage = rawChatUsage(payload.usage)
     const result: ModelResponse = {
       done_reason: payload.stop_reason,
       message: {
@@ -1664,7 +1982,8 @@ export class ModelClient {
             ? [{ id: item.id, function: { name: item.name, arguments: item.input ?? {} } }]
             : []
         )
-      }
+      },
+      ...(usage ? { usage } : {})
     }
     if (input.stream) {
       emitVisibleTextDelta(input.onTextDelta, request.signal, result.message?.content)
@@ -1678,7 +1997,10 @@ export class ModelClient {
     }
   }
 
-  private openAiThinkingParams(thinking: boolean): Record<string, unknown> {
+  private openAiThinkingParams(
+    thinking: boolean,
+    reasoningEffort?: ModelReasoningEffort
+  ): Record<string, unknown> {
     if (this.settings.provider === 'deepseek' || this.settings.provider === 'zhipu') {
       return { thinking: { type: thinking ? 'enabled' : 'disabled' } }
     }
@@ -1686,6 +2008,9 @@ export class ModelClient {
       return { enable_thinking: thinking }
     }
     if (this.settings.provider === 'openai' && this.isOpenAiReasoningModel()) {
+      if (reasoningEffort !== undefined) {
+        return { reasoning_effort: providerReasoningEffort(reasoningEffort) }
+      }
       if (!thinking && !this.supportsOpenAiNoReasoning()) return {}
       return { reasoning_effort: thinking ? 'medium' : 'none' }
     }
@@ -1700,11 +2025,11 @@ export class ModelClient {
     return /^gpt-5\.(?:1|2)(?:[.-]|$)/i.test(this.settings.model.trim())
   }
 
-  private anthropicThinkingParams(): Record<string, unknown> {
+  private anthropicThinkingParams(reasoningEffort?: ModelReasoningEffort): Record<string, unknown> {
     if (this.supportsAnthropicAdaptiveThinking()) {
       return {
         thinking: { type: 'adaptive' },
-        output_config: { effort: 'high' }
+        output_config: { effort: reasoningEffort ? providerReasoningEffort(reasoningEffort) : 'high' }
       }
     }
     return {
@@ -1751,23 +2076,36 @@ export class ModelClient {
     return this.usesRawChatResponses() ? 'RawChat Codex' : (names[this.settings.provider] ?? this.settings.provider)
   }
 
-  private async httpError(response: Response): Promise<Error> {
-    const body = (await response.text()).slice(0, 500)
-    if (this.usesRawChatResponses() && /Codex is not enabled/i.test(body)) {
-      return new Error(
-        `${this.providerName()} HTTP ${response.status}：当前 API Key 未开通 RawChat Codex 服务，请在 RawChat 控制台启用 Codex 权限或更换 Key。`
+  private async httpError(response: Response): Promise<ModelHttpError> {
+    let rawBody = ''
+    try {
+      rawBody = await response.text()
+    } catch {
+      // Keep the structured status/headers even when an upstream closes the
+      // body before it can be read.
+    }
+    const body = safeModelErrorBody(rawBody, this.settings.apiKey)
+    const requestId = response.headers.get('x-request-id')?.trim() || response.headers.get('request-id')?.trim() || undefined
+    const retryAfterMs = retryAfterMsFromHeader(response.headers.get('retry-after'))
+    const details = { status: response.status, retryAfterMs, requestId, body }
+    if (this.usesRawChatResponses() && /Codex is not enabled/i.test(rawBody)) {
+      return new ModelHttpError(
+        `${this.providerName()} HTTP ${response.status}：当前 API Key 未开通 RawChat Codex 服务，请在 RawChat 控制台启用 Codex 权限或更换 Key。`,
+        details
       )
     }
-    if (this.usesRawChatResponses() && /invalid api key|incorrect api key|unauthorized/i.test(body)) {
-      return new Error(
-        `${this.providerName()} HTTP ${response.status}：API Key 无效、已撤销或未正确填写，请重新生成并保存新的 Key。`
+    if (this.usesRawChatResponses() && /invalid api key|incorrect api key|unauthorized/i.test(rawBody)) {
+      return new ModelHttpError(
+        `${this.providerName()} HTTP ${response.status}：API Key 无效、已撤销或未正确填写，请重新生成并保存新的 Key。`,
+        details
       )
     }
-    if (this.settings.provider === 'openai-compatible' && /Codex is not enabled/i.test(body)) {
-      return new Error(
-        `${this.providerName()} HTTP ${response.status}：当前 API Key 未开通该地址对应的 Codex 聊天服务。请在服务商控制台启用相应权限，或改用已开通 Chat Completions 的 API 地址和模型。`
+    if (this.settings.provider === 'openai-compatible' && /Codex is not enabled/i.test(rawBody)) {
+      return new ModelHttpError(
+        `${this.providerName()} HTTP ${response.status}：当前 API Key 未开通该地址对应的 Codex 聊天服务。请在服务商控制台启用相应权限，或改用已开通 Chat Completions 的 API 地址和模型。`,
+        details
       )
     }
-    return new Error(`${this.providerName()} HTTP ${response.status}${body ? `: ${body}` : ''}`)
+    return new ModelHttpError(`${this.providerName()} HTTP ${response.status}${body ? `: ${body}` : ''}`, details)
   }
 }

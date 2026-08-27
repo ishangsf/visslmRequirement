@@ -44,6 +44,12 @@ const resultModes: readonly AssistantIntentResultMode[] = [
 ]
 
 const skillIds = new Set(['general', 'knowledge-base', 'visualization', 'requirement-analysis', 'artifact'])
+// Artifact delivery is an explicit-mention capability. Keeping it out of the
+// automatic classifier schema/prompt avoids spending classification tokens on
+// a route that Auto mode is never authorized to select.
+const automaticTaskTypes = taskTypes.filter((taskType) => taskType !== 'artifact_generation')
+const automaticResultModes = resultModes.filter((resultMode) => resultMode !== 'artifact')
+const automaticSkillIds = ['general', 'knowledge-base', 'visualization', 'requirement-analysis'] as const
 
 const intentInitialOutputBudget = 900
 const intentRetryOutputBudget = 1_800
@@ -62,11 +68,11 @@ export const assistantIntentDecisionFormat = {
     'reason'
   ],
   properties: {
-    taskType: { type: 'string', enum: taskTypes },
-    skillId: { type: 'string', enum: ['general', 'knowledge-base', 'visualization', 'requirement-analysis', 'artifact'] },
+    taskType: { type: 'string', enum: automaticTaskTypes },
+    skillId: { type: 'string', enum: automaticSkillIds },
     sourceMode: { type: 'string', enum: sourceModes },
     resolvedQuestion: { type: 'string' },
-    resultMode: { type: 'string', enum: resultModes },
+    resultMode: { type: 'string', enum: automaticResultModes },
     groupEntities: {
       type: 'array',
       maxItems: 12,
@@ -226,7 +232,7 @@ const artifactSourceModeOf = (
   return hasDocument ? 'knowledge' : 'records'
 }
 
-const capabilitySummary = expertRegistry.map((expert) => ({
+const capabilitySummary = expertRegistry.filter((expert) => expert.id !== 'artifact').map((expert) => ({
   skillId: expert.id,
   name: expert.name,
   description: expert.description,
@@ -250,6 +256,7 @@ export class AssistantIntentRouter {
     const cleanedQuestion = stripMentions(question)
     const history = userHistory(request.history)
     const sourceText = groundingText(question, request.history)
+    const explicitArtifactMention = mentionPatterns.artifact.test(question)
     if (!cleanedQuestion) {
       return {
         taskType: 'conversation',
@@ -302,7 +309,7 @@ export class AssistantIntentRouter {
         reason: 'explicit-knowledge-base-skill'
       }
     }
-    if (mentionPatterns.artifact.test(question)) {
+    if (explicitArtifactMention) {
       const hasEvidence = Boolean(request.artifactSource?.evidenceBlocks.length)
       return {
         taskType: 'artifact_generation',
@@ -340,9 +347,10 @@ export class AssistantIntentRouter {
         content: [
           '你是 VISSLM Auto 助手的统一意图路由器，只输出一个严格 JSON 决策，不回答用户问题。',
           '这是模型优先的分类阶段：不得访问、猜测或依赖数据库字段、向量索引、知识库内容或工具结果。',
-          'taskType 必须是 conversation、record_query、knowledge_qa、mixed_analysis、visualization、requirement_matching、artifact_generation 之一。',
+          'taskType 必须是 conversation、record_query、knowledge_qa、mixed_analysis、visualization、requirement_matching 之一。',
           'sourceMode 必须分别表示普通对话、数据中心记录、上传文档知识库或两种来源；不要把记录向量当作文档知识。',
-          'visualization 只用于明确的大屏/看板/图表交付，requirement_matching 只用于需求编号或需求相似匹配，artifact_generation 只用于把已验证证据生成 DOCX/XLSX/PPTX/ZIP；普通数据列表、筛选、统计和分析使用 record_query。',
+          'visualization 只用于明确的大屏/看板/图表交付，requirement_matching 只用于需求编号或需求相似匹配；普通数据列表、筛选、统计和分析使用 record_query。',
+          '交付物生成不属于自动分类范围；不得选择、建议或准备交付物技能。该能力只由模型调用前的显式 @交付物专家 入口处理。',
           'resultMode 表示 answer、list、grouped_list、table 或 dashboard。用户要求按多个已提及实体分别列出时使用 grouped_list。',
           'groupEntities 只能填写当前问题或用户历史中实际出现、且与 grouped_list 直接相关的实体；不得创造、补全或猜测名称。',
           '当前句子省略实体时，可以从用户历史恢复明确实体；不要把助手上一轮的推测当作用户实体。',
@@ -412,10 +420,12 @@ export class AssistantIntentRouter {
     ].filter(Boolean).join('\n')
     const modelNeedsClarification = raw.needsClarification === true
     const groupedWithoutGroundedEntities = resultMode === 'grouped_list' && entities.length === 0
+    const artifactWithoutExplicitMention = resolvedTask === 'artifact_generation' && !explicitArtifactMention
     const artifactWithoutEvidence = resolvedTask === 'artifact_generation' &&
+      explicitArtifactMention &&
       !request.artifactSource?.evidenceBlocks.length
-    const sourceMismatch = rawSourceMode !== undefined && rawSourceMode !== sourceMode
-    const taskSkillMismatch = modelSkill !== undefined && modelSkill !== canonicalSkillForTask(resolvedTask)
+    const sourceMismatch = !artifactWithoutExplicitMention && rawSourceMode !== undefined && rawSourceMode !== sourceMode
+    const taskSkillMismatch = !artifactWithoutExplicitMention && modelSkill !== undefined && modelSkill !== canonicalSkillForTask(resolvedTask)
     const needsClarification = modelNeedsClarification || groupedWithoutGroundedEntities || artifactWithoutEvidence ||
       hasUngroundedGroupEntity || invalidDecisionShape || sourceMismatch || taskSkillMismatch
     const clarificationQuestion = typeof raw.clarificationQuestion === 'string'
@@ -427,13 +437,21 @@ export class AssistantIntentRouter {
 
     // A forced general mention can still classify conversation, records,
     // knowledge or mixed work. It cannot silently escalate to a specialist.
-    const normalizedTask = forcedSkill === 'general' && (
-      resolvedTask === 'visualization' || resolvedTask === 'requirement_matching' || resolvedTask === 'artifact_generation'
-    ) ? 'record_query' : resolvedTask
+    const normalizedTask = artifactWithoutExplicitMention
+      ? 'conversation'
+      : forcedSkill === 'general' && (
+        resolvedTask === 'visualization' || resolvedTask === 'requirement_matching' || resolvedTask === 'artifact_generation'
+      )
+        ? 'record_query'
+        : resolvedTask
     const normalizedSource = canonicalSourceForTask(normalizedTask)
-    const normalizedResult = normalizedTask === 'record_query' && resultMode === 'dashboard'
-      ? 'list'
-      : resultMode
+    const normalizedResult = artifactWithoutExplicitMention
+      ? 'answer'
+      : normalizedTask === 'record_query' && (
+          resultMode === 'dashboard' || resultMode === 'artifact'
+        )
+        ? 'list'
+        : resultMode
     const normalizedSkill = forcedSkill ?? canonicalSkillForTask(normalizedTask)
 
     return {
