@@ -46,6 +46,10 @@ import { normalizeProjectRequirementText } from '../shared/project-requirement-u
 import { AppDatabase } from './database'
 import { KnowledgeService, type KnowledgeRecordMatch } from './knowledge'
 import { ModelClient } from './model-client'
+import { buildProjectRequirementMatchCard } from './requirements/requirement-match-card'
+import type { RequirementMatchingCore } from './requirements/requirement-matching-core'
+import { createRequirementMatchingCore } from './requirements/requirement-matching-runtime'
+import { projectRequirementMatchProjection } from './requirements/requirement-match-adapters'
 
 const supportedAgreementExtensions = new Set(['.docx', '.pdf', '.xlsx', '.xls', '.txt'])
 // Keep local-model requests small enough that a slow CPU model can finish
@@ -351,14 +355,17 @@ interface MatchReview {
 
 export class ProjectManagementService {
   private readonly runningProjectIds = new Set<string>()
+  private readonly matchingCore: RequirementMatchingCore
 
   constructor(
     private readonly db: AppDatabase,
     private readonly knowledge: KnowledgeService,
     private readonly modelSettings: () => ModelSettings,
     private readonly progress?: (progress: ProjectAnalysisProgress) => void,
-    private readonly projectMatchingSettings: () => ProjectMatchingSettings = () => DEFAULT_PROJECT_MATCHING_SETTINGS
+    private readonly projectMatchingSettings: () => ProjectMatchingSettings = () => DEFAULT_PROJECT_MATCHING_SETTINGS,
+    matchingCore?: RequirementMatchingCore
   ) {
+    this.matchingCore = matchingCore ?? createRequirementMatchingCore(db, knowledge, modelSettings)
     this.db.reconcileInterruptedProjectAnalysis()
   }
 
@@ -1760,27 +1767,37 @@ export class ProjectManagementService {
   }
 
   private async matchSingleRequirement(requirement: ProjectRequirement): Promise<void> {
-    const matchingQuery = this.buildRequirementMatchQuery(requirement)
-    const vectorMatches = await this.knowledge.rankRecordMatches(matchingQuery)
-    const reviewed = await this.reviewMatches(requirement, vectorMatches.slice(0, 20))
-    const reviewByRecord = new Map(
-      (reviewed.matches ?? [])
-        .filter((item) => item.recordUid)
-        .map((item) => [String(item.recordUid), item])
-    )
-    const matches = vectorMatches.map((match) => {
-      const review = reviewByRecord.get(match.recordUid)
-      const aiScore = review?.score === undefined ? undefined : this.clampScore(review.score)
-      return {
-        recordUid: match.recordUid,
-        vectorScore: this.clampScore(match.score),
-        ...(aiScore === undefined ? {} : { aiScore }),
-        finalScore: aiScore ?? this.clampScore(match.score),
-        scoreSource: aiScore === undefined ? 'vector' as const : 'ai' as const,
-        reason: review?.reason?.trim() ?? '',
-        bestChunkId: match.chunkId
+    const base = buildProjectRequirementMatchCard(requirement)
+    const result = await this.matchingCore.match({
+      base,
+      excludedUids: new Set<string>(),
+      includeCurrentProjectRecords: false,
+      explainTopN: 10,
+      explanationPolicy: {
+        mode: this.modelSettings().source === 'local' ? 'local' : 'online',
+        allowExternalProcessing: false
       }
     })
+    const candidateByUid = new Map(result.candidates.map((candidate) => [candidate.recordUid, candidate]))
+    const matches = projectRequirementMatchProjection(result)
+      .map((projected) => {
+        const candidate = candidateByUid.get(projected.recordUid)!
+        return {
+        recordUid: projected.recordUid,
+        vectorScore: candidate.stageScores.fusedScore,
+        finalScore: projected.rankingScore,
+        scoreSource: 'vector' as const,
+        reason: JSON.stringify({
+          rankingVersion: candidate.rankingVersion,
+          relation: candidate.relation,
+          decisionStatus: candidate.decisionStatus,
+          evidenceLevel: candidate.evidenceLevel,
+          reasonCodes: candidate.reasonCodes,
+          degradationCodes: candidate.degradationCodes,
+          explanation: candidate.explanation
+        }),
+        bestChunkId: ''
+      }})
     this.db.replaceRequirementMatches(requirement.id, matches)
   }
 

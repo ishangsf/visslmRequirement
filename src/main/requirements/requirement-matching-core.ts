@@ -3,6 +3,7 @@ import type { RequirementReranker } from './cross-encoder-reranker'
 import type { HybridRequirementCandidate } from './hybrid-retrieval'
 import {
   hashRequirementBusiness,
+  normalizeRequirementAction,
   normalizeRequirementBusinessText,
   REQUIREMENT_NORMALIZATION_VERSION
 } from './requirement-business-normalization'
@@ -31,7 +32,7 @@ export interface RequirementMatchingRetriever {
 }
 
 export interface RequirementMatchingExplainer {
-  mode: 'local' | 'online'
+  mode: 'local' | 'online' | (() => 'local' | 'online')
   explain(
     base: RequirementMatchRequest['base'],
     candidates: HybridRequirementCandidate[]
@@ -71,7 +72,10 @@ const deterministicAgreement = (
   const equal = (a: string, b: string): boolean => (
     Boolean(a && b) && normalizeRequirementBusinessText(a) === normalizeRequirementBusinessText(b)
   )
-  if (left.action && right.action) { weight += 0.4; if (equal(left.action, right.action)) score += 0.4 }
+  if (left.action && right.action) {
+    weight += 0.4
+    if (normalizeRequirementAction(left.action) === normalizeRequirementAction(right.action)) score += 0.4
+  }
   if (left.object && right.object) { weight += 0.4; if (equal(left.object, right.object)) score += 0.4 }
   if (left.negated !== null && right.negated !== null) { weight += 0.1; if (left.negated === right.negated) score += 0.1 }
   if (left.constraints.length || right.constraints.length) {
@@ -174,8 +178,11 @@ export class RequirementMatchingCore {
 
     let ranked = rankRequirementCandidates(inputs, manifest)
     const explainLimit = Math.max(0, Math.min(EXPLANATION_LIMIT, Math.floor(request.explainTopN)))
+    const explainerMode = typeof this.deps.explainer?.mode === 'function'
+      ? this.deps.explainer.mode()
+      : this.deps.explainer?.mode
     const shouldExplain = Boolean(this.deps.explainer) && request.explanationPolicy.mode !== 'disabled' &&
-      (this.deps.explainer?.mode === 'local' || request.explanationPolicy.allowExternalProcessing)
+      (explainerMode === 'local' || request.explanationPolicy.allowExternalProcessing)
     if (shouldExplain && explainLimit > 0) {
       const candidateByUid = new Map(candidates.map((candidate) => [candidate.record.uid, candidate]))
       const explainCandidates = ranked

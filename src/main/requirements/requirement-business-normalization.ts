@@ -46,6 +46,22 @@ const ACTIONS = [
   'configures', 'configure', 'manages', 'manage', 'uploads', 'upload', 'downloads', 'download'
 ] as const
 
+const ACTION_ALIASES: Readonly<Record<string, string>> = Object.freeze({
+  查询: 'query', 检索: 'query', 搜索: 'query', 查看: 'query', query: 'query', queries: 'query', search: 'query', searches: 'query',
+  新增: 'create', 创建: 'create', create: 'create', creates: 'create',
+  删除: 'delete', delete: 'delete', deletes: 'delete',
+  编辑: 'update', 修改: 'update', update: 'update', updates: 'update',
+  配置: 'configure', configure: 'configure', configures: 'configure',
+  导入: 'import', 批量导入: 'import', import: 'import', imports: 'import',
+  导出: 'export', 批量导出: 'export', export: 'export', exports: 'export',
+  校验: 'validate', 权限校验: 'validate', validate: 'validate', validates: 'validate'
+})
+
+export const normalizeRequirementAction = (value: string): string => {
+  const normalized = value.normalize('NFKC').toLocaleLowerCase().trim()
+  return ACTION_ALIASES[normalized] ?? normalized
+}
+
 const NEGATION_PATTERN = /(?:不得|禁止|不允许|不可|不能|无需|不应|不支持|\b(?:must\s+not|shall\s+not|cannot|can't|does\s+not|do\s+not|not\s+allowed)\b)/iu
 const LEADING_NOISE_PATTERN = /^(?:(?:系统|平台|软件|用户|管理员|应|需|需要|可以|可|能够|支持|提供|实现|允许)\s*|(?:the\s+)?(?:system|platform|software|user|administrator)\s+)+/iu
 const CONSTRAINT_PATTERNS = [
@@ -69,7 +85,8 @@ export const extractRequirementBusinessFacts = (value: unknown): RequirementBusi
   const text = decodeEntities(String(value ?? ''))
     .replace(/<[^>]*>/g, ' ')
     .normalize('NFKC')
-    .replace(/\s+/g, ' ')
+    .replace(/[\t\r\f\v ]+/g, ' ')
+    .replace(/\n{2,}/g, '\n')
     .trim()
   const negated = NEGATION_PATTERN.test(text)
   const withoutNegation = text.replace(NEGATION_PATTERN, '').replace(LEADING_NOISE_PATTERN, '').trim()
@@ -82,7 +99,13 @@ export const extractRequirementBusinessFacts = (value: unknown): RequirementBusi
     return { action: '', object: '', constraints: [], negated: negated || null, source: 'missing' }
   }
   const actionIndex = searchable.indexOf(action.toLocaleLowerCase())
-  const object = cleanObject(withoutNegation.slice(actionIndex + action.length))
+  const trailingObject = cleanObject(withoutNegation.slice(actionIndex + action.length))
+  const leadingObject = cleanObject(withoutNegation.slice(0, actionIndex))
+    .replace(/^(?:支持|提供|实现|允许|能够|可以|可|按|根据|通过)/u, '')
+    .trim()
+  const object = !trailingObject || /^(?:能力|功能|规则|信息|数据)$/u.test(trailingObject)
+    ? `${leadingObject}${trailingObject}`.trim()
+    : trailingObject
   const constraints = [...new Set(CONSTRAINT_PATTERNS.flatMap((pattern) => text.match(pattern) ?? []))]
   return { action, object, constraints, negated, source: 'deterministic' }
 }

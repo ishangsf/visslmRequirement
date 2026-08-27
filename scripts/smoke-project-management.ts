@@ -12,6 +12,8 @@ import {
 import type { KnowledgeRecordMatch, KnowledgeService } from '../src/main/knowledge'
 import type { ProjectAnalysisProgress, ProjectRequirement } from '../src/shared/project-types'
 import { normalizeProjectRequirementText } from '../src/shared/project-requirement-utils'
+import { buildRequirementSourceView } from '../src/main/requirements/requirement-match-card'
+import { RequirementMatchingCore } from '../src/main/requirements/requirement-matching-core'
 
 const directory = mkdtempSync(join(tmpdir(), 'visslm-project-management-'))
 const db = new AppDatabase(join(directory, 'projects.db'), join(directory, 'assets'))
@@ -338,6 +340,36 @@ try {
       return semanticCandidates
     }
   } as unknown as KnowledgeService
+  const matchingCore = new RequirementMatchingCore({
+    retriever: {
+      async retrieve(base) {
+        semanticMatchQueries.push(base.matchingText)
+        return semanticCandidates.flatMap((match) => {
+          const record = db.getRecord(match.recordUid, false)
+          if (!record) return []
+          return [{
+            record,
+            card: buildRequirementSourceView(record),
+            denseScore: match.score,
+            lexicalScore: 0,
+            retrievalScore: match.score,
+            snippet: match.snippet
+          }]
+        })
+      }
+    },
+    reranker: {
+      modelId: 'project-smoke-reranker',
+      async rerank(_base, candidates) {
+        return candidates.map((candidate) => ({
+          recordUid: candidate.record.uid,
+          score: candidate.denseScore
+        }))
+      }
+    },
+    async exactBusinessHashCandidates() { return [] },
+    candidateEligible() { return true }
+  })
   const service = new ProjectManagementService(
     db,
     fakeKnowledge,
@@ -347,7 +379,10 @@ try {
       baseUrl: 'http://127.0.0.1:1',
       model: 'smoke',
       thinking: false
-    })
+    }),
+    undefined,
+    undefined,
+    matchingCore
   )
   const originalFetch = globalThis.fetch
   const extractBatch = (service as unknown as {
@@ -583,7 +618,9 @@ try {
   const requirementAfterSemanticMatching = db.getProjectRequirement('smoke-requirement-1')
   assert.equal(requirementAfterSemanticMatching?.status, requirementBeforeSemanticMatching.status)
   assert.equal(requirementAfterSemanticMatching?.statusSource, requirementBeforeSemanticMatching.statusSource)
-  assert.equal(db.listProjectRequirementMatches({ requirementId: 'smoke-requirement-1', page: 1, pageSize: 20 }).total, 2)
+  const automaticMatches = db.listProjectRequirementMatches({ requirementId: 'smoke-requirement-1', page: 1, pageSize: 20 })
+  assert.equal(automaticMatches.total, 1, 'hard-conflict candidates must be excluded from the default suggestion list')
+  assert.equal(automaticMatches.rows[0]?.recordUid, 'smoke-record-1')
   db.replaceRequirementMatches('smoke-requirement-1', [
     {
       recordUid: 'smoke-record-1',
@@ -817,10 +854,9 @@ try {
   assert.equal(matchedDraftProject.lifecycle, 'draft')
   assert.equal(matchedDraftProject.matchStatus, 'ready')
   const semanticQuery = semanticMatchQueries.at(-1) ?? ''
-  assert.match(semanticQuery, /业务模块：订单管理/)
-  assert.match(semanticQuery, /需求标题：订单明细导出/)
-  assert.match(semanticQuery, /需求描述：系统应允许业务人员按时间范围筛选订单，并导出包含商品与金额的明细文件。/)
-  assert.match(semanticQuery, /补充信息词：订单导出、时间范围/)
+  assert.match(semanticQuery, /明确模块：订单管理/)
+  assert.match(semanticQuery, /名称：订单明细导出/)
+  assert.match(semanticQuery, /描述：系统应允许业务人员按时间范围筛选订单，并导出包含商品与金额的明细文件。/)
 
   const matchCallCountBeforeConfirm = semanticMatchQueries.length
   const confirmedDraftProject = service.confirmProject(draftProject.id)

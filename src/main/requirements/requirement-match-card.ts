@@ -252,7 +252,7 @@ export const buildRequirementSourceView = (record: RecordDetail): RequirementMat
     lexicalTerms: requirementLexicalTermsOf([
       sourceTitle, sourceDescription, requirementType, productDomain, module
     ]),
-    businessFacts: extractRequirementBusinessFacts(evidence)
+    businessFacts: extractRequirementBusinessFacts([sourceDescription, sourceTitle].filter(Boolean).join('\n'))
   }
 }
 
@@ -281,7 +281,7 @@ export const buildProjectRequirementMatchCard = (
     lexicalTerms: requirementLexicalTermsOf([
       sourceTitle, sourceDescription, requirementType, module, ...(requirement.keyInfoTerms ?? [])
     ]),
-    businessFacts: extractRequirementBusinessFacts(evidence)
+    businessFacts: extractRequirementBusinessFacts([sourceDescription, sourceTitle].filter(Boolean).join('\n'))
   }
 }
 

@@ -142,6 +142,8 @@ import {
   type ImportResumeCheckpoint
 } from './data-import-stream'
 import { ProjectManagementService } from './project-management'
+import type { RequirementMatchingCore } from './requirements/requirement-matching-core'
+import { createRequirementMatchingCore } from './requirements/requirement-matching-runtime'
 import { exportVisslmPack, importVisslmPack } from './transfer-pack'
 import type { UpdateManager } from './updater'
 import {
@@ -182,6 +184,7 @@ let knowledgeService: KnowledgeService
 let recordMaintenanceService: RecordMaintenanceService
 let recordIndexLock: AsyncMutex
 let projectManagementService: ProjectManagementService
+let requirementMatchingCore: RequirementMatchingCore
 let knowledgeInitializationTimer: ReturnType<typeof setTimeout> | null = null
 let knowledgeInitializationStarted = false
 let isQuitting = false
@@ -1756,7 +1759,8 @@ const registerIpc = (): void => {
         db,
         knowledgeService,
         settings.getModelCredentials(),
-        (event: Extract<AgentEvent, { type: 'status' }>) => emitAgentProgress(event)
+        (event: Extract<AgentEvent, { type: 'status' }>) => emitAgentProgress(event),
+        { matchingCore: requirementMatchingCore }
       )
       return agent.ask({ ...request, question: route.question }).then((response) => {
         emitActivity(workLogForVerification())
@@ -2952,12 +2956,18 @@ if (!hasSingleInstanceLock) {
       (progress) => mainWindow?.webContents.send('knowledge:progress', progress),
       recordIndexLock
     )
+      requirementMatchingCore = createRequirementMatchingCore(
+        db,
+        knowledgeService,
+        () => settings.getModelCredentials()
+      )
       projectManagementService = new ProjectManagementService(
       db,
       knowledgeService,
       () => settings.getModelCredentials(),
       (progress) => mainWindow?.webContents.send('project:progress', progress),
-      () => settings.getAll().projectMatching
+      () => settings.getAll().projectMatching,
+      requirementMatchingCore
     )
       recordMaintenanceService = new RecordMaintenanceService(
       db,

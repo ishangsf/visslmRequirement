@@ -5,6 +5,7 @@ import type {
   RequirementBusinessFacts
 } from './requirement-match-domain'
 import type { RequirementMatchCard } from './requirement-match-card'
+import { normalizeRequirementAction } from './requirement-business-normalization'
 
 export const REQUIREMENT_MATCH_REASON_CODES = [
   'EXACT_BUSINESS_HASH',
@@ -42,9 +43,13 @@ const normalizedFact = (value: string): string => value
   .toLocaleLowerCase()
   .replace(/[\s\p{P}\p{S}]+/gu, '')
 
+const normalizedObject = (value: string): string => normalizedFact(value)
+  .replace(/明细/gu, '详情')
+  .replace(/检索结果|查询结果/gu, '结果')
+
 const objectConflict = (left: string, right: string): boolean => {
-  const a = normalizedFact(left)
-  const b = normalizedFact(right)
+  const a = normalizedObject(left)
+  const b = normalizedObject(right)
   if (!a || !b || a === b || a.includes(b) || b.includes(a)) return false
   const charsA = new Set([...a])
   const charsB = new Set([...b])
@@ -95,7 +100,8 @@ export const evaluateRequirementMatchPolicy = (
 
   const baseFacts = base.businessFacts
   const candidateFacts = candidate.businessFacts
-  if (baseFacts.action && candidateFacts.action && normalizedFact(baseFacts.action) !== normalizedFact(candidateFacts.action)) {
+  if (baseFacts.action && candidateFacts.action &&
+      normalizeRequirementAction(baseFacts.action) !== normalizeRequirementAction(candidateFacts.action)) {
     return rejected('ACTION_CONFLICT')
   }
   if (baseFacts.negated !== null && candidateFacts.negated !== null && baseFacts.negated !== candidateFacts.negated) {

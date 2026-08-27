@@ -41,6 +41,9 @@ import {
   type RequirementMatchExplanation,
   type RequirementMatchExplanationModelClient
 } from '../requirements/requirement-match-explainer'
+import type { MatchDecisionStatus, RequirementMatchCandidateResult } from '../requirements/requirement-match-domain'
+import { RequirementMatchingCore } from '../requirements/requirement-matching-core'
+import { agentRequirementMatchProjection } from '../requirements/requirement-match-adapters'
 
 type AgentStatusEvent = Extract<AgentEvent, { type: 'status' }>
 
@@ -62,6 +65,7 @@ interface RequirementAnalysisAgentOptions {
   reranker?: RequirementReranker
   retriever?: Pick<HybridRequirementRetriever, 'retrieve'>
   modelClient?: RequirementMatchExplanationModelClient
+  matchingCore?: RequirementMatchingCore
 }
 
 interface RequirementProfile {
@@ -89,6 +93,7 @@ interface MatchedCandidate extends RankedCandidate {
   score: RequirementMatchScoreResult
   explanation: MatchExplanationState
   explanationStatus: 'live_verified' | 'unavailable'
+  decisionStatus: MatchDecisionStatus
 }
 
 interface RequirementAnalysisEntry {
@@ -247,6 +252,7 @@ export class RequirementAnalysisAgent {
   private readonly retriever: Pick<HybridRequirementRetriever, 'retrieve'>
   private readonly reranker: RequirementReranker
   private readonly modelClient: RequirementMatchExplanationModelClient
+  private readonly matchingCore: RequirementMatchingCore
   private progressState: RequirementProgressState = {
     totalRequirements: 0,
     currentRequirement: 0,
@@ -268,6 +274,28 @@ export class RequirementAnalysisAgent {
     this.retriever = options.retriever ?? new HybridRequirementRetriever(db, knowledge)
     this.reranker = options.reranker ?? createRequirementReranker()
     this.modelClient = options.modelClient ?? new ModelClient(settings)
+    this.matchingCore = options.matchingCore ?? new RequirementMatchingCore({
+      retriever: this.retriever,
+      reranker: this.reranker,
+      explainer: {
+        mode: settings.source === 'local' ? 'local' : 'online',
+        explain: async (base, candidates) => {
+          const batch = await explainRequirementMatches(this.modelClient, { base, candidates }, {
+            think: this.settings.thinking,
+            forceThinking: this.settings.thinking,
+            temperature: 0,
+            numPredict: this.settings.source === 'local' && this.settings.thinking
+              ? -1
+              : Math.max(2_400, candidates.length * 260),
+            numCtx: EXPLANATION_MAX_CONTEXT,
+            timeoutMs: EXPLANATION_TIMEOUT_MS
+          })
+          return new Map(batch.items.map((item) => [item.recordUid, JSON.stringify(item)]))
+        }
+      },
+      async exactBusinessHashCandidates() { return [] },
+      candidateEligible() { return true }
+    })
   }
 
   async ask(request: ChatRequest): Promise<ChatResponse> {
@@ -341,50 +369,57 @@ export class RequirementAnalysisAgent {
     }
 
     try {
-      this.progress('recall', `${record.itemId}：Dense、BM25 两路召回开始`)
-      const candidates = (await this.retriever.retrieve(card, excludedUids)).slice(0, HYBRID_CANDIDATE_LIMIT)
-      this.progress('recall', `${record.itemId}：Dense/BM25 两路召回与 RRF 完成，共 ${candidates.length} 条候选`, candidates.length, HYBRID_CANDIDATE_LIMIT)
-      if (!candidates.length) return { requestedItemId, base, formal: [], references: [], reviewSummary: '全库混合召回未发现候选记录。' }
-
-      this.progress('rerank', `${record.itemId}：Cross-Encoder 正在重排 ${candidates.length} 条候选`, 0, candidates.length)
-      const reranked = validateRerankerOutput(await this.reranker.rerank(card, candidates), candidates)
-      const candidateByUid = new Map(candidates.map((candidate) => [candidate.record.uid, candidate]))
-      const ranked = reranked.slice(0, RERANK_CANDIDATE_LIMIT).flatMap((item): RankedCandidate[] => {
-        const candidate = candidateByUid.get(item.recordUid)
-        return candidate ? [{ ...candidate, rerankerScore: item.score }] : []
+      this.progress('recall', `${record.itemId}：统一匹配核心开始 Dense/BM25 召回、RRF 与精确哈希补召`)
+      const result = await this.matchingCore.match({
+        base: card,
+        excludedUids,
+        includeCurrentProjectRecords: false,
+        explainTopN: EXPLANATION_CANDIDATE_LIMIT,
+        explanationPolicy: {
+          mode: this.settings.source === 'local' ? 'local' : 'online',
+          allowExternalProcessing: this.settings.source === 'local'
+        }
       })
-      this.progress('rerank', `${record.itemId}：Cross-Encoder 重排完成，进入前 ${ranked.length} 条`, ranked.length, RERANK_CANDIDATE_LIMIT)
+      this.progress('score', `${record.itemId}：统一核心完成排序，共 ${result.candidates.length} 条候选`, result.candidates.length, HYBRID_CANDIDATE_LIMIT)
+      if (!result.candidates.length) return { requestedItemId, base, formal: [], references: [], reviewSummary: '全库混合召回未发现候选记录。' }
 
-      const scored = ranked.map((candidate) => ({
-        candidate,
-        score: scoreRequirementCandidate(card, candidate, { rerankerScore: candidate.rerankerScore })
-      })).sort((left, right) => (
-        right.score.finalScore - left.score.finalScore ||
-        right.candidate.rerankerScore - left.candidate.rerankerScore ||
-        right.candidate.retrievalScore - left.candidate.retrievalScore ||
-        left.candidate.record.uid.localeCompare(right.candidate.record.uid)
-      ))
-      const selected = scored.slice(0, EXPLANATION_CANDIDATE_LIMIT)
-      this.progress('score', `${record.itemId}：已完成 ${scored.length} 条候选确定性评分，前 ${selected.length} 条进入批量 AI 关系解释`, scored.length, Math.max(1, scored.length))
-      const explained = await this.explainAndMerge(question, base, selected)
-      const matched = explained.matches
-      const visible = matched.filter((candidate) => (
-        FORMAL_RELATIONS.has(candidate.score.relation) || REFERENCE_RELATIONS.has(candidate.score.relation)
-      ))
-      const warnings = matched
-        .filter((candidate) => candidate.explanationStatus === 'unavailable')
-        .map((candidate) => isDeterministicRequirementMatch(candidate.score)
-          ? `UID ${candidate.record.uid} 的 AI 说明暂不可用，正式关系已由清洗原文近重复路径独立确认`
-          : `UID ${candidate.record.uid} 的 AI 关系解释暂不可用，已保留确定性评分与召回审计`)
+      const resultByUid = new Map(result.candidates.map((candidate) => [candidate.recordUid, candidate]))
+      const matched = agentRequirementMatchProjection(result).slice(0, EXPLANATION_CANDIDATE_LIMIT).flatMap((projected): MatchedCandidate[] => {
+        const candidate = resultByUid.get(projected.recordUid)!
+        const candidateRecord = this.db.getRecord(candidate.recordUid, false)
+        if (!candidateRecord) return []
+        const candidateCard = buildRequirementSourceView(candidateRecord)
+        const rankedCandidate: RankedCandidate = {
+          record: candidateRecord,
+          card: candidateCard,
+          denseScore: candidate.stageScores.denseScore ?? 0,
+          lexicalScore: candidate.stageScores.lexicalScore ?? 0,
+          retrievalScore: candidate.stageScores.fusedScore,
+          rerankerScore: candidate.stageScores.rerankerScore ?? 0,
+          snippet: candidateCard.evidence
+        }
+        const explanation = this.explanationState(candidate, base, rankedCandidate)
+        return [{
+          ...rankedCandidate,
+          score: this.legacyScore(candidate),
+          explanation,
+          explanationStatus: candidate.explanation ? 'live_verified' : 'unavailable',
+          decisionStatus: candidate.decisionStatus
+        }]
+      })
+      const visible = matched.filter((candidate) => candidate.decisionStatus !== 'rejected')
+      const warnings = [
+        ...result.degradationCodes.map((code) => `统一匹配核心降级：${code}`),
+        ...matched
+          .filter((candidate) => candidate.explanationStatus === 'unavailable')
+          .map((candidate) => `UID ${candidate.record.uid} 的 AI 关系解释暂不可用，已保留确定性排序与审计信息`)
+      ]
       return {
         requestedItemId,
         base,
-        formal: visible.filter((candidate) => FORMAL_RELATIONS.has(candidate.score.relation)),
-        references: visible.filter((candidate) => REFERENCE_RELATIONS.has(candidate.score.relation)),
-        reviewSummary: [
-          'Dense/BM25 经 RRF、Cross-Encoder 与确定性评分完成；一次批量 AI 关系解释已执行',
-          explained.summary ? `AI 总结：${truncate(explained.summary, 240)}` : ''
-        ].filter(Boolean).join('；'),
+        formal: visible.filter((candidate) => candidate.decisionStatus === 'confirmed'),
+        references: visible.filter((candidate) => candidate.decisionStatus !== 'confirmed'),
+        reviewSummary: `统一核心 ${result.pipelineVersion} 已完成；排序版本 ${result.rankingVersion}`,
         reviewWarnings: warnings
       }
     } catch (error) {
@@ -447,13 +482,62 @@ export class RequirementAnalysisAgent {
         ...candidate,
         score,
         explanation,
-        explanationStatus: modelExplanation ? 'live_verified' as const : 'unavailable' as const
+        explanationStatus: modelExplanation ? 'live_verified' as const : 'unavailable' as const,
+        decisionStatus: 'suggested' as const
       }
     })
     if (explanationSummary) {
       this.progress('explain', `${base.record.itemId}：AI 解释总结已生成`, selected.length, selected.length)
     }
     return { matches, summary: explanationSummary || undefined }
+  }
+
+  /** Adapter only: preserve the existing response schema without recalculating the core score. */
+  private legacyScore(candidate: RequirementMatchCandidateResult): RequirementMatchScoreResult {
+    const dimensions = {
+      dense: candidate.stageScores.denseScore ?? undefined,
+      lexical: candidate.stageScores.lexicalScore ?? undefined,
+      reranker: candidate.stageScores.rerankerScore ?? undefined
+    }
+    return {
+      recordUid: candidate.recordUid,
+      relation: candidate.relation ?? 'unrelated',
+      finalScore: candidate.rankingScore,
+      downgradeReasons: [...candidate.reasonCodes, ...candidate.degradationCodes],
+      dimensions,
+      dimensionDetails: [],
+      validDimensions: (Object.keys(dimensions) as Array<'dense' | 'lexical' | 'reranker'>)
+        .filter((key) => dimensions[key] !== undefined),
+      totalWeight: 1,
+      objectSimilarity: 0,
+      actionComparison: 'unknown',
+      decisionPath: candidate.evidenceLevel === 'exact_business_hash' ? 'exact_text' : 'deterministic_score',
+      confidenceBasis: [`统一核心排序版本：${candidate.rankingVersion}`, ...candidate.reasonCodes]
+    }
+  }
+
+  private explanationState(
+    result: RequirementMatchCandidateResult,
+    base: RequirementProfile,
+    candidate: RankedCandidate
+  ): MatchExplanationState {
+    if (!result.explanation) return fallbackExplanation(base, candidate)
+    try {
+      const parsed = JSON.parse(result.explanation) as RequirementMatchExplanation
+      return {
+        sharedEvidence: parsed.similarities.join('；'),
+        difference: parsed.differences.join('；'),
+        baseEvidence: parsed.baseEvidence,
+        candidateEvidence: parsed.candidateEvidence
+      }
+    } catch {
+      return {
+        sharedEvidence: result.explanation,
+        difference: '详细差异请结合原文证据查看。',
+        baseEvidence: evidenceExcerpt(base.card.evidence),
+        candidateEvidence: evidenceExcerpt(candidate.card.evidence)
+      }
+    }
   }
 
   private progress(stage: string, message: string, stageCurrent = 0, stageTotal = 0): void {
