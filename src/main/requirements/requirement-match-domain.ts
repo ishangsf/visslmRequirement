@@ -72,6 +72,46 @@ export interface RequirementMatchResult {
   candidates: RequirementMatchCandidateResult[]
 }
 
+export type RequirementMatchRunStatus = 'running' | 'succeeded' | 'failed' | 'stale'
+
+export interface RequirementMatchRun {
+  id: string
+  requirementId: string
+  requirementSnapshotHash: string
+  normalizationVersion: string
+  pipelineVersion: string
+  rankingVersion: string
+  configHash: string
+  modelVersion: string | null
+  status: RequirementMatchRunStatus
+  degradationCodes: RequirementMatchDegradationCode[]
+  failureCode: string | null
+  createdAt: string
+  completedAt: string | null
+}
+
+export type RequirementMatchRunCreateInput = Omit<
+  RequirementMatchRun,
+  'id' | 'status' | 'degradationCodes' | 'failureCode' | 'createdAt' | 'completedAt'
+>
+
+export interface PersistedRequirementMatchCandidate extends RequirementMatchCandidateResult {
+  runId: string
+  recordSnapshotHash: string
+}
+
+export interface RequirementMatchCandidatePage {
+  rows: PersistedRequirementMatchCandidate[]
+  total: number
+}
+
+export interface RequirementMatchRunCompatibilityQuery {
+  requirementId: string
+  requirementSnapshotHash: string
+  normalizationVersion?: string
+  pipelineVersion?: string
+}
+
 export const isMatchRelation = (value: unknown): value is Exclude<MatchRelation, null> =>
   typeof value === 'string' && MATCH_RELATIONS.includes(value as Exclude<MatchRelation, null>)
 

@@ -80,6 +80,15 @@ import { sanitizeChatMessageContent } from '../shared/chat-message-format'
 import { buildRequirementBusinessText } from './requirements/requirement-match-card'
 import { hashRequirementBusinessText } from './requirements/requirement-business-normalization'
 import type {
+  PersistedRequirementMatchCandidate,
+  RequirementMatchCandidatePage,
+  RequirementMatchCandidateResult,
+  RequirementMatchDegradationCode,
+  RequirementMatchRun,
+  RequirementMatchRunCompatibilityQuery,
+  RequirementMatchRunCreateInput
+} from './requirements/requirement-match-domain'
+import type {
   ManagedProject,
   ManagedProjectInput,
   ManagedProjectListQuery,
@@ -1688,6 +1697,48 @@ export class AppDatabase {
       );
       CREATE INDEX IF NOT EXISTS idx_pm_requirement_matches_rank
         ON pm_requirement_matches(requirement_id, final_score DESC, record_uid);
+
+      CREATE TABLE IF NOT EXISTS pm_requirement_match_runs (
+        id TEXT PRIMARY KEY,
+        requirement_id TEXT NOT NULL,
+        requirement_snapshot_hash TEXT NOT NULL,
+        normalization_version TEXT NOT NULL,
+        pipeline_version TEXT NOT NULL,
+        ranking_version TEXT NOT NULL,
+        config_hash TEXT NOT NULL,
+        model_version TEXT,
+        status TEXT NOT NULL,
+        degradation_codes_json TEXT NOT NULL DEFAULT '[]',
+        failure_code TEXT,
+        created_at TEXT NOT NULL,
+        completed_at TEXT,
+        FOREIGN KEY(requirement_id) REFERENCES pm_requirements(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_pm_requirement_match_runs_latest
+        ON pm_requirement_match_runs(requirement_id, status, completed_at DESC);
+
+      CREATE TABLE IF NOT EXISTS pm_requirement_match_candidates (
+        run_id TEXT NOT NULL,
+        record_uid TEXT NOT NULL,
+        final_rank INTEGER NOT NULL,
+        ranking_score REAL NOT NULL,
+        ranking_version TEXT NOT NULL,
+        relation TEXT,
+        decision_status TEXT NOT NULL,
+        evidence_level TEXT NOT NULL,
+        reason_codes_json TEXT NOT NULL DEFAULT '[]',
+        degradation_codes_json TEXT NOT NULL DEFAULT '[]',
+        stage_scores_json TEXT NOT NULL,
+        explanation TEXT,
+        record_snapshot_hash TEXT NOT NULL,
+        PRIMARY KEY(run_id, record_uid),
+        FOREIGN KEY(run_id) REFERENCES pm_requirement_match_runs(id) ON DELETE CASCADE,
+        FOREIGN KEY(record_uid) REFERENCES records(uid) ON DELETE RESTRICT
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_pm_requirement_match_candidates_rank
+        ON pm_requirement_match_candidates(run_id, final_rank);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_pm_requirement_match_candidates_record
+        ON pm_requirement_match_candidates(run_id, record_uid);
 
       CREATE TABLE IF NOT EXISTS pm_project_asset_requirements (
         project_id TEXT NOT NULL,
@@ -5487,6 +5538,151 @@ export class AppDatabase {
     }
     const row = this.db.prepare('SELECT * FROM pm_requirements WHERE id = ?').get(id) as SqlRow | undefined
     return row ? this.mapProjectRequirement(row) : null
+  }
+
+  createRequirementMatchRun(input: RequirementMatchRunCreateInput): RequirementMatchRun {
+    const id = randomUUID()
+    const createdAt = nowIso()
+    this.db.prepare(`
+      INSERT INTO pm_requirement_match_runs(
+        id, requirement_id, requirement_snapshot_hash, normalization_version,
+        pipeline_version, ranking_version, config_hash, model_version, status,
+        degradation_codes_json, failure_code, created_at, completed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', '[]', NULL, ?, NULL)
+    `).run(
+      id, input.requirementId, input.requirementSnapshotHash, input.normalizationVersion,
+      input.pipelineVersion, input.rankingVersion, input.configHash, input.modelVersion, createdAt
+    )
+    return this.getRequirementMatchRun(id)!
+  }
+
+  private mapRequirementMatchRun(row: SqlRow): RequirementMatchRun {
+    return {
+      id: String(row.id),
+      requirementId: String(row.requirement_id),
+      requirementSnapshotHash: String(row.requirement_snapshot_hash),
+      normalizationVersion: String(row.normalization_version),
+      pipelineVersion: String(row.pipeline_version),
+      rankingVersion: String(row.ranking_version),
+      configHash: String(row.config_hash),
+      modelVersion: row.model_version === null || row.model_version === undefined ? null : String(row.model_version),
+      status: String(row.status) as RequirementMatchRun['status'],
+      degradationCodes: parseJsonArray(row.degradation_codes_json) as RequirementMatchDegradationCode[],
+      failureCode: row.failure_code === null || row.failure_code === undefined ? null : String(row.failure_code),
+      createdAt: String(row.created_at),
+      completedAt: row.completed_at === null || row.completed_at === undefined ? null : String(row.completed_at)
+    }
+  }
+
+  getRequirementMatchRun(id: string): RequirementMatchRun | null {
+    const row = this.db.prepare('SELECT * FROM pm_requirement_match_runs WHERE id = ?').get(id) as SqlRow | undefined
+    return row ? this.mapRequirementMatchRun(row) : null
+  }
+
+  completeRequirementMatchRun(
+    runId: string,
+    candidates: Array<RequirementMatchCandidateResult & { recordSnapshotHash: string }>,
+    degradationCodes: RequirementMatchDegradationCode[]
+  ): void {
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const run = this.db.prepare('SELECT status FROM pm_requirement_match_runs WHERE id = ?').get(runId) as SqlRow | undefined
+      if (!run || String(run.status) !== 'running') throw new Error('匹配运行不存在或已结束')
+      const insert = this.db.prepare(`
+        INSERT INTO pm_requirement_match_candidates(
+          run_id, record_uid, final_rank, ranking_score, ranking_version, relation,
+          decision_status, evidence_level, reason_codes_json, degradation_codes_json,
+          stage_scores_json, explanation, record_snapshot_hash
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      for (const candidate of candidates) {
+        insert.run(
+          runId, candidate.recordUid, candidate.finalRank, candidate.rankingScore,
+          candidate.rankingVersion, candidate.relation, candidate.decisionStatus,
+          candidate.evidenceLevel, JSON.stringify(candidate.reasonCodes),
+          JSON.stringify(candidate.degradationCodes), JSON.stringify(candidate.stageScores),
+          candidate.explanation, candidate.recordSnapshotHash
+        )
+      }
+      this.db.prepare(`
+        UPDATE pm_requirement_match_runs
+        SET status = 'succeeded', degradation_codes_json = ?, completed_at = ?
+        WHERE id = ? AND status = 'running'
+      `).run(JSON.stringify(degradationCodes), nowIso(), runId)
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  failRequirementMatchRun(runId: string, failureCode: string): void {
+    this.db.prepare(`
+      UPDATE pm_requirement_match_runs
+      SET status = 'failed', failure_code = ?, completed_at = ?
+      WHERE id = ? AND status = 'running'
+    `).run(failureCode, nowIso(), runId)
+  }
+
+  markRequirementMatchRunsStale(requirementId?: string): void {
+    const where = requirementId ? ' AND requirement_id = ?' : ''
+    this.db.prepare(`
+      UPDATE pm_requirement_match_runs SET status = 'stale'
+      WHERE status = 'succeeded'${where}
+    `).run(...(requirementId ? [requirementId] : []))
+  }
+
+  getLatestCompatibleRequirementMatchRun(query: RequirementMatchRunCompatibilityQuery): RequirementMatchRun | null {
+    const conditions = [
+      'requirement_id = ?', "status = 'succeeded'", 'requirement_snapshot_hash = ?'
+    ]
+    const params: string[] = [query.requirementId, query.requirementSnapshotHash]
+    if (query.normalizationVersion) { conditions.push('normalization_version = ?'); params.push(query.normalizationVersion) }
+    if (query.pipelineVersion) { conditions.push('pipeline_version = ?'); params.push(query.pipelineVersion) }
+    const row = this.db.prepare(`
+      SELECT * FROM pm_requirement_match_runs
+      WHERE ${conditions.join(' AND ')}
+      ORDER BY completed_at DESC, created_at DESC LIMIT 1
+    `).get(...params) as SqlRow | undefined
+    return row ? this.mapRequirementMatchRun(row) : null
+  }
+
+  listRequirementMatchCandidates(query: {
+    runId: string
+    page: number
+    pageSize: number
+    diagnostics?: boolean
+  }): RequirementMatchCandidatePage {
+    const page = Math.max(1, Math.floor(query.page))
+    const pageSize = Math.max(1, Math.min(200, Math.floor(query.pageSize)))
+    const diagnostics = query.diagnostics === true
+    const filter = diagnostics ? '' : " AND decision_status <> 'rejected'"
+    const totalRow = this.db.prepare(`
+      SELECT COUNT(*) AS count FROM pm_requirement_match_candidates WHERE run_id = ?${filter}
+    `).get(query.runId) as SqlRow
+    const rows = this.db.prepare(`
+      SELECT * FROM pm_requirement_match_candidates
+      WHERE run_id = ?${filter}
+      ORDER BY final_rank ASC LIMIT ? OFFSET ?
+    `).all(query.runId, pageSize, (page - 1) * pageSize) as SqlRow[]
+    return {
+      total: Number(totalRow.count ?? 0),
+      rows: rows.map((row): PersistedRequirementMatchCandidate => ({
+        runId: String(row.run_id),
+        recordUid: String(row.record_uid),
+        finalRank: Number(row.final_rank),
+        rankingScore: Number(row.ranking_score),
+        rankingVersion: String(row.ranking_version),
+        relation: row.relation === null || row.relation === undefined ? null : String(row.relation) as PersistedRequirementMatchCandidate['relation'],
+        decisionStatus: String(row.decision_status) as PersistedRequirementMatchCandidate['decisionStatus'],
+        evidenceLevel: String(row.evidence_level) as PersistedRequirementMatchCandidate['evidenceLevel'],
+        reasonCodes: parseJsonArray(row.reason_codes_json),
+        degradationCodes: parseJsonArray(row.degradation_codes_json) as RequirementMatchDegradationCode[],
+        stageScores: parseJsonValue(row.stage_scores_json, {}) as PersistedRequirementMatchCandidate['stageScores'],
+        explanation: row.explanation === null || row.explanation === undefined ? null : String(row.explanation),
+        recordSnapshotHash: String(row.record_snapshot_hash)
+      }))
+    }
   }
 
   replaceRequirementMatches(
