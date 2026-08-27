@@ -1,8 +1,8 @@
 # 需求历史匹配 v1.1 验证报告
 
 验证日期：2026-08-28（Asia/Singapore）  
-分支：`codex/requirement-matching-v1.1`  
-验证基线提交：`d2493e1`（最终文档提交前）  
+分支：`main`  
+验证基线提交：`c0fd38a`（功能分支合并提交）  
 内部交付结论：`ACCEPTED_WITH_RISKS`
 
 ## 已交付行为
@@ -19,7 +19,7 @@
 
 ## 自动化验证证据
 
-以下命令于同一工作树执行并全部退出 0：
+以下命令在功能分支变基后执行，并在合并后的 `main` 再次执行；全部退出 0：
 
 - `npm run typecheck`
 - `npm run test:requirement-matching-safety`
@@ -38,7 +38,9 @@
 - `npm run smoke:project-management`
 - `VISSLM_UI_STATIC_ONLY=1 npm run smoke:project-management-ui`
 - `npm run smoke:project-matching-run-ui`
+- `npm run smoke:agent-similarity`
 - `npm run smoke:agent-requirement-analysis`
+- `npm run build`
 
 硬闸门结果：精确合格重复 `Recall@50 = 100%`；重复执行结果完全一致；项目与 Agent 投影一致；业务写入计数为 0；排序清单哈希为 `9c5ed8aa71146a86ce9f38892a4dce5fdcdf1ac34c209823719621cafd373285`。
 
