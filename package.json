@@ -24,6 +24,7 @@
     "test:requirement-matching-safety": "npx tsx ./tests/requirement-matching/safety-stopgap-regression.ts",
     "test:requirement-matching-domain": "npx tsx ./tests/requirement-matching/domain-contract-regression.ts",
     "test:requirement-matching-metamorphic": "npx tsx ./tests/requirement-matching/metamorphic-regression.ts",
+    "test:requirement-matching-gates": "npx tsx ./tests/requirement-matching/automated-quality-gates.ts",
     "smoke:agent-similarity": "npx tsx ./scripts/smoke-agent-similarity.ts",
     "smoke:agent-requirement-analysis": "npx tsx ./scripts/smoke-agent-requirement-analysis.ts",
     "smoke:plain-chat": "npx tsx ./scripts/smoke-plain-chat.ts",

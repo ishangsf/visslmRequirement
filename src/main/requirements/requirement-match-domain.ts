@@ -73,6 +73,13 @@ export interface RequirementMatchResult {
 }
 
 export type RequirementMatchRunStatus = 'running' | 'succeeded' | 'failed' | 'stale'
+export type RequirementMatchFailureCode =
+  | 'INDEX_VERSION_MISMATCH'
+  | 'REQUIREMENT_SNAPSHOT_CHANGED'
+  | 'NORMALIZATION_VERSION_UNAVAILABLE'
+  | 'RANKING_VERSION_UNAVAILABLE'
+  | 'CANDIDATE_PERSISTENCE_FAILED'
+  | 'ACCESS_DENIED'
 
 export interface RequirementMatchRun {
   id: string
