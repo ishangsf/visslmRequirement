@@ -89,6 +89,7 @@ import type {
   OrganizationPersonPage,
   ProjectAnalysisLogEntry,
   ProjectAsset,
+  ProjectAssetLinkSource,
   ProjectAnalysisProgress,
   ProjectCostEntry,
   ProjectCostEntryInput,
@@ -6179,7 +6180,17 @@ export class AppDatabase {
     })
   }
 
-  linkProjectAsset(projectId: string, recordUid: string, requirementId?: string): ProjectAsset | null {
+  linkProjectAsset(
+    projectId: string,
+    recordUid: string,
+    requirementId?: string,
+    provenance: {
+      linkSource: ProjectAssetLinkSource
+      confirmedBy: string
+      confirmedAt?: string
+      matchRunId?: string
+    } = { linkSource: 'manual', confirmedBy: 'local-user' }
+  ): ProjectAsset | null {
     const exists = this.db.prepare('SELECT uid FROM records WHERE uid = ?').get(recordUid)
     if (!exists) return null
     if (requirementId) {
@@ -6188,17 +6199,43 @@ export class AppDatabase {
       ).get(requirementId, projectId)
       if (!requirement) return null
     }
+    const confirmedAt = provenance.confirmedAt?.trim() || nowIso()
+    const matchRunId = provenance.matchRunId?.trim() || null
     this.db.prepare(`
-      INSERT INTO pm_project_assets(project_id, record_uid, linked_at)
-      VALUES (?, ?, ?)
-      ON CONFLICT(project_id, record_uid) DO NOTHING
-    `).run(projectId, recordUid, nowIso())
+      INSERT INTO pm_project_assets(
+        project_id, record_uid, linked_at, link_source, confirmed_by, confirmed_at, match_run_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(project_id, record_uid) DO UPDATE SET
+        link_source = excluded.link_source,
+        confirmed_by = excluded.confirmed_by,
+        confirmed_at = excluded.confirmed_at,
+        match_run_id = excluded.match_run_id
+      WHERE pm_project_assets.link_source <> 'manual'
+        AND excluded.link_source <> 'legacy_unknown'
+    `).run(projectId, recordUid, confirmedAt, provenance.linkSource, provenance.confirmedBy.trim(), confirmedAt, matchRunId)
     if (requirementId) {
       this.db.prepare(`
-        INSERT INTO pm_project_asset_requirements(project_id, record_uid, requirement_id, linked_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(project_id, record_uid, requirement_id) DO NOTHING
-      `).run(projectId, recordUid, requirementId, nowIso())
+        INSERT INTO pm_project_asset_requirements(
+          project_id, record_uid, requirement_id, linked_at,
+          link_source, confirmed_by, confirmed_at, match_run_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(project_id, record_uid, requirement_id) DO UPDATE SET
+          link_source = excluded.link_source,
+          confirmed_by = excluded.confirmed_by,
+          confirmed_at = excluded.confirmed_at,
+          match_run_id = excluded.match_run_id
+        WHERE pm_project_asset_requirements.link_source <> 'manual'
+          AND excluded.link_source <> 'legacy_unknown'
+      `).run(
+        projectId,
+        recordUid,
+        requirementId,
+        confirmedAt,
+        provenance.linkSource,
+        provenance.confirmedBy.trim(),
+        confirmedAt,
+        matchRunId
+      )
     }
     return this.listProjectAssets(projectId).find((asset) => asset.recordUid === recordUid) ?? null
   }

@@ -27,7 +27,10 @@ try {
     content: '支持按订单号查询订单详情', sourceLocation: '第 1 页', sourceChunkId: 'chunk-1',
     status: 'satisfied', statusReason: '历史 AI 自动判断'
   }])
-  assert(db.linkProjectAsset(project.id, 'legacy-record', 'legacy-requirement'))
+  assert(db.linkProjectAsset(project.id, 'legacy-record', 'legacy-requirement', {
+    linkSource: 'legacy_unknown',
+    confirmedBy: ''
+  }))
   db.setSetting('requirementMatching.provenanceMigration', '')
   db.close()
 
@@ -41,6 +44,17 @@ try {
   assert.equal(asset.requirements[0]?.linkSource, 'legacy_unknown')
   assert.equal(requirement.status, 'satisfied')
   assert.equal(requirement.statusSource, 'legacy_unverified')
+
+  db.upsertRecord({
+    uid: 'manual-record', projectId: 'historical-project', nodeType: 'Requirement', itemId: 'MANUAL-1',
+    parentId: '', name: '人工确认能力', lastModifyTime: new Date().toISOString(),
+    raw: { description: '人工确认的历史能力' }, normalizedText: '人工确认的历史能力'
+  })
+  const manual = db.linkProjectAsset(project.id, 'manual-record', 'legacy-requirement')
+  assert.equal(manual?.linkSource, 'manual')
+  assert.equal(manual?.confirmedBy, 'local-user')
+  assert.ok(manual?.confirmedAt)
+  assert.equal(manual?.requirements[0]?.linkSource, 'manual')
 
   db.updateProjectRequirementStatus('legacy-requirement', 'satisfied')
   db.close()

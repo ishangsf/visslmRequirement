@@ -760,7 +760,10 @@ export class ProjectManagementService {
         throw new Error('需求条目不存在或不属于当前项目')
       }
     }
-    return this.db.linkProjectAsset(projectId, recordUid, normalizedRequirementId)
+    return this.db.linkProjectAsset(projectId, recordUid, normalizedRequirementId, {
+      linkSource: 'manual',
+      confirmedBy: 'local-user'
+    })
   }
 
   unlinkAsset(projectId: string, recordUid: string): { ok: boolean; message: string } {
