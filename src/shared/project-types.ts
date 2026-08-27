@@ -412,12 +412,15 @@ export interface ProjectRequirementMatchQuery {
 export interface ProjectRequirementMatchRunSummary {
   id: string
   requirementId: string
+  requirementBusinessHash: string
+  indexVersion: string
   normalizationVersion: string
   pipelineVersion: string
   rankingVersion: string
   configHash: string
   modelVersion: string | null
   degradationCodes: string[]
+  startedAt: string
   completedAt: string
 }
 
@@ -437,6 +440,7 @@ export interface ProjectRequirementMatchCandidate {
   evidenceLevel: 'exact_business_hash' | 'exact_normalized_text' | 'deterministic_rule' | 'model_supported' | 'retrieval_only'
   reasonCodes: string[]
   degradationCodes: string[]
+  evidenceJson?: unknown
   explanation: string | null
   denseScore: number | null
   lexicalScore: number | null

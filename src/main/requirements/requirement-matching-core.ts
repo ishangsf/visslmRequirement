@@ -50,6 +50,15 @@ export interface RequirementMatchingDependencies {
   candidateEligible(candidate: HybridRequirementCandidate, request: RequirementMatchRequest): boolean
 }
 
+const auditableRerankerModelVersion = (reranker: RequirementReranker): string | null => {
+  const modelProvenance = typeof reranker.modelProvenance === 'string' ? reranker.modelProvenance.trim() : ''
+  if (modelProvenance) return modelProvenance
+  const modelVersion = typeof reranker.modelVersion === 'string' ? reranker.modelVersion.trim() : ''
+  if (modelVersion) return modelVersion
+  const modelId = typeof reranker.modelId === 'string' ? reranker.modelId.trim() : ''
+  return modelId || null
+}
+
 const finiteScore = (value: unknown): number => (
   typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 0
 )
@@ -105,21 +114,61 @@ export class RequirementMatchingCore {
       this.deps.retriever.retrieve(request.base, new Set(request.excludedUids)),
       this.deps.exactBusinessHashCandidates(baseBusinessHash, request)
     ])
-    const candidatesByUid = new Map<string, HybridRequirementCandidate>()
-    for (const candidate of [...exactCandidates, ...retrieved]) {
+
+    // Eligibility is a pre-selection boundary. Keep the retrieved position so
+    // exact-hash injection cannot change the RRF audit rank of a retrieved row.
+    const eligibleExactByUid = new Map<string, HybridRequirementCandidate>()
+    for (const candidate of exactCandidates) {
       const uid = candidate.record.uid
-      if (!uid || request.excludedUids.has(uid) || candidatesByUid.has(uid)) continue
+      if (!uid || request.excludedUids.has(uid) || eligibleExactByUid.has(uid)) continue
+      if (!this.deps.candidateEligible(candidate, request)) continue
+      eligibleExactByUid.set(uid, candidate)
+    }
+
+    const eligibleRetrieved: Array<{
+      candidate: HybridRequirementCandidate
+      fusedRank: number
+    }> = []
+    const retrievedUids = new Set<string>()
+    for (const [index, candidate] of retrieved.entries()) {
+      const uid = candidate.record.uid
+      if (!uid || request.excludedUids.has(uid) || retrievedUids.has(uid)) continue
+      if (!this.deps.candidateEligible(candidate, request)) continue
+      retrievedUids.add(uid)
+      eligibleRetrieved.push({ candidate, fusedRank: index + 1 })
+    }
+
+    const candidatesByUid = new Map<string, HybridRequirementCandidate>()
+    const fusedRanks = new Map<string, number>()
+    const addCandidate = (candidate: HybridRequirementCandidate, fusedRank: number): void => {
+      const uid = candidate.record.uid
+      if (!uid || candidatesByUid.has(uid) || candidatesByUid.size >= RETRIEVAL_LIMIT) return
       candidatesByUid.set(uid, candidate)
-      if (candidatesByUid.size >= RETRIEVAL_LIMIT) break
+      fusedRanks.set(uid, fusedRank)
+    }
+
+    // Reserve the original retrieved Top20 first. Exact candidates then use
+    // the remaining Top50 capacity, followed by the rest of retrieved rows.
+    for (const entry of eligibleRetrieved.slice(0, RERANK_LIMIT)) {
+      addCandidate(entry.candidate, entry.fusedRank)
+    }
+    let exactInjectionIndex = 0
+    for (const candidate of eligibleExactByUid.values()) {
+      addCandidate(candidate, RETRIEVAL_LIMIT + exactInjectionIndex + 1)
+      exactInjectionIndex += 1
+    }
+    for (const entry of eligibleRetrieved.slice(RERANK_LIMIT)) {
+      addCandidate(entry.candidate, entry.fusedRank)
     }
     const candidates = [...candidatesByUid.values()]
-    const fusedRanks = new Map(candidates.map((candidate, index) => [candidate.record.uid, index + 1]))
     const denseRanks = rankByScore(candidates, (candidate) => finiteScore(candidate.denseScore))
     const lexicalRanks = rankByScore(candidates, (candidate) => finiteScore(candidate.lexicalScore))
-    const maximumRetrieval = Math.max(0, ...candidates.map((candidate) => candidate.retrievalScore))
+    const maximumRetrieval = Math.max(0, ...eligibleRetrieved.map(({ candidate }) => candidate.retrievalScore))
 
     const degradationCodes: RequirementMatchDegradationCode[] = []
-    const rerankTarget = candidates.slice(0, RERANK_LIMIT)
+    const rerankTarget = eligibleRetrieved
+      .slice(0, RERANK_LIMIT)
+      .map(({ candidate }) => candidate)
     let rerankerByUid = new Map<string, { rank: number; score: number }>()
     let manifest: RequirementRankingManifest = FULL_REQUIREMENT_RANKING_MANIFEST
     if (rerankTarget.length) {
@@ -212,7 +261,9 @@ export class RequirementMatchingCore {
       ranked = rankRequirementCandidates(inputs, manifest)
     }
 
-    const modelVersion = manifest === FULL_REQUIREMENT_RANKING_MANIFEST ? this.deps.reranker.modelId : null
+    const modelVersion = manifest === FULL_REQUIREMENT_RANKING_MANIFEST
+      ? auditableRerankerModelVersion(this.deps.reranker)
+      : null
     return {
       normalizationVersion: REQUIREMENT_NORMALIZATION_VERSION,
       pipelineVersion: REQUIREMENT_MATCH_PIPELINE_VERSION,

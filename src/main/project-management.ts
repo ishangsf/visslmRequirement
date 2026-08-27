@@ -25,6 +25,8 @@ import type {
   ProjectRequirementCategory,
   ProjectRequirementInput,
   ProjectRequirementMergeInput,
+  LegacyProjectRequirementMatch,
+  ProjectRequirementMatchCandidate,
   ProjectRequirementMatchPage,
   ProjectRequirementMatchQuery,
   ProjectRequirementPage,
@@ -43,7 +45,7 @@ import {
 } from '../shared/types'
 import type { KnowledgeIndexProgress, ModelSettings, ProjectMatchingSettings } from '../shared/types'
 import { normalizeProjectRequirementText } from '../shared/project-requirement-utils'
-import { AppDatabase } from './database'
+import { AppDatabase, REQUIREMENT_BUSINESS_INDEX_VERSION } from './database'
 import { KnowledgeService, type KnowledgeRecordMatch } from './knowledge'
 import { ModelClient } from './model-client'
 import { buildProjectRequirementMatchCard } from './requirements/requirement-match-card'
@@ -51,8 +53,15 @@ import type { RequirementMatchingCore } from './requirements/requirement-matchin
 import { createRequirementMatchingCore } from './requirements/requirement-matching-runtime'
 import { projectRequirementMatchProjection } from './requirements/requirement-match-adapters'
 import { hashProjectRequirementSnapshot, RequirementMatchRunService } from './requirements/requirement-match-run-service'
-import { resolveRequirementMatchingRollout } from './requirements/requirement-matching-rollout'
-import { REQUIREMENT_NORMALIZATION_VERSION } from './requirements/requirement-business-normalization'
+import {
+  compareRequirementMatchingResults,
+  resolveRequirementMatchingRollout,
+  type RequirementMatchingComparisonRow
+} from './requirements/requirement-matching-rollout'
+import {
+  hashRequirementBusiness,
+  REQUIREMENT_NORMALIZATION_VERSION
+} from './requirements/requirement-business-normalization'
 import { REQUIREMENT_MATCH_PIPELINE_VERSION } from './requirements/requirement-matching-core'
 
 const supportedAgreementExtensions = new Set(['.docx', '.pdf', '.xlsx', '.xls', '.txt'])
@@ -68,6 +77,51 @@ const requirementCategories = new Set<ProjectRequirementCategory>([
   'functional', 'interface', 'data', 'performance', 'security',
   'deployment', 'operations', 'acceptance', 'business'
 ])
+
+const LEGACY_SAFE_RUN_ID_PREFIX = 'legacy-safe'
+const LEGACY_SAFE_PIPELINE_VERSION = 'legacy_safe'
+const LEGACY_SAFE_RANKING_VERSION = 'legacy-retrieval-only'
+const LEGACY_SAFE_REASON_CODES = ['LEGACY_UNVERIFIED', 'RETRIEVAL_ONLY']
+const LEGACY_SAFE_DEGRADATION_CODES = ['LEGACY_SAFE_READ']
+
+const legacySafeRunId = (requirementId: string): string => `${LEGACY_SAFE_RUN_ID_PREFIX}:${requirementId}`
+
+const mapLegacyMatchesToCandidatePage = (
+  query: ProjectRequirementMatchQuery,
+  page: { rows: LegacyProjectRequirementMatch[]; total: number }
+): ProjectRequirementMatchPage => {
+  const normalizedPage = Math.max(1, Math.floor(Number(query.page) || 1))
+  const normalizedPageSize = Math.min(200, Math.max(1, Math.floor(Number(query.pageSize) || 20)))
+  const runId = legacySafeRunId(query.requirementId)
+  return {
+    run: null,
+    rows: page.rows.map((match, index): ProjectRequirementMatchCandidate => ({
+      requirementId: query.requirementId,
+      runId,
+      recordUid: match.recordUid,
+      recordName: match.recordName,
+      nodeType: match.nodeType,
+      itemId: match.itemId,
+      description: match.description,
+      finalRank: (normalizedPage - 1) * normalizedPageSize + index + 1,
+      rankingScore: match.finalScore,
+      rankingVersion: LEGACY_SAFE_RANKING_VERSION,
+      relation: null,
+      decisionStatus: 'ambiguous',
+      evidenceLevel: 'retrieval_only',
+      reasonCodes: [...LEGACY_SAFE_REASON_CODES],
+      degradationCodes: [...LEGACY_SAFE_DEGRADATION_CODES],
+      explanation: match.reason.trim() || null,
+      denseScore: match.vectorScore,
+      lexicalScore: null,
+      fusedScore: match.finalScore,
+      rerankerScore: null,
+      assetLinked: match.assetLinked,
+      requirementLinked: match.requirementLinked
+    })),
+    total: page.total
+  }
+}
 
 interface ExtractedProject {
   projectName?: string
@@ -532,6 +586,9 @@ export class ProjectManagementService {
     if (!project) return { ok: false, message: '项目不存在' }
     if (!project.requirementCount) return { ok: false, message: '当前项目没有可匹配的需求条目' }
     if (project.reviewSetId) return { ok: false, message: '存在未发布的需求审核版本，请先完成审核并发布' }
+    if (resolveRequirementMatchingRollout(this.projectMatchingSettings().rolloutMode).mode === 'legacy_safe') {
+      return { ok: false, projectId: id, message: '安全旧链路仅提供历史结果只读查看，请切换到影子验证或 v1.1 后重新匹配' }
+    }
     if (this.runningProjectIds.has(id)) return { ok: false, projectId: id, message: '该项目已有任务正在运行' }
     const taskId = randomUUID()
     this.runningProjectIds.add(id)
@@ -640,6 +697,9 @@ export class ProjectManagementService {
     if (!requirement) return { ok: false, message: '功能需求不存在' }
     const project = this.db.getManagedProject(requirement.projectId)
     if (project?.reviewSetId) return { ok: false, message: '待审核需求不能启动匹配' }
+    if (resolveRequirementMatchingRollout(this.projectMatchingSettings().rolloutMode).mode === 'legacy_safe') {
+      return { ok: false, message: '安全旧链路仅提供历史结果只读查看，请切换到影子验证或 v1.1 后重新匹配' }
+    }
     if (this.runningProjectIds.has(requirement.projectId)) return { ok: false, message: '该项目已有任务正在运行' }
     const taskId = randomUUID()
     this.runningProjectIds.add(requirement.projectId)
@@ -653,7 +713,10 @@ export class ProjectManagementService {
 
   listMatches(query: ProjectRequirementMatchQuery): ProjectRequirementMatchPage {
     if (resolveRequirementMatchingRollout(this.projectMatchingSettings().rolloutMode).primaryReadPath !== 'v1_1' && !query.runId) {
-      return { run: null, rows: [], total: 0 }
+      return mapLegacyMatchesToCandidatePage(
+        query,
+        this.db.listLegacyProjectRequirementMatches({ ...query, minScore: -1 })
+      )
     }
     const requirement = this.db.getProjectRequirement(query.requirementId)
     if (!requirement) return { run: null, rows: [], total: 0 }
@@ -662,8 +725,10 @@ export class ProjectManagementService {
       : this.db.getLatestCompatibleRequirementMatchRun({
           requirementId: requirement.id,
           requirementSnapshotHash: hashProjectRequirementSnapshot(requirement),
+          requirementBusinessHash: hashRequirementBusiness(buildProjectRequirementMatchCard(requirement)),
           normalizationVersion: REQUIREMENT_NORMALIZATION_VERSION,
-          pipelineVersion: REQUIREMENT_MATCH_PIPELINE_VERSION
+          pipelineVersion: REQUIREMENT_MATCH_PIPELINE_VERSION,
+          indexVersion: REQUIREMENT_BUSINESS_INDEX_VERSION
         })
     if (!run || run.requirementId !== requirement.id || !['succeeded', 'stale'].includes(run.status)) {
       return { run: null, rows: [], total: 0 }
@@ -673,12 +738,15 @@ export class ProjectManagementService {
       run: {
         id: run.id,
         requirementId: run.requirementId,
+        requirementBusinessHash: run.requirementBusinessHash,
+        indexVersion: run.indexVersion,
         normalizationVersion: run.normalizationVersion,
         pipelineVersion: run.pipelineVersion,
         rankingVersion: run.rankingVersion,
         configHash: run.configHash,
         modelVersion: run.modelVersion,
         degradationCodes: run.degradationCodes,
+        startedAt: run.startedAt,
         completedAt: run.completedAt ?? ''
       },
       ...page
@@ -1737,7 +1805,7 @@ export class ProjectManagementService {
           total: requirements.length,
           status: 'running'
         })
-        await this.matchSingleRequirement(requirement)
+        await this.matchSingleRequirement(requirement, taskId)
       }
       this.db.updateManagedProjectState(projectId, {
         matchStatus: 'ready',
@@ -1773,7 +1841,7 @@ export class ProjectManagementService {
         total: 1,
         status: 'running'
       })
-      await this.matchSingleRequirement(requirement)
+      await this.matchSingleRequirement(requirement, taskId)
       this.db.updateManagedProjectState(projectId, {
         matchStatus: 'ready',
         matchMessage: `已完成「${requirement.title}」的匹配`
@@ -1800,7 +1868,7 @@ export class ProjectManagementService {
     }
   }
 
-  private async matchSingleRequirement(requirement: ProjectRequirement): Promise<void> {
+  private async matchSingleRequirement(requirement: ProjectRequirement, taskId: string): Promise<void> {
     const rollout = resolveRequirementMatchingRollout(this.projectMatchingSettings().rolloutMode)
     if (!rollout.newPipelinePersisted) return
     const { runId } = await this.requirementMatchRuns.start({
@@ -1812,6 +1880,47 @@ export class ProjectManagementService {
       explainTopN: 10
     })
     await this.requirementMatchRuns.execute(runId)
+    const completedRun = this.db.getRequirementMatchRun(runId)
+    if (!completedRun || completedRun.status !== 'succeeded') {
+      throw new Error(`需求匹配运行未成功完成：${completedRun?.failureCode || completedRun?.status || 'RUN_NOT_FOUND'}`)
+    }
+    if (rollout.mode === 'shadow') {
+      const legacy = this.db.listLegacyProjectRequirementMatches({
+        requirementId: requirement.id,
+        page: 1,
+        pageSize: 20,
+        minScore: -1
+      })
+      const current = this.db.listRequirementMatchCandidates({
+        runId,
+        page: 1,
+        pageSize: 20,
+        diagnostics: true
+      })
+      const comparison = compareRequirementMatchingResults(
+        legacy.rows.map((row, index): RequirementMatchingComparisonRow => ({
+          recordUid: row.recordUid,
+          rank: index + 1,
+          decisionStatus: 'ambiguous'
+        })),
+        current.rows.map((row): RequirementMatchingComparisonRow => ({
+          recordUid: row.recordUid,
+          rank: row.finalRank,
+          decisionStatus: row.decisionStatus
+        }))
+      )
+      this.emit({
+        taskId,
+        projectId: requirement.projectId,
+        phase: 'matching',
+        message: `影子匹配技术对比：${requirement.title}`,
+        detail: JSON.stringify(comparison),
+        current: 1,
+        total: 1,
+        status: 'success',
+        logKind: 'stage'
+      })
+    }
   }
 
   private buildRequirementMatchQuery(requirement: ProjectRequirement): string {

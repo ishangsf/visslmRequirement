@@ -73,7 +73,7 @@ try {
   database = new AppDatabase(databasePath, assetDir, { runMigrations: false })
   assert.equal(
     database.getSetting('migration:requirement-business-index'),
-    'requirement-business-index-v3',
+    'requirement-business-index-v4',
     'the Worker must commit the current database migration before the main process opens it'
   )
   assert.equal(database.getStats().recordCount, records.length)

@@ -79,7 +79,7 @@ const ineligibleCore = new RequirementMatchingCore({
   candidateEligible() { return false }
 })
 const rejected = await ineligibleCore.match({ ...request, explanationPolicy: { mode: 'disabled', allowExternalProcessing: false } })
-assert.equal(rejected.candidates[0]?.decisionStatus, 'rejected')
+assert.equal(rejected.candidates.length, 0)
 
 let onlineCalls = 0
 const onlineCore = new RequirementMatchingCore({

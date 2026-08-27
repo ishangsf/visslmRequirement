@@ -77,8 +77,8 @@ import {
   sanitizeContextText
 } from './context-budget'
 import { sanitizeChatMessageContent } from '../shared/chat-message-format'
-import { buildRequirementBusinessText } from './requirements/requirement-match-card'
-import { hashRequirementBusinessText } from './requirements/requirement-business-normalization'
+import { buildProjectRequirementMatchCard, buildRequirementBusinessText } from './requirements/requirement-match-card'
+import { hashRequirementBusiness, hashRequirementBusinessText } from './requirements/requirement-business-normalization'
 import type {
   PersistedRequirementMatchCandidate,
   RequirementMatchCandidatePage,
@@ -517,7 +517,7 @@ export interface RequirementLexicalMatch {
 const REQUIREMENT_BUSINESS_INDEX_MIGRATION_KEY = 'migration:requirement-business-index'
 const REQUIREMENT_MATCH_PROVENANCE_MIGRATION_KEY = 'requirementMatching.provenanceMigration'
 const REQUIREMENT_MATCH_PROVENANCE_MIGRATION_VERSION = 'v1'
-const REQUIREMENT_BUSINESS_INDEX_VERSION = 'requirement-business-index-v4'
+export const REQUIREMENT_BUSINESS_INDEX_VERSION = 'requirement-business-index-v4'
 
 const requirementSourceHash = (input: {
   name: string
@@ -1703,7 +1703,9 @@ export class AppDatabase {
         id TEXT PRIMARY KEY,
         requirement_id TEXT NOT NULL,
         requirement_snapshot_hash TEXT NOT NULL,
+        requirement_business_hash TEXT NOT NULL DEFAULT '',
         normalization_version TEXT NOT NULL,
+        index_version TEXT NOT NULL DEFAULT 'legacy_unknown',
         pipeline_version TEXT NOT NULL,
         ranking_version TEXT NOT NULL,
         config_hash TEXT NOT NULL,
@@ -1711,6 +1713,7 @@ export class AppDatabase {
         status TEXT NOT NULL,
         degradation_codes_json TEXT NOT NULL DEFAULT '[]',
         failure_code TEXT,
+        started_at TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL,
         completed_at TEXT,
         FOREIGN KEY(requirement_id) REFERENCES pm_requirements(id) ON DELETE CASCADE
@@ -1725,12 +1728,13 @@ export class AppDatabase {
         ranking_score REAL NOT NULL,
         ranking_version TEXT NOT NULL,
         relation TEXT,
-        decision_status TEXT NOT NULL,
-        evidence_level TEXT NOT NULL,
-        reason_codes_json TEXT NOT NULL DEFAULT '[]',
-        degradation_codes_json TEXT NOT NULL DEFAULT '[]',
-        stage_scores_json TEXT NOT NULL,
-        explanation TEXT,
+          decision_status TEXT NOT NULL,
+          evidence_level TEXT NOT NULL,
+          reason_codes_json TEXT NOT NULL DEFAULT '[]',
+          degradation_codes_json TEXT NOT NULL DEFAULT '[]',
+          stage_scores_json TEXT NOT NULL,
+          evidence_json TEXT NOT NULL DEFAULT '{}',
+          explanation TEXT,
         record_snapshot_hash TEXT NOT NULL,
         PRIMARY KEY(run_id, record_uid),
         FOREIGN KEY(run_id) REFERENCES pm_requirement_match_runs(id) ON DELETE CASCADE,
@@ -1948,6 +1952,10 @@ export class AppDatabase {
       "ALTER TABLE pm_requirements ADD COLUMN confidence REAL NOT NULL DEFAULT 1",
       "ALTER TABLE pm_requirements ADD COLUMN review_status TEXT NOT NULL DEFAULT 'approved'",
       "ALTER TABLE pm_requirements ADD COLUMN review_note TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE pm_requirement_match_runs ADD COLUMN requirement_business_hash TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE pm_requirement_match_runs ADD COLUMN index_version TEXT NOT NULL DEFAULT 'legacy_unknown'",
+      "ALTER TABLE pm_requirement_match_runs ADD COLUMN started_at TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE pm_requirement_match_candidates ADD COLUMN evidence_json TEXT NOT NULL DEFAULT '{}'",
       "UPDATE pm_requirements SET status = 'unmarked', status_reason = '待人工标记' WHERE status_source = 'ai' AND status <> 'satisfied'",
       "ALTER TABLE pm_cost_entries ADD COLUMN responsible_participant_id TEXT",
       "ALTER TABLE pm_cost_entries ADD COLUMN responsible_person_name TEXT NOT NULL DEFAULT ''",
@@ -1970,6 +1978,35 @@ export class AppDatabase {
       } catch {
         // Existing databases may already contain the migration column.
       }
+    }
+    // New run provenance columns are added lazily for existing databases. Keep
+    // the canonical start time and business hash populated before readers can
+    // use them; unknown historical rows remain safely non-compatible.
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      this.db.exec(`
+        UPDATE pm_requirement_match_runs
+        SET started_at = created_at
+        WHERE COALESCE(started_at, '') = ''
+      `)
+      const legacyRuns = this.db.prepare(`
+        SELECT run.id, run.requirement_id
+        FROM pm_requirement_match_runs run
+        WHERE COALESCE(run.requirement_business_hash, '') = ''
+      `).all() as SqlRow[]
+      const updateBusinessHash = this.db.prepare(
+        'UPDATE pm_requirement_match_runs SET requirement_business_hash = ? WHERE id = ?'
+      )
+      for (const run of legacyRuns) {
+        const requirement = this.db.prepare('SELECT * FROM pm_requirements WHERE id = ?')
+          .get(String(run.requirement_id)) as SqlRow | undefined
+        if (!requirement) continue
+        updateBusinessHash.run(hashRequirementBusiness(buildProjectRequirementMatchCard(this.mapProjectRequirement(requirement))), String(run.id))
+      }
+      this.db.exec('COMMIT')
+    } catch (error) {
+      try { this.db.exec('ROLLBACK') } catch {}
+      throw error
     }
     for (const statement of [
       "ALTER TABLE pm_project_assets ADD COLUMN link_source TEXT NOT NULL DEFAULT 'legacy_unknown'",
@@ -4739,7 +4776,11 @@ export class AppDatabase {
           'approved',
           String(requirement.reviewNote ?? ''),
           validValue(requirement.status, ['unmarked', 'satisfied', 'to_develop', 'to_negotiate'] as const, 'unmarked'),
-          validValue(requirement.statusSource, ['ai', 'manual'] as const, 'ai'),
+          validValue(
+            requirement.statusSource,
+            ['ai', 'manual', 'system_rule', 'legacy_unverified'] as const,
+            'legacy_unverified'
+          ),
           String(requirement.statusReason ?? ''),
           Math.max(0, Number(requirement.highestMatchScore ?? 0)),
           Math.max(0, Math.trunc(Number(requirement.matchCount ?? 0))),
@@ -5543,16 +5584,22 @@ export class AppDatabase {
 
   createRequirementMatchRun(input: RequirementMatchRunCreateInput): RequirementMatchRun {
     const id = randomUUID()
-    const createdAt = nowIso()
+    const startedAt = input.startedAt?.trim() || nowIso()
+    const requirement = this.getProjectRequirement(input.requirementId)
+    const requirementBusinessHash = input.requirementBusinessHash?.trim() ||
+      (requirement ? hashRequirementBusiness(buildProjectRequirementMatchCard(requirement)) : '')
+    const indexVersion = input.indexVersion?.trim() || REQUIREMENT_BUSINESS_INDEX_VERSION
     this.db.prepare(`
       INSERT INTO pm_requirement_match_runs(
-        id, requirement_id, requirement_snapshot_hash, normalization_version,
-        pipeline_version, ranking_version, config_hash, model_version, status,
-        degradation_codes_json, failure_code, created_at, completed_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', '[]', NULL, ?, NULL)
+        id, requirement_id, requirement_snapshot_hash, requirement_business_hash,
+        normalization_version, index_version, pipeline_version, ranking_version,
+        config_hash, model_version, status, degradation_codes_json, failure_code,
+        started_at, created_at, completed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', '[]', NULL, ?, ?, NULL)
     `).run(
-      id, input.requirementId, input.requirementSnapshotHash, input.normalizationVersion,
-      input.pipelineVersion, input.rankingVersion, input.configHash, input.modelVersion, createdAt
+      id, input.requirementId, input.requirementSnapshotHash, requirementBusinessHash,
+      input.normalizationVersion, indexVersion, input.pipelineVersion, input.rankingVersion,
+      input.configHash, input.modelVersion, startedAt, startedAt
     )
     return this.getRequirementMatchRun(id)!
   }
@@ -5562,7 +5609,9 @@ export class AppDatabase {
       id: String(row.id),
       requirementId: String(row.requirement_id),
       requirementSnapshotHash: String(row.requirement_snapshot_hash),
+      requirementBusinessHash: String(row.requirement_business_hash ?? ''),
       normalizationVersion: String(row.normalization_version),
+      indexVersion: String(row.index_version ?? ''),
       pipelineVersion: String(row.pipeline_version),
       rankingVersion: String(row.ranking_version),
       configHash: String(row.config_hash),
@@ -5570,6 +5619,7 @@ export class AppDatabase {
       status: String(row.status) as RequirementMatchRun['status'],
       degradationCodes: parseJsonArray(row.degradation_codes_json) as RequirementMatchDegradationCode[],
       failureCode: row.failure_code === null || row.failure_code === undefined ? null : String(row.failure_code),
+      startedAt: String(row.started_at ?? row.created_at ?? ''),
       createdAt: String(row.created_at),
       completedAt: row.completed_at === null || row.completed_at === undefined ? null : String(row.completed_at)
     }
@@ -5592,10 +5642,10 @@ export class AppDatabase {
       if (!run || String(run.status) !== 'running') throw new Error('匹配运行不存在或已结束')
       const insert = this.db.prepare(`
         INSERT INTO pm_requirement_match_candidates(
-          run_id, record_uid, final_rank, ranking_score, ranking_version, relation,
+        run_id, record_uid, final_rank, ranking_score, ranking_version, relation,
           decision_status, evidence_level, reason_codes_json, degradation_codes_json,
-          stage_scores_json, explanation, record_snapshot_hash
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          stage_scores_json, evidence_json, explanation, record_snapshot_hash
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
       for (const candidate of candidates) {
         insert.run(
@@ -5603,7 +5653,7 @@ export class AppDatabase {
           candidate.rankingVersion, candidate.relation, candidate.decisionStatus,
           candidate.evidenceLevel, JSON.stringify(candidate.reasonCodes),
           JSON.stringify(candidate.degradationCodes), JSON.stringify(candidate.stageScores),
-          candidate.explanation, candidate.recordSnapshotHash
+          JSON.stringify(candidate.evidenceJson ?? {}), candidate.explanation, candidate.recordSnapshotHash
         )
       }
       this.db.prepare(`
@@ -5650,6 +5700,8 @@ export class AppDatabase {
     const params: string[] = [query.requirementId, query.requirementSnapshotHash]
     if (query.normalizationVersion) { conditions.push('normalization_version = ?'); params.push(query.normalizationVersion) }
     if (query.pipelineVersion) { conditions.push('pipeline_version = ?'); params.push(query.pipelineVersion) }
+    if (query.requirementBusinessHash) { conditions.push('requirement_business_hash = ?'); params.push(query.requirementBusinessHash) }
+    if (query.indexVersion) { conditions.push('index_version = ?'); params.push(query.indexVersion) }
     const row = this.db.prepare(`
       SELECT * FROM pm_requirement_match_runs
       WHERE ${conditions.join(' AND ')}
@@ -5690,6 +5742,7 @@ export class AppDatabase {
         reasonCodes: parseJsonArray(row.reason_codes_json),
         degradationCodes: parseJsonArray(row.degradation_codes_json) as RequirementMatchDegradationCode[],
         stageScores: parseJsonValue(row.stage_scores_json, {}) as PersistedRequirementMatchCandidate['stageScores'],
+        evidenceJson: parseJsonValue(row.evidence_json, {}),
         explanation: row.explanation === null || row.explanation === undefined ? null : String(row.explanation),
         recordSnapshotHash: String(row.record_snapshot_hash)
       }))
@@ -5876,6 +5929,7 @@ export class AppDatabase {
           decisionStatus: String(row.decision_status) as ProjectRequirementMatchCandidate['decisionStatus'],
           evidenceLevel: String(row.evidence_level) as ProjectRequirementMatchCandidate['evidenceLevel'],
           reasonCodes: parseJsonArray(row.reason_codes_json), degradationCodes: parseJsonArray(row.degradation_codes_json),
+          evidenceJson: parseJsonValue(row.evidence_json, {}),
           explanation: row.explanation === null || row.explanation === undefined ? null : String(row.explanation),
           denseScore: stage.denseScore === null || stage.denseScore === undefined ? null : Number(stage.denseScore),
           lexicalScore: stage.lexicalScore === null || stage.lexicalScore === undefined ? null : Number(stage.lexicalScore),

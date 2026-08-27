@@ -41,7 +41,11 @@ import {
   type RequirementMatchExplanation,
   type RequirementMatchExplanationModelClient
 } from '../requirements/requirement-match-explainer'
-import type { MatchDecisionStatus, RequirementMatchCandidateResult } from '../requirements/requirement-match-domain'
+import type {
+  MatchDecisionStatus,
+  RequirementMatchCandidateResult,
+  RequirementMatchRequest
+} from '../requirements/requirement-match-domain'
 import { RequirementMatchingCore } from '../requirements/requirement-matching-core'
 import { agentRequirementMatchProjection } from '../requirements/requirement-match-adapters'
 
@@ -66,6 +70,10 @@ interface RequirementAnalysisAgentOptions {
   retriever?: Pick<HybridRequirementRetriever, 'retrieve'>
   modelClient?: RequirementMatchExplanationModelClient
   matchingCore?: RequirementMatchingCore
+}
+
+type RequirementMatchRequestWithCurrentProject = RequirementMatchRequest & {
+  currentProjectId?: string
 }
 
 interface RequirementProfile {
@@ -370,16 +378,18 @@ export class RequirementAnalysisAgent {
 
     try {
       this.progress('recall', `${record.itemId}：统一匹配核心开始 Dense/BM25 召回、RRF 与精确哈希补召`)
-      const result = await this.matchingCore.match({
+      const matchRequest: RequirementMatchRequestWithCurrentProject = {
         base: card,
         excludedUids,
         includeCurrentProjectRecords: false,
+        currentProjectId: record.projectId,
         explainTopN: EXPLANATION_CANDIDATE_LIMIT,
         explanationPolicy: {
           mode: this.settings.source === 'local' ? 'local' : 'online',
           allowExternalProcessing: this.settings.source === 'local'
         }
-      })
+      }
+      const result = await this.matchingCore.match(matchRequest)
       this.progress('score', `${record.itemId}：统一核心完成排序，共 ${result.candidates.length} 条候选`, result.candidates.length, HYBRID_CANDIDATE_LIMIT)
       if (!result.candidates.length) return { requestedItemId, base, formal: [], references: [], reviewSummary: '全库混合召回未发现候选记录。' }
 

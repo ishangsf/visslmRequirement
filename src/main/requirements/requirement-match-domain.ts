@@ -41,6 +41,8 @@ export interface RequirementMatchRequest {
   base: RequirementMatchCard
   excludedUids: ReadonlySet<string>
   includeCurrentProjectRecords: boolean
+  /** Project scope used by candidate eligibility checks. */
+  currentProjectId?: string
   explainTopN: number
   explanationPolicy: {
     mode: 'disabled' | 'local' | 'online'
@@ -59,6 +61,8 @@ export interface RequirementMatchCandidateResult {
   reasonCodes: string[]
   degradationCodes: RequirementMatchDegradationCode[]
   stageScores: RequirementMatchStageScores
+  /** Source-derived evidence only; model explanations must not invent this data. */
+  evidenceJson?: unknown
   explanation: string | null
 }
 
@@ -85,7 +89,9 @@ export interface RequirementMatchRun {
   id: string
   requirementId: string
   requirementSnapshotHash: string
+  requirementBusinessHash: string
   normalizationVersion: string
+  indexVersion: string
   pipelineVersion: string
   rankingVersion: string
   configHash: string
@@ -93,14 +99,18 @@ export interface RequirementMatchRun {
   status: RequirementMatchRunStatus
   degradationCodes: RequirementMatchDegradationCode[]
   failureCode: string | null
+  /** Canonical run start time. */
+  startedAt: string
+  /** Legacy compatibility alias retained for existing readers. */
   createdAt: string
   completedAt: string | null
 }
 
 export type RequirementMatchRunCreateInput = Omit<
   RequirementMatchRun,
-  'id' | 'status' | 'degradationCodes' | 'failureCode' | 'createdAt' | 'completedAt'
->
+  'id' | 'status' | 'degradationCodes' | 'failureCode' | 'createdAt' | 'startedAt' | 'completedAt' |
+  'requirementBusinessHash' | 'indexVersion'
+> & Partial<Pick<RequirementMatchRun, 'requirementBusinessHash' | 'indexVersion' | 'startedAt'>>
 
 export interface PersistedRequirementMatchCandidate extends RequirementMatchCandidateResult {
   runId: string
@@ -115,8 +125,10 @@ export interface RequirementMatchCandidatePage {
 export interface RequirementMatchRunCompatibilityQuery {
   requirementId: string
   requirementSnapshotHash: string
+  requirementBusinessHash?: string
   normalizationVersion?: string
   pipelineVersion?: string
+  indexVersion?: string
 }
 
 export const isMatchRelation = (value: unknown): value is Exclude<MatchRelation, null> =>

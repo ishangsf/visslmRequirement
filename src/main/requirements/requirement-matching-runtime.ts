@@ -8,6 +8,11 @@ import { hashRequirementBusiness } from './requirement-business-normalization'
 import { buildRequirementSourceView } from './requirement-match-card'
 import { explainRequirementMatches } from './requirement-match-explainer'
 import { RequirementMatchingCore } from './requirement-matching-core'
+import type { RequirementMatchRequest } from './requirement-match-domain'
+
+type RequirementMatchRequestWithCurrentProject = RequirementMatchRequest & {
+  currentProjectId?: string
+}
 
 export const createRequirementMatchingCore = (
   db: AppDatabase,
@@ -46,6 +51,11 @@ export const createRequirementMatchingCore = (
         return [{ record, card, denseScore: 0, lexicalScore: 0, retrievalScore: 0, snippet: card.evidence }]
       })
     },
-    candidateEligible() { return true }
+    candidateEligible(_candidate, request) {
+      const scopedRequest = request as RequirementMatchRequestWithCurrentProject
+      if (scopedRequest.includeCurrentProjectRecords) return true
+      const currentProjectId = scopedRequest.currentProjectId?.trim()
+      return !currentProjectId || _candidate.record.projectId !== currentProjectId
+    }
   })
 }

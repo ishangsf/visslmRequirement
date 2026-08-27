@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import type { ProjectRequirement } from '../../shared/project-types'
-import { AppDatabase } from '../database'
+import { AppDatabase, REQUIREMENT_BUSINESS_INDEX_VERSION } from '../database'
 import { buildProjectRequirementMatchCard, buildRequirementSourceView } from './requirement-match-card'
 import {
   REQUIREMENT_NORMALIZATION_VERSION,
@@ -48,10 +48,13 @@ export class RequirementMatchRunService {
     const requirement = this.db.getProjectRequirement(input.requirementId)
     if (!requirement) throw new Error('功能需求不存在')
     const requirementSnapshotHash = hashProjectRequirementSnapshot(requirement)
+    const requirementBusinessHash = hashRequirementBusiness(buildProjectRequirementMatchCard(requirement))
     const run = this.db.createRequirementMatchRun({
       requirementId: requirement.id,
       requirementSnapshotHash,
+      requirementBusinessHash,
       normalizationVersion: REQUIREMENT_NORMALIZATION_VERSION,
+      indexVersion: REQUIREMENT_BUSINESS_INDEX_VERSION,
       pipelineVersion: REQUIREMENT_MATCH_PIPELINE_VERSION,
       rankingVersion: FULL_RERANK_RANKING_VERSION,
       configHash: 'pending',
@@ -71,10 +74,15 @@ export class RequirementMatchRunService {
         this.db.failRequirementMatchRun(runId, 'REQUIREMENT_SNAPSHOT_CHANGED')
         return
       }
+      if (run.indexVersion !== REQUIREMENT_BUSINESS_INDEX_VERSION) {
+        this.db.failRequirementMatchRun(runId, 'INDEX_VERSION_MISMATCH')
+        return
+      }
       const result = await this.core.match({
         base: buildProjectRequirementMatchCard(requirement),
         excludedUids: new Set<string>(),
         includeCurrentProjectRecords: false,
+        currentProjectId: requirement.projectId,
         explainTopN: pending.explainTopN ?? 10,
         explanationPolicy: pending.explanationPolicy
       })
@@ -86,7 +94,16 @@ export class RequirementMatchRunService {
       const candidates = result.candidates.map((candidate) => {
         const record = this.db.getRecord(candidate.recordUid, false)
         const recordSnapshotHash = record ? hashRequirementBusiness(buildRequirementSourceView(record)) : ''
-        return { ...candidate, recordSnapshotHash }
+        return {
+          ...candidate,
+          recordSnapshotHash,
+          evidenceJson: {
+            baseBusinessHash: run.requirementBusinessHash,
+            recordBusinessHash: recordSnapshotHash,
+            evidenceLevel: candidate.evidenceLevel,
+            reasonCodes: [...candidate.reasonCodes]
+          }
+        }
       })
       this.db.completeRequirementMatchRun(runId, candidates, result.degradationCodes, result)
     } catch (error) {

@@ -12,11 +12,20 @@ export interface RequirementRerankItem {
 
 export interface RequirementReranker {
   readonly modelId: string
+  /** Stable, pinned identity used for audit/config provenance. */
+  readonly modelVersion?: string
+  readonly modelProvenance?: string
   rerank(base: RequirementMatchCard, candidates: HybridRequirementCandidate[]): Promise<RequirementRerankItem[]>
 }
 
 export const REQUIREMENT_RERANKER_MODEL_ID = 'Xenova/bge-reranker-base'
 export const REQUIREMENT_RERANKER_MODEL_VERSION = 'bge-reranker-base-int8-local-v1'
+export const REQUIREMENT_RERANKER_MODEL_PROVENANCE = [
+  REQUIREMENT_RERANKER_MODEL_VERSION,
+  'revision=280bcc27a84e0b898c251e06fddb25171bd9b101',
+  'model_int8_sha256=2059d8ef0b6e935b4845e11b38c9af9e9e2e7b91f69fc99efe03254e0a7da8d3',
+  'license=Apache-2.0'
+].join(';')
 
 const locateResource = (...parts: string[]): string | null => {
   const moduleDir = dirname(fileURLToPath(import.meta.url))
@@ -56,6 +65,8 @@ const scoreFromLogits = (result: any, index: number): number => {
 
 export class LocalRequirementReranker implements RequirementReranker {
   readonly modelId = REQUIREMENT_RERANKER_MODEL_ID
+  readonly modelVersion = REQUIREMENT_RERANKER_MODEL_VERSION
+  readonly modelProvenance = REQUIREMENT_RERANKER_MODEL_PROVENANCE
   private tokenizer: any | null = null
   private model: any | null = null
   private preparing: Promise<void> | null = null
