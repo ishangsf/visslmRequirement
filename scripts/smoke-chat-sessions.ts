@@ -87,6 +87,20 @@ try {
     '这是有证据支持的正文结论。',
     'structured sources must replace repeated standalone 来源/依据 Markdown sections'
   )
+  const genericNumberedCitationAnswer = [
+    '这是另一条有证据支持的正文结论。',
+    '',
+    '> 来源：',
+    '> `',
+    '> 1. [平台技术方案.docx · 正文](https://example.invalid/source-1)',
+    '> `',
+    '> [2] [平台技术方案.docx · 历史记录](https://example.invalid/source-2)'
+  ].join('\n')
+  assert.equal(
+    stripRedundantAssistantCitationSections(genericNumberedCitationAnswer, true),
+    '这是另一条有证据支持的正文结论。',
+    'structured sources must replace trailing generic Markdown citation lists and their list scaffolding'
+  )
   assert.equal(
     stripRedundantAssistantCitationSections('结论依据：标准第 3 条。', true),
     '结论依据：标准第 3 条。',

@@ -66,6 +66,26 @@ export interface AssistantExecutionSummary {
   }
 }
 
+/**
+ * A safe, append-only work-log item for the assistant run.  This is kept
+ * separate from ordinary status prose so clients can render a continuous
+ * execution log without inspecting or interpreting the final answer.
+ */
+export type AssistantActivityKind = 'narrative' | 'tool' | 'checkpoint'
+
+export type AssistantActivityStatus = 'running' | 'completed' | 'warning' | 'failed'
+
+export interface AssistantActivity {
+  activityId: string
+  sequence: number
+  kind: AssistantActivityKind
+  stage: string
+  title?: string
+  summary: string
+  status: AssistantActivityStatus
+  createdAt: string
+}
+
 export type AgentEvent =
   | {
       type: 'status'
@@ -98,6 +118,7 @@ export type AgentEvent =
       summary: AssistantExecutionSummary
       requiresConfirmation: true
     }
+  | ({ type: 'activity' } & AssistantActivity)
   | { type: 'artifact'; artifactId: string; version: number; dashboard: DashboardSpec }
   | {
       type: 'error'

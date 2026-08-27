@@ -73,23 +73,32 @@ const collapsedChecks = await evaluate(`(async () => {
   [...document.querySelectorAll('.ant-menu-item')]
     .find((item) => item.textContent?.includes('AI 助手'))?.click()
   const session = await waitFor(() => [...document.querySelectorAll('.chat-history-item')]
-    .find((item) => item.textContent?.includes('回答依据折叠验收')), 'seeded chat session')
+    .find((item) => item.textContent?.includes('回答依据分组验收')), 'seeded chat session')
   session.click()
   const details = await waitFor(() => document.querySelector('details.source-list'), 'answer source list')
   const markdown = document.querySelector('.message-row.assistant .chat-markdown')
   const summary = details.querySelector('summary.source-list-title')
+  const count = details.querySelector('.source-list-count')
   const chips = details.querySelector('.source-chips')
   const openLabel = details.querySelector('.source-list-action-open')
+  const sourceNames = ['设备接口规范.pdf', '接口测试记录.pdf', '接口验证任务']
+  summary?.focus()
   return {
     theme: document.documentElement.dataset.theme,
-    answerVisible: markdown?.textContent?.includes('GJB5000B 采用分级成熟度模型') ?? false,
+    answerVisible: markdown?.textContent?.includes('设备接口协议用于描述系统边界') ?? false,
     repeatedSourceAbsent: !(markdown?.textContent ?? '').includes('来源：'),
     repeatedBasisAbsent: !(markdown?.textContent ?? '').includes('依据：'),
+    repeatedSourceNamesAbsent: sourceNames.every((name) => !(markdown?.textContent ?? '').includes(name)),
     collapsedByDefault: !details.open,
     chipsHiddenWhenCollapsed: chips?.getClientRects().length === 0,
     summaryVisible: Boolean(summary?.textContent?.includes('回答依据')),
-    countVisible: Boolean(summary?.textContent?.includes('1 份文档')),
-    viewListVisible: getComputedStyle(openLabel).display !== 'none'
+    uniqueDocumentCountVisible: Boolean(count?.textContent?.includes('2 份文档')),
+    recordCountVisible: Boolean(count?.textContent?.includes('1 条记录')),
+    countLabelVisible: Boolean(count?.getAttribute('aria-label')?.includes('2 份知识文档')),
+    summaryFocusable: document.activeElement === summary,
+    viewListVisible: openLabel ? getComputedStyle(openLabel).display !== 'none' : false,
+    noHorizontalOverflow: document.documentElement.scrollWidth <= window.innerWidth + 1 &&
+      document.body.scrollWidth <= window.innerWidth + 1
   }
 })()`)
 
@@ -101,13 +110,39 @@ const expandedChecks = await evaluate(`(async () => {
   await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))
   const chips = details?.querySelector('.source-chips')
   const closeLabel = details?.querySelector('.source-list-action-close')
-  const sourceButton = details?.querySelector('.source-chip')
+  const groups = details ? [...details.querySelectorAll('.source-group')] : []
+  const references = details ? [...details.querySelectorAll('.source-reference')] : []
+  const groupReferenceCounts = groups
+    .map((group) => group.querySelectorAll('.source-reference').length)
+    .sort((left, right) => left - right)
+  const primaryGroupCount = groups.filter((group) => {
+    const text = (group.textContent ?? '').replace(/\s+/gu, '')
+    return text.includes('第19页') && text.includes('第20页')
+  }).length
+  const referenceLabels = references.map((reference) => reference.getAttribute('aria-label')?.trim() ?? '')
+  const groupText = groups.map((group) => group.textContent ?? '').join(' ')
+  const referenceText = references.map((reference) => reference.textContent ?? '').join(' ').replace(/\s+/gu, '')
+  const focusableReferences = references.every((reference) =>
+    reference.tagName === 'BUTTON' && !reference.disabled && reference.tabIndex >= 0
+  )
+  references[0]?.focus()
   return {
     expanded: Boolean(details?.open),
     chipsVisible: (chips?.getClientRects().length ?? 0) > 0,
     closeListVisible: closeLabel ? getComputedStyle(closeLabel).display !== 'none' : false,
-    sourceReadable: sourceButton?.textContent?.includes('GJB5000B实施指南.pdf') ?? false,
-    locationReadable: sourceButton?.textContent?.includes('第3页') ?? false
+    groupCount: groups.length === 3,
+    referenceCount: references.length === 4,
+    sameDocumentGrouped: primaryGroupCount === 1 && groupReferenceCounts.join(',') === '1,1,2',
+    sourceNamesReadable: groupText.includes('设备接口规范.pdf') &&
+      groupText.includes('接口测试记录.pdf') && groupText.includes('接口验证任务'),
+    locationsReadable: referenceText.includes('第19页') &&
+      referenceText.includes('第20页') && referenceText.includes('第4页'),
+    referenceLabelsPresent: referenceLabels.every((label) => label.length > 0),
+    referenceLabelsUnique: new Set(referenceLabels).size === referenceLabels.length,
+    focusableReferences,
+    firstReferenceFocused: document.activeElement === references[0],
+    noHorizontalOverflow: document.documentElement.scrollWidth <= window.innerWidth + 1 &&
+      document.body.scrollWidth <= window.innerWidth + 1
   }
 })()`)
 
@@ -127,12 +162,40 @@ const responsiveChecks = await evaluate(`(async () => {
     await new Promise((resolve) => setTimeout(resolve, 100))
   }
   const summary = details?.querySelector('summary.source-list-title')
-  const rect = summary?.getBoundingClientRect()
+  if (!details?.open) summary?.click()
+  await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+  const chips = details?.querySelector('.source-chips')
+  const groups = details ? [...details.querySelectorAll('.source-group')] : []
+  const groupRects = groups.map((group) => group.getBoundingClientRect())
+  const chipsStyle = chips ? getComputedStyle(chips) : null
+  const count = details?.querySelector('.source-list-count')
+  const countItems = count ? [...count.querySelectorAll('.source-kind-count')] : []
+  const summaryRect = summary?.getBoundingClientRect()
+  const sameColumn = groupRects.length <= 1 || groupRects.every((rect, index) => {
+    const first = groupRects[0]
+    const previous = groupRects[index - 1]
+    return first && Math.abs(rect.left - first.left) <= 1 && (!previous || rect.top >= previous.bottom - 1)
+  })
+  const oneColumn = Boolean(chipsStyle && (
+    (chipsStyle.display === 'grid' && chipsStyle.gridTemplateColumns.trim().split(/\s+/u).length === 1) ||
+    (chipsStyle.display === 'flex' && chipsStyle.flexDirection === 'column') ||
+    sameColumn
+  ))
+  const groupsWithinViewport = groupRects.every((rect) => rect.left >= -1 && rect.right <= window.innerWidth + 1)
+  const countItemsNoWrap = countItems.length > 0 && countItems.every((item) => getComputedStyle(item).whiteSpace === 'nowrap')
+  if (details?.open) summary?.click()
   return {
     theme: document.documentElement.dataset.theme,
     collapsed: !details?.open,
-    summaryWithinViewport: Boolean(rect && rect.left >= 0 && rect.right <= window.innerWidth + 1),
-    viewListVisible: getComputedStyle(details.querySelector('.source-list-action-open')).display !== 'none'
+    summaryWithinViewport: Boolean(summaryRect && summaryRect.left >= 0 && summaryRect.right <= window.innerWidth + 1),
+    oneColumn,
+    groupsWithinViewport,
+    countItemsNoWrap,
+    viewListVisible: details?.querySelector('.source-list-action-open')
+      ? getComputedStyle(details.querySelector('.source-list-action-open')).display !== 'none'
+      : false,
+    noHorizontalOverflow: document.documentElement.scrollWidth <= window.innerWidth + 1 &&
+      document.body.scrollWidth <= window.innerWidth + 1
   }
 })()`)
 const responsiveScreenshot = await capture('chat-answer-basis-collapsed-light-660')

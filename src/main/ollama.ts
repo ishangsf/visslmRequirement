@@ -32,6 +32,13 @@ import {
 } from './assistant/task-trace'
 import { traceContextFromDecision } from './assistant/task-trace'
 import {
+  workLogForDelivery,
+  workLogForEvidence,
+  workLogForStatus,
+  workLogForVerification,
+  type AssistantWorkLogDraft
+} from './assistant/work-log'
+import {
   compactContextValue,
   compactEvidenceJson,
   sanitizeContextText,
@@ -145,6 +152,14 @@ const removeRecordUidIndex = (value: unknown, propertyKey?: string): unknown => 
       .filter(([key]) => !['recordUids', 'recordUidsByTerm'].includes(key) && !(recordSource && key === 'uid'))
       .map(([key, nested]) => [key, removeRecordUidIndex(nested, key)])
   )
+}
+
+const matchedRecordCount = (result: unknown): number => {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return 0
+  const value = result as { matchedCount?: unknown; records?: unknown }
+  const matchedCount = Number(value.matchedCount)
+  if (Number.isFinite(matchedCount) && matchedCount >= 0) return Math.trunc(matchedCount)
+  return Array.isArray(value.records) ? value.records.length : 0
 }
 
 interface MutableJsonSchema {
@@ -299,7 +314,8 @@ export class OllamaAgent {
     private readonly onPlanConfirmation?: (
       summary: AssistantExecutionSummary,
       dataScope?: DataScope
-    ) => Promise<ConfirmedAssistantPlan | void>
+    ) => Promise<ConfirmedAssistantPlan | void>,
+    private readonly onActivity?: (activity: AssistantWorkLogDraft) => void
   ) {
     this.dataCenterAgent = new DataCenterAgent(db)
     this.knowledgeBaseAgent = new KnowledgeBaseAgent(db, knowledge, {
@@ -404,6 +420,13 @@ export class OllamaAgent {
     }
     if (plan.needsClarification) {
       const clarificationQuestion = plan.clarificationQuestion || '为了避免执行猜测性查询，请补充查询范围、字段或资料来源。'
+      this.activity({
+        kind: 'checkpoint',
+        stage: 'scope-confirmation',
+        title: '需要补充查询范围',
+        summary: '当前计划缺少安全执行所需的范围或字段，等待补充信息。',
+        status: 'warning'
+      })
       const context = this.traceContextForPlan(plan)
       return {
         answer: clarificationQuestion,
@@ -476,6 +499,11 @@ export class OllamaAgent {
 
   private progress(stage: string, message: string): void {
     this.onProgress?.({ type: 'status', stage, message })
+    this.onActivity?.(workLogForStatus(stage, message))
+  }
+
+  private activity(activity: AssistantWorkLogDraft): void {
+    this.onActivity?.(activity)
   }
 
   private executionSummaryFor(request: ChatRequest, plan: QuestionPlan): AssistantExecutionSummary {
@@ -969,6 +997,7 @@ export class OllamaAgent {
         numPredict: 800,
         ...(this.onTextDelta ? { onTextDelta: this.onTextDelta } : {})
       })
+      this.activity(workLogForDelivery())
       return {
         response: {
           answer: response.message?.content?.trim() || '你好，我是 VISSLM AI 助手。',
@@ -1018,6 +1047,11 @@ export class OllamaAgent {
           selectedProjectId
         )
       : null
+
+    this.activity(workLogForEvidence(
+      recordExecution ? matchedRecordCount(recordExecution.result) : 0,
+      knowledgeExecution?.hits.length ?? 0
+    ))
 
     // Never ask the model to fill an empty source with a plausible answer.
     if (
@@ -1105,6 +1139,8 @@ export class OllamaAgent {
       answer = `${answer.trim()}\n\n未获得${missingSources.join('、')}证据，本次回答仅基于已返回来源。`
     }
     answer = this.ensureVerifiableCitations(answer, [...sources.values()])
+    this.activity(workLogForVerification())
+    this.activity(workLogForDelivery())
     return {
       response: {
         answer,

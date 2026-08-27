@@ -3,10 +3,11 @@ const inlineHeadingPattern = /(?:^|\s)(#{2,4})\s+(?=\S)/gu
 const inlineNumberedItemPattern = /(?:^|\s)(\d{1,3}[.、])\s+(?=\S)/gu
 const inlineBulletItemPattern = /(?:^|\s)([-*])\s+(?=\S)/gu
 const standaloneCitationSectionPattern = /(?:^|\n)[ \t]*(?:>[ \t]*)?(?:#{1,6}[ \t]+)?(?:来源|依据)[：:][ \t]*(?=$|\n|\[)/gu
-const verifiableCitationTokenPattern = /#knowledge-document=|\[UID:[^\]]+\]/u
+const markdownCitationPattern = /\[[^\]\n]+\]\([^)\n]+\)/gu
+const verifiableCitationTokenPattern = /#knowledge-document=|\[UID:[^\]]+\]|\[[^\]\n]+\]\([^)\n]+\)/u
 const knowledgeCitationMarkdownPattern = /\[[^\]\n]+\]\(#knowledge-document=[^)\n]+\)/gu
 const recordCitationPattern = /\[UID:[^\]\n]+\]/gu
-const citationSectionScaffoldingPattern = /(?:来源|依据)[：:]?|[\s>#*`、,，.。;；:：|\\-]/gu
+const citationSectionScaffoldingPattern = /(?:来源|依据)[：:]?|\[\d{1,3}\]|\d{1,3}[.)、]|[\s>#*`、,，.。;；:：|\\-]/gu
 
 /**
  * Keep user-visible chat formatting intact while removing control characters
@@ -68,6 +69,7 @@ export const stripRedundantAssistantCitationSections = (
     const tail = value.slice(start)
     if (!verifiableCitationTokenPattern.test(tail)) continue
     const nonCitationText = tail
+      .replace(markdownCitationPattern, '')
       .replace(knowledgeCitationMarkdownPattern, '')
       .replace(recordCitationPattern, '')
       .replace(citationSectionScaffoldingPattern, '')

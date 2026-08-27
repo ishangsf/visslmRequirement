@@ -106,6 +106,15 @@ import {
 import { AnswerStream } from './assistant/answer-stream'
 import { AssistantPlanConfirmationController } from './assistant/plan-confirmation'
 import type { AssistantPlanValidationMetadata, ConfirmedAssistantPlan } from './assistant/execution-plan'
+import {
+  workLogForDelivery,
+  workLogForFailure,
+  workLogForIntent,
+  workLogForSkill,
+  workLogForStatus,
+  workLogForVerification,
+  type AssistantWorkLogDraft
+} from './assistant/work-log'
 import { buildSafeQueryRecoverySuggestions } from './assistant/recovery-suggestions'
 import { buildEvidenceBlocks } from './assistant/evidence-block'
 import {
@@ -1100,6 +1109,8 @@ const registerIpc = (): void => {
       }
     }
     let runFinished = false
+    let activitySequence = 0
+    let lastActivityFingerprint: string | undefined
     const sendAgentEvent = (event: AgentEvent): void => {
       if (runFinished || registration.signal.aborted || ipcEvent.sender.isDestroyed()) return
       if (event.type === 'status') {
@@ -1115,6 +1126,27 @@ const registerIpc = (): void => {
         // A renderer can disappear between the destroyed check and send.
       }
     }
+    const emitActivity = (draft: AssistantWorkLogDraft): void => {
+      const fingerprint = [draft.kind, draft.stage, draft.title ?? '', draft.summary, draft.status].join('|')
+      if (fingerprint === lastActivityFingerprint) return
+      lastActivityFingerprint = fingerprint
+      const sequence = ++activitySequence
+      sendAgentEvent({
+        type: 'activity',
+        activityId: `${registration.runId}:activity:${sequence}`,
+        sequence,
+        kind: draft.kind,
+        stage: draft.stage,
+        ...(draft.title ? { title: draft.title } : {}),
+        summary: draft.summary,
+        status: draft.status,
+        createdAt: new Date().toISOString()
+      })
+    }
+    const emitAgentProgress = (event: AgentEvent): void => {
+      sendAgentEvent(event)
+      if (event.type === 'status') emitActivity(workLogForStatus(event.stage, event.message))
+    }
     const answerStream = new AnswerStream({
       emit: (event) => sendAgentEvent(event),
       signal: registration.signal
@@ -1129,6 +1161,13 @@ const registerIpc = (): void => {
         dataScope: dataScope ?? request.dataScope,
         metadata: planValidationMetadata(summary, dataScope ?? request.dataScope)
       }
+      emitActivity({
+        kind: 'checkpoint',
+        stage: 'scope-confirmation',
+        title: '确认执行范围',
+        summary: '正在等待执行范围确认。',
+        status: 'running'
+      })
       const confirmation = assistantPlanConfirmation.wait(
         ipcEvent.sender,
         registration.runId,
@@ -1140,6 +1179,13 @@ const registerIpc = (): void => {
       if (!approved) throw new Error('执行计划确认未完成')
       confirmedExecutionSummary = approved.effectiveSummary
       request = { ...request, dataScope: approved.effectiveDataScope }
+      emitActivity({
+        kind: 'checkpoint',
+        stage: 'scope-confirmation',
+        title: '范围已确认',
+        summary: '范围已确认，开始执行。',
+        status: 'completed'
+      })
       return approved
     }
     return runWithAssistantRunContext(registration.context, async () => {
@@ -1230,6 +1276,7 @@ const registerIpc = (): void => {
         metadata?: Extract<AgentEvent, { type: 'status' }>['metadata']
       ): void => {
         sendAgentEvent({ type: 'status' as const, stage, message, ...(metadata ? { metadata } : {}) })
+        emitActivity(workLogForStatus(stage, message))
       }
       emitIntentStatus('classify', '正在理解目标、上下文与任务类型')
       try {
@@ -1250,6 +1297,7 @@ const registerIpc = (): void => {
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error)
         emitIntentStatus('classify', `统一意图判断失败：${errorMessage}`)
+        emitActivity(workLogForFailure('task-judgment'))
         return {
           answer: '本次请求无法安全判断任务类型，未访问数据中心或知识库。请补充问题范围后重试。',
           sources: [],
@@ -1275,10 +1323,12 @@ const registerIpc = (): void => {
           }]
         }
       }
+      emitActivity(workLogForIntent(assistantIntent))
       const routeValidation = validateAssistantExecutionRoute(assistantIntent)
       if (!routeValidation.ok) {
         const errorMessage = routeValidation.error
         emitIntentStatus('skill', `任务与来源组合未通过校验：${errorMessage}`)
+        emitActivity(workLogForFailure('skill-selection'))
         return {
           ...attachAssistantIntent({
             answer: '本次请求的任务与数据来源组合无法安全执行，未访问数据中心或知识库。请重新说明目标。',
@@ -1331,7 +1381,15 @@ const registerIpc = (): void => {
             : {})
         }
       )
+      emitActivity(workLogForSkill(assistantIntent))
       if (assistantIntent.needsClarification) {
+        emitActivity({
+          kind: 'checkpoint',
+          stage: 'scope-confirmation',
+          title: '需要补充范围',
+          summary: '当前请求的范围或来源尚未安全确定，等待补充信息。',
+          status: 'warning'
+        })
         const clarificationQuestion = assistantIntent.clarificationQuestion ||
           '为了避免执行猜测性查询，请补充任务范围或数据来源。'
         return attachAssistantIntent({
@@ -1364,6 +1422,15 @@ const registerIpc = (): void => {
         }
       : request
     const route = expertRouter.route(routedRequest)
+    if (!isAutoChat) {
+      emitActivity({
+        kind: 'narrative',
+        stage: 'skill-selection',
+        title: '执行技能已确定',
+        summary: '已根据当前入口与用户选择确定执行技能。',
+        status: 'completed'
+      })
+    }
     const artifactRouteRequested = assistantIntent?.taskType === 'artifact_generation' || route.expert.id === 'artifact'
     if (artifactRouteRequested && !explicitArtifactMentionPattern.test(originalUserQuestion)) {
       const message = '交付物生成必须由用户在原始问题中显式输入 @交付物专家；本次未生成交付物。'
@@ -1424,6 +1491,13 @@ const registerIpc = (): void => {
     if (assistantIntent?.taskType === 'artifact_generation' || route.expert.id === 'artifact') {
       const source = request.artifactSource
       if (!source?.evidenceBlocks.length) {
+        emitActivity({
+          kind: 'checkpoint',
+          stage: 'evidence-verification',
+          title: '等待可核验证据',
+          summary: '交付物需要已有回答中的可核验证据，当前未开始生成。',
+          status: 'warning'
+        })
         return attachAssistantIntent({
           answer: '请先选择一条包含可核验证据的已完成回答，再生成交付物。',
           sources: [],
@@ -1438,6 +1512,7 @@ const registerIpc = (): void => {
         type: source.type ?? 'delivery_draft',
         title: source.title || `交付物草稿 · ${source.question}`
       })
+      emitActivity(workLogForDelivery())
       return attachAssistantIntent({
         answer: '已基于所选回答的 EvidenceBlock 生成交付物预览。确认影响范围和回滚点后才能保存；当前未写入任何原始数据。',
         sources: source.sources ?? [],
@@ -1485,6 +1560,13 @@ const registerIpc = (): void => {
       }, scope)
     }
     if (autoRequirementIdsForRequest?.length) {
+      emitActivity({
+        kind: 'tool',
+        stage: 'query',
+        title: '查询需求数据',
+        summary: '正在按已确认需求编号查询数据中心记录。',
+        status: 'running'
+      })
       const agent = new DirectRequirementDataAnalysisAgent(
         db,
         settings.getModelCredentials(),
@@ -1495,10 +1577,15 @@ const registerIpc = (): void => {
         ...request,
         question: request.question,
         extractedRequirementIds: autoRequirementIdsForRequest
-      }).then((response) => attachAssistantIntent(response, {
-        invokedAgents: ['requirement-analysis']
-      })).catch((error: unknown) => {
+      }).then((response) => {
+        emitActivity(workLogForVerification())
+        emitActivity(workLogForDelivery())
+        return attachAssistantIntent(response, {
+          invokedAgents: ['requirement-analysis']
+        })
+      }).catch((error: unknown) => {
         const errorMessage = error instanceof Error ? error.message : String(error)
+        emitActivity(workLogForFailure('query'))
         return attachAssistantIntent({
           answer: `本次需求数据分析没有完成。\n\n${errorMessage}\n\n请检查需求编号对应的本地数据后重试。`,
           sources: [],
@@ -1521,15 +1608,26 @@ const registerIpc = (): void => {
       })
     }
     if (request.entrypoint !== 'dashboard' && request.chatMode === 'plain') {
+      emitActivity({
+        kind: 'narrative',
+        stage: 'answer',
+        title: '生成对话回答',
+        summary: '正在生成普通对话回答。',
+        status: 'running'
+      })
       const agent = new PlainChatAgent(
         settings.getModelCredentials(),
         undefined,
         (content) => answerStream.push(content)
       )
-      return agent.ask({ ...request, question: route.question }).then((response) => attachAssistantIntent(response, {
-        invokedAgents: ['conversation']
-      })).catch((error: unknown) => {
+      return agent.ask({ ...request, question: route.question }).then((response) => {
+        emitActivity(workLogForDelivery())
+        return attachAssistantIntent(response, {
+          invokedAgents: ['conversation']
+        })
+      }).catch((error: unknown) => {
         const errorMessage = error instanceof Error ? error.message : String(error)
+        emitActivity(workLogForFailure('answer'))
         return attachAssistantIntent({
           answer: `本次普通对话没有完成。\n\n${errorMessage}\n\n你可以检查模型连接后重试。`,
           sources: [],
@@ -1556,6 +1654,7 @@ const registerIpc = (): void => {
       const focusComponentId = request.focusComponentId?.trim() || undefined
       if (activeArtifact && activeArtifact.artifactId !== activeArtifact.dashboard.id) {
         const message = '活动大屏标识与 DashboardSpec 不一致，无法执行修改'
+        emitActivity(workLogForFailure('scope-confirmation'))
         return attachAssistantIntent({
           answer: '本次大屏修改未应用，当前画布保持不变。',
           sources: [],
@@ -1576,6 +1675,7 @@ const registerIpc = (): void => {
       }
       if (focusComponentId && !activeArtifact) {
         const message = '指定组件修改需要先打开一个活动大屏'
+        emitActivity(workLogForFailure('scope-confirmation'))
         return attachAssistantIntent({
           answer: '本次大屏修改未应用，当前画布保持不变。',
           sources: [],
@@ -1597,6 +1697,7 @@ const registerIpc = (): void => {
       if (focusComponentId && activeArtifact &&
           !activeArtifact.dashboard.components.some((component) => component.id === focusComponentId)) {
         const message = `指定组件 ${focusComponentId} 不存在，无法执行修改`
+        emitActivity(workLogForFailure('scope-confirmation'))
         return attachAssistantIntent({
           answer: '本次大屏修改未应用，当前画布保持不变。',
           sources: [],
@@ -1626,6 +1727,7 @@ const registerIpc = (): void => {
         focusComponentId
       )
       const isPatchRequest = requestMode === 'patch'
+      emitActivity(workLogForStatus('execute'))
       let latestVisualizationRun: VisualizationRunInput | undefined
       const agent = new VisualizationAgent(
         queryEngine,
@@ -1634,7 +1736,7 @@ const registerIpc = (): void => {
           latestVisualizationRun = run
           if (!registration.signal.aborted) db.recordVisualizationRun(run)
         },
-        (event) => sendAgentEvent(event)
+        (event) => emitAgentProgress(event)
       )
       const task = activeArtifact && isPatchRequest
         ? agent.patch(
@@ -1686,11 +1788,16 @@ const registerIpc = (): void => {
               answer: `已完成对“${response.dashboard?.title ?? '当前大屏'}”的修改，结果已通过校验，等待保存为新版本。`
             }
           : response)
-        .then((response) => attachAssistantIntent(response, {
-          invokedAgents: ['visualization']
-        }))
+        .then((response) => {
+          emitActivity(workLogForVerification())
+          emitActivity(workLogForDelivery())
+          return attachAssistantIntent(response, {
+            invokedAgents: ['visualization']
+          })
+        })
         .catch((error: unknown) => {
           const message = error instanceof Error ? error.message : String(error)
+          emitActivity(workLogForFailure('execute'))
           if (message === '当前数据范围没有可用字段，请先采集数据') {
             return attachAssistantIntent({
               answer: '当前数据范围内没有可用于生成大屏的记录。请先完成数据采集，或调整数据范围后重试。',
@@ -1755,20 +1862,26 @@ const registerIpc = (): void => {
         })
     }
     if (route.expert.id === 'requirement-analysis') {
+      emitActivity(workLogForStatus('execute'))
       const agent = new RequirementAnalysisAgent(
         db,
         knowledgeService,
         settings.getModelCredentials(),
-        (event: Extract<AgentEvent, { type: 'status' }>) => sendAgentEvent(event)
+        (event: Extract<AgentEvent, { type: 'status' }>) => emitAgentProgress(event)
       )
-      return agent.ask({ ...request, question: route.question }).then((response) => attachAssistantIntent({
-        ...response,
-        contextRefs: response.contextRefs ?? contextRefsFromResponse(response),
-        expertId: route.expert.id
-      }, {
-        invokedAgents: ['requirement-analysis']
-      })).catch((error: unknown) => {
+      return agent.ask({ ...request, question: route.question }).then((response) => {
+        emitActivity(workLogForVerification())
+        emitActivity(workLogForDelivery())
+        return attachAssistantIntent({
+          ...response,
+          contextRefs: response.contextRefs ?? contextRefsFromResponse(response),
+          expertId: route.expert.id
+        }, {
+          invokedAgents: ['requirement-analysis']
+        })
+      }).catch((error: unknown) => {
         const errorMessage = error instanceof Error ? error.message : String(error)
+        emitActivity(workLogForFailure('execute'))
         return attachAssistantIntent({
           answer: `需求分析未完成。\n\n${errorMessage}\n\n请检查需求编号和本地数据索引后重试。`,
           sources: [],
@@ -1812,7 +1925,8 @@ const registerIpc = (): void => {
       knowledgeService,
       (event: Extract<AgentEvent, { type: 'status' }>) => sendAgentEvent(event),
       (content) => answerStream.push(content),
-      confirmExecutionSummary
+      confirmExecutionSummary,
+      emitActivity
     )
     return agent.ask({ ...executionRequest, question: route.question }).then((response) => attachAssistantIntent({
       ...response,
@@ -1820,6 +1934,7 @@ const registerIpc = (): void => {
       expertId: route.expert.id
     })).catch((error: unknown) => {
       const errorMessage = error instanceof Error ? error.message : String(error)
+      emitActivity(workLogForFailure('execution'))
       const failure = error as {
         invokedAgents?: AssistantExecutionAgentId[]
         traceContext?: AssistantTraceContext

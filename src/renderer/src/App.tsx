@@ -426,31 +426,131 @@ const agentStageRankOf = (stage: string): number => {
   return rank * 100 + (legacyOffset[normalized] ?? 0)
 }
 
+type ChatSource = NonNullable<ChatMessage['sources']>[number]
+
+type ChatSourceReference = {
+  id: string
+  source: ChatSource
+  label: string
+}
+
+type ChatSourceGroup = {
+  id: string
+  sourceType: 'record' | 'document'
+  name: string
+  source: ChatSource
+  references: ChatSourceReference[]
+}
+
 type ChatSourceSummary = {
   records: number
   documents: number
+  references: number
+}
+
+const normalizedChatSourceValueOf = (value?: string): string => value?.trim().replace(/\s+/g, ' ') ?? ''
+
+const chatSourceTypeOf = (source: ChatSource): ChatSourceGroup['sourceType'] => (
+  source.sourceType === 'document' ? 'document' : 'record'
+)
+
+const chatSourceNameOf = (source: ChatSource, sourceType: ChatSourceGroup['sourceType']): string => {
+  const name = sourceType === 'document'
+    ? normalizedChatSourceValueOf(source.fileName) || normalizedChatSourceValueOf(source.name)
+    : normalizedChatSourceValueOf(source.name) || normalizedChatSourceValueOf(source.fileName)
+  return name || (sourceType === 'document' ? '未命名知识文档' : '未命名数据记录')
+}
+
+const chatSourceGroupKeyOf = (source: ChatSource): string => {
+  const sourceType = chatSourceTypeOf(source)
+  const identity = sourceType === 'document'
+    ? normalizedChatSourceValueOf(source.documentId) ||
+      normalizedChatSourceValueOf(source.fileName) ||
+      normalizedChatSourceValueOf(source.name)
+    : normalizedChatSourceValueOf(source.uid) ||
+      normalizedChatSourceValueOf(source.itemId) ||
+      normalizedChatSourceValueOf(source.name)
+  return `${sourceType}:${identity || 'unknown'}`
+}
+
+const chatSourceReferenceKeyOf = (source: ChatSource): string => {
+  const chunkId = normalizedChatSourceValueOf(source.chunkId)
+  if (chunkId) return `chunk:${chunkId}`
+  if (typeof source.pageNumber === 'number' && Number.isFinite(source.pageNumber) && source.pageNumber > 0) {
+    return `page:${source.pageNumber}`
+  }
+  const sheetName = normalizedChatSourceValueOf(source.sheetName)
+  if (sheetName) return `sheet:${sheetName}`
+  const location = normalizedChatSourceValueOf(source.location)
+  if (location && !/^(?:文档)?正文(?:内容)?$|^(?:分块|chunk)(?:\s*[#：:.-]?\s*\d+)?$/i.test(location)) {
+    return `location:${location}`
+  }
+  const snippet = normalizedChatSourceValueOf(source.snippet)
+  if (snippet) return `snippet:${snippet}`
+  return 'default'
+}
+
+const chatSourceReferenceLabelOf = (source: ChatSource, sourceType: ChatSourceGroup['sourceType']): string => {
+  if (sourceType === 'document') {
+    if (typeof source.pageNumber === 'number' && Number.isFinite(source.pageNumber) && source.pageNumber > 0) {
+      return `第${source.pageNumber}页`
+    }
+    const sheetName = normalizedChatSourceValueOf(source.sheetName)
+    if (sheetName) return `工作表「${sheetName}」`
+    const location = normalizedChatSourceValueOf(source.location)
+    if (location && !/^(?:文档)?正文(?:内容)?$|^(?:分块|chunk)(?:\s*[#：:.-]?\s*\d+)?$/i.test(location)) {
+      return location
+    }
+    return '正文位置'
+  }
+  const location = normalizedChatSourceValueOf(source.location)
+  if (location) return location
+  const nodeType = normalizedChatSourceValueOf(source.nodeType)
+  return nodeType || '记录详情'
+}
+
+const chatRecordDescriptionOf = (source: ChatSource): string => {
+  const location = normalizedChatSourceValueOf(source.location)
+  const name = chatSourceNameOf(source, 'record')
+  if (location && location !== name) return location
+  const snippet = normalizedChatSourceValueOf(source.snippet)
+  if (!snippet || snippet === name) return ''
+  return snippet.length > 64 ? `${snippet.slice(0, 64)}…` : snippet
+}
+
+const chatSourceGroupsOf = (sources: ChatMessage['sources']): ChatSourceGroup[] => {
+  const groups = new Map<string, ChatSourceGroup>()
+  for (const source of sources ?? []) {
+    const sourceType = chatSourceTypeOf(source)
+    const groupId = chatSourceGroupKeyOf(source)
+    const current = groups.get(groupId)
+    const group = current ?? {
+      id: groupId,
+      sourceType,
+      name: chatSourceNameOf(source, sourceType),
+      source,
+      references: []
+    }
+    const referenceId = chatSourceReferenceKeyOf(source)
+    const referenceStableId = `${groupId}:${referenceId}`
+    if (!group.references.some((reference) => reference.id === referenceStableId)) {
+      group.references.push({
+        id: referenceStableId,
+        source,
+        label: chatSourceReferenceLabelOf(source, sourceType)
+      })
+    }
+    if (!current) groups.set(groupId, group)
+  }
+  return Array.from(groups.values())
 }
 
 const chatSourceSummaryOf = (sources: ChatMessage['sources']): ChatSourceSummary => {
-  const documentIds = new Set<string>()
-  let documentsWithoutId = 0
-  let records = 0
-  for (const source of sources ?? []) {
-    // Legacy persisted sources omitted sourceType and were always data-center
-    // records. Treat them as records so an old session never loses its count.
-    if (source.sourceType !== 'document') {
-      records += 1
-      continue
-    }
-    // Several retrieved chunks may belong to one document. Count the document
-    // once in the summary while leaving each chunk visible in the source list.
-    const documentId = source.documentId?.trim()
-    if (documentId) documentIds.add(documentId)
-    else documentsWithoutId += 1
-  }
+  const groups = chatSourceGroupsOf(sources)
   return {
-    records,
-    documents: documentIds.size + documentsWithoutId
+    records: groups.filter((group) => group.sourceType === 'record').length,
+    documents: groups.filter((group) => group.sourceType === 'document').length,
+    references: groups.reduce((total, group) => total + group.references.length, 0)
   }
 }
 
@@ -478,22 +578,6 @@ const knowledgeCitationTargetOf = (href?: string): KnowledgeCitationTarget | nul
   } catch {
     return null
   }
-}
-
-const knowledgeSourceLocationLabelOf = (source: NonNullable<ChatMessage['sources']>[number]): string => {
-  if (typeof source.pageNumber === 'number' && Number.isFinite(source.pageNumber) && source.pageNumber > 0) {
-    return `第${source.pageNumber}页`
-  }
-  const sheetName = source.sheetName?.trim()
-  if (sheetName) return `工作表「${sheetName}」`
-  const location = source.location?.trim()
-  if (location && !/^(?:文档)?正文(?:内容)?$|^(?:分块|chunk)(?:\s*[#：:.-]?\s*\d+)?$/i.test(location)) return location
-  const snippet = source.snippet?.trim().replace(/\s+/g, ' ')
-  if (snippet) {
-    const shortened = snippet.length > 44 ? `${snippet.slice(0, 44)}…` : snippet
-    return `正文「${shortened}」`
-  }
-  return '引用位置'
 }
 
 type AssistantMarkdownLinkProps = React.ComponentPropsWithoutRef<'a'> & {
@@ -612,6 +696,41 @@ type AgentRunMetadata = {
   resultMode?: string
   followUp?: boolean
   clarificationQuestion?: string
+}
+
+type AgentActivityKind = 'narrative' | 'tool' | 'checkpoint'
+type AgentActivityStatus = 'running' | 'completed' | 'warning' | 'failed'
+
+type AgentActivityEvent = {
+  type: 'activity'
+  activityId: string
+  sequence: number
+  kind: AgentActivityKind
+  stage: string
+  title?: string
+  summary: string
+  status: AgentActivityStatus
+  createdAt: string
+}
+
+type AgentWorkLogEntry = {
+  activityId: string
+  sequence?: number
+  kind: AgentActivityKind
+  stage: string
+  title?: string
+  summary: string
+  status: AgentActivityStatus
+  createdAt: string
+  source: 'activity' | 'status'
+  order: number
+}
+
+type AgentExecutionRationale = {
+  current?: string
+  basis?: string
+  next?: string
+  source: 'structured' | 'status'
 }
 
 type AssistantTaskStatus = 'pending' | 'running' | 'completed' | 'clarification' | 'failed' | 'cancelled'
@@ -812,6 +931,121 @@ const stringPropertyOf = (
     }
   }
   return undefined
+}
+
+const agentInternalTextPattern = /(?:reasoning(?:_content)?|thinking(?:_content)?|raw\s*args?|tool\s*(?:args|arguments)|function\s*arguments)/i
+
+const safeAgentActivityTextOf = (value: unknown, maxLength = 240): string | undefined => {
+  if (typeof value !== 'string') return undefined
+  const normalized = value.replace(/\s+/g, ' ').trim()
+  if (!normalized || normalized.length > maxLength || agentInternalTextPattern.test(normalized)) return undefined
+  return normalized
+}
+
+const agentActivityEventOf = (event: AgentEvent): AgentActivityEvent | undefined => {
+  const value: unknown = event
+  if (!isRecordObject(value) || value.type !== 'activity') return undefined
+  const activityId = safeAgentActivityTextOf(value.activityId, 120)
+  const rawSequence = value.sequence
+  const stage = safeAgentActivityTextOf(value.stage, 80)
+  const summary = safeAgentActivityTextOf(value.summary)
+  const kind = value.kind
+  const status = value.status
+  if (!activityId || typeof rawSequence !== 'number' || !Number.isSafeInteger(rawSequence) || rawSequence < 0 ||
+    !stage || !summary ||
+    (kind !== 'narrative' && kind !== 'tool' && kind !== 'checkpoint') ||
+    (status !== 'running' && status !== 'completed' && status !== 'warning' && status !== 'failed')) {
+    return undefined
+  }
+  const sequence = rawSequence
+  const createdAt = typeof value.createdAt === 'string' && !Number.isNaN(Date.parse(value.createdAt))
+    ? value.createdAt
+    : new Date().toISOString()
+  const title = safeAgentActivityTextOf(value.title, 120)
+  return {
+    type: 'activity',
+    activityId,
+    sequence,
+    kind,
+    stage,
+    ...(title ? { title } : {}),
+    summary,
+    status,
+    createdAt
+  }
+}
+
+const agentWorkLogEntryOfActivity = (
+  activity: AgentActivityEvent,
+  order: number
+): AgentWorkLogEntry => ({
+  activityId: activity.activityId,
+  sequence: activity.sequence,
+  kind: activity.kind,
+  stage: activity.stage,
+  ...(activity.title ? { title: activity.title } : {}),
+  summary: activity.summary,
+  status: activity.status,
+  createdAt: activity.createdAt,
+  source: 'activity',
+  order
+})
+
+const agentWorkLogEntryOfStatus = (
+  event: Extract<AgentEvent, { type: 'status' }>,
+  order: number
+): AgentWorkLogEntry | undefined => {
+  const summary = safeAgentActivityTextOf(event.message)
+  if (!summary) return undefined
+  return {
+    activityId: `status-${order}`,
+    kind: 'checkpoint',
+    stage: event.stage,
+    title: agentStageLabelOf(event.stage),
+    summary,
+    status: 'running',
+    createdAt: new Date().toISOString(),
+    source: 'status',
+    order
+  }
+}
+
+const agentWorkLogEntriesSorted = (entries: AgentWorkLogEntry[]): AgentWorkLogEntry[] => (
+  [...entries].sort((left, right) => (
+    left.source === 'activity' && right.source === 'activity'
+      ? (left.sequence ?? 0) - (right.sequence ?? 0)
+      : left.order - right.order
+  ))
+)
+
+const agentExecutionRationaleOf = (
+  event: Extract<AgentEvent, { type: 'status' }>
+): AgentExecutionRationale => {
+  const metadata: Record<string, unknown> | undefined = isRecordObject(event.metadata)
+    ? event.metadata as Record<string, unknown>
+    : undefined
+  const read = (keys: readonly string[]): string | undefined => {
+    if (!metadata) return undefined
+    for (const key of keys) {
+      const result = safeAgentActivityTextOf(metadata[key])
+      if (result) return result
+    }
+    return undefined
+  }
+  const current = read(['current', 'judgment', 'decision', 'decisionSummary', 'rationale', 'summary'])
+  const basis = read(['basis', 'evidenceSummary', 'strategy', 'policy'])
+  const next = read(['next', 'nextStep', 'upcoming'])
+  if (current || basis || next) {
+    return { current, basis, next, source: 'structured' }
+  }
+  return { current: safeAgentActivityTextOf(event.message), source: 'status' }
+}
+
+const formatAgentRunElapsed = (elapsedMs: number): string => {
+  const totalSeconds = Math.max(0, Math.floor(elapsedMs / 1000))
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  return `用时 ${minutes}m ${seconds}s`
 }
 
 /**
@@ -1719,12 +1953,58 @@ function AssistantExecutionPlanCard({
     )
   }
 
+  const renderReadonlyValues = (): React.JSX.Element => (
+    <div className="agent-plan-readonly-values" aria-label="计划参数">
+      {capabilities.searchTerms && fixedFact('检索词', summary.searchTerms.join('、') || '无全文检索词')}
+      {capabilities.fields && fixedFact('读取字段', summary.fields.join('、') || '按任务所需字段')}
+      {capabilities.scope && fixedFact('项目范围', summary.scope.projectIds.join('、') || '全部项目')}
+      {capabilities.scope && fixedFact('数据类型', summary.scope.nodeTypes.join('、') || '全部类型')}
+      {capabilities.scope && fixedFact('记录范围', summary.scope.recordCount === undefined ? '当前范围全部记录' : `${summary.scope.recordCount} 条指定记录`)}
+      {fixedFact('结果上限', `${summary.limit} 条`)}
+      {fixedFact('交付形式', assistantResultModeLabels[summary.resultMode] ?? summary.resultMode)}
+      {capabilities.filters && (
+        <div className="agent-plan-readonly-filters">
+          <span>筛选条件</span>
+          <div>
+            {[...summary.scope.baseFilters, ...summary.filters].length
+              ? [...summary.scope.baseFilters, ...summary.filters].map((filter, index) => (
+                  <Tag key={`${filter.field}-${filter.operator}-${index}`}>
+                    {filter.field} {assistantPlanFilterOperators.find((option) => option.value === assistantPlanOperatorOf(filter.operator))?.label ?? filter.operator}{filter.value === undefined ? '' : ` ${filter.value}`}
+                  </Tag>
+                ))
+              : <Text type="secondary">无额外筛选条件</Text>}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+
   const canEdit = pending && !expired
+  const showFullScope = pending && !expired
+  const confirmedScopeHeadline = [
+    assistantSourceModeLabels[summary.sourceMode] ?? summary.sourceMode,
+    assistantTaskTypeLabels[summary.taskType] ?? summary.taskType,
+    summary.scope.recordCount === undefined ? '当前范围' : `${summary.scope.recordCount} 条记录`,
+    assistantResultModeLabels[summary.resultMode] ?? summary.resultMode
+  ].join(' · ')
   const statusLabel = expired
     ? '计划已失效'
     : pending
       ? (editing ? '编辑中，尚未执行工具' : '等待确认后执行工具')
       : '范围已确认，正在执行'
+  if (!pending && !expired) {
+    return (
+      <details className="agent-confirmed-scope agent-confirmed-scope-standalone" aria-label="已确认范围详情">
+        <summary>
+          <span className="agent-confirmed-scope-title">已确认范围</span>
+          <span className="agent-confirmed-scope-copy" title={confirmedScopeHeadline}>{confirmedScopeHeadline}</span>
+          <span className="agent-confirmed-scope-action">展开核对</span>
+          <DownOutlined aria-hidden="true" />
+        </summary>
+        {renderReadonlyValues()}
+      </details>
+    )
+  }
   return (
     <section
       className={`agent-execution-summary agent-plan-card ${pending ? 'is-pending' : 'is-confirmed'} ${expired ? 'is-expired' : ''}`.trim()}
@@ -1732,7 +2012,7 @@ function AssistantExecutionPlanCard({
     >
       <div className="agent-plan-card-heading">
         <div>
-          <strong>执行计划</strong>
+          <strong>{showFullScope ? '执行计划' : '已确认范围'}</strong>
           <small>{statusLabel}</small>
         </div>
         <div className="agent-plan-heading-actions">
@@ -1766,21 +2046,23 @@ function AssistantExecutionPlanCard({
         </div>
       </div>
       <div className="agent-execution-summary-body agent-plan-card-body">
-        <div className="agent-plan-fixed-grid" aria-label="计划固定事实">
-          {fixedFact('用户问题', summary.question, 'is-question')}
-          {fixedFact('来源模式', assistantSourceModeLabels[summary.sourceMode] ?? summary.sourceMode)}
-          {fixedFact('任务类型', assistantTaskTypeLabels[summary.taskType] ?? summary.taskType)}
-          {fixedFact('计划意图', agentIntentLabels[summary.intent] ?? summary.intent)}
-          {summary.scope.snapshotAt ? fixedFact('范围快照', summary.scope.snapshotAt) : null}
-          {extras.groupEntities?.length ? fixedFact('分组实体', extras.groupEntities.join('、')) : null}
-          {extras.groupByField ? fixedFact('分组字段', extras.groupByField) : null}
-          {extras.sort ? fixedFact('排序', `${extras.sort.field} · ${extras.sort.direction === 'asc' ? '升序' : '降序'}`) : null}
-          {extras.metric ? fixedFact('指标', extras.metric) : null}
-          {extras.searchMode ? fixedFact('搜索模式', extras.searchMode === 'all' ? '全部匹配' : '任一匹配') : null}
-          {capabilities.resultMode.length === 1
-            ? fixedFact('交付形式', assistantResultModeLabels[capabilities.resultMode[0]] ?? capabilities.resultMode[0])
-            : null}
-        </div>
+        {showFullScope && (
+          <div className="agent-plan-fixed-grid" aria-label="计划固定事实">
+            {fixedFact('用户问题', summary.question, 'is-question')}
+            {fixedFact('来源模式', assistantSourceModeLabels[summary.sourceMode] ?? summary.sourceMode)}
+            {fixedFact('任务类型', assistantTaskTypeLabels[summary.taskType] ?? summary.taskType)}
+            {fixedFact('计划意图', agentIntentLabels[summary.intent] ?? summary.intent)}
+            {summary.scope.snapshotAt ? fixedFact('范围快照', summary.scope.snapshotAt) : null}
+            {extras.groupEntities?.length ? fixedFact('分组实体', extras.groupEntities.join('、')) : null}
+            {extras.groupByField ? fixedFact('分组字段', extras.groupByField) : null}
+            {extras.sort ? fixedFact('排序', `${extras.sort.field} · ${extras.sort.direction === 'asc' ? '升序' : '降序'}`) : null}
+            {extras.metric ? fixedFact('指标', extras.metric) : null}
+            {extras.searchMode ? fixedFact('搜索模式', extras.searchMode === 'all' ? '全部匹配' : '任一匹配') : null}
+            {capabilities.resultMode.length === 1
+              ? fixedFact('交付形式', assistantResultModeLabels[capabilities.resultMode[0]] ?? capabilities.resultMode[0])
+              : null}
+          </div>
+        )}
 
         {canEdit && editing ? (
           <div className="agent-plan-editors" aria-label="可编辑执行计划">
@@ -1912,29 +2194,15 @@ function AssistantExecutionPlanCard({
             )}
           </div>
         ) : (
-          <div className="agent-plan-readonly-values" aria-label="计划参数">
-            {capabilities.searchTerms && fixedFact('检索词', summary.searchTerms.join('、') || '无全文检索词')}
-            {capabilities.fields && fixedFact('读取字段', summary.fields.join('、') || '按任务所需字段')}
-            {capabilities.scope && fixedFact('项目范围', summary.scope.projectIds.join('、') || '全部项目')}
-            {capabilities.scope && fixedFact('数据类型', summary.scope.nodeTypes.join('、') || '全部类型')}
-            {capabilities.scope && fixedFact('记录范围', summary.scope.recordCount === undefined ? '当前范围全部记录' : `${summary.scope.recordCount} 条指定记录`)}
-            {fixedFact('结果上限', `${summary.limit} 条`)}
-            {fixedFact('交付形式', assistantResultModeLabels[summary.resultMode] ?? summary.resultMode)}
-            {capabilities.filters && (
-              <div className="agent-plan-readonly-filters">
-                <span>筛选条件</span>
-                <div>
-                  {[...summary.scope.baseFilters, ...summary.filters].length
-                    ? [...summary.scope.baseFilters, ...summary.filters].map((filter, index) => (
-                        <Tag key={`${filter.field}-${filter.operator}-${index}`}>
-                          {filter.field} {assistantPlanFilterOperators.find((option) => option.value === assistantPlanOperatorOf(filter.operator))?.label ?? filter.operator}{filter.value === undefined ? '' : ` ${filter.value}`}
-                        </Tag>
-                      ))
-                    : <Text type="secondary">无额外筛选条件</Text>}
-                </div>
-              </div>
-            )}
-          </div>
+          <details className="agent-confirmed-scope" aria-label="已确认范围详情">
+            <summary>
+              <span className="agent-confirmed-scope-title">已确认范围</span>
+              <span className="agent-confirmed-scope-copy" title={confirmedScopeHeadline}>{confirmedScopeHeadline}</span>
+              <span className="agent-confirmed-scope-action">展开核对</span>
+              <DownOutlined aria-hidden="true" />
+            </summary>
+            {renderReadonlyValues()}
+          </details>
         )}
 
         {warnings.length > 0 && (
@@ -6384,6 +6652,12 @@ function ChatPage({
   const [mentionQuery, setMentionQuery] = useState('')
   const [mentionIndex, setMentionIndex] = useState(0)
   const [agentProgress, setAgentProgress] = useState<Array<Extract<AgentEvent, { type: 'status' }>>>([])
+  const [agentWorkLog, setAgentWorkLog] = useState<AgentWorkLogEntry[]>([])
+  const [agentExecutionRationale, setAgentExecutionRationale] = useState<AgentExecutionRationale | null>(null)
+  const [agentWorkLogOpen, setAgentWorkLogOpen] = useState(false)
+  const [agentRunElapsedMs, setAgentRunElapsedMs] = useState(0)
+  const agentWorkLogOrderRef = useRef(0)
+  const planAwaitingConfirmationPreviousRef = useRef(false)
   const [agentRunMetadata, setAgentRunMetadata] = useState<AgentRunMetadata>({})
   const [agentRunStatus, setAgentRunStatus] = useState<AgentRunStatus>('idle')
   const [agentDetailsOpen, setAgentDetailsOpen] = useState(false)
@@ -6777,6 +7051,29 @@ function ChatPage({
     }
   }, [scheduleAnswerStreamFlush])
 
+  const resetAgentWorkLog = useCallback((): void => {
+    agentWorkLogOrderRef.current = 0
+    setAgentWorkLog([])
+    setAgentExecutionRationale(null)
+    setAgentWorkLogOpen(false)
+    setAgentRunElapsedMs(0)
+  }, [])
+
+  const appendAgentWorkLog = useCallback((entry: Omit<AgentWorkLogEntry, 'order'>): void => {
+    const order = ++agentWorkLogOrderRef.current
+    setAgentWorkLog((current) => {
+      if (entry.source === 'activity' && current.some((item) => (
+        item.source === 'activity' && (
+          item.activityId === entry.activityId ||
+          (item.sequence !== undefined && item.sequence === entry.sequence)
+        )
+      ))) {
+        return current
+      }
+      return agentWorkLogEntriesSorted([...current, { ...entry, order }]).slice(-80)
+    })
+  }, [])
+
   const clearActiveRun = (runId: string): boolean => {
     if (!isCurrentRun(runId)) return false
     activeRunRef.current = null
@@ -6787,8 +7084,35 @@ function ChatPage({
     setPlanExpired(false)
     setPlanValidationErrors([])
     setPlanWarnings([])
+    resetAgentWorkLog()
     return true
   }
+
+  useEffect(() => {
+    if (!loading || !activeRunId) {
+      setAgentRunElapsedMs(0)
+      return
+    }
+    const startedAt = activeRunRef.current?.startedAt
+    const startedAtMs = startedAt ? Date.parse(startedAt) : Number.NaN
+    const updateElapsed = (): void => {
+      const elapsed = Number.isFinite(startedAtMs)
+        ? Math.max(0, Date.now() - startedAtMs)
+        : 0
+      setAgentRunElapsedMs(elapsed)
+    }
+    updateElapsed()
+    const timer = window.setInterval(updateElapsed, 1000)
+    return () => window.clearInterval(timer)
+  }, [activeRunId, loading])
+
+  useEffect(() => {
+    const wasAwaitingConfirmation = planAwaitingConfirmationPreviousRef.current
+    if (wasAwaitingConfirmation && !planAwaitingConfirmation && agentWorkLog.length > 0) {
+      setAgentWorkLogOpen(true)
+    }
+    planAwaitingConfirmationPreviousRef.current = planAwaitingConfirmation
+  }, [agentWorkLog.length, planAwaitingConfirmation])
 
   const finalizeCancelledRun = (run: ActiveChatRun, responseTaskTrace?: AssistantTaskTrace): void => {
     if (!isCurrentRun(run.runId)) return
@@ -6922,6 +7246,7 @@ function ChatPage({
     setHistoryMobileOpen(false)
     setMentionOpen(false)
     setAgentProgress([])
+    resetAgentWorkLog()
     setAgentRunMetadata({})
     setAgentRunStatus('idle')
     setAgentDetailsOpen(false)
@@ -7004,6 +7329,7 @@ function ChatPage({
       setHistoryMobileOpen(false)
       setMentionOpen(false)
       setAgentProgress([])
+      resetAgentWorkLog()
       setAgentRunMetadata({})
       setAgentRunStatus('idle')
       setAgentDetailsOpen(false)
@@ -7229,8 +7555,21 @@ function ChatPage({
       setAgentRunStatus('running')
       return
     }
+    const activityEvent = agentActivityEventOf(event)
+    if (activityEvent) {
+      appendAgentWorkLog(agentWorkLogEntryOfActivity(
+        activityEvent,
+        agentWorkLogOrderRef.current + 1
+      ))
+      setAgentRunStatus('running')
+      return
+    }
     const statusEvent = event
     if (statusEvent.type !== 'status') return
+    const statusLog = agentWorkLogEntryOfStatus(statusEvent, agentWorkLogOrderRef.current + 1)
+    if (statusLog) appendAgentWorkLog(statusLog)
+    const rationale = agentExecutionRationaleOf(statusEvent)
+    if (rationale.source === 'structured') setAgentExecutionRationale(rationale)
     setAgentProgress((items) => [...items, statusEvent].slice(-80))
     const eventMetadata = agentRunMetadataOf(statusEvent)
     if (Object.keys(eventMetadata).length) {
@@ -7241,7 +7580,7 @@ function ChatPage({
       setAgentTaskTrace((current) => mergeAssistantTaskTraceViews(current, eventTaskTrace) ?? eventTaskTrace)
     }
     setAgentRunStatus('running')
-  }), [acceptAnswerTextEvent, conversationId])
+  }), [acceptAnswerTextEvent, appendAgentWorkLog, conversationId])
 
   const confirmExecutionPlan = async (patch: AssistantPlanPatchInput = {}): Promise<void> => {
     const run = activeRunRef.current
@@ -7331,6 +7670,7 @@ function ChatPage({
     setQuestion('')
     setMentionOpen(false)
     setAgentProgress([])
+    resetAgentWorkLog()
     setAgentRunMetadata(initialRunMetadata)
     setAgentRunStatus('running')
     setAgentDetailsOpen(false)
@@ -7714,6 +8054,7 @@ function ChatPage({
     }
   })()
   const latestStatus = agentProgress.at(-1)
+  const latestStatusMessage = safeAgentActivityTextOf(latestStatus?.message) ?? '正在准备任务'
   const activeAgentControlStep = agentControlStepOfStage(latestStatus?.stage) ?? 'understand'
   const observedAgentControlSteps = useMemo(
     () => new Set(agentProgress.map((event) => agentControlStepOfStage(event.stage)).filter(
@@ -7746,6 +8087,17 @@ function ChatPage({
   }, [agentProgress])
   const overallProgress = useMemo(() => requirementAnalysisProgressOf(agentProgress), [agentProgress])
   const matchProgress = useMemo(() => parseRequirementMatchProgress(agentProgress), [agentProgress])
+  const visibleAgentWorkLog = useMemo(() => {
+    const currentStage = latestStatus?.stage.trim().toLocaleLowerCase()
+    const currentMessage = latestStatus ? safeAgentActivityTextOf(latestStatus.message) : undefined
+    return agentWorkLog.filter((entry) => !(
+      entry.source === 'status' &&
+      currentStage &&
+      currentMessage &&
+      entry.stage.trim().toLocaleLowerCase() === currentStage &&
+      entry.summary === currentMessage
+    ))
+  }, [agentWorkLog, latestStatus])
 
   const matchProgressCount = (current?: number, total?: number): string => {
     if (current === undefined && total === undefined) return '—'
@@ -8096,6 +8448,8 @@ function ChatPage({
               const messageTaskTrace = assistantTaskTraceForMessage(message, messageMetadata)
               const clarificationQuestion = messageTaskTrace?.clarificationQuestion ||
                 clarificationByMessageId[message.id]
+              const sourceGroups = chatSourceGroupsOf(message.sources)
+              const sourceSummary = chatSourceSummaryOf(message.sources)
               return (
               <div className={`message-row ${message.role}`} key={message.id}>
                 <div className="message-avatar">
@@ -8312,32 +8666,35 @@ function ChatPage({
                           </div>
                         </section>
                       ) : null}
-                      {message.role === 'assistant' && message.sources?.length ? (
+                      {message.role === 'assistant' && sourceGroups.length ? (
                         <details className="source-list">
                           <summary className="source-list-title">
-                            <BulbOutlined />
+                            <FileSearchOutlined aria-hidden="true" />
                             <Text strong>回答依据</Text>
                             <div
                               className="source-list-count"
                               aria-label={`回答依据：${[
-                                chatSourceSummaryOf(message.sources).records
-                                  ? `${chatSourceSummaryOf(message.sources).records} 条数据记录`
-                                  : '',
-                                chatSourceSummaryOf(message.sources).documents
-                                  ? `${chatSourceSummaryOf(message.sources).documents} 份知识文档`
-                                  : ''
+                                sourceSummary.records ? `${sourceSummary.records} 条数据记录` : '',
+                                sourceSummary.documents ? `${sourceSummary.documents} 份知识文档` : '',
+                                sourceSummary.references ? `${sourceSummary.references} 处引用` : ''
                               ].filter(Boolean).join('，')}`}
                             >
-                              {chatSourceSummaryOf(message.sources).records > 0 && (
+                              {sourceSummary.records > 0 && (
                                 <span className="source-kind-count record">
                                   <DatabaseOutlined aria-hidden="true" />
-                                  <span>{chatSourceSummaryOf(message.sources).records} 条记录</span>
+                                  <span>{sourceSummary.records} 条记录</span>
                                 </span>
                               )}
-                              {chatSourceSummaryOf(message.sources).documents > 0 && (
+                              {sourceSummary.documents > 0 && (
                                 <span className="source-kind-count document">
                                   <FileTextOutlined aria-hidden="true" />
-                                  <span>{chatSourceSummaryOf(message.sources).documents} 份文档</span>
+                                  <span>{sourceSummary.documents} 份文档</span>
+                                </span>
+                              )}
+                              {sourceSummary.references > 0 && (
+                                <span className="source-kind-count references">
+                                  <FileSearchOutlined aria-hidden="true" />
+                                  <span>{sourceSummary.references} 处引用</span>
                                 </span>
                               )}
                             </div>
@@ -8347,49 +8704,80 @@ function ChatPage({
                               <DownOutlined />
                             </span>
                           </summary>
-                          <div className="source-chips">
-                            {message.sources.map((source, index) => {
-                              const sourceIsDocument = source.sourceType === 'document'
+                          <section className="source-chips source-group-list" aria-label="回答依据来源分组" role="list">
+                            {sourceGroups.map((group) => {
+                              const sourceIsDocument = group.sourceType === 'document'
                               const sourceTypeLabel = sourceIsDocument ? '知识文档' : '数据记录'
-                              const sourceLocation = sourceIsDocument
-                                ? knowledgeSourceLocationLabelOf(source)
-                                : source.location || source.fileName || source.nodeType || '来源详情'
-                              const snippet = source.snippet?.trim()
+                              const recordDescription = sourceIsDocument ? '' : chatRecordDescriptionOf(group.source)
                               return (
-                                <Button
-                                  type="text"
-                                  className={`source-chip ${sourceIsDocument ? 'document' : 'record'}`}
-                                  key={`${source.chunkId ?? source.uid}-${index}`}
-                                  aria-label={`打开${sourceTypeLabel}依据：${source.name}`}
-                                  data-source-type={sourceIsDocument ? 'document' : 'record'}
-                                  onClick={() => {
-                                    if (sourceIsDocument) {
-                                      if (source.documentId) void openKnowledgeDetail(source.documentId, source.chunkId)
-                                      else notify.warning('该知识文档依据缺少文档标识，暂时无法打开详情')
-                                      return
-                                    }
-                                    void openRecordDetail({
-                                      uid: source.uid,
-                                      name: source.name,
-                                      nodeType: source.nodeType,
-                                      itemId: source.itemId,
-                                      values: {}
-                                    }, true)
-                                  }}
+                                <article
+                                  key={group.id}
+                                  className={`source-group source-chip ${sourceIsDocument ? 'document' : 'record'}`}
+                                  data-source-type={group.sourceType}
+                                  role="listitem"
                                 >
-                                  {sourceIsDocument ? <FileTextOutlined aria-hidden="true" /> : <DatabaseOutlined aria-hidden="true" />}
-                                  <span>
-                                    <strong>[{index + 1}] {source.name}</strong>
-                                    <small>
-                                      <span className="source-chip-type">{sourceTypeLabel}</span>
-                                      <span className="source-chip-location"> · {sourceLocation}</span>
-                                      {snippet && !sourceIsDocument ? ` · 原文片段：${snippet.slice(0, 80)}` : ''}
-                                    </small>
-                                  </span>
-                                </Button>
+                                  <div className="source-group-heading">
+                                    <span className="source-group-icon" aria-hidden="true">
+                                      {sourceIsDocument ? <FileTextOutlined /> : <DatabaseOutlined />}
+                                    </span>
+                                    <div className="source-group-heading-copy">
+                                      <strong className="source-group-name" title={group.name}>{group.name}</strong>
+                                      {recordDescription && (
+                                        <small className="source-group-description" title={recordDescription}>
+                                          {recordDescription}
+                                        </small>
+                                      )}
+                                    </div>
+                                    <div className="source-group-meta" aria-label={`${sourceTypeLabel}，${group.references.length} 处引用`}>
+                                      <span className="source-group-type">{sourceTypeLabel}</span>
+                                      <span className="source-group-reference-count">{group.references.length} 处引用</span>
+                                    </div>
+                                  </div>
+                                  <ul className="source-reference-list" aria-label={`${group.name}的引用位置`}>
+                                    {group.references.map((reference) => {
+                                      const source = reference.source
+                                      const documentId = normalizedChatSourceValueOf(source.documentId)
+                                      const recordUid = normalizedChatSourceValueOf(source.uid)
+                                      const canOpen = sourceIsDocument ? Boolean(documentId) : Boolean(recordUid)
+                                      const unavailableLabel = sourceIsDocument
+                                        ? '缺少文档标识，无法打开详情'
+                                        : '缺少记录标识，无法打开详情'
+                                      return (
+                                        <li key={reference.id} className="source-reference-item">
+                                          <Button
+                                            type="text"
+                                            className={`source-reference ${sourceIsDocument ? 'document' : 'record'}`}
+                                            data-source-type={group.sourceType}
+                                            data-source-reference-id={reference.id}
+                                            aria-label={`${group.name}，${sourceTypeLabel}，${reference.label}${canOpen ? '，打开详情' : `，${unavailableLabel}`}`}
+                                            title={canOpen ? `打开${group.name}：${reference.label}` : unavailableLabel}
+                                            disabled={!canOpen}
+                                            onClick={() => {
+                                              if (sourceIsDocument) {
+                                                if (documentId) void openKnowledgeDetail(documentId, normalizedChatSourceValueOf(source.chunkId) || undefined)
+                                                return
+                                              }
+                                              if (recordUid) {
+                                                void openRecordDetail({
+                                                  uid: recordUid,
+                                                  name: source.name,
+                                                  nodeType: source.nodeType,
+                                                  itemId: source.itemId,
+                                                  values: {}
+                                                }, true)
+                                              }
+                                            }}
+                                          >
+                                            <span>{reference.label}</span>
+                                          </Button>
+                                        </li>
+                                      )
+                                    })}
+                                  </ul>
+                                </article>
                               )
                             })}
-                          </div>
+                          </section>
                         </details>
                       ) : null}
                   </div>
@@ -8400,7 +8788,6 @@ function ChatPage({
           )}
           {loading && (
             <>
-            {!activeStreamingAnswer && (
             <div className="message-row assistant">
               <div className="message-avatar">
                 <ThemedAppIcon alt="VISSLM AI" />
@@ -8414,8 +8801,99 @@ function ChatPage({
                   <div className="agent-run-panel" aria-live="polite">
                     <div className="agent-run-current">
                       <span className="thinking-dots"><i /><i /><i /></span>
-                      <span>{latestStatus?.message ?? '正在准备任务'}</span>
+                      <span>{latestStatusMessage}</span>
                       <Tag>{agentStageLabelOf(latestStatus?.stage)}</Tag>
+                    </div>
+                    <div className="agent-work-log-disclosure">
+                      <button
+                        type="button"
+                        className="agent-work-log-toggle"
+                        aria-expanded={agentWorkLogOpen}
+                        aria-controls="agent-work-log-content"
+                        onClick={() => setAgentWorkLogOpen((open) => !open)}
+                      >
+                        <span className="agent-work-log-duration">{formatAgentRunElapsed(agentRunElapsedMs)}</span>
+                        <span className="agent-work-log-toggle-label">执行日志</span>
+                        <span className="agent-work-log-count">
+                          {visibleAgentWorkLog.length ? `${visibleAgentWorkLog.length} 条` : '等待事件'}
+                        </span>
+                        <DownOutlined aria-hidden="true" />
+                      </button>
+                      {agentWorkLogOpen && (
+                        <div
+                          id="agent-work-log-content"
+                          className="agent-work-log-content"
+                          aria-label="Agent 连续执行日志"
+                          aria-live="polite"
+                        >
+                          {agentExecutionRationale && (
+                            <section className="agent-execution-rationale" aria-label="执行思路摘要">
+                              <div className="agent-execution-rationale-heading">
+                                <BulbOutlined aria-hidden="true" />
+                                <strong>执行思路摘要</strong>
+                                <small>仅展示可审计摘要，不是模型私有思维链</small>
+                              </div>
+                              <div className="agent-execution-rationale-grid">
+                                {agentExecutionRationale.current && (
+                                  <div>
+                                    <span>当前判断</span>
+                                    <p>{agentExecutionRationale.current}</p>
+                                  </div>
+                                )}
+                                {agentExecutionRationale.basis && (
+                                  <div>
+                                    <span>依据 / 策略</span>
+                                    <p>{agentExecutionRationale.basis}</p>
+                                  </div>
+                                )}
+                                {agentExecutionRationale.next && (
+                                  <div>
+                                    <span>下一步</span>
+                                    <p>{agentExecutionRationale.next}</p>
+                                  </div>
+                                )}
+                              </div>
+                            </section>
+                          )}
+                          {visibleAgentWorkLog.length ? (
+                            <div className="agent-work-log-list" role="list">
+                              {visibleAgentWorkLog.map((entry) => {
+                                const entryTitle = entry.title ?? agentStageLabelOf(entry.stage)
+                                const entryIcon = entry.kind === 'tool'
+                                  ? <ThunderboltOutlined aria-hidden="true" />
+                                  : entry.kind === 'narrative'
+                                    ? <BulbOutlined aria-hidden="true" />
+                                    : <InfoCircleOutlined aria-hidden="true" />
+                                const entryStatusLabel = entry.status === 'running'
+                                  ? '进行中'
+                                  : entry.status === 'completed'
+                                    ? '已完成'
+                                    : entry.status === 'warning'
+                                      ? '需注意'
+                                      : '失败'
+                                return (
+                                  <div
+                                    className={`agent-work-log-entry ${entry.kind} status-${entry.status}`}
+                                    key={`${entry.source}-${entry.activityId}`}
+                                    role="listitem"
+                                  >
+                                    <span className="agent-work-log-entry-icon">{entryIcon}</span>
+                                    <div className="agent-work-log-entry-copy">
+                                      <div className="agent-work-log-entry-heading">
+                                        <strong>{entryTitle}</strong>
+                                        <span>{entryStatusLabel}</span>
+                                      </div>
+                                      <p>{entry.summary}</p>
+                                    </div>
+                                  </div>
+                                )
+                              })}
+                            </div>
+                          ) : (
+                            <span className="agent-work-log-empty">等待 Agent 发布可审计执行事件…</span>
+                          )}
+                        </div>
+                      )}
                     </div>
                     {activeExecutionSummary && (
                       <AssistantExecutionPlanCard
@@ -8506,7 +8984,7 @@ function ChatPage({
                             className={isActive ? 'active' : 'complete'}
                             key={`${event.stage}-${index}`}
                             aria-current={isActive ? 'step' : undefined}
-                            title={event.message}
+                            title={safeAgentActivityTextOf(event.message) ?? '执行阶段'}
                           >
                             {isActive ? <InfoCircleOutlined /> : <CheckCircleOutlined />}
                             <span>{agentStageLabelOf(event.stage)}</span>
@@ -8557,7 +9035,6 @@ function ChatPage({
               </div>
               </div>
             </div>
-            )}
             {activeStreamingAnswer && (
                 <div className="message-row assistant streaming-answer-row">
                   <div className="message-avatar">
