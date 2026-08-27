@@ -78,6 +78,7 @@ import {
 } from './context-budget'
 import { sanitizeChatMessageContent } from '../shared/chat-message-format'
 import { buildRequirementBusinessText } from './requirements/requirement-match-card'
+import { hashRequirementBusinessText } from './requirements/requirement-business-normalization'
 import type {
   ManagedProject,
   ManagedProjectInput,
@@ -506,7 +507,7 @@ export interface RequirementLexicalMatch {
 const REQUIREMENT_BUSINESS_INDEX_MIGRATION_KEY = 'migration:requirement-business-index'
 const REQUIREMENT_MATCH_PROVENANCE_MIGRATION_KEY = 'requirementMatching.provenanceMigration'
 const REQUIREMENT_MATCH_PROVENANCE_MIGRATION_VERSION = 'v1'
-const REQUIREMENT_BUSINESS_INDEX_VERSION = 'requirement-business-index-v3'
+const REQUIREMENT_BUSINESS_INDEX_VERSION = 'requirement-business-index-v4'
 
 const requirementSourceHash = (input: {
   name: string
@@ -524,13 +525,11 @@ const requirementSourceHash = (input: {
   } catch {
     raw = {}
   }
-  return createHash('sha256')
-    .update(`requirement-business-source-v3\n${buildRequirementBusinessText({
-      name: input.name,
-      raw,
-      fieldLabels: input.fieldLabels
-    })}`)
-    .digest('hex')
+  return hashRequirementBusinessText(buildRequirementBusinessText({
+    name: input.name,
+    raw,
+    fieldLabels: input.fieldLabels
+  }))
 }
 
 export interface KnowledgeVectorRow {
