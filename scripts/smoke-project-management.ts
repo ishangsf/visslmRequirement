@@ -538,6 +538,8 @@ try {
   assert.equal(normalizedRequirement.title, '支持按订单号查询订单详情')
   const initialRequirementPage = db.listProjectRequirements({ projectId: project.id, page: 1, pageSize: 20 })
   assert.equal(initialRequirementPage.rows[0]?.status, 'unmarked')
+  const requirementBeforeSemanticMatching = db.getProjectRequirement('smoke-requirement-1')
+  assert(requirementBeforeSemanticMatching)
   semanticCandidates = [
     {
       recordUid: 'smoke-record-2',
@@ -575,10 +577,13 @@ try {
   } finally {
     globalThis.fetch = originalMatchingFetch
   }
-  const automaticallyLinkedAssets = db.listProjectAssets(project.id)
-  assert.equal(automaticallyLinkedAssets.find((item) => item.recordUid === 'smoke-record-2')?.requirements.some((item) => item.requirementId === 'smoke-requirement-1'), true)
-  assert.equal(automaticallyLinkedAssets.find((item) => item.recordUid === 'smoke-record-1')?.requirements.some((item) => item.requirementId === 'smoke-requirement-1'), false)
-  assert.equal(db.unlinkProjectAsset(project.id, 'smoke-record-2').ok, true)
+  const assetsAfterSemanticMatching = db.listProjectAssets(project.id)
+  assert.equal(assetsAfterSemanticMatching.some((item) => item.recordUid === 'smoke-record-2'), false)
+  assert.equal(assetsAfterSemanticMatching.find((item) => item.recordUid === 'smoke-record-1')?.requirements.some((item) => item.requirementId === 'smoke-requirement-1'), false)
+  const requirementAfterSemanticMatching = db.getProjectRequirement('smoke-requirement-1')
+  assert.equal(requirementAfterSemanticMatching?.status, requirementBeforeSemanticMatching.status)
+  assert.equal(requirementAfterSemanticMatching?.statusSource, requirementBeforeSemanticMatching.statusSource)
+  assert.equal(db.listProjectRequirementMatches({ requirementId: 'smoke-requirement-1', page: 1, pageSize: 20 }).total, 2)
   db.replaceRequirementMatches('smoke-requirement-1', [
     {
       recordUid: 'smoke-record-1',

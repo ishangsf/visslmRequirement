@@ -60,7 +60,6 @@ const requirementCategories = new Set<ProjectRequirementCategory>([
   'functional', 'interface', 'data', 'performance', 'security',
   'deployment', 'operations', 'acceptance', 'business'
 ])
-const projectRequirementAutoLinkScoreThreshold = 80
 
 interface ExtractedProject {
   projectName?: string
@@ -1783,18 +1782,6 @@ export class ProjectManagementService {
       }
     })
     this.db.replaceRequirementMatches(requirement.id, matches)
-    this.db.linkRequirementMatchesAboveScore(requirement.id, projectRequirementAutoLinkScoreThreshold)
-    const highestMatchScore = matches.reduce((value, item) => Math.max(value, item.finalScore), 0)
-    const scoreThreshold = projectRequirementAutoLinkScoreThreshold
-    const aiStatus: ProjectRequirementStatus = reviewed.status === 'satisfied' && highestMatchScore >= scoreThreshold
-      ? 'satisfied'
-      : 'unmarked'
-    const aiReason = aiStatus === 'satisfied'
-      ? reviewed.reason?.trim() || `最高匹配度 ${highestMatchScore.toFixed(1)}%，AI 初判为已满足`
-      : highestMatchScore > 0
-        ? `最高匹配度 ${highestMatchScore.toFixed(1)}% 未达到已满足阈值 ${scoreThreshold}%，待人工标记`
-        : reviewed.reason?.trim() || '当前没有足够匹配依据，待人工标记'
-    this.db.updateProjectRequirementAiStatus(requirement.id, aiStatus, aiReason)
   }
 
   private buildRequirementMatchQuery(requirement: ProjectRequirement): string {
