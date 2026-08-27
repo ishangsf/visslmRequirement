@@ -2,7 +2,8 @@ export type ManagedProjectLifecycle = 'draft' | 'active'
 export type ProjectAnalysisStatus = 'idle' | 'processing' | 'ready' | 'failed'
 export type ProjectMatchStatus = 'idle' | 'processing' | 'ready' | 'stale' | 'failed'
 export type ProjectRequirementStatus = 'unmarked' | 'satisfied' | 'to_develop' | 'to_negotiate'
-export type ProjectRequirementStatusSource = 'ai' | 'manual'
+export type ProjectRequirementStatusSource = 'ai' | 'manual' | 'system_rule' | 'legacy_unverified'
+export type ProjectAssetLinkSource = 'manual' | 'exact_business_hash' | 'legacy_unknown'
 export type ProjectRequirementKeyInfoTermsSource = 'ai' | 'manual'
 export type ProjectRequirementCategory =
   | 'functional'
@@ -225,6 +226,10 @@ export interface ProjectAssetRequirement {
   requirementNo: number
   title: string
   linkedAt: string
+  linkSource: ProjectAssetLinkSource
+  confirmedBy: string
+  confirmedAt: string
+  matchRunId: string | null
   matchScore?: number
 }
 
@@ -236,6 +241,10 @@ export interface ProjectAsset {
   itemId: string
   description: string
   linkedAt: string
+  linkSource: ProjectAssetLinkSource
+  confirmedBy: string
+  confirmedAt: string
+  matchRunId: string | null
   requirements: ProjectAssetRequirement[]
 }
 

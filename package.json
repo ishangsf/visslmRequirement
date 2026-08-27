@@ -21,6 +21,7 @@
     "test:database-bootstrap": "npx tsx ./tests/database-bootstrap-regression.ts",
     "test:record-maintenance": "npx tsx ./tests/record-maintenance.ts",
     "test:record-vector-scaling": "npx tsx ./tests/record-vector-scaling-regression.ts",
+    "test:requirement-matching-safety": "npx tsx ./tests/requirement-matching/safety-stopgap-regression.ts",
     "smoke:agent-similarity": "npx tsx ./scripts/smoke-agent-similarity.ts",
     "smoke:agent-requirement-analysis": "npx tsx ./scripts/smoke-agent-requirement-analysis.ts",
     "smoke:plain-chat": "npx tsx ./scripts/smoke-plain-chat.ts",

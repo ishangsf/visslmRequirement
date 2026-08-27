@@ -503,6 +503,8 @@ export interface RequirementLexicalMatch {
 }
 
 const REQUIREMENT_BUSINESS_INDEX_MIGRATION_KEY = 'migration:requirement-business-index'
+const REQUIREMENT_MATCH_PROVENANCE_MIGRATION_KEY = 'requirementMatching.provenanceMigration'
+const REQUIREMENT_MATCH_PROVENANCE_MIGRATION_VERSION = 'v1'
 const REQUIREMENT_BUSINESS_INDEX_VERSION = 'requirement-business-index-v3'
 
 const requirementSourceHash = (input: {
@@ -1584,6 +1586,10 @@ export class AppDatabase {
         project_id TEXT NOT NULL,
         record_uid TEXT NOT NULL,
         linked_at TEXT NOT NULL,
+        link_source TEXT NOT NULL DEFAULT 'legacy_unknown',
+        confirmed_by TEXT NOT NULL DEFAULT '',
+        confirmed_at TEXT NOT NULL DEFAULT '',
+        match_run_id TEXT,
         PRIMARY KEY(project_id, record_uid),
         FOREIGN KEY(project_id) REFERENCES pm_projects(id) ON DELETE CASCADE,
         FOREIGN KEY(record_uid) REFERENCES records(uid) ON DELETE CASCADE
@@ -1688,6 +1694,10 @@ export class AppDatabase {
         record_uid TEXT NOT NULL,
         requirement_id TEXT NOT NULL,
         linked_at TEXT NOT NULL,
+        link_source TEXT NOT NULL DEFAULT 'legacy_unknown',
+        confirmed_by TEXT NOT NULL DEFAULT '',
+        confirmed_at TEXT NOT NULL DEFAULT '',
+        match_run_id TEXT,
         PRIMARY KEY(project_id, record_uid, requirement_id),
         FOREIGN KEY(project_id) REFERENCES pm_projects(id) ON DELETE CASCADE,
         FOREIGN KEY(record_uid) REFERENCES records(uid) ON DELETE CASCADE,
@@ -1907,6 +1917,33 @@ export class AppDatabase {
         this.db.exec(statement)
       } catch {
         // Existing databases may already contain the migration column.
+      }
+    }
+    for (const statement of [
+      "ALTER TABLE pm_project_assets ADD COLUMN link_source TEXT NOT NULL DEFAULT 'legacy_unknown'",
+      "ALTER TABLE pm_project_assets ADD COLUMN confirmed_by TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE pm_project_assets ADD COLUMN confirmed_at TEXT NOT NULL DEFAULT ''",
+      'ALTER TABLE pm_project_assets ADD COLUMN match_run_id TEXT',
+      "ALTER TABLE pm_project_asset_requirements ADD COLUMN link_source TEXT NOT NULL DEFAULT 'legacy_unknown'",
+      "ALTER TABLE pm_project_asset_requirements ADD COLUMN confirmed_by TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE pm_project_asset_requirements ADD COLUMN confirmed_at TEXT NOT NULL DEFAULT ''",
+      'ALTER TABLE pm_project_asset_requirements ADD COLUMN match_run_id TEXT'
+    ]) {
+      try {
+        this.db.exec(statement)
+      } catch {
+        // Existing databases may already contain the provenance column.
+      }
+    }
+    if (this.getSetting(REQUIREMENT_MATCH_PROVENANCE_MIGRATION_KEY) !== REQUIREMENT_MATCH_PROVENANCE_MIGRATION_VERSION) {
+      this.db.exec('BEGIN IMMEDIATE')
+      try {
+        this.db.exec("UPDATE pm_requirements SET status_source = 'legacy_unverified' WHERE status_source = 'ai'")
+        this.setSetting(REQUIREMENT_MATCH_PROVENANCE_MIGRATION_KEY, REQUIREMENT_MATCH_PROVENANCE_MIGRATION_VERSION)
+        this.db.exec('COMMIT')
+      } catch (error) {
+        try { this.db.exec('ROLLBACK') } catch {}
+        throw error
       }
     }
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_records_push_status ON records(push_status)')
@@ -6083,7 +6120,8 @@ export class AppDatabase {
 
   listProjectAssets(projectId: string): ProjectAsset[] {
     const rows = this.db.prepare(`
-      SELECT a.project_id, a.record_uid, a.linked_at, r.uid AS uid, r.name, r.node_type, r.item_id,
+      SELECT a.project_id, a.record_uid, a.linked_at, a.link_source, a.confirmed_by,
+             a.confirmed_at, a.match_run_id, r.uid AS uid, r.name, r.node_type, r.item_id,
              r.raw_json, r.normalized_text, r.last_modify_time, r.project_id AS source_project_id,
              r.parent_id, r.synced_at, r.content_hash, r.push_status, r.push_message,
              r.pushed_at, r.pushed_uid, COUNT(i.id) AS image_count
@@ -6095,7 +6133,8 @@ export class AppDatabase {
       ORDER BY a.linked_at DESC, r.name ASC
     `).all(projectId) as SqlRow[]
     const requirementRows = this.db.prepare(`
-      SELECT ar.record_uid, ar.linked_at, q.id AS requirement_id,
+      SELECT ar.record_uid, ar.linked_at, ar.link_source, ar.confirmed_by,
+             ar.confirmed_at, ar.match_run_id, q.id AS requirement_id,
              q.requirement_no, q.title, m.final_score AS match_score
       FROM pm_project_asset_requirements ar
       JOIN pm_requirements q ON q.id = ar.requirement_id
@@ -6113,6 +6152,10 @@ export class AppDatabase {
         requirementNo: Number(row.requirement_no ?? 0),
         title: String(row.title ?? ''),
         linkedAt: String(row.linked_at ?? ''),
+        linkSource: String(row.link_source ?? 'legacy_unknown') as ProjectAsset['linkSource'],
+        confirmedBy: String(row.confirmed_by ?? ''),
+        confirmedAt: String(row.confirmed_at ?? ''),
+        matchRunId: row.match_run_id === null || row.match_run_id === undefined ? null : String(row.match_run_id),
         ...(row.match_score === null || row.match_score === undefined ? {} : { matchScore: Number(row.match_score) })
       })
       requirementsByRecord.set(recordUid, requirements)
@@ -6127,6 +6170,10 @@ export class AppDatabase {
         itemId: record.itemId,
         description: record.description,
         linkedAt: String(row.linked_at ?? ''),
+        linkSource: String(row.link_source ?? 'legacy_unknown') as ProjectAsset['linkSource'],
+        confirmedBy: String(row.confirmed_by ?? ''),
+        confirmedAt: String(row.confirmed_at ?? ''),
+        matchRunId: row.match_run_id === null || row.match_run_id === undefined ? null : String(row.match_run_id),
         requirements: requirementsByRecord.get(record.uid) ?? []
       }
     })
