@@ -1,0 +1,14 @@
+{
+  "status": "BLOCKED_PENDING_TARGET_MODEL",
+  "mode": "end-to-end-local",
+  "hardwareProfile": "target-hardware-not-yet-recorded",
+  "dataSnapshotHash": "records-5000-v1",
+  "pipelineVersion": "requirement-matching-pipeline-v1",
+  "rankingVersion": "requirement-ranking-v1-cross-encoder",
+  "modelHash": "bge-reranker-base-int8-local-v1-resource-unavailable",
+  "includesModelLoad": false,
+  "p50Ms": 0,
+  "p95Ms": 0,
+  "peakMemoryMb": 0,
+  "note": "The repository does not contain the packaged local Cross-Encoder resource; record this baseline on designated packaged target hardware before release enforcement."
+}

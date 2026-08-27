@@ -16,7 +16,8 @@ import {
   DEFAULT_PROJECT_MATCHING_SETTINGS,
   DEFAULT_FEATURE_MODULE_SETTINGS,
   DEFAULT_FEATURE_NAVIGATION_ORDER,
-  normalizeProjectMatchScore
+  normalizeProjectMatchScore,
+  normalizeRequirementMatchingRolloutMode
 } from '../shared/types'
 import { AppDatabase } from './database'
 
@@ -28,6 +29,7 @@ const USER_PROPERTY_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_.]*$/
 const USER_PROPERTY_KEYS_SETTING = 'system.userPropertyKeys'
 const LEGACY_USER_PROPERTY_KEYS_SETTING = 'platform.userPropertyKeys'
 const PROJECT_MATCH_SCORE_SETTING = 'projectMatching.minScore'
+const PROJECT_MATCH_ROLLOUT_SETTING = 'projectMatching.rolloutMode'
 
 const MODEL_API_KEY_LEGACY_COMPATIBLE_PROVIDER = 'openai-compatible'
 const MODEL_PROFILE_PREFIX = 'model.profile.'
@@ -106,7 +108,10 @@ export class SettingsService {
       model: activeProfile,
       modelProfiles,
       projectMatching: {
-        minScore: normalizeProjectMatchScore(this.db.getSetting(PROJECT_MATCH_SCORE_SETTING))
+        minScore: normalizeProjectMatchScore(this.db.getSetting(PROJECT_MATCH_SCORE_SETTING)),
+        rolloutMode: this.db.getSetting(PROJECT_MATCH_ROLLOUT_SETTING) === null
+          ? DEFAULT_PROJECT_MATCHING_SETTINGS.rolloutMode
+          : normalizeRequirementMatchingRolloutMode(this.db.getSetting(PROJECT_MATCH_ROLLOUT_SETTING))
       },
       features: this.getFeatureSettings(),
       navigationOrder: this.getNavigationOrder()
@@ -195,6 +200,7 @@ export class SettingsService {
 
   saveProjectMatching(input: ProjectMatchingSettings): AppSettings {
     this.db.setSetting(PROJECT_MATCH_SCORE_SETTING, String(normalizeProjectMatchScore(input.minScore)))
+    this.db.setSetting(PROJECT_MATCH_ROLLOUT_SETTING, normalizeRequirementMatchingRolloutMode(input.rolloutMode))
     return this.getAll()
   }
 

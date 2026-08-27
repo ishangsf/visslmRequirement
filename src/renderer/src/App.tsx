@@ -10699,7 +10699,7 @@ function SettingsPage({
                     <SettingsPanelHeading
                       title="项目需求匹配"
                       titleId="project-matching-settings-title"
-                      description="控制“查看匹配”列表展示的数据最低匹配度，低于或等于阈值的数据不会显示。"
+                      description="控制需求匹配链路的安全发布模式；模式切换不会修改历史资产关联或需求状态。"
                     />
                     <Form
                       className="settings-form settings-matching-form"
@@ -10715,6 +10715,20 @@ function SettingsPage({
                         rules={[{ required: true, message: '请输入最低匹配度' }]}
                       >
                         <InputNumber min={0} max={100} precision={0} step={1} suffix="%" />
+                      </Form.Item>
+                      <Form.Item
+                        name="rolloutMode"
+                        label="需求匹配发布模式"
+                        extra="回滚仅切换读取路径，不会恢复语义分数自动关联资产或自动修改需求状态。"
+                        rules={[{ required: true, message: '请选择发布模式' }]}
+                      >
+                        <Select
+                          options={[
+                            { value: 'legacy_safe', label: '安全旧链路' },
+                            { value: 'shadow', label: '影子验证' },
+                            { value: 'v1_1', label: 'v1.1 正式链路' }
+                          ]}
+                        />
                       </Form.Item>
                       <div className="settings-form-actions">
                         <Button type="primary" htmlType="submit">保存项目匹配配置</Button>

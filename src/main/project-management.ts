@@ -51,6 +51,7 @@ import type { RequirementMatchingCore } from './requirements/requirement-matchin
 import { createRequirementMatchingCore } from './requirements/requirement-matching-runtime'
 import { projectRequirementMatchProjection } from './requirements/requirement-match-adapters'
 import { hashProjectRequirementSnapshot, RequirementMatchRunService } from './requirements/requirement-match-run-service'
+import { resolveRequirementMatchingRollout } from './requirements/requirement-matching-rollout'
 
 const supportedAgreementExtensions = new Set(['.docx', '.pdf', '.xlsx', '.xls', '.txt'])
 // Keep local-model requests small enough that a slow CPU model can finish
@@ -649,6 +650,9 @@ export class ProjectManagementService {
   }
 
   listMatches(query: ProjectRequirementMatchQuery): ProjectRequirementMatchPage {
+    if (resolveRequirementMatchingRollout(this.projectMatchingSettings().rolloutMode).primaryReadPath !== 'v1_1' && !query.runId) {
+      return { run: null, rows: [], total: 0 }
+    }
     const requirement = this.db.getProjectRequirement(query.requirementId)
     if (!requirement) return { run: null, rows: [], total: 0 }
     const run = query.runId
@@ -1793,6 +1797,8 @@ export class ProjectManagementService {
   }
 
   private async matchSingleRequirement(requirement: ProjectRequirement): Promise<void> {
+    const rollout = resolveRequirementMatchingRollout(this.projectMatchingSettings().rolloutMode)
+    if (!rollout.newPipelinePersisted) return
     const { runId } = await this.requirementMatchRuns.start({
       requirementId: requirement.id,
       explanationPolicy: {
