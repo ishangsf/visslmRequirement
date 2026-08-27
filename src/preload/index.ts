@@ -2,8 +2,6 @@ import { contextBridge, ipcRenderer } from 'electron'
 import type {
   AppApi,
   CancelAgentRunResult,
-  ConfirmAgentPlanResult,
-  AssistantPlanPatch,
   AssistantArtifactInput,
   AssistantArtifactPreview,
   ChatRequest,
@@ -32,10 +30,6 @@ import type {
   RecordMaintenancePreview,
   RecordMaintenanceStartInput,
   RecordMaintenanceTaskSnapshot,
-  RequirementSemanticizationControl,
-  RequirementSemanticizationProgress,
-  RequirementSemanticizationStartInput,
-  RequirementSemanticizationTaskSnapshot,
   SyncProgress,
   SyncScopeConfig,
   UpdateStatus,
@@ -142,22 +136,6 @@ const api: AppApi = {
     ipcRenderer.on('data:maintenance-progress', listener)
     return () => ipcRenderer.removeListener('data:maintenance-progress', listener)
   },
-  startRequirementSemanticization: (input: RequirementSemanticizationStartInput) =>
-    ipcRenderer.invoke('requirements:semanticize', input),
-  getRequirementSemanticizationTask: (): Promise<RequirementSemanticizationTaskSnapshot | null> =>
-    ipcRenderer.invoke('requirements:semanticization-task'),
-  controlRequirementSemanticization: (
-    action: RequirementSemanticizationControl
-  ): Promise<RequirementSemanticizationTaskSnapshot | null> =>
-    ipcRenderer.invoke('requirements:semanticization-control', action),
-  onRequirementSemanticizationProgress: (
-    callback: (snapshot: RequirementSemanticizationProgress) => void
-  ) => {
-    const listener = (_event: Electron.IpcRendererEvent, snapshot: RequirementSemanticizationProgress): void =>
-      callback(snapshot)
-    ipcRenderer.on('requirements:semanticization-progress', listener)
-    return () => ipcRenderer.removeListener('requirements:semanticization-progress', listener)
-  },
   getStats: () => ipcRenderer.invoke('data:stats'),
   getSyncConfig: () => ipcRenderer.invoke('sync:get-config'),
   saveSyncConfig: (config: SyncScopeConfig) => ipcRenderer.invoke('sync:save-config', config),
@@ -170,8 +148,6 @@ const api: AppApi = {
   askAgent: (request: ChatRequest) => ipcRenderer.invoke('agent:ask', request),
   cancelAgentRun: (runId: string): Promise<CancelAgentRunResult> =>
     ipcRenderer.invoke('agent:cancel', runId),
-  confirmAgentPlan: (runId: string, patch?: AssistantPlanPatch): Promise<ConfirmAgentPlanResult> =>
-    ipcRenderer.invoke('agent:confirm-plan', runId, patch),
   previewAssistantArtifact: (input: AssistantArtifactInput) =>
     ipcRenderer.invoke('assistant-artifacts:preview', input),
   commitAssistantArtifact: (preview: AssistantArtifactPreview) =>

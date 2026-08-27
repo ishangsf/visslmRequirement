@@ -1,11 +1,16 @@
 import { strict as assert } from 'node:assert'
 import { QueryEngine } from '../src/main/analytics/query-engine'
 import type { AnalyticsRecord, AppDatabase } from '../src/main/database'
-import { VisualizationAgent } from '../src/main/experts/visualization-agent'
+import { planAnalysisBlueprint, VisualizationAgent } from '../src/main/experts/visualization-agent'
 import { resolveVisualizationRequestMode } from '../src/main/experts/visualization-intent'
 import { ExpertRouter } from '../src/main/experts/router'
 import { validateDashboardSpec } from '../src/main/dashboards/validator'
+import {
+  automaticDashboardComponentTitle,
+  validateDashboardSemanticConsistency
+} from '../src/shared/dashboard-semantics'
 import type {
+  DashboardAnalysisBlueprint,
   DashboardComponentSpec,
   DashboardSpec,
   VisualizationRunInput
@@ -19,7 +24,7 @@ const records: AnalyticsRecord[] = [
     itemId: 'I-1',
     name: 'Issue 1',
     lastModifyTime: '2026-07-01T10:00:00Z',
-    raw: { status: 'open', effort: 3 }
+    raw: { status: 'open', effort: 3, score: 8, email: 'one@example.com', note: 'high' }
   },
   {
     uid: 'ai-context-2',
@@ -28,7 +33,7 @@ const records: AnalyticsRecord[] = [
     itemId: 'I-2',
     name: 'Issue 2',
     lastModifyTime: '2026-07-08T10:00:00Z',
-    raw: { status: 'closed', effort: 5 }
+    raw: { status: 'closed', effort: 5, score: 13, email: 'two@example.com', note: 'low' }
   }
 ]
 
@@ -73,6 +78,65 @@ const baseDashboard: DashboardSpec = {
     component('kpi-closed', 'Closed issues', 12),
     component('kpi-effort', 'Total effort', 18)
   ]
+}
+
+const semanticBlueprint: DashboardAnalysisBlueprint = {
+  version: '1.0',
+  request: '观察缺陷总量和状态分布',
+  audience: '项目经理',
+  objective: '跟踪研发质量',
+  scopeDescription: 'p1 Issue 数据',
+  metrics: [{
+    id: 'issueCount',
+    label: '缺陷',
+    measureId: 'records',
+    aggregation: 'count',
+    source: 'catalog',
+    confidence: 1
+  }],
+  questions: [
+    {
+      id: 'q-total',
+      question: '当前缺陷总量是多少？',
+      metricIds: ['issueCount'],
+      dimensionFields: [],
+      preferredComponentTypes: ['kpi'],
+      slotRole: 'headline',
+      priority: 1,
+      required: true
+    },
+    {
+      id: 'q-status',
+      question: '缺陷按状态如何分布？',
+      metricIds: ['issueCount'],
+      dimensionFields: ['status'],
+      preferredComponentTypes: ['bar'],
+      slotRole: 'comparison',
+      priority: 2,
+      required: false
+    }
+  ],
+  assumptions: [],
+  unresolvedAmbiguities: [],
+  generatedAt: '2026-08-27T00:00:00.000Z'
+}
+
+const semanticDashboard: DashboardSpec = {
+  ...baseDashboard,
+  id: 'dashboard-ai-context-semantic',
+  analysisBlueprint: semanticBlueprint,
+  components: baseDashboard.components.map((item) => ({
+    ...item,
+    title: '缺陷数量',
+    semanticBinding: {
+      questionId: 'q-total',
+      metricIds: ['issueCount'],
+      dimensionFields: [],
+      titleMode: 'auto' as const,
+      confidence: 1
+    },
+    slotRole: 'headline' as const
+  }))
 }
 
 const settings = {
@@ -196,6 +260,7 @@ try {
     (run) => runs.push(run)
   )
   const scope = { projectIds: ['p1'] }
+  let semanticUpgradePatchCount = 0
 
   const applySuccessfulPatch = async (
     question: string,
@@ -203,11 +268,13 @@ try {
       focusComponentId?: string
       expectedQueries: number
       allowLayoutChanges?: boolean
+      allowSemanticUpgrade?: boolean
       history?: Array<{ role: 'user' | 'assistant'; content: string }>
     }
   ): Promise<DashboardSpec> => {
     const before = current
     const unaffectedBefore = componentSnapshot(before, options.focusComponentId)
+    const beforeSource = JSON.stringify(before)
     const next = await agent.patch(
       question,
       before,
@@ -221,7 +288,64 @@ try {
     assert.equal(next.id, baseDashboard.id)
     assert.equal(queryExecutions(runs.at(-1)!), options.expectedQueries)
     assert.equal(patchMetadata(runs.at(-1)!)?.queryExecutionCount, options.expectedQueries)
-    if (!options.allowLayoutChanges) {
+    assert.equal(JSON.stringify(before), beforeSource, 'patch 不得修改传入的源 Spec')
+    if (options.allowSemanticUpgrade) {
+      assert.equal(semanticUpgradePatchCount, 0,
+        'allowSemanticUpgrade 只能用于首次 legacy 数据变更 patch')
+      assert.equal(question, 'Show the top 25 results',
+        'allowSemanticUpgrade 只能用于 Show the top 25 results legacy patch')
+      assert.equal(options.focusComponentId, 'kpi-total')
+      assert.equal(options.expectedQueries, 1)
+      assert.equal(options.allowLayoutChanges, undefined,
+        '语义升级契约不得放宽布局不变断言')
+      semanticUpgradePatchCount += 1
+      const beforeById = new Map(unaffectedBefore.map((item) => [item.id, item]))
+      assert.equal(next.components.length, before.components.length,
+        'legacy 语义升级 patch 不得增删组件')
+      for (const item of next.components.filter((candidate) => candidate.id !== options.focusComponentId)) {
+        const previous = beforeById.get(item.id)
+        assert.ok(previous)
+        assert.deepEqual({
+          id: item.id,
+          type: item.type,
+          title: item.title,
+          layout: item.layout,
+          data: item.data,
+          query: item.query,
+          encoding: item.encoding
+        }, {
+          id: previous.id,
+          type: previous.type,
+          title: previous.title,
+          layout: previous.layout,
+          data: previous.data,
+          query: previous.query,
+          encoding: previous.encoding
+        }, `legacy 语义升级不得改写未聚焦组件 ${item.id} 的业务内容`)
+        assert.ok(item.semanticBinding, `legacy 组件 ${item.id} 必须补齐 semanticBinding`)
+        assert.ok(item.slotRole, `legacy 组件 ${item.id} 必须补齐 slotRole`)
+      }
+      assert.ok(next.analysisBlueprint, 'legacy 数据变更后必须生成 Blueprint')
+      assert.ok(next.components.every((item) => item.semanticBinding && item.slotRole),
+        'legacy 数据变更后全部组件必须具备 semanticBinding 与 slotRole')
+      const semanticIssues = validateDashboardSemanticConsistency(next)
+      assert.deepEqual(
+        semanticIssues.filter((issue) => issue.severity === 'error'),
+        [],
+        'legacy 数据变更升级后的完整 Spec 不得有语义错误'
+      )
+      const legacyComponentIds = new Set(before.components.map((item) => item.id))
+      const warningCounts = new Map<string, number>()
+      for (const issue of semanticIssues.filter((item) => item.severity === 'warning')) {
+        assert.equal(issue.code, 'custom-title-weak-match',
+          'legacy 保留用户标题时仅允许 custom-title-weak-match warning')
+        assert.ok(issue.componentId && legacyComponentIds.has(issue.componentId),
+          'legacy 标题 warning 必须指向旧组件')
+        const count = (warningCounts.get(issue.componentId) ?? 0) + 1
+        warningCounts.set(issue.componentId, count)
+        assert.ok(count <= 1, `legacy 旧组件 ${issue.componentId} 最多允许一条标题 warning`)
+      }
+    } else if (!options.allowLayoutChanges) {
       assert.deepEqual(componentSnapshot(next, options.focusComponentId), unaffectedBefore)
     } else {
       const beforeById = new Map(unaffectedBefore.map((item) => [item.id, item]))
@@ -287,7 +411,8 @@ try {
 
   await applySuccessfulPatch('Show the top 25 results', {
     focusComponentId: 'kpi-total',
-    expectedQueries: 1
+    expectedQueries: 1,
+    allowSemanticUpgrade: true
   })
   assert.equal(current.components.find((item) => item.id === 'kpi-total')?.query?.limit, 25)
 
@@ -396,7 +521,11 @@ try {
     new QueryEngine(fakeDb),
     settings
   ).generate('Generate a dashboard', { projectIds: ['p1'] })
-  assert.equal(generatedWithFallback.components[1].title, '核心指标 2')
+  assert.equal(
+    generatedWithFallback.components[1].title,
+    '记录数',
+    '缺失模型标题时应从受控 count QuerySpec 生成语义标题'
+  )
   assert.equal(generatedWithFallback.globalFilters?.[0].label, 'status')
   assert.deepEqual(validateDashboardSpec(generatedWithFallback, new QueryEngine(fakeDb)), [])
 
@@ -418,3 +547,471 @@ try {
 } finally {
   globalThis.fetch = originalFetch
 }
+
+const runSemanticPatchContract = async (): Promise<void> => {
+  const previousFetch = globalThis.fetch
+  let responsePayload: unknown = {
+    ...semanticDashboard,
+    id: 'generated-semantic-dashboard',
+    title: '研发质量语义大屏',
+    components: semanticDashboard.components.map((item) => ({ ...item, data: [] }))
+  }
+  const responseOf = (): Response => new Response(JSON.stringify({
+    message: { content: JSON.stringify(responsePayload) }
+  }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+
+  const addOperation = {
+    op: 'add-component',
+    type: 'bar',
+    title: '状态分布',
+    questionId: 'q-status',
+    dimensionField: 'status',
+    aggregation: 'count'
+  }
+  const focusedAddOperation = addOperation
+  const missingFieldOperation = {
+    ...addOperation,
+    dimensionField: 'missing-field'
+  }
+  const incompatibleOperation = {
+    ...addOperation,
+    type: 'line'
+  }
+  const scatterOperation = {
+    ...addOperation,
+    type: 'scatter'
+  }
+
+  try {
+    globalThis.fetch = async () => responseOf()
+    const agent = new VisualizationAgent(
+      new QueryEngine(fakeDb),
+      settings
+    )
+    const generated = await agent.generate('生成带业务语义绑定的研发质量大屏', { projectIds: ['p1'] })
+    assert.ok(generated.analysisBlueprint, '新生成大屏必须携带 analysisBlueprint')
+    assert.ok(generated.components.length >= 4)
+    assert.ok(generated.components.every((item) => item.semanticBinding && item.slotRole),
+      '新生成组件必须携带 semanticBinding 与 slotRole')
+    assert.deepEqual(validateDashboardSemanticConsistency(generated), [],
+      '新生成大屏的语义绑定必须通过一致性校验')
+
+    responsePayload = { operations: [addOperation] }
+    const added = await agent.patch(
+      '增加一个按状态展示的分布组件',
+      semanticDashboard,
+      { projectIds: ['p1'] }
+    )
+    assert.equal(added.components.length, semanticDashboard.components.length + 1,
+      'add-component 必须只新增一个组件')
+    const originalIds = new Set(semanticDashboard.components.map((item) => item.id))
+    const addedComponent = added.components.find((item) => !originalIds.has(item.id))
+    assert.ok(addedComponent, 'add-component 必须产生新的组件 id')
+    assert.equal(addedComponent.type, 'bar')
+    assert.equal(addedComponent.query?.dimensions?.[0]?.field, 'status')
+    assert.equal(addedComponent.encoding?.label, 'status')
+    assert.equal(addedComponent.semanticBinding?.questionId, 'q-status')
+    assert.deepEqual(addedComponent.semanticBinding?.metricIds, ['issueCount'])
+    assert.equal(addedComponent.slotRole, 'comparison')
+    assert.equal(
+      addedComponent.title,
+      automaticDashboardComponentTitle(semanticBlueprint, addedComponent),
+      '新增组件标题必须由复用的指标和维度自动生成'
+    )
+    assert.ok(addedComponent.data.length > 0, '新增受控组件必须完成查询物化')
+    assert.deepEqual(validateDashboardSemanticConsistency(added), [])
+
+    responsePayload = { operations: [focusedAddOperation] }
+    const focusedBefore = JSON.parse(JSON.stringify(semanticDashboard)) as DashboardSpec
+    await assert.rejects(() => agent.patch(
+      '在选中组件内新增一个状态分布图',
+      semanticDashboard,
+      { projectIds: ['p1'] },
+      'kpi-total'
+    ), '聚焦组件模式不得执行 add-component')
+    assert.deepEqual(semanticDashboard, focusedBefore, '聚焦新增被拒时原 Spec 必须保持不变')
+
+    responsePayload = { operations: [missingFieldOperation] }
+    const missingBefore = JSON.parse(JSON.stringify(semanticDashboard)) as DashboardSpec
+    await assert.rejects(() => agent.patch(
+      '增加一个使用不存在字段的组件',
+      semanticDashboard,
+      { projectIds: ['p1'] }
+    ), '不存在字段必须拒绝而不能静默替换')
+    assert.deepEqual(semanticDashboard, missingBefore, '不存在字段失败时原 Spec 必须保持不变')
+
+    responsePayload = { operations: [incompatibleOperation] }
+    const incompatibleBefore = JSON.parse(JSON.stringify(semanticDashboard)) as DashboardSpec
+    await assert.rejects(() => agent.patch(
+      '增加一个不兼容的折线组件',
+      semanticDashboard,
+      { projectIds: ['p1'] }
+    ), '不兼容组件/字段必须拒绝而不能静默替换')
+    assert.deepEqual(semanticDashboard, incompatibleBefore, '不兼容字段失败时原 Spec 必须保持不变')
+
+    responsePayload = { operations: [scatterOperation] }
+    const scatterBefore = JSON.parse(JSON.stringify(semanticDashboard)) as DashboardSpec
+    await assert.rejects(() => agent.patch(
+      '增加一个散点图',
+      semanticDashboard,
+      { projectIds: ['p1'] }
+    ), 'add-component 必须明确拒绝散点图，而不是隐式补齐第二个数值指标')
+    assert.deepEqual(semanticDashboard, scatterBefore, '散点图拒绝时原 Spec 必须保持不变')
+
+    console.log(JSON.stringify({
+      ok: true,
+      generatedBlueprint: true,
+      generatedBindings: generated.components.length,
+      addedComponent: {
+        id: addedComponent.id,
+        type: addedComponent.type,
+        questionId: addedComponent.semanticBinding?.questionId,
+        dimension: addedComponent.query?.dimensions?.[0]?.field
+      },
+      rejectedAddCases: ['focused-component', 'missing-field', 'incompatible-field', 'scatter']
+    }, null, 2))
+  } finally {
+    globalThis.fetch = previousFetch
+  }
+}
+
+await runSemanticPatchContract()
+
+const runBlueprintFirstContract = async (): Promise<void> => {
+  const previousFetch = globalThis.fetch
+  const ambiguousRequest = '生成研发质量大屏；负责人可能指开发负责人或测试负责人，请保留歧义并说明假设。'
+  const ambiguousBlueprint: DashboardAnalysisBlueprint = {
+    ...semanticBlueprint,
+    request: ambiguousRequest,
+    assumptions: ['当前仅按可识别的负责人字段生成候选分析，不替用户选择业务口径'],
+    unresolvedAmbiguities: ['负责人未明确指开发负责人还是测试负责人，需后续确认']
+  }
+  const responsePayload: DashboardSpec = {
+    ...semanticDashboard,
+    id: 'blueprint-first-generated',
+    title: '研发质量候选大屏',
+    analysisBlueprint: ambiguousBlueprint,
+    components: semanticDashboard.components.map((item) => ({ ...item, data: [] }))
+  }
+  const modelBodies: Array<Record<string, unknown>> = []
+  const auditRuns: VisualizationRunInput[] = []
+  try {
+    globalThis.fetch = async (_input, init) => {
+      if (typeof init?.body === 'string') {
+        modelBodies.push(JSON.parse(init.body) as Record<string, unknown>)
+      }
+      return new Response(JSON.stringify({
+        message: { content: JSON.stringify(responsePayload) }
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+    const generated = await new VisualizationAgent(
+      new QueryEngine(fakeDb),
+      settings,
+      (run) => auditRuns.push(run)
+    ).generate(ambiguousRequest, { projectIds: ['p1'] })
+    const firstMessages = Array.isArray(modelBodies[0]?.messages)
+      ? modelBodies[0].messages as Array<Record<string, unknown>>
+      : []
+    const firstPrompt = firstMessages
+      .map((message) => typeof message.content === 'string' ? message.content : '')
+      .join('\n')
+    const promptBlueprintPayload = firstMessages
+      .map((message) => {
+        if (typeof message.content !== 'string') return undefined
+        try {
+          return JSON.parse(message.content) as Record<string, unknown>
+        } catch {
+          return undefined
+        }
+      })
+      .find((payload) => payload && payload.analysisBlueprint && typeof payload.analysisBlueprint === 'object')
+    const promptBlueprint = promptBlueprintPayload?.analysisBlueprint as {
+      request?: unknown
+      metrics?: Array<{ id?: unknown; measureId?: unknown }>
+      questions?: Array<{ id?: unknown; metricIds?: unknown }>
+    } | undefined
+    assert.ok(modelBodies.length > 0, 'Blueprint-first 生成必须发起模型请求')
+    assert.match(firstPrompt, /analysisBlueprint/, '模型 prompt 必须包含主机先生成的 AnalysisBlueprint')
+    assert.ok(promptBlueprint, '模型 prompt 必须携带 concrete AnalysisBlueprint，而不是仅写审计标签')
+    assert.equal(promptBlueprint?.request, ambiguousRequest)
+    assert.ok((promptBlueprint?.metrics?.length ?? 0) > 0, 'prompt Blueprint 必须包含 concrete metric ids')
+    assert.ok((promptBlueprint?.questions?.length ?? 0) > 0, 'prompt Blueprint 必须包含 concrete question ids')
+    const promptMetricIds = new Set(
+      (promptBlueprint?.metrics ?? []).map((metric) => metric.id).filter((id): id is string => typeof id === 'string' && id.length > 0)
+    )
+    assert.equal(promptMetricIds.size, promptBlueprint?.metrics?.length,
+      'prompt Blueprint metric ids 必须非空且唯一')
+    for (const question of promptBlueprint?.questions ?? []) {
+      assert.ok(typeof question.id === 'string' && question.id.length > 0,
+        'prompt Blueprint question id 必须为非空字符串')
+      assert.ok(Array.isArray(question.metricIds), 'prompt Blueprint question 必须绑定 metric ids')
+      for (const metricId of question.metricIds as unknown[]) {
+        assert.ok(typeof metricId === 'string' && promptMetricIds.has(metricId),
+          `prompt Blueprint question ${String(question.id)} 引用了不存在的 metric id`)
+      }
+    }
+    const run = auditRuns.find((item) => item.mode === 'generate' && item.status === 'success')
+    assert.ok(run, 'Blueprint-first 生成必须写入成功审计记录')
+    const planCall = run.toolCalls.find((call) => call.tool === 'plan-analysis')
+    const composeCall = run.toolCalls.find((call) => call.tool === 'model-compose')
+    assert.ok(planCall && composeCall, '生成审计必须同时包含 plan-analysis 与 model-compose')
+    assert.ok(planCall.sequence < composeCall.sequence,
+      'plan-analysis 必须在 model-compose 之前完成')
+    assert.ok(generated.analysisBlueprint, '生成结果必须携带 AnalysisBlueprint')
+    assert.deepEqual(
+      generated.analysisBlueprint.metrics.map((metric) => metric.id),
+      [...promptMetricIds],
+      '最终 Blueprint 必须延续 prompt 中主机先生成的 metric ids'
+    )
+    assert.deepEqual(
+      generated.analysisBlueprint.questions.map((question) => question.id),
+      (promptBlueprint?.questions ?? []).map((question) => question.id),
+      '最终 Blueprint 必须延续 prompt 中主机先生成的 question ids'
+    )
+    assert.ok(generated.analysisBlueprint.assumptions.length > 0,
+      '歧义请求必须记录 assumptions')
+    assert.ok(generated.analysisBlueprint.unresolvedAmbiguities.length > 0,
+      '歧义请求必须记录 unresolvedAmbiguities')
+    const requiredQuestions = generated.analysisBlueprint.questions.filter((question) => question.required)
+    assert.ok(requiredQuestions.length > 0, 'Blueprint 至少应包含一个必答业务问题')
+    for (const question of requiredQuestions) {
+      const boundComponent = generated.components.find((component) =>
+        component.semanticBinding?.questionId === question.id
+      )
+      assert.ok(boundComponent, `必答问题 ${question.id} 必须映射到组件`)
+      assert.ok(boundComponent.query, `必答问题 ${question.id} 必须映射到 QuerySpec`)
+      assert.deepEqual(boundComponent.semanticBinding?.metricIds, question.metricIds,
+        `必答问题 ${question.id} 的指标绑定必须精确一致`)
+      for (const metricId of question.metricIds) {
+        const metric = generated.analysisBlueprint.metrics.find((item) => item.id === metricId)
+        assert.ok(metric, `必答问题 ${question.id} 引用了不存在指标 ${metricId}`)
+        assert.ok(boundComponent.query!.measures.some((measure) => measure.id === metric!.measureId),
+          `必答问题 ${question.id} 的指标必须落到 QuerySpec measure`)
+      }
+      assert.equal(boundComponent.title,
+        automaticDashboardComponentTitle(generated.analysisBlueprint, boundComponent),
+        `必答问题 ${question.id} 的标题必须由绑定指标、维度自动生成`)
+    }
+    console.log(JSON.stringify({
+      ok: true,
+      auditOrder: run.toolCalls.map((call) => call.tool),
+      assumptions: generated.analysisBlueprint.assumptions.length,
+      unresolvedAmbiguities: generated.analysisBlueprint.unresolvedAmbiguities.length,
+      requiredQuestions: requiredQuestions.length
+    }, null, 2))
+  } finally {
+    globalThis.fetch = previousFetch
+  }
+}
+
+const runLegacyUpgradeContract = async (): Promise<void> => {
+  const previousFetch = globalThis.fetch
+  const legacyDashboard = JSON.parse(JSON.stringify(baseDashboard)) as DashboardSpec
+  legacyDashboard.id = 'legacy-ai-upgrade-smoke'
+  delete legacyDashboard.analysisBlueprint
+  const legacySource = JSON.stringify(legacyDashboard)
+  let responsePayload: unknown = {
+    operations: [{
+      op: 'add-component',
+      type: 'bar',
+      title: '状态分布',
+      dimensionField: 'status',
+      aggregation: 'count'
+    }]
+  }
+  const responseOf = (): Response => new Response(JSON.stringify({
+    message: { content: JSON.stringify(responsePayload) }
+  }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  try {
+    globalThis.fetch = async () => responseOf()
+    const agent = new VisualizationAgent(new QueryEngine(fakeDb), settings)
+    const upgraded = await agent.patch(
+      '在 legacy 大屏中新增状态分布组件并升级语义绑定',
+      legacyDashboard,
+      { projectIds: ['p1'] }
+    )
+    assert.equal(upgraded.components.length, legacyDashboard.components.length + 1)
+    assert.ok(upgraded.analysisBlueprint, 'legacy AI add 必须升级为 Blueprint')
+    assert.ok(upgraded.components.every((component) => component.semanticBinding && component.slotRole),
+      'legacy AI add 必须为旧组件和新组件补齐语义绑定')
+    const legacySemanticIssues = validateDashboardSemanticConsistency(upgraded)
+    assert.deepEqual(
+      legacySemanticIssues.filter((issue) => issue.severity === 'error'),
+      [],
+      'legacy AI add 升级后的完整 Spec 不得有语义错误'
+    )
+    const legacyIds = new Set(legacyDashboard.components.map((component) => component.id))
+    const legacyWarningCounts = new Map<string, number>()
+    for (const issue of legacySemanticIssues.filter((item) => item.severity === 'warning')) {
+      assert.equal(issue.code, 'custom-title-weak-match',
+        'legacy AI add 保留用户标题时仅允许 custom-title-weak-match warning')
+      assert.ok(issue.componentId && legacyIds.has(issue.componentId),
+        'legacy AI add 标题 warning 必须指向旧组件')
+      const count = (legacyWarningCounts.get(issue.componentId) ?? 0) + 1
+      legacyWarningCounts.set(issue.componentId, count)
+      assert.ok(count <= 1, `legacy AI add 旧组件 ${issue.componentId} 最多允许一条标题 warning`)
+    }
+    assert.equal(JSON.stringify(legacyDashboard), legacySource,
+      'legacy AI add 失败或成功均不得修改源 Spec')
+
+    const legacyPresentation = JSON.parse(JSON.stringify(baseDashboard)) as DashboardSpec
+    legacyPresentation.id = 'legacy-presentation-smoke'
+    legacyPresentation.components = [{
+      ...legacyPresentation.components[0],
+      query: undefined,
+      encoding: undefined
+    }]
+    delete legacyPresentation.analysisBlueprint
+    const presentationSource = JSON.stringify(legacyPresentation)
+    responsePayload = { operations: [{ op: 'set-dashboard-title', value: 'Legacy presentation snapshot' }] }
+    const presentation = await agent.patch(
+      '只修改 legacy 展示快照标题',
+      legacyPresentation,
+      { projectIds: ['p1'] }
+    )
+    assert.equal(presentation.title, 'Legacy presentation snapshot')
+    assert.equal(presentation.analysisBlueprint, undefined,
+      'legacy presentation-only 模式应保持无 Blueprint 兼容')
+    assert.equal(JSON.stringify(legacyPresentation), presentationSource,
+      'legacy presentation-only patch 不得修改源 Spec')
+    console.log(JSON.stringify({
+      ok: true,
+      upgradedComponents: upgraded.components.length,
+      legacyBlueprint: true,
+      legacyBindings: upgraded.components.filter((component) => component.semanticBinding).length,
+      presentationOnlyCompatible: true
+    }, null, 2))
+  } finally {
+    globalThis.fetch = previousFetch
+  }
+}
+
+const runAiScatterContract = async (): Promise<void> => {
+  const previousFetch = globalThis.fetch
+  const scatterScope = { projectIds: ['p1'] }
+  const scatterBlueprint = planAnalysisBlueprint(
+    '生成投入工时与评分的双指标散点图',
+    scatterScope,
+    new QueryEngine(fakeDb).profile(scatterScope)
+  )
+  const scatterQuestion = scatterBlueprint.questions.find((question) =>
+    question.preferredComponentTypes.includes('scatter')
+  )
+  assert.ok(scatterQuestion, '散点图请求必须先规划 scatter 业务问题')
+  assert.equal(scatterQuestion.metricIds.length, 2, '散点图 Blueprint 必须规划两个指标')
+  const scatterMetrics = scatterQuestion.metricIds.map((metricId) => {
+    const metric = scatterBlueprint.metrics.find((candidate) => candidate.id === metricId)
+    assert.ok(metric, `散点图 Blueprint 缺少指标 ${metricId}`)
+    return metric
+  })
+  const scatterMeasures = scatterMetrics.map((metric) => ({
+    id: metric.measureId,
+    ...(metric.field ? { field: metric.field } : {}),
+    aggregation: metric.aggregation,
+    ...(metric.calculation ? { calculation: metric.calculation } : {})
+  }))
+  const scatterComponent: DashboardComponentSpec = {
+    ...baseDashboard.components[0],
+    id: 'scatter-generated',
+    type: 'scatter',
+    title: '投入工时与评分相关性',
+    layout: { x: 0, y: 0, w: 10, h: 5 },
+    data: [],
+    query: {
+      source: 'records',
+      scope: scatterScope,
+      dimensions: scatterQuestion.dimensionFields.map((field) => ({
+        field,
+        ...(scatterQuestion.timeGrain && field === scatterQuestion.dimensionFields[0]
+          ? { timeGrain: scatterQuestion.timeGrain }
+          : {})
+      })),
+      measures: scatterMeasures,
+      limit: 100
+    },
+    encoding: {
+      ...(scatterQuestion.dimensionFields[0] ? { label: scatterQuestion.dimensionFields[0] } : {}),
+      value: scatterMeasures[0].id,
+      secondaryValue: scatterMeasures[1].id
+    }
+  }
+  const scatterRaw: DashboardSpec = {
+    ...baseDashboard,
+    id: 'ai-scatter-smoke',
+    title: 'AI 双指标散点大屏',
+    analysisBlueprint: scatterBlueprint,
+    components: [scatterComponent, ...baseDashboard.components.slice(1)]
+  }
+  let responsePayload: unknown = scatterRaw
+  const responseOf = (): Response => new Response(JSON.stringify({
+    message: { content: JSON.stringify(responsePayload) }
+  }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  const assertScatterRejected = async (
+    label: string,
+    mutate: (candidate: DashboardSpec) => void
+  ): Promise<void> => {
+    const candidate = JSON.parse(JSON.stringify(scatterRaw)) as DashboardSpec
+    mutate(candidate)
+    const source = JSON.stringify(candidate)
+    responsePayload = candidate
+    const agent = new VisualizationAgent(new QueryEngine(fakeDb), settings)
+    await assert.rejects(
+      () => agent.generate(`生成散点图：${label}`, { projectIds: ['p1'] }),
+      `散点图 ${label} 必须被原子拒绝`
+    )
+    assert.equal(JSON.stringify(candidate), source, `散点图 ${label} 拒绝时输入必须保持不变`)
+  }
+  try {
+    globalThis.fetch = async () => responseOf()
+    const generated = await new VisualizationAgent(new QueryEngine(fakeDb), settings).generate(
+      '生成投入工时与评分的双指标散点图',
+      { projectIds: ['p1'] }
+    )
+    const scatter = generated.components.find((component) => component.type === 'scatter')
+    assert.ok(scatter, 'AI 生成结果必须包含散点组件')
+    assert.ok(scatter.query, 'AI 散点组件必须带受控 QuerySpec')
+    assert.equal(scatter.query.measures.length, 2, 'AI 散点必须恰好使用两个 measure')
+    assert.notEqual(scatter.query.measures[0].id, scatter.query.measures[1].id)
+    assert.notEqual(scatter.query.measures[0].field, scatter.query.measures[1].field)
+    assert.equal(scatter.encoding?.secondaryValue, scatter.query.measures[1].id)
+    assert.equal(scatter.semanticBinding?.metricIds.length, 2)
+    assert.deepEqual(
+      scatter.semanticBinding?.metricIds,
+      scatter.query.measures.map((measure) => generated.analysisBlueprint!.metrics.find((metric) => metric.measureId === measure.id)?.id)
+    )
+    assert.deepEqual(validateDashboardSemanticConsistency(generated), [])
+
+    await assertScatterRejected('缺少第二指标字段', (candidate) => {
+      const target = candidate.components.find((component) => component.type === 'scatter')!
+      target.query!.measures[1] = { id: 'scoreSum', aggregation: 'sum' }
+    })
+    await assertScatterRejected('重复第二指标', (candidate) => {
+      const target = candidate.components.find((component) => component.type === 'scatter')!
+      target.query!.measures[1] = { ...target.query!.measures[0] }
+      target.encoding!.secondaryValue = target.query!.measures[0].id
+    })
+    await assertScatterRejected('敏感第二指标', (candidate) => {
+      const target = candidate.components.find((component) => component.type === 'scatter')!
+      target.query!.measures[1] = { id: 'emailSum', field: 'email', aggregation: 'sum' }
+      target.encoding!.secondaryValue = 'emailSum'
+    })
+    await assertScatterRejected('非数值第二指标', (candidate) => {
+      const target = candidate.components.find((component) => component.type === 'scatter')!
+      target.query!.measures[1] = { id: 'statusSum', field: 'status', aggregation: 'sum' }
+      target.encoding!.secondaryValue = 'statusSum'
+    })
+    console.log(JSON.stringify({
+      ok: true,
+      measures: scatter.query.measures.map((measure) => measure.id),
+      secondaryValue: scatter.encoding?.secondaryValue,
+      metricBindings: scatter.semanticBinding?.metricIds,
+      rejectedCases: ['missing-field', 'duplicate', 'sensitive', 'non-numeric']
+    }, null, 2))
+  } finally {
+    globalThis.fetch = previousFetch
+  }
+}
+
+await runBlueprintFirstContract()
+await runLegacyUpgradeContract()
+await runAiScatterContract()

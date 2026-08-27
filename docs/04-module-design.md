@@ -125,7 +125,7 @@
 11. **Service**：`ExpertRouter`、`OllamaAgent`、`ModelClient`、`KnowledgeService`、`QueryEngine`。
 12. **DAO**：`AppDatabase` chat CRUD、`searchForAgent/inspectFields/queryRecordsByFields/aggregate/aggregateByField/getRecord`。
 13. **数据表**：`chat_sessions`、`records`、`knowledge_*`、`field_profiles`、`query_cache`；可视化请求写 `visualization_runs`。
-14. **核心流程**：路由专家 -> 通用助手计划/工具调用、需求分析专家编号定位与有效语义资产读取 -> 全量原文 Dense/FTS5/BM25 + ready 卡片结构化 RRF 召回 -> 本地 Cross-Encoder 重排 -> 确定性多维评分 -> Top10 一次批量 AI 解释 -> UID/证据/schema 程序校验 -> 返回 answer/sources/dataViews；未就绪资产使用 source-only 原文视图，不在查询阶段生成语义卡片；会话由前端保存。
+14. **核心流程**：路由专家 -> 通用助手计划/工具调用、需求分析专家按编号读取完整清洗原文 -> 全量原文 Dense/FTS5/BM25 两路 RRF 召回 -> 本地 Cross-Encoder 重排 -> 确定性评分 -> Top10 一次批量 AI 解释 -> UID/证据/schema 程序校验 -> 返回 answer/sources/dataViews；查询阶段不生成或持久化额外预生成结构化资产；会话由前端保存。
 15. **状态变化**：前端 loading；工具循环直到无 tool_calls；可视化路径发送 status/artifact/error 事件。
 16. **业务规则**：指定记录属性必须用字段查询证据；字段不确定先画像；总量和字段聚合不能混用；模型不能直接 SQL。
 17. **权限点**：无；在线模型和本地模型由设置决定。

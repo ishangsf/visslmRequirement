@@ -101,7 +101,11 @@ const main = async () => {
     assert(searchCalls[0]?.sourceType === 'document', 'knowledge mode must request document vectors only')
     assert(result.sources.length === 1 && result.sources[0]?.uid === 'doc-signing', 'record vectors must not enter a document answer')
     assert(result.dataViews.length === 0, 'document evidence must not fabricate a data-center view')
-    assert(result.answer.includes('[UID:doc-signing]'), 'the answer must retain a validated document UID citation')
+    assert(!result.answer.includes('[UID:doc-signing]'), 'document answers must not expose an opaque document UID')
+    assert(
+      result.answer.includes('[doc-signing.txt · 第 1 页](#knowledge-document=doc-signing&chunk=chunk-doc-signing)'),
+      `the answer must retain the validated, user-readable document citation; received: ${result.answer}; sources: ${JSON.stringify(result.sources)}`
+    )
     for (const stage of ['route', 'plan', 'query', 'retrieve', 'verify']) {
       assert(progressStages.includes(stage), `agent progress should include ${stage}`)
     }

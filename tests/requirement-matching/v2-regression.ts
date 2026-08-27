@@ -9,11 +9,7 @@ import {
   type HybridRequirementCandidate,
   type RequirementDenseRetriever
 } from '../../src/main/requirements/hybrid-retrieval'
-import {
-  buildRequirementSemanticCard,
-  type RequirementAction,
-  type RequirementSemanticCard
-} from '../../src/main/requirements/semantic-card'
+import { buildRequirementSourceView } from '../../src/main/requirements/requirement-match-card'
 import { RequirementAnalysisAgent } from '../../src/main/experts/requirement-analysis-agent'
 import type { RequirementReranker } from '../../src/main/requirements/cross-encoder-reranker'
 import {
@@ -24,25 +20,18 @@ import {
 } from '../../src/main/requirements/requirement-match-explainer'
 import {
   scoreRequirementCandidate,
-  scoreRequirementCards,
   type RequirementMatchScoringSignals
 } from '../../src/main/requirements/requirement-match-scoring'
-import {
-  REQUIREMENT_SEMANTIC_ANALYZER_VERSION,
-  requirementSemanticModelSignature
-} from '../../src/main/requirements/semanticization-service'
 import type { ModelChatInput, ModelResponse } from '../../src/main/model-client'
 import type { ModelSettings, RecordDetail } from '../../src/shared/types'
 
 /**
- * V2 regression boundary:
- * retrieval, deterministic scoring, and explanation are separate stages.
- * The explanation stage may add evidence text only; it cannot decide a
- * relation, replace a score, or turn a malformed response into a match.
+ * Source-only regression boundary: retrieval, deterministic scoring, and the
+ * explanation model remain separate. No test fixture persists or fabricates a
+ * generated requirement card.
  */
 
 const TEST_MODEL_VERSION = 'requirement-v2-regression-embedding-v1'
-const TEST_MATCH_SIGNATURE = 'requirement-v2-regression-match-v1'
 const settings: ModelSettings = {
   source: 'local',
   provider: 'ollama',
@@ -50,10 +39,18 @@ const settings: ModelSettings = {
   model: 'requirement-v2-regression-model',
   thinking: false
 }
-const semanticContext = {
-  analyzerVersion: REQUIREMENT_SEMANTIC_ANALYZER_VERSION,
-  modelSignature: requirementSemanticModelSignature(settings)
-}
+
+const rerankerOnlyWeights = {
+  semantic: 0,
+  keyword: 0,
+  domain: 0,
+  requirementType: 0,
+  productDomain: 0,
+  module: 0,
+  dense: 0,
+  lexical: 0,
+  reranker: 1
+} as NonNullable<RequirementMatchScoringSignals['weights']>
 
 type FixtureRecord = {
   uid: string
@@ -80,37 +77,6 @@ type ExplanationModel = {
   inputs: ModelChatInput[]
 }
 
-const rerankerOnlyWeights: NonNullable<RequirementMatchScoringSignals['weights']> = {
-  semantic: 0,
-  keyword: 0,
-  domain: 0,
-  object: 0,
-  functionalObject: 0,
-  action: 0,
-  currentState: 0,
-  targetState: 0,
-  trigger: 0,
-  input: 0,
-  output: 0,
-  behavior: 0,
-  constraints: 0,
-  acceptance: 0,
-  businessScene: 0,
-  requirementType: 0,
-  productDomain: 0,
-  module: 0,
-  dense: 0,
-  lexical: 0,
-  structural: 0,
-  reranker: 1
-}
-
-const behaviorOnlyWeights: NonNullable<RequirementMatchScoringSignals['weights']> = {
-  ...rerankerOnlyWeights,
-  behavior: 1,
-  reranker: 0
-}
-
 const parseExplanationPrompt = (input: ModelChatInput): ExplanationPrompt => {
   try {
     const value = JSON.parse(input.messages.at(-1)?.content ?? '{}') as unknown
@@ -126,7 +92,7 @@ const validExplanationBody = (input: ModelChatInput): Record<string, unknown> =>
   const prompt = parseExplanationPrompt(input)
   const baseEvidence = prompt.requirement?.evidenceSegments?.[0]?.id ?? 'B001'
   return {
-    summary: 'The explanation batch was generated from the supplied evidence.',
+    summary: 'The explanation batch was generated from the supplied source evidence.',
     items: (prompt.candidates ?? []).map((candidate) => ({
       recordUid: candidate.recordUid,
       relation: 'partial_overlap',
@@ -206,56 +172,17 @@ const addVectorIndex = (db: AppDatabase, record: RecordDetail): void => {
   )
 }
 
-const aiCard = (
-  record: RecordDetail,
-  overrides: { action?: RequirementAction; functionalObject?: string } = {}
-): RequirementSemanticCard => {
-  const source = buildRequirementSemanticCard(record)
-  const functionalObject = overrides.functionalObject ?? record.name
-  const action = overrides.action ?? 'add_capability'
-  return {
-    ...source,
-    functionalObject,
-    action,
-    matchingText: `${source.evidence}\n功能对象：${functionalObject}`,
-    fieldAssessments: {
-      ...source.fieldAssessments,
-      functionalObject: { value: functionalObject, confidence: 0.95, evidence: source.evidence },
-      action: { value: action, confidence: 0.95, evidence: source.evidence }
-    },
-    analysisStatus: 'ai_adjudicated',
-    analysisSummary: 'V2 regression fixture AI card'
-  }
-}
-
-const persistReadyCard = (db: AppDatabase, record: RecordDetail, card: RequirementSemanticCard): void => {
-  const contentHash = db.getRecordContentHash(record.uid)
-  if (!contentHash) throw new Error(`fixture record has no semantic content hash: ${record.uid}`)
-  assert.equal(
-    db.claimRequirementSemanticCard({ recordUid: record.uid, contentHash, ...semanticContext }),
-    true,
-    `fixture card claim failed: ${record.uid}`
-  )
-  db.completeRequirementSemanticCard(record.uid, card)
-  assert.ok(
-    db.getReadyRequirementSemanticCard({ recordUid: record.uid, contentHash, ...semanticContext }),
-    `fixture card was not ready: ${record.uid}`
-  )
-}
-
 const sourceCandidate = (
   record: RecordDetail,
-  denseScore = 0.5,
-  card = buildRequirementSemanticCard(record)
+  denseScore = 0.5
 ): HybridRequirementCandidate => ({
   record,
-  card,
+  card: buildRequirementSourceView(record),
   denseScore,
   lexicalScore: denseScore,
-  structuralScore: 0,
   retrievalScore: denseScore,
   snippet: record.description
-})
+} as HybridRequirementCandidate)
 
 const denseStub = (
   db: AppDatabase,
@@ -309,11 +236,11 @@ const withDatabase = async <T>(worker: (db: AppDatabase) => Promise<T> | T): Pro
 }
 
 const makeExplanationRequest = (
-  base: RequirementSemanticCard,
+  base: HybridRequirementCandidate['card'],
   candidates: HybridRequirementCandidate[]
 ): RequirementMatchExplanationRequest => ({ base, candidates })
 
-const testHybridRecallDoesNotFilterSourceOnly = async (): Promise<void> => {
+const testHybridRecallUsesFullCurrentIndex = async (): Promise<void> => {
   await withDatabase(async (db) => {
     const base = addRecord(db, {
       uid: 'v2-base-uid',
@@ -326,7 +253,7 @@ const testHybridRecallDoesNotFilterSourceOnly = async (): Promise<void> => {
       uid: 'v2-dense-source-only-uid',
       itemId: 'V2-DENSE-SOURCE-ONLY',
       name: 'Vector recall fixture',
-      description: 'A semantic vector route identifies the reporting behavior.',
+      description: 'A vector route identifies the reporting behavior.',
       module: 'reporting'
     })
     const lexicalOnly = addRecord(db, {
@@ -336,67 +263,37 @@ const testHybridRecallDoesNotFilterSourceOnly = async (): Promise<void> => {
       description: 'The reporting page exports report records to CSV.',
       module: 'reporting'
     })
-    const structured = addRecord(db, {
-      uid: 'v2-structured-ready-uid',
-      itemId: 'V2-STRUCTURED-READY',
-      name: 'Structured recall fixture',
-      description: 'The reporting module handles output configuration.',
-      module: 'reporting'
-    })
-    for (const record of [base, denseOnly, lexicalOnly, structured]) addVectorIndex(db, record)
+    for (const record of [base, denseOnly, lexicalOnly]) addVectorIndex(db, record)
 
-    const baseCard = aiCard(base, {
-      action: 'add_capability',
-      functionalObject: 'report export settings'
-    })
-    const structuredCard = aiCard(structured, {
-      action: 'add_capability',
-      functionalObject: 'report export settings'
-    })
-    persistReadyCard(db, base, baseCard)
-    persistReadyCard(db, structured, structuredCard)
-
-    const allCurrentIndexUids = [base.uid, denseOnly.uid, lexicalOnly.uid, structured.uid]
+    const allCurrentIndexUids = [base.uid, denseOnly.uid, lexicalOnly.uid]
     const dense = denseStub(
       db,
       allCurrentIndexUids,
       [base.uid, denseOnly.uid],
       new Map([[denseOnly.uid, 91]])
     )
-    const candidates = await new HybridRequirementRetriever(db, dense, semanticContext)
-      .retrieve(baseCard, new Set([base.uid]))
+    const candidates = await new HybridRequirementRetriever(db, dense)
+      .retrieve(buildRequirementSourceView(base), new Set([base.uid]))
     const byUid = new Map(candidates.map((candidate) => [candidate.record.uid, candidate]))
 
-    assert.deepEqual(
-      dense.allowedCalls,
-      [allCurrentIndexUids.sort()],
-      'Dense must receive every current-index UID, not only ready-card records'
-    )
+    assert.deepEqual(dense.allowedCalls, [allCurrentIndexUids.sort()])
     assert.ok(byUid.has(denseOnly.uid), 'Dense source-only candidate must remain eligible')
     assert.ok(byUid.has(lexicalOnly.uid), 'BM25 source-only candidate must remain eligible')
-    assert.ok(byUid.has(structured.uid), 'structured ready-card candidate must remain eligible')
-    assert.equal(byUid.get(denseOnly.uid)?.card.analysisStatus, 'source_only')
-    assert.equal(byUid.get(lexicalOnly.uid)?.card.analysisStatus, 'source_only')
-    assert.equal(byUid.get(structured.uid)?.card.analysisStatus, 'ai_adjudicated')
-    assert.ok((byUid.get(denseOnly.uid)?.denseScore ?? 0) > 0, 'Dense score must survive source-only fallback')
-    assert.ok((byUid.get(lexicalOnly.uid)?.lexicalScore ?? 0) > 0, 'BM25 score must survive source-only fallback')
-    assert.ok((byUid.get(structured.uid)?.structuralScore ?? 0) > 0, 'structured score must use a ready card')
+    assert.deepEqual(byUid.get(denseOnly.uid)?.card, buildRequirementSourceView(denseOnly))
+    assert.deepEqual(byUid.get(lexicalOnly.uid)?.card, buildRequirementSourceView(lexicalOnly))
+    assert.ok((byUid.get(denseOnly.uid)?.denseScore ?? 0) > 0)
+    assert.ok((byUid.get(lexicalOnly.uid)?.lexicalScore ?? 0) > 0)
   })
 }
 
 const testCrossEncoderTop20FlowsToOneBatchExplanation = async (): Promise<void> => {
-  const baseRecord = {
-    uid: 'v2-top20-base-uid',
-    itemId: 'V2-TOP20-BASE',
-    name: 'Top twenty base fixture',
-    description: 'The reporting page exports records for review.',
-    module: 'reporting'
-  }
   await withDatabase(async (db) => {
-    const base = addRecord(db, baseRecord)
-    const baseCard = aiCard(base, {
-      action: 'add_capability',
-      functionalObject: 'report export'
+    const base = addRecord(db, {
+      uid: 'v2-top20-base-uid',
+      itemId: 'V2-TOP20-BASE',
+      name: 'Top twenty base fixture',
+      description: 'The reporting page exports records for review.',
+      module: 'reporting'
     })
     const candidates = Array.from({ length: 25 }, (_, index) => {
       const record = addRecord(db, {
@@ -408,7 +305,7 @@ const testCrossEncoderTop20FlowsToOneBatchExplanation = async (): Promise<void> 
       })
       return sourceCandidate(record, 0.01 * (index + 1))
     })
-
+    const baseCard = buildRequirementSourceView(base)
     const crossEncoder: RequirementReranker = {
       modelId: 'requirement-v2-regression-cross-encoder',
       async rerank(_base, input) {
@@ -444,36 +341,25 @@ const testCrossEncoderTop20FlowsToOneBatchExplanation = async (): Promise<void> 
     const explanations = await explainRequirementMatches(model.client, request)
     const explanationByUid = new Map(explanations.items.map((item) => [item.recordUid, item]))
 
-    assert.equal(reranked.length, 25, 'Cross-Encoder must score the full hybrid candidate set')
-    assert.equal(top20.length, 20, 'only Cross-Encoder Top20 may enter V2 scoring')
-    assert.equal(scored.length, 20, 'Cross-Encoder Top20 must all reach deterministic scoring')
-    assert.equal(model.calls, 1, 'AI explanation must be exactly one batch call')
-    assert.equal(model.inputs[0]?.format !== undefined, true, 'batch explanation must use a structured response schema')
-    assert.equal(explanationCandidates.length, 10, 'only the top ten deterministic candidates may enter explanation')
-    assert.equal(explanations.items.length, 10, 'the one explanation batch must cover only the top ten candidates')
+    assert.equal(reranked.length, 25)
+    assert.equal(top20.length, 20)
+    assert.equal(scored.length, 20)
+    assert.equal(model.calls, 1)
+    assert.equal(model.inputs[0]?.format !== undefined, true)
+    assert.equal(explanationCandidates.length, 10)
+    assert.equal(explanations.items.length, 10)
     assert.equal(
       explanationCandidates.every((item) => explanationByUid.has(item.candidate.record.uid)),
-      true,
-      'each explained candidate must receive one explanation'
+      true
     )
     for (const item of explanationCandidates) {
       const explanation = explanationByUid.get(item.candidate.record.uid)
       assert.ok(explanation)
-      assert.equal('relation' in explanation, true, 'explanation must return a validated relation')
-      assert.equal('score' in explanation, false, 'explanation cannot return a score decision')
+      assert.equal('score' in explanation, false)
       assert.equal(explanation.relation, 'partial_overlap')
     }
     const explainedUids = new Set(explanationCandidates.map((item) => item.candidate.record.uid))
-    assert.equal(
-      scored.filter((item) => !explainedUids.has(item.candidate.record.uid)).length,
-      10,
-      'the ten candidates outside final-score Top10 must be deterministically scored but not explained'
-    )
-    assert.equal(
-      [...explainedUids].every((uid) => explanationByUid.has(uid)),
-      true,
-      'final-score Top10 must be fully covered by the explanation batch'
-    )
+    assert.equal(scored.filter((item) => !explainedUids.has(item.candidate.record.uid)).length, 10)
     assert.equal(candidateByUid.has(reranked[20]!.recordUid), true)
     assert.equal(scored.some((item) => item.candidate.record.uid === reranked[20]!.recordUid), false)
   })
@@ -495,48 +381,18 @@ const testFinalScoreIsNotCosine = async (): Promise<void> => {
       description: 'The reporting page exports records to CSV.',
       module: 'reporting'
     })
-    const baseCard = aiCard(base, { functionalObject: 'report export' })
+    const baseCard = buildRequirementSourceView(base)
     const candidate = sourceCandidate(candidateRecord, 0.99)
     const result = scoreRequirementCandidate(baseCard, candidate, {
       denseScore: 0.99,
       rerankerScore: 61,
       weights: rerankerOnlyWeights
     })
-
-    assert.equal(result.finalScore, 61, 'final score must come from deterministic business scoring')
+    assert.equal(result.finalScore, 61)
     assert.equal(result.relation, 'partial_overlap')
     assert.equal(result.dimensions.reranker, 61)
-    assert.equal(result.dimensions.dense, undefined, 'cosine/dense is not the final score dimension')
-    assert.notEqual(result.finalScore, candidate.denseScore, 'final score must not be the cosine value')
-  })
-}
-
-const testActionConflictDowngrades = async (): Promise<void> => {
-  await withDatabase(async (db) => {
-    const base = addRecord(db, {
-      uid: 'v2-action-base-uid',
-      itemId: 'V2-ACTION-BASE',
-      name: 'Action base fixture',
-      description: 'The reporting page adds a new export capability.',
-      module: 'reporting'
-    })
-    const candidate = addRecord(db, {
-      uid: 'v2-action-candidate-uid',
-      itemId: 'V2-ACTION-CANDIDATE',
-      name: 'Action candidate fixture',
-      description: 'The reporting page fixes an export defect.',
-      module: 'reporting'
-    })
-    const baseCard = aiCard(base, { action: 'add_capability', functionalObject: 'report export' })
-    const candidateCard = aiCard(candidate, { action: 'fix_defect', functionalObject: 'report export' })
-    const result = scoreRequirementCards(baseCard, candidateCard, {
-      dimensionScores: { behavior: 94 },
-      weights: behaviorOnlyWeights
-    })
-
-    assert.equal(result.relation, 'topic_only', 'conflicting actions must be downgraded')
-    assert.ok(result.finalScore <= 39, 'conflicting actions must cap the final score')
-    assert.ok(result.downgradeReasons.length > 0, 'the downgrade must remain diagnosable')
+    assert.equal(result.dimensions.dense, undefined)
+    assert.notEqual(result.finalScore, candidate.denseScore)
   })
 }
 
@@ -557,24 +413,21 @@ const testUidAndEvidenceValidation = async (): Promise<void> => {
       module: 'reporting'
     })
     const request = makeExplanationRequest(
-      aiCard(baseRecord, { functionalObject: 'report export' }),
+      buildRequirementSourceView(baseRecord),
       [sourceCandidate(candidateRecord)]
     )
     const validModel = createExplanationModel(validExplanationBody)
     const valid = await explainRequirementMatches(validModel.client, request)
     assert.equal(validModel.calls, 1)
-    assert.equal(valid.summary.length > 0, true, 'valid explanation must include a summary')
-    assert.deepEqual(valid.items.map((item) => item.recordUid), [candidateRecord.uid], 'valid UID must be retained')
-    assert.ok(valid.items[0]?.baseEvidence.includes('名称：'), 'base evidence must resolve to source text')
-    assert.ok(valid.items[0]?.candidateEvidence.includes('名称：'), 'candidate evidence must resolve to source text')
+    assert.ok(valid.summary.length > 0)
+    assert.deepEqual(valid.items.map((item) => item.recordUid), [candidateRecord.uid])
+    assert.ok(valid.items[0]?.baseEvidence.includes('名称：'))
+    assert.ok(valid.items[0]?.candidateEvidence.includes('名称：'))
 
     const unknownUid = tryParseRequirementMatchExplanationResponse(
       JSON.stringify({
         summary: valid.summary,
-        items: [{
-          ...valid.items[0],
-          recordUid: 'v2-unknown-returned-uid'
-        }]
+        items: [{ ...valid.items[0], recordUid: 'v2-unknown-returned-uid' }]
       }),
       request
     )
@@ -584,11 +437,7 @@ const testUidAndEvidenceValidation = async (): Promise<void> => {
     const invalidEvidence = tryParseRequirementMatchExplanationResponse(
       JSON.stringify({
         summary: valid.summary,
-        items: [{
-          ...valid.items[0],
-          baseEvidence: 'B999',
-          candidateEvidence: 'C999'
-        }]
+        items: [{ ...valid.items[0], baseEvidence: 'B999', candidateEvidence: 'C999' }]
       }),
       request
     )
@@ -614,65 +463,51 @@ const testMalformedExplanationKeepsDeterministicResult = async (): Promise<void>
       module: 'reporting'
     })
     const request = makeExplanationRequest(
-      aiCard(base, { functionalObject: 'report export' }),
+      buildRequirementSourceView(base),
       [sourceCandidate(candidateRecord)]
     )
     const deterministic = scoreRequirementCandidate(request.base, request.candidates[0]!, {
       rerankerScore: 61,
       weights: rerankerOnlyWeights
     })
-
     for (const body of ['not-json', '']) {
       const parsed = tryParseRequirementMatchExplanationResponse(body, request)
-      assert.equal(parsed.ok, false, `${body || 'empty'} explanation must be rejected as protocol input`)
-      if (!parsed.ok) {
-        assert.ok(['non_json', 'empty_body'].includes(parsed.error.code))
-      }
+      assert.equal(parsed.ok, false, `${body || 'empty'} explanation must be rejected`)
+      if (!parsed.ok) assert.ok(['non_json', 'empty_body'].includes(parsed.error.code))
     }
-    assert.equal(deterministic.relation, 'partial_overlap', 'fallback must retain deterministic relation')
-    assert.equal(deterministic.finalScore, 61, 'fallback must retain deterministic score')
+    assert.equal(deterministic.relation, 'partial_overlap')
+    assert.equal(deterministic.finalScore, 61)
   })
 }
 
-const testDuplicateQueryUsesCache = async (): Promise<void> => {
+const testRepeatedQueryRunsFreshExplanation = async (): Promise<void> => {
   await withDatabase(async (db) => {
     const base = addRecord(db, {
-      uid: 'v2-cache-base-uid',
-      itemId: 'V2-CACHE-BASE',
-      name: 'Cache base fixture',
-      description: 'The reporting page exports records for cache validation.',
+      uid: 'v2-repeat-base-uid',
+      itemId: 'V2-REPEAT-BASE',
+      name: 'Repeated query base fixture',
+      description: 'The reporting page exports records for repeated-query validation.',
       module: 'reporting'
     })
     const candidate = addRecord(db, {
-      uid: 'v2-cache-candidate-uid',
-      itemId: 'V2-CACHE-CANDIDATE',
-      name: 'Cache candidate fixture',
-      description: 'The reporting page exports records for cache validation.',
+      uid: 'v2-repeat-candidate-uid',
+      itemId: 'V2-REPEAT-CANDIDATE',
+      name: 'Repeated query candidate fixture',
+      description: 'The reporting page exports records for repeated-query validation.',
       module: 'reporting'
     })
-    const baseCard = aiCard(base, { functionalObject: 'report export' })
-    const candidateCard = aiCard(candidate, { functionalObject: 'report export' })
-    persistReadyCard(db, base, baseCard)
-    persistReadyCard(db, candidate, candidateCard)
+    const currentCandidate = (): HybridRequirementCandidate => {
+      const currentRecord = db.getRecord(candidate.uid, false)
+      assert.ok(currentRecord)
+      return sourceCandidate(currentRecord, 0.5)
+    }
     const deterministicReranker: RequirementReranker = {
-      modelId: 'v2-cache-reranker',
+      modelId: 'v2-repeat-reranker',
       async rerank(_base, input) {
         return input.map((item) => ({ recordUid: item.record.uid, score: 61 }))
       }
     }
     const model = createExplanationModel(validExplanationBody)
-    const currentCandidate = (): HybridRequirementCandidate => {
-      const currentRecord = db.getRecord(candidate.uid, false)
-      assert.ok(currentRecord)
-      const currentContentHash = db.getRecordContentHash(candidate.uid)
-      assert.ok(currentContentHash)
-      const currentCard = db.getReadyRequirementSemanticCard({
-        recordUid: candidate.uid,
-        contentHash: currentContentHash,
-        ...semanticContext
-      }) ?? buildRequirementSemanticCard(currentRecord)
-      return sourceCandidate(currentRecord, 0.5, currentCard)
-    }
     const agent = new RequirementAnalysisAgent(
       db,
       {} as import('../../src/main/knowledge').KnowledgeService,
@@ -685,55 +520,17 @@ const testDuplicateQueryUsesCache = async (): Promise<void> => {
           }
         },
         reranker: deterministicReranker,
-        modelClient: model.client,
-        semanticContext,
-        embeddingModelVersion: TEST_MODEL_VERSION,
-        matchModelSignature: TEST_MATCH_SIGNATURE
+        modelClient: model.client
       }
     )
-    const first = await agent.ask({ question: '分析需求编号 V2-CACHE-BASE' })
-    assert.equal(model.calls, 1, 'first query should use one batch explanation call')
-    assert.ok(first.sources.some((source) => source.itemId === 'V2-CACHE-CANDIDATE'))
-    const second = await agent.ask({ question: '分析需求编号 V2-CACHE-BASE' })
-    assert.equal(model.calls, 1, 'second identical query must use persistent verified cache with zero model calls')
-    assert.ok(second.sources.some((source) => source.itemId === 'V2-CACHE-CANDIDATE'))
-    const changedQuestion = await agent.ask({ question: '请分析需求编号 V2-CACHE-BASE' })
-    assert.equal(model.calls, 2, 'query hash changes must invalidate the explanation cache')
-    assert.ok(changedQuestion.sources.some((source) => source.itemId === 'V2-CACHE-CANDIDATE'))
-    const changedSignatureAgent = new RequirementAnalysisAgent(
-      db,
-      {} as import('../../src/main/knowledge').KnowledgeService,
-      settings,
-      undefined,
-      {
-        retriever: {
-          async retrieve(_base, excludedUids) {
-            return excludedUids.has(base.uid) ? [currentCandidate()] : []
-          }
-        },
-        reranker: deterministicReranker,
-        modelClient: model.client,
-        semanticContext,
-        embeddingModelVersion: TEST_MODEL_VERSION,
-        matchModelSignature: 'changed-match-signature'
-      }
-    )
-    await changedSignatureAgent.ask({ question: '分析需求编号 V2-CACHE-BASE' })
-    assert.equal(model.calls, 3, 'explanation model signature changes must invalidate the cache')
-    // The current match-cache contract tracks every stored source field.
-    // Even a normalizedText-only source change therefore invalidates it.
-    db.updateRecordNormalizedText(candidate.uid, `${candidate.normalizedText}\n纯元数据变化`)
-    await agent.ask({ question: '分析需求编号 V2-CACHE-BASE' })
-    assert.equal(model.calls, 4, 'normalizedText-only source changes must invalidate the cache')
-    addRecord(db, {
-      uid: candidate.uid,
-      itemId: candidate.itemId,
-      name: 'Cache candidate fixture changed',
-      description: 'The reporting page now exports records and status for cache validation.',
-      module: 'reporting'
-    })
-    await agent.ask({ question: '分析需求编号 V2-CACHE-BASE' })
-    assert.equal(model.calls, 5, 'candidate business content changes must invalidate the cache')
+    const first = await agent.ask({ question: '分析需求编号 V2-REPEAT-BASE' })
+    assert.equal(model.calls, 1)
+    assert.ok(first.sources.some((source) => source.itemId === 'V2-REPEAT-CANDIDATE'))
+    const second = await agent.ask({ question: '分析需求编号 V2-REPEAT-BASE' })
+    assert.equal(model.calls, 2, 'identical source query must run a fresh explanation batch')
+    assert.ok(second.sources.some((source) => source.itemId === 'V2-REPEAT-CANDIDATE'))
+    await agent.ask({ question: '请分析需求编号 V2-REPEAT-BASE' })
+    assert.equal(model.calls, 3, 'changed wording must run a fresh explanation batch')
   })
 }
 
@@ -756,9 +553,12 @@ const testExplanationPromptIsBounded = async (): Promise<void> => {
       })
       return sourceCandidate(record, 0.5)
     })
-    const input = buildRequirementMatchExplanationInput({ base: aiCard(base), candidates })
+    const input = buildRequirementMatchExplanationInput({
+      base: buildRequirementSourceView(base),
+      candidates
+    })
     const userMessage = input.messages.at(-1)?.content ?? ''
-    assert.ok(userMessage.length < 50_000, 'ten long candidates must fit the bounded explanation prompt')
+    assert.ok(userMessage.length < 50_000)
     assert.match(userMessage, /B001/)
     assert.match(userMessage, /C001/)
   })
@@ -767,13 +567,12 @@ const testExplanationPromptIsBounded = async (): Promise<void> => {
 type ContractTest = { name: string; run: () => Promise<void> }
 
 const tests: ContractTest[] = [
-  { name: 'hybrid recall keeps Dense/BM25 source-only and structured candidates', run: testHybridRecallDoesNotFilterSourceOnly },
-  { name: 'Cross-Encoder Top20 flows to one batch explanation without changing scores', run: testCrossEncoderTop20FlowsToOneBatchExplanation },
+  { name: 'hybrid recall keeps every current-index source-only record', run: testHybridRecallUsesFullCurrentIndex },
+  { name: 'Cross-Encoder Top20 flows to one batch explanation', run: testCrossEncoderTop20FlowsToOneBatchExplanation },
   { name: 'final score is not cosine', run: testFinalScoreIsNotCosine },
-  { name: 'conflicting actions downgrade conservatively', run: testActionConflictDowngrades },
   { name: 'UID and evidence validation fails closed', run: testUidAndEvidenceValidation },
   { name: 'malformed or empty explanation retains deterministic result', run: testMalformedExplanationKeepsDeterministicResult },
-  { name: 'duplicate query reuses conclusion cache', run: testDuplicateQueryUsesCache },
+  { name: 'repeated query runs a fresh source-only explanation', run: testRepeatedQueryRunsFreshExplanation },
   { name: 'batch explanation prompt stays within a bounded context', run: testExplanationPromptIsBounded }
 ]
 

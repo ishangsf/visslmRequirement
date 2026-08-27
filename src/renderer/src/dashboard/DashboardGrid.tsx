@@ -10,7 +10,7 @@ import { InfoCircleOutlined } from '@ant-design/icons'
 import 'react-grid-layout/css/styles.css'
 import 'react-resizable/css/styles.css'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { CSSProperties, Ref } from 'react'
+import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, Ref } from 'react'
 import type {
   DashboardComponentSpec,
   DashboardLayout,
@@ -110,7 +110,8 @@ const resizeHandle = (
     ref={ref}
     className={`dashboard-resize-handle react-resizable-handle-${axis}`}
     role="separator"
-    aria-label="调整组件大小"
+    tabIndex={0}
+    aria-label="调整组件大小，可使用方向键调整"
   />
 )
 
@@ -343,6 +344,46 @@ export function DashboardGrid({
           {components.map((component) => {
             const isDragging = !preview && activeDragId === component.id
             const isSwapTarget = !preview && swapTargetId === component.id
+            const handleWidgetKeyDown = (event: ReactKeyboardEvent<HTMLElement>): void => {
+              if (preview) return
+              if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault()
+                onSelect(component.id)
+                return
+              }
+              const isResizeHandle = event.target instanceof HTMLElement &&
+                Boolean(event.target.closest('.dashboard-resize-handle'))
+              const movement = event.shiftKey || isResizeHandle ? 0 : 1
+              const resize = event.shiftKey || isResizeHandle
+              if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return
+              event.preventDefault()
+              const profile = dashboardLayoutProfiles[component.type]
+              const next = { ...component.layout }
+              if (!resize) {
+                if (event.key === 'ArrowLeft') next.x -= movement
+                if (event.key === 'ArrowRight') next.x += movement
+                if (event.key === 'ArrowUp') next.y -= movement
+                if (event.key === 'ArrowDown') next.y += movement
+              } else {
+                if (event.key === 'ArrowLeft') next.w -= 1
+                if (event.key === 'ArrowRight') next.w += 1
+                if (event.key === 'ArrowUp') next.h -= 1
+                if (event.key === 'ArrowDown') next.h += 1
+                next.w = Math.max(profile.minimumWidth, next.w)
+                next.h = Math.max(profile.minimumHeight, next.h)
+              }
+              const errors = validateDashboardLayout(components, component.id, next)
+              if (errors.length) {
+                onInteractionError(errors[0])
+                return
+              }
+              onInteractionError('')
+              onSelect(component.id)
+              onLayoutCommit({
+                ...Object.fromEntries(components.map((item) => [item.id, item.layout])),
+                [component.id]: next
+              })
+            }
             return (
               <section
                 className={[
@@ -360,7 +401,12 @@ export function DashboardGrid({
                   '--dashboard-widget-padding': `${component.style?.padding ?? 9}px`,
                   borderRadius: component.style?.borderRadius
                 } as CSSProperties}
+                tabIndex={0}
+                role="button"
+                aria-label={`${component.title}，${component.type}组件`}
+                aria-current={!preview && selectedId === component.id ? 'true' : undefined}
                 onClick={() => !preview && onSelect(component.id)}
+                onKeyDown={handleWidgetKeyDown}
               >
                 <header>
                   <div>
@@ -372,7 +418,7 @@ export function DashboardGrid({
                       <button
                         type="button"
                         className="dashboard-provenance-button"
-                        aria-label={`鏌ョ湅${component.title}鏁版嵁鍙ｅ緞`}
+                        aria-label={`查看${component.title}数据口径`}
                         onClick={(event) => {
                           event.stopPropagation()
                           onProvenance(component)

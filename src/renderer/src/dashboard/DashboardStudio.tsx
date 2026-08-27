@@ -2,6 +2,8 @@ import {
   AppstoreOutlined,
   AuditOutlined,
   BgColorsOutlined,
+  CloseOutlined,
+  CopyOutlined,
   DeleteOutlined,
   DownloadOutlined,
   EditOutlined,
@@ -17,7 +19,8 @@ import {
   RobotOutlined,
   SafetyCertificateOutlined,
   SaveOutlined,
-  UndoOutlined
+  UndoOutlined,
+  UnorderedListOutlined
 } from '@ant-design/icons'
 import {
   App,
@@ -41,6 +44,7 @@ import {
   Space,
   Switch,
   Tag,
+  Tabs,
   Tooltip,
   Typography
 } from 'antd'
@@ -51,6 +55,7 @@ import type {
   PointerEvent as ReactPointerEvent
 } from 'react'
 import type {
+  DashboardAnalysisBlueprint,
   DashboardComponentSpec,
   DashboardComponentType,
   DashboardFilter,
@@ -65,6 +70,7 @@ import type {
   VisualizationRun
 } from '../../../shared/dashboard'
 import { compareDashboardSpecs } from '../../../shared/dashboard'
+import { automaticDashboardComponentTitle } from '../../../shared/dashboard-semantics'
 import type { DashboardStats } from '../../../shared/types'
 import type {
   FieldProfile,
@@ -80,6 +86,7 @@ import type {
 } from '../../../shared/query-spec'
 import {
   dashboardLayoutProfiles,
+  findFirstAvailableDashboardLayout,
   validateDashboardLayout
 } from '../../../shared/dashboard-layout'
 import {
@@ -87,6 +94,11 @@ import {
   analyzeDashboardExport
 } from '../../../shared/dashboard-governance'
 import { dashboardComponentRegistry } from './componentRegistry'
+import {
+  createDashboardComponentId,
+  createManualDashboardComponent,
+  planDashboardComponentRemoval
+} from './dashboardComponentFactory'
 import {
   dashboardComponentDataShape,
   planDashboardComponentTypeChange
@@ -114,15 +126,19 @@ const componentTypeIcons: Record<DashboardComponentType, string> = {
   gauge: '08',
   funnel: '09',
   radar: '10',
-  scatter: '11'
+  scatter: '11',
+  treemap: '12',
+  combo: '13'
 }
 
 const repairableQualityIssueCodes = new Set(['spec-validation', 'query-error'])
 
 const visualizationToolLabels: Record<VisualizationRun['toolCalls'][number]['tool'], string> = {
+  'plan-analysis': '业务分析规划',
   'profile-fields': '字段画像',
   'model-compose': '模型编排',
   'validate-dashboard': '结构校验',
+  'validate-semantics': '语义校验',
   'execute-query': '执行查询',
   'apply-patch': '应用修改',
   'repair-attempt': '自动修复'
@@ -253,6 +269,9 @@ const filterValueArray = (value: DashboardFilter['value']): string[] => {
 const cloneSpec = (spec: DashboardSpec): DashboardSpec =>
   JSON.parse(JSON.stringify(spec)) as DashboardSpec
 
+const cloneValue = <T,>(value: T): T =>
+  JSON.parse(JSON.stringify(value)) as T
+
 const cloneQuery = (query: QuerySpec): QuerySpec =>
   JSON.parse(JSON.stringify(query)) as QuerySpec
 
@@ -278,9 +297,9 @@ const nextFrame = (): Promise<void> =>
   new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
 
 const dashboardInspectorWidthStorageKey = 'visslm:dashboard-inspector-width:v1'
-const dashboardInspectorDefaultWidth = 200
-const dashboardInspectorMinimumWidth = 200
-const dashboardInspectorMaximumWidth = 420
+const dashboardInspectorDefaultWidth = 320
+const dashboardInspectorMinimumWidth = 280
+const dashboardInspectorMaximumWidth = 480
 
 const clampDashboardInspectorWidth = (value: number): number =>
   Math.min(
@@ -361,6 +380,13 @@ export function DashboardStudio({
   const [inspectorWidth, setInspectorWidth] = useState(readDashboardInspectorWidth)
   const inspectorWidthRef = useRef(inspectorWidth)
   const [interactionError, setInteractionError] = useState('')
+  const [libraryTab, setLibraryTab] = useState<'library' | 'outline'>('library')
+  const [libraryPanelOpen, setLibraryPanelOpen] = useState(false)
+  const [inspectorOpen, setInspectorOpen] = useState(false)
+  const [focusMode, setFocusMode] = useState(false)
+  const [librarySearch, setLibrarySearch] = useState('')
+  const [libraryCategory, setLibraryCategory] = useState<string>('全部')
+  const [addingComponentType, setAddingComponentType] = useState<DashboardComponentType | null>(null)
 
   useEffect(() => () => {
     inspectorResizeCleanupRef.current?.()
@@ -429,6 +455,31 @@ export function DashboardStudio({
     event.preventDefault()
     event.stopPropagation()
     applyInspectorWidth(inspectorWidthRef.current + delta, true)
+  }
+
+  const toggleLibraryPanel = (nextTab: 'library' | 'outline'): void => {
+    setFocusMode(false)
+    if ((studioBodyRef.current?.clientWidth ?? 0) < 1000) setInspectorOpen(false)
+    setLibraryTab(nextTab)
+    setLibraryPanelOpen((open) => (libraryTab === nextTab ? !open : true))
+  }
+
+  const toggleInspectorPanel = (): void => {
+    setFocusMode(false)
+    if ((studioBodyRef.current?.clientWidth ?? 0) < 1000) setLibraryPanelOpen(false)
+    setInspectorOpen((open) => !open)
+  }
+
+  const toggleFocusMode = (): void => {
+    setFocusMode((active) => !active)
+  }
+
+  const selectCanvasComponent = (componentId: string | null): void => {
+    setSelectedId(componentId)
+    if (componentId && !focusMode) {
+      if ((studioBodyRef.current?.clientWidth ?? 0) < 1000) setLibraryPanelOpen(false)
+      setInspectorOpen(true)
+    }
   }
 
   const restoreDraft = (spec: DashboardSpec): DashboardSpec => {
@@ -500,6 +551,17 @@ export function DashboardStudio({
     [dashboard, selectedId]
   )
 
+  const libraryDefinitions = useMemo(() => {
+    const normalizedSearch = librarySearch.trim().toLocaleLowerCase()
+    return dashboardComponentRegistry.filter((definition) => {
+      if (libraryCategory !== '全部' && definition.category !== libraryCategory) return false
+      if (!normalizedSearch) return true
+      return `${definition.name} ${definition.description} ${definition.type}`
+        .toLocaleLowerCase()
+        .includes(normalizedSearch)
+    })
+  }, [libraryCategory, librarySearch])
+
   const applyAgentDashboard = (nextDashboard: DashboardSpec, version?: number): void => {
     if (dashboard) setHistory((items) => [...items.slice(-29), cloneSpec(dashboard)])
     setDashboard(nextDashboard)
@@ -560,6 +622,115 @@ export function DashboardStudio({
     [provenanceComponent]
   )
 
+  /** Keep the semantic sidecar in lockstep with edits made in the query editor. */
+  const reconcileSemanticBinding = (
+    draft: DashboardSpec,
+    component: DashboardComponentSpec,
+    query: QuerySpec,
+    previousQuery?: QuerySpec
+  ): void => {
+    const blueprint = draft.analysisBlueprint
+    const binding = component.semanticBinding
+    if (!blueprint || !binding) return
+    const previousMeasures = previousQuery?.measures ?? []
+    const previousMetricIds = [...binding.metricIds]
+    const nextMetricIds = query.measures.map((measure, index) => {
+      const previousIndex = previousMeasures.findIndex((item) => item.id === measure.id)
+      const previousMetricId = previousMetricIds[previousIndex >= 0 ? previousIndex : index]
+      let metric = previousMetricId
+        ? blueprint.metrics.find((item) => item.id === previousMetricId)
+        : undefined
+      const metricMatches = metric &&
+        metric.measureId === measure.id &&
+        metric.aggregation === measure.aggregation &&
+        (metric.field ?? '') === (measure.field ?? '') &&
+        (metric.calculation ?? '') === (measure.calculation ?? '')
+      const referencedByAnotherComponent = previousMetricId
+        ? draft.components.some((item) =>
+            item.id !== component.id && item.semanticBinding?.metricIds.includes(previousMetricId)
+          )
+        : false
+      if (!metric || (referencedByAnotherComponent && !metricMatches)) {
+        const metricId = createDashboardComponentId(
+          `manual-sync-metric-${component.id}-${index + 1}`,
+          new Set(blueprint.metrics.map((item) => item.id))
+        )
+        metric = {
+          id: metricId,
+          label: measure.field
+            ? (fieldProfiles.find((profile) => profile.field === measure.field)?.displayName ?? measure.field)
+            : measure.id === 'record_count' ? '记录数' : measure.id,
+          measureId: measure.id,
+          aggregation: measure.aggregation,
+          source: 'user' as const,
+          confidence: 0.5
+        }
+        blueprint.metrics.push(metric)
+      }
+      metric.measureId = measure.id
+      metric.aggregation = measure.aggregation
+      metric.calculation = measure.calculation
+      if (measure.field) metric.field = measure.field
+      else delete metric.field
+      const profile = measure.field
+        ? fieldProfiles.find((item) => item.field === measure.field)
+        : undefined
+      metric.label = profile?.displayName ?? (measure.id === 'record_count' ? '记录数' : measure.id)
+      return metric.id
+    })
+    binding.metricIds = nextMetricIds
+    binding.dimensionFields = query.dimensions?.map((dimension) => dimension.field) ?? []
+    const activeTimeGrain = query.dimensions
+      ?.find((dimension) =>
+        binding.dimensionFields.includes(dimension.field) && Boolean(dimension.timeGrain)
+      )
+      ?.timeGrain
+    const existingQuestion = blueprint.questions.find((item) => item.id === binding.questionId)
+    const slotRole = component.slotRole ?? existingQuestion?.slotRole ?? 'diagnosis'
+    const questionChanged = !existingQuestion ||
+      JSON.stringify(existingQuestion.metricIds) !== JSON.stringify(nextMetricIds) ||
+      JSON.stringify(existingQuestion.dimensionFields) !== JSON.stringify(binding.dimensionFields) ||
+      existingQuestion.timeGrain !== activeTimeGrain ||
+      existingQuestion.slotRole !== slotRole ||
+      !existingQuestion.preferredComponentTypes.includes(component.type)
+    const questionSharedByAnotherComponent = draft.components.some((item) =>
+      item.id !== component.id && item.semanticBinding?.questionId === binding.questionId
+    )
+    if (!existingQuestion || (questionSharedByAnotherComponent && questionChanged)) {
+      const questionId = createDashboardComponentId(
+        `manual-sync-question-${component.id}`,
+        new Set(blueprint.questions.map((item) => item.id))
+      )
+      const nextQuestion: DashboardAnalysisBlueprint['questions'][number] = {
+        ...(existingQuestion ?? {
+          question: `${component.title}如何表现？`,
+          priority: blueprint.questions.length + 1
+        }),
+        id: questionId,
+        metricIds: [...nextMetricIds],
+        dimensionFields: [...binding.dimensionFields],
+        preferredComponentTypes: [component.type],
+        slotRole,
+        required: false
+      }
+      if (activeTimeGrain) nextQuestion.timeGrain = activeTimeGrain
+      else delete nextQuestion.timeGrain
+      blueprint.questions.push(nextQuestion)
+      binding.questionId = questionId
+    } else {
+      existingQuestion.metricIds = [...nextMetricIds]
+      existingQuestion.dimensionFields = [...binding.dimensionFields]
+      if (activeTimeGrain) existingQuestion.timeGrain = activeTimeGrain
+      else delete existingQuestion.timeGrain
+      existingQuestion.preferredComponentTypes = [component.type]
+      existingQuestion.slotRole = slotRole
+    }
+    if (binding.titleMode === 'auto') {
+      const automaticTitle = automaticDashboardComponentTitle(blueprint, component)
+      if (automaticTitle) component.title = automaticTitle
+    }
+  }
+
   const executeComponentQuery = async (
     query: QuerySpec,
     encodingPatch?: DashboardComponentSpec['encoding']
@@ -572,8 +743,10 @@ export function DashboardStudio({
       mutateDashboard((draft) => {
         const component = draft.components.find((item) => item.id === componentId)
         if (!component) return
+        const previousQuery = component.query
         component.query = query
         if (encodingPatch) component.encoding = { ...component.encoding, ...encodingPatch }
+        reconcileSemanticBinding(draft, component, query, previousQuery)
         component.data = queryDataPoints(component, dataset)
       })
     } catch (error) {
@@ -686,6 +859,150 @@ export function DashboardStudio({
     })
   }
 
+  const updateComponentTitle = (title: string): void => {
+    if (!selectedId) return
+    mutateDashboard((draft) => {
+      const component = draft.components.find((item) => item.id === selectedId)
+      if (!component) return
+      component.title = title
+      if (component.semanticBinding) {
+        component.semanticBinding = {
+          ...component.semanticBinding,
+          titleMode: 'custom',
+          titleTemplate: title
+        }
+      }
+    })
+  }
+
+  const restoreAutomaticComponentTitle = (): void => {
+    if (!dashboard || !selectedComponent?.semanticBinding || !dashboard.analysisBlueprint) {
+      message.info('当前组件没有可用的业务蓝图，暂时无法生成自动标题。')
+      return
+    }
+    const title = automaticDashboardComponentTitle(dashboard.analysisBlueprint, selectedComponent)
+    if (!title) {
+      message.info('当前组件的语义绑定没有可显示的指标。')
+      return
+    }
+    updateComponent({
+      title,
+      semanticBinding: {
+        ...selectedComponent.semanticBinding,
+        titleMode: 'auto',
+        titleTemplate: undefined
+      }
+    })
+  }
+
+  const addManualComponent = async (type: DashboardComponentType): Promise<void> => {
+    if (!dashboard || queryLoading) return
+    if (dashboard.components.length >= 10) {
+      message.warning('大屏最多保留 10 个组件。')
+      return
+    }
+    setAddingComponentType(type)
+    const plan = createManualDashboardComponent(dashboard, type, fieldProfiles)
+    if ('error' in plan) {
+      setAddingComponentType(null)
+      message.warning(plan.error)
+      return
+    }
+    setQueryLoading(true)
+    try {
+      const dataset = await window.visslm.executeQuery(plan.component.query!)
+      const hydratedComponent: DashboardComponentSpec = {
+        ...plan.component,
+        data: queryDataPoints(plan.component, dataset),
+        ...(plan.component.type === 'insight'
+          ? { insight: `当前数据范围匹配 ${dataset.matchedRows} 条记录。` }
+          : {})
+      }
+      mutateDashboard((draft) => {
+        if (draft.components.length >= 10) return
+        if (draft.components.some((component) => component.id === hydratedComponent.id)) return
+        draft.components = plan.components
+          ? plan.components.map((component) => component.id === hydratedComponent.id
+              ? hydratedComponent
+              : cloneValue(component))
+          : [...draft.components, hydratedComponent]
+        if (plan.analysisBlueprint) {
+          draft.analysisBlueprint = cloneValue(plan.analysisBlueprint)
+        }
+      })
+      setSelectedId(hydratedComponent.id)
+      message.success(`已添加${dashboardComponentRegistry.find((item) => item.type === type)?.name ?? '组件'}`)
+    } catch (error) {
+      message.error(`组件添加失败，画布未改变：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setQueryLoading(false)
+      setAddingComponentType(null)
+    }
+  }
+
+  const copySelectedComponent = (sourceComponent = selectedComponent): void => {
+    if (!dashboard || !sourceComponent || queryLoading) return
+    if (!sourceComponent.query) {
+      message.warning('该组件尚未绑定 QuerySpec，不能复制为可保存组件。')
+      return
+    }
+    if (dashboard.components.length >= 10) {
+      message.warning('大屏最多保留 10 个组件。')
+      return
+    }
+    const layout = findFirstAvailableDashboardLayout(dashboard.components, sourceComponent.type)
+    if (!layout) {
+      message.warning('画布没有满足副本最小尺寸的空位。')
+      return
+    }
+    const id = createDashboardComponentId(
+      `copy-${sourceComponent.type}`,
+      new Set(dashboard.components.map((component) => component.id))
+    )
+    const copy: DashboardComponentSpec = {
+      ...cloneValue(sourceComponent),
+      id,
+      title: `${sourceComponent.title}（副本）`,
+      layout,
+      query: cloneQuery(sourceComponent.query),
+      data: sourceComponent.data.map((item) => ({ ...item })),
+      ...(sourceComponent.semanticBinding ? {
+        semanticBinding: {
+          ...sourceComponent.semanticBinding,
+          titleMode: 'custom' as const,
+          titleTemplate: `${sourceComponent.title}（副本）`
+        }
+      } : {})
+    }
+    mutateDashboard((draft) => {
+      if (draft.components.length < 10) draft.components.push(copy)
+    })
+    setSelectedId(id)
+    message.success('已复制组件并自动放置到首个空位。')
+  }
+
+  const deleteComponent = (componentId = selectedId): void => {
+    if (!dashboard || !componentId) return
+    const removal = planDashboardComponentRemoval(dashboard, componentId)
+    if ('error' in removal) {
+      message.warning(removal.error)
+      return
+    }
+    const index = dashboard.components.findIndex((component) => component.id === componentId)
+    if (index < 0) return
+    const nextSelectedId = dashboard.components[index + 1]?.id
+      ?? dashboard.components[index - 1]?.id
+      ?? null
+    mutateDashboard((draft) => {
+      draft.components = removal.components.map((component) => cloneValue(component))
+      if (removal.analysisBlueprint) {
+        draft.analysisBlueprint = cloneValue(removal.analysisBlueprint)
+      }
+    })
+    if (selectedId === componentId) setSelectedId(nextSelectedId)
+    message.success('已删除组件，可使用撤销恢复。')
+  }
+
   const changeComponentType = async (type: DashboardComponentType): Promise<void> => {
     if (!dashboard || !selectedComponent || queryLoading || selectedComponent.type === type) return
     const componentId = selectedComponent.id
@@ -699,24 +1016,43 @@ export function DashboardStudio({
       message.warning(plan.error)
       return
     }
-    if (!plan.refreshData || !plan.component.query) {
+    const targetDefinition = dashboardComponentRegistry.find((item) => item.type === type)
+    const currentSlotRole = selectedComponent.slotRole
+    const plannedSlotRole = currentSlotRole && targetDefinition?.compatibleSlotRoles.includes(currentSlotRole)
+      ? currentSlotRole
+      : targetDefinition?.compatibleSlotRoles[0]
+    const plannedComponent: DashboardComponentSpec = {
+      ...plan.component,
+      ...(plannedSlotRole ? { slotRole: plannedSlotRole } : {})
+    }
+    if (!plan.refreshData || !plannedComponent.query) {
       mutateDashboard((draft) => {
         const index = draft.components.findIndex((component) => component.id === componentId)
-        if (index >= 0) draft.components[index] = plan.component
+        if (index < 0) return
+        const previousQuery = draft.components[index].query
+        draft.components[index] = plannedComponent
+        if (plannedComponent.query) {
+          reconcileSemanticBinding(draft, plannedComponent, plannedComponent.query, previousQuery)
+        }
       })
       return
     }
 
     setQueryLoading(true)
     try {
-      const dataset = await window.visslm.executeQuery(plan.component.query)
+      const dataset = await window.visslm.executeQuery(plannedComponent.query)
       const nextComponent: DashboardComponentSpec = {
-        ...plan.component,
-        data: queryDataPoints(plan.component, dataset)
+        ...plannedComponent,
+        data: queryDataPoints(plannedComponent, dataset)
       }
       mutateDashboard((draft) => {
         const index = draft.components.findIndex((component) => component.id === componentId)
-        if (index >= 0) draft.components[index] = nextComponent
+        if (index < 0) return
+        const previousQuery = draft.components[index].query
+        draft.components[index] = nextComponent
+        if (nextComponent.query) {
+          reconcileSemanticBinding(draft, nextComponent, nextComponent.query, previousQuery)
+        }
       })
     } catch (error) {
       message.error(`图表类型切换失败，已保留原组件：${error instanceof Error ? error.message : String(error)}`)
@@ -1758,9 +2094,9 @@ export function DashboardStudio({
   const renderComponentStyleEditor = (component: DashboardComponentSpec): React.JSX.Element => {
     const style = component.style ?? {}
     const isValueComponent = ['kpi', 'progress', 'gauge'].includes(component.type)
-    const supportsLegend = ['bar', 'line', 'pie', 'funnel', 'radar'].includes(component.type)
-    const supportsGrid = ['bar', 'line', 'scatter'].includes(component.type)
-    const supportsLineWidth = ['line', 'radar'].includes(component.type)
+    const supportsLegend = ['bar', 'line', 'pie', 'funnel', 'radar', 'combo'].includes(component.type)
+    const supportsGrid = ['bar', 'line', 'scatter', 'combo'].includes(component.type)
+    const supportsLineWidth = ['line', 'radar', 'combo'].includes(component.type)
     const supportsOrientation = ['bar', 'funnel'].includes(component.type)
 
     return (
@@ -2053,7 +2389,7 @@ export function DashboardStudio({
         theme={dashboard?.theme ?? 'technology-dark'}
         preview={preview}
         selectedId={selectedId}
-        onSelect={setSelectedId}
+        onSelect={selectCanvasComponent}
         onProvenance={setProvenanceComponent}
         onLayoutCommit={commitCanvasLayout}
         onInteractionError={setInteractionError}
@@ -2068,47 +2404,54 @@ export function DashboardStudio({
       captureMode ? 'dashboard-capture-mode' : ''
     ].filter(Boolean).join(' ')}>
       <div className="dashboard-studio-toolbar">
-        <div>
-          <div className="dashboard-studio-heading">
-            <RobotOutlined />
-            <span>数据可视化专家工作台</span>
-            <Tag color={currentVersion ? 'blue' : 'default'}>
-              {currentVersion ? `V${currentVersion}` : '未保存'}
-            </Tag>
-            {draftSavedAt && (
-              <Tooltip title={`本地草稿已于 ${new Date(draftSavedAt).toLocaleTimeString('zh-CN')} 自动保存`}>
-                <Tag color="cyan">草稿</Tag>
-              </Tooltip>
-            )}
+        <div className="dashboard-studio-context">
+          <div className="dashboard-studio-copy">
+            <div className="dashboard-studio-heading">
+              <RobotOutlined />
+              <span>数据可视化专家工作台</span>
+              <Tag color={currentVersion ? 'blue' : 'default'}>
+                {currentVersion ? `V${currentVersion}` : '未保存'}
+              </Tag>
+              {draftSavedAt && (
+                <Tooltip title={`本地草稿已于 ${new Date(draftSavedAt).toLocaleTimeString('zh-CN')} 自动保存`}>
+                  <Tag color="cyan">草稿</Tag>
+                </Tooltip>
+              )}
+            </div>
+            <Text type="secondary">结构化画布 · 本地版本 · 可追溯导出</Text>
           </div>
-          <Text type="secondary">结构化画布 · 本地版本 · 可追溯导出</Text>
+          <Select
+            aria-label="打开已保存大屏"
+            className="dashboard-toolbar-selector dashboard-selector"
+            value={currentVersion ? dashboard?.id : undefined}
+            placeholder={`已保存大屏 ${dashboards.length}`}
+            popupMatchSelectWidth={280}
+            options={dashboards.map((item) => ({
+              value: item.id,
+              label: `${item.title} · V${item.currentVersion}`
+            }))}
+            onChange={(id) => void openDashboard(id)}
+          />
         </div>
         <div className="dashboard-studio-actions">
-          <Segmented
+          <Select
+            aria-label="大屏主题"
+            className="dashboard-theme-select"
             value={dashboard?.theme}
             onChange={(value) => mutateDashboard((draft) => {
               draft.theme = value as DashboardThemeId
             })}
+            suffixIcon={<BgColorsOutlined />}
             options={[
-              { label: '深色科技', value: 'technology-dark', icon: <BgColorsOutlined /> },
-              { label: '明亮商务', value: 'business-light', icon: <AppstoreOutlined /> },
-              { label: '深色稳重', value: 'charcoal-dark', icon: <BgColorsOutlined /> },
-              { label: '明亮简洁', value: 'minimal-light', icon: <AppstoreOutlined /> }
+              { label: '深色科技', value: 'technology-dark' },
+              { label: '明亮商务', value: 'business-light' },
+              { label: '深色稳重', value: 'charcoal-dark' },
+              { label: '明亮简洁', value: 'minimal-light' }
             ]}
           />
           <Tooltip title="撤销本次编辑">
-            <Button icon={<UndoOutlined />} disabled={!history.length} onClick={undo} />
+            <Button aria-label="撤销本次编辑" icon={<UndoOutlined />} disabled={!history.length} onClick={undo} />
           </Tooltip>
-          <Tooltip title="清除本地草稿">
-            <Button icon={<DeleteOutlined />} disabled={!draftSavedAt} onClick={discardDraft} />
-          </Tooltip>
-          <Button
-            icon={<SafetyCertificateOutlined />}
-            loading={diagnosing}
-            onClick={() => void openQuality()}
-          >
-            质量
-          </Button>
           <Button
             icon={<MessageOutlined />}
             onClick={() => setAiOpen(true)}
@@ -2116,12 +2459,27 @@ export function DashboardStudio({
           >
             AI 修改
           </Button>
-          <Button icon={<HistoryOutlined />} disabled={!currentVersion} onClick={() => void openHistory()}>
-            版本
-          </Button>
-          <Button icon={<AuditOutlined />} onClick={() => void openAudit()}>
-            审计
-          </Button>
+          <Dropdown.Button
+            className="dashboard-check-menu"
+            loading={diagnosing}
+            onClick={() => void openQuality()}
+            menu={{
+              items: [
+                { key: 'version', label: '版本历史', icon: <HistoryOutlined />, disabled: !currentVersion },
+                { key: 'audit', label: '操作审计', icon: <AuditOutlined /> },
+                { type: 'divider' },
+                { key: 'discard', label: '清除本地草稿', icon: <DeleteOutlined />, danger: true, disabled: !draftSavedAt }
+              ],
+              onClick: ({ key }) => {
+                if (key === 'version') void openHistory()
+                if (key === 'audit') void openAudit()
+                if (key === 'discard') discardDraft()
+              }
+            }}
+          >
+            <SafetyCertificateOutlined />
+            检查
+          </Dropdown.Button>
           <Button icon={<FullscreenOutlined />} onClick={() => setPreviewOpen(true)}>预览</Button>
           <Dropdown
             trigger={['click']}
@@ -2155,52 +2513,217 @@ export function DashboardStudio({
 
       <div
         ref={studioBodyRef}
-        className="dashboard-studio-body"
+        className={[
+          'dashboard-studio-body',
+          libraryPanelOpen ? 'is-library-open' : '',
+          inspectorOpen ? 'is-inspector-open' : '',
+          focusMode ? 'is-focus-mode' : ''
+        ].filter(Boolean).join(' ')}
         style={{ '--dashboard-inspector-width': `${inspectorWidth}px` } as CSSProperties}
       >
-        <aside className="dashboard-library">
-          <div className="dashboard-panel-title">
-            <span>已保存大屏</span>
-            <small>{dashboards.length} 个</small>
+        <nav className="dashboard-workbench-rail" aria-label="大屏工作台工具">
+          <Tooltip placement="right" title="组件库">
+            <button
+              type="button"
+              className={libraryPanelOpen && libraryTab === 'library' && !focusMode ? 'active' : ''}
+              aria-label="打开组件库"
+              aria-pressed={libraryPanelOpen && libraryTab === 'library' && !focusMode}
+              onClick={() => toggleLibraryPanel('library')}
+            >
+              <AppstoreOutlined />
+              <span>组件</span>
+            </button>
+          </Tooltip>
+          <Tooltip placement="right" title="页面大纲">
+            <button
+              type="button"
+              className={libraryPanelOpen && libraryTab === 'outline' && !focusMode ? 'active' : ''}
+              aria-label="打开页面大纲"
+              aria-pressed={libraryPanelOpen && libraryTab === 'outline' && !focusMode}
+              onClick={() => toggleLibraryPanel('outline')}
+            >
+              <UnorderedListOutlined />
+              <span>大纲</span>
+            </button>
+          </Tooltip>
+          <Tooltip placement="right" title="属性面板">
+            <button
+              type="button"
+              className={inspectorOpen && !focusMode ? 'active' : ''}
+              aria-label="切换属性面板"
+              aria-pressed={inspectorOpen && !focusMode}
+              onClick={toggleInspectorPanel}
+            >
+              <EditOutlined />
+              <span>属性</span>
+            </button>
+          </Tooltip>
+          <span className="dashboard-workbench-rail-spacer" />
+          <Tooltip placement="right" title={focusMode ? '退出专注编辑' : '专注编辑'}>
+            <button
+              type="button"
+              className={focusMode ? 'active' : ''}
+              aria-label={focusMode ? '退出专注编辑' : '进入专注编辑'}
+              aria-pressed={focusMode}
+              onClick={toggleFocusMode}
+            >
+              <FullscreenOutlined />
+              <span>专注</span>
+            </button>
+          </Tooltip>
+        </nav>
+
+        <aside
+          className="dashboard-library"
+          aria-hidden={!libraryPanelOpen || focusMode}
+          inert={libraryPanelOpen && !focusMode ? undefined : true}
+        >
+          <div className="dashboard-panel-header">
+            <div className="dashboard-panel-title">
+              <span>{libraryTab === 'library' ? '组件库' : '页面大纲'}</span>
+              <small>{libraryTab === 'library' ? `${libraryDefinitions.length} 类` : `${dashboard?.components.length ?? 0} / 10`}</small>
+            </div>
+            <Button
+              type="text"
+              size="small"
+              icon={<CloseOutlined />}
+              aria-label="关闭左侧面板"
+              onClick={() => setLibraryPanelOpen(false)}
+            />
           </div>
-          <Select
-            className="dashboard-selector"
-            value={currentVersion ? dashboard?.id : undefined}
-            placeholder="打开大屏"
-            options={dashboards.map((item) => ({
-              value: item.id,
-              label: `${item.title} · V${item.currentVersion}`
-            }))}
-            onChange={(id) => void openDashboard(id)}
+          <Tabs
+            className="dashboard-library-tabs"
+            activeKey={libraryTab}
+            onChange={(key) => setLibraryTab(key as 'library' | 'outline')}
+            items={[
+              {
+                key: 'library',
+                label: '组件库',
+                children: (
+                  <div className="dashboard-component-library">
+                    <Input.Search
+                      aria-label="搜索组件库"
+                      placeholder="搜索组件"
+                      allowClear
+                      value={librarySearch}
+                      onChange={(event) => setLibrarySearch(event.target.value)}
+                    />
+                    <Select
+                      aria-label="组件分类"
+                      className="dashboard-component-category"
+                      value={libraryCategory}
+                      options={[
+                        { value: '全部', label: '全部分类' },
+                        ...Array.from(new Set(dashboardComponentRegistry.map((item) => item.category)))
+                          .map((category) => ({ value: category, label: category }))
+                      ]}
+                      onChange={setLibraryCategory}
+                    />
+                    <div className="dashboard-component-library-list">
+                      {libraryDefinitions.map((definition) => (
+                        <button
+                          type="button"
+                          key={definition.type}
+                          className="dashboard-component-library-card"
+                          disabled={queryLoading || !dashboard || Boolean(addingComponentType)}
+                          aria-label={`添加${definition.name}：${definition.description}`}
+                          onClick={() => void addManualComponent(definition.type)}
+                        >
+                          <span className="dashboard-component-icon">{componentTypeIcons[definition.type]}</span>
+                          <span className="dashboard-component-library-card-copy">
+                            <strong>{definition.name}</strong>
+                            <small>{definition.description}</small>
+                            <em>{definition.preferredSize.w}×{definition.preferredSize.h} · {definition.category}</em>
+                          </span>
+                          <PlusOutlined className="dashboard-component-library-add" />
+                        </button>
+                      ))}
+                      {!libraryDefinitions.length && <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="没有匹配组件" />}
+                    </div>
+                    <div className="dashboard-component-help">
+                      <strong>安全添加</strong>
+                      <p>点击卡片或按 Enter / Space 执行查询，成功后才会写入画布。</p>
+                      <span>{dashboard?.components.length ?? 0} / 10 个组件</span>
+                    </div>
+                  </div>
+                )
+              },
+              {
+                key: 'outline',
+                label: `页面大纲 ${dashboard?.components.length ?? 0}`,
+                children: (
+                  <div className="dashboard-component-outline">
+                    <div className="dashboard-panel-title dashboard-outline-title">
+                      <span>页面大纲</span>
+                      <small>{dashboard?.components.length ?? 0} / 10</small>
+                    </div>
+                    <div className="dashboard-component-list">
+                      {dashboard?.components.map((component) => (
+                        <div
+                          className={`dashboard-component-outline-row ${selectedId === component.id ? 'selected' : ''}`}
+                          key={component.id}
+                        >
+                          <button
+                            type="button"
+                            className="dashboard-component-outline-select"
+                            aria-label={`选择${component.title}`}
+                            onClick={() => selectCanvasComponent(component.id)}
+                          >
+                            <span className="dashboard-component-icon">{componentTypeIcons[component.type]}</span>
+                            <span>
+                              <strong>{component.title}</strong>
+                              <small>{dashboardComponentRegistry.find((item) => item.type === component.type)?.name}</small>
+                            </span>
+                          </button>
+                          <span className="dashboard-component-outline-actions">
+                            <Tooltip title="复制组件">
+                              <Button
+                                type="text"
+                                size="small"
+                                icon={<CopyOutlined />}
+                                aria-label={`复制${component.title}`}
+                                disabled={queryLoading || !component.query || (dashboard?.components.length ?? 0) >= 10}
+                                onClick={(event) => {
+                                  event.stopPropagation()
+                                  setSelectedId(component.id)
+                                  copySelectedComponent(component)
+                                }}
+                              />
+                            </Tooltip>
+                            <Tooltip title={dashboard?.components.length === 1 ? '至少保留一个组件' : '删除组件'}>
+                              <Button
+                                type="text"
+                                danger
+                                size="small"
+                                icon={<DeleteOutlined />}
+                                aria-label={`删除${component.title}`}
+                                disabled={queryLoading || dashboard?.components.length === 1}
+                                onClick={(event) => {
+                                  event.stopPropagation()
+                                  deleteComponent(component.id)
+                                }}
+                              />
+                            </Tooltip>
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )
+              }
+            ]}
           />
-          <Divider />
-          <div className="dashboard-panel-title">
-            <span>看板组件</span>
-            <small>{dashboard?.components.length ?? 0} 个</small>
-          </div>
-          <div className="dashboard-component-list">
-            {dashboard?.components.map((component) => (
-              <button
-                type="button"
-                key={component.id}
-                className={selectedId === component.id ? 'selected' : ''}
-                onClick={() => setSelectedId(component.id)}
-              >
-                <span className="dashboard-component-icon">{componentTypeIcons[component.type]}</span>
-                <span>
-                  <strong>{component.title}</strong>
-                  <small>{dashboardComponentRegistry.find((item) => item.type === component.type)?.name}</small>
-                </span>
-              </button>
-            ))}
-          </div>
         </aside>
 
         <main className={`dashboard-preview-shell theme-${dashboard?.theme ?? 'technology-dark'}`}>
           {!dashboard ? <div className="dashboard-loading"><Skeleton active paragraph={{ rows: 8 }} /></div> : renderCanvas()}
         </main>
 
-        <aside className="dashboard-inspector">
+        <aside
+          className="dashboard-inspector"
+          aria-hidden={!inspectorOpen || focusMode}
+          inert={inspectorOpen && !focusMode ? undefined : true}
+        >
           <div
             className="dashboard-inspector-resizer"
             role="separator"
@@ -2214,110 +2737,269 @@ export function DashboardStudio({
             onPointerDown={beginInspectorResize}
             onKeyDown={adjustInspectorWidthByKeyboard}
           />
-          <div className="dashboard-inspector-scroll">
-          <div className="dashboard-panel-title">
-            <span><EditOutlined /> {selectedComponent ? '组件属性' : '大屏属性'}</span>
-            <small>{selectedComponent?.id ?? '未选择组件'}</small>
-          </div>
-          {!selectedComponent && dashboard && (
-            <>
-              <section className="dashboard-dashboard-info-editor" aria-label="大屏信息编辑">
-                <div className="dashboard-query-section-header">
-                  <strong>大屏信息</strong>
-                  <Text type="secondary">点击组件可切换到组件属性</Text>
-                </div>
-                <label htmlFor="dashboard-title-editor">主标题</label>
-                <Input
-                  id="dashboard-title-editor"
-                  aria-label="大屏主标题"
-                  value={dashboard.title}
-                  placeholder="输入大屏主标题"
-                  onChange={(event) => mutateDashboard((draft) => {
-                    draft.title = event.target.value
-                  })}
-                />
-                <label htmlFor="dashboard-subtitle-editor">副标题</label>
-                <Input
-                  id="dashboard-subtitle-editor"
-                  aria-label="大屏副标题"
-                  value={dashboard.subtitle}
-                  placeholder="输入大屏副标题"
-                  onChange={(event) => mutateDashboard((draft) => {
-                    draft.subtitle = event.target.value
-                  })}
-                />
-              </section>
-              {renderGlobalFilterEditor()}
-            </>
-          )}
-          {selectedComponent && (
-            <div className="dashboard-inspector-form">
-              <label>组件标题</label>
-              <Input
-                value={selectedComponent.title}
-                onChange={(event) => updateComponent({ title: event.target.value })}
-              />
-              <label>副标题</label>
-              <Input
-                value={selectedComponent.subtitle}
-                onChange={(event) => updateComponent({ subtitle: event.target.value })}
-              />
-              <label>图表类型</label>
-              <Select
-                value={selectedComponent.type}
-                options={dashboardComponentRegistry.map((item) => ({
-                  value: item.type,
-                  label: item.name
-                }))}
-                disabled={queryLoading}
-                onChange={(type) => void changeComponentType(type)}
-              />
-              {['kpi', 'progress', 'gauge'].includes(selectedComponent.type) && (
-                <>
-                  <label>单位</label>
-                  <Input
-                    value={selectedComponent.unit}
-                    placeholder="条、个、%"
-                    onChange={(event) => updateComponent({ unit: event.target.value })}
-                  />
-                </>
-              )}
-              {selectedComponent.type === 'insight' && (
-                <>
-                  <label>洞察内容</label>
-                  <Input.TextArea
-                    value={selectedComponent.insight}
-                    autoSize={{ minRows: 3, maxRows: 6 }}
-                    onChange={(event) => updateComponent({ insight: event.target.value })}
-                  />
-                </>
-              )}
-              {renderComponentDataEditor(selectedComponent)}
-              {renderComponentStyleEditor(selectedComponent)}
-              <Divider>24 列网格</Divider>
-              <div className="dashboard-layout-inputs">
-                {(['x', 'y', 'w', 'h'] as const).map((field) => (
-                  <label key={field}>
-                    <span>{field.toUpperCase()}</span>
-                    <InputNumber
-                      min={field === 'w'
-                        ? dashboardLayoutProfiles[selectedComponent.type].minimumWidth
-                        : field === 'h'
-                          ? dashboardLayoutProfiles[selectedComponent.type].minimumHeight
-                          : 0}
-                      max={field === 'x' || field === 'w' ? 24 : 20}
-                      value={selectedComponent.layout[field]}
-                      onChange={(value) => updateLayout(field, value)}
-                    />
-                  </label>
-                ))}
-              </div>
-              <Text type="secondary">
-                保存前会检查组件越界、重叠、查询字段与图表编码。
-              </Text>
-              {selectedComponent.query && renderQueryEditor(selectedComponent.query)}
+          <div className="dashboard-panel-header dashboard-inspector-header">
+            <div className="dashboard-panel-title">
+              <span><EditOutlined /> {selectedComponent ? '组件属性' : '大屏属性'}</span>
+              <small title={selectedComponent?.id ?? '未选择组件'}>
+                {selectedComponent?.id ?? '未选择组件'}
+              </small>
             </div>
-          )}
+            <div className="dashboard-inspector-header-actions">
+              {selectedComponent && (
+                <>
+                  <Tooltip title="复制组件">
+                    <Button
+                      type="text"
+                      size="small"
+                      icon={<CopyOutlined />}
+                      aria-label="复制当前组件"
+                      disabled={queryLoading || !selectedComponent.query || (dashboard?.components.length ?? 0) >= 10}
+                      onClick={() => copySelectedComponent()}
+                    />
+                  </Tooltip>
+                  <Popconfirm
+                    title="删除此组件？"
+                    description="删除后可用撤销恢复。"
+                    okText="删除"
+                    cancelText="取消"
+                    onConfirm={() => deleteComponent()}
+                  >
+                    <Tooltip title={dashboard?.components.length === 1 ? '至少保留一个组件' : '删除组件'}>
+                      <Button
+                        type="text"
+                        danger
+                        size="small"
+                        icon={<DeleteOutlined />}
+                        aria-label="删除当前组件"
+                        disabled={queryLoading || dashboard?.components.length === 1}
+                      />
+                    </Tooltip>
+                  </Popconfirm>
+                </>
+              )}
+              <Button
+                type="text"
+                size="small"
+                icon={<CloseOutlined />}
+                aria-label="关闭属性面板"
+                onClick={() => setInspectorOpen(false)}
+              />
+            </div>
+          </div>
+          <div className="dashboard-inspector-scroll">
+            {!selectedComponent && dashboard && (
+              <Collapse
+                className="dashboard-inspector-groups"
+                bordered={false}
+                defaultActiveKey={['dashboard-info', 'global-filter']}
+                items={[
+                  {
+                    key: 'dashboard-info',
+                    label: (
+                      <span className="dashboard-inspector-group-label">
+                        <strong>大屏信息</strong>
+                        <small>标题与说明</small>
+                      </span>
+                    ),
+                    children: (
+                      <section className="dashboard-dashboard-info-editor" aria-label="大屏信息编辑">
+                        <Text type="secondary">点击组件可切换到组件属性</Text>
+                        <label htmlFor="dashboard-title-editor">主标题</label>
+                        <Input
+                          id="dashboard-title-editor"
+                          aria-label="大屏主标题"
+                          value={dashboard.title}
+                          placeholder="输入大屏主标题"
+                          onChange={(event) => mutateDashboard((draft) => {
+                            draft.title = event.target.value
+                          })}
+                        />
+                        <label htmlFor="dashboard-subtitle-editor">副标题</label>
+                        <Input
+                          id="dashboard-subtitle-editor"
+                          aria-label="大屏副标题"
+                          value={dashboard.subtitle}
+                          placeholder="输入大屏副标题"
+                          onChange={(event) => mutateDashboard((draft) => {
+                            draft.subtitle = event.target.value
+                          })}
+                        />
+                      </section>
+                    )
+                  },
+                  {
+                    key: 'global-filter',
+                    label: (
+                      <span className="dashboard-inspector-group-label">
+                        <strong>全局筛选</strong>
+                        <small>{dashboard.globalFilters?.length ?? 0} 项</small>
+                      </span>
+                    ),
+                    children: renderGlobalFilterEditor()
+                  }
+                ]}
+              />
+            )}
+            {selectedComponent && (
+              <Collapse
+                className="dashboard-inspector-groups"
+                bordered={false}
+                defaultActiveKey={['basic', 'data', 'layout-query']}
+                items={[
+                  {
+                    key: 'basic',
+                    label: (
+                      <span className="dashboard-inspector-group-label">
+                        <strong>基础信息</strong>
+                        <small>标题与类型</small>
+                      </span>
+                    ),
+                    children: (
+                      <div className="dashboard-inspector-form">
+                        <div className="dashboard-inspector-field-header">
+                          <label htmlFor="dashboard-component-title-editor">组件标题</label>
+                          {selectedComponent.semanticBinding && (
+                            <Tag color={selectedComponent.semanticBinding.titleMode === 'auto' ? 'processing' : 'default'}>
+                              {selectedComponent.semanticBinding.titleMode === 'auto' ? '自动标题' : '自定义标题'}
+                            </Tag>
+                          )}
+                        </div>
+                        <div className="dashboard-component-title-actions">
+                          <Input
+                            id="dashboard-component-title-editor"
+                            aria-label="组件标题"
+                            value={selectedComponent.title}
+                            onChange={(event) => updateComponentTitle(event.target.value)}
+                          />
+                          <Tooltip title={dashboard?.analysisBlueprint ? '根据业务问题和指标恢复自动标题' : '当前大屏没有业务蓝图'}>
+                            <Button
+                              type="text"
+                              size="small"
+                              disabled={!dashboard?.analysisBlueprint || !selectedComponent.semanticBinding}
+                              onClick={restoreAutomaticComponentTitle}
+                            >
+                              自动
+                            </Button>
+                          </Tooltip>
+                        </div>
+                        {selectedComponent.semanticBinding && (
+                          <section className="dashboard-semantic-binding" aria-label="组件指标绑定">
+                            <div className="dashboard-semantic-binding-header">
+                              <strong>业务绑定</strong>
+                              <Tag>{selectedComponent.slotRole ?? '未分配槽位'}</Tag>
+                            </div>
+                            <Text type="secondary">
+                              {dashboard?.analysisBlueprint?.questions.find((question) =>
+                                question.id === selectedComponent.semanticBinding?.questionId
+                              )?.question ?? '当前组件保留了语义绑定；建立业务蓝图后可继续校验。'}
+                            </Text>
+                            <small>
+                              指标：{selectedComponent.semanticBinding.metricIds.map((metricId) =>
+                                dashboard?.analysisBlueprint?.metrics.find((metric) => metric.id === metricId)?.label ?? metricId
+                              ).join('、') || '未指定'}
+                            </small>
+                            {selectedComponent.semanticBinding.titleMode === 'custom' && (
+                              <small className="dashboard-semantic-binding-hint">
+                                自定义标题不会随指标变化自动更新；编辑查询字段或聚合方式时，绑定定义会同步校正。
+                              </small>
+                            )}
+                          </section>
+                        )}
+                        <label>副标题</label>
+                        <Input
+                          value={selectedComponent.subtitle}
+                          onChange={(event) => updateComponent({ subtitle: event.target.value })}
+                        />
+                        <label>图表类型</label>
+                        <Select
+                          value={selectedComponent.type}
+                          options={dashboardComponentRegistry.map((item) => ({
+                            value: item.type,
+                            label: item.name
+                          }))}
+                          disabled={queryLoading}
+                          onChange={(type) => void changeComponentType(type)}
+                        />
+                        {['kpi', 'progress', 'gauge'].includes(selectedComponent.type) && (
+                          <>
+                            <label>单位</label>
+                            <Input
+                              value={selectedComponent.unit}
+                              placeholder="条、个、%"
+                              onChange={(event) => updateComponent({ unit: event.target.value })}
+                            />
+                          </>
+                        )}
+                        {selectedComponent.type === 'insight' && (
+                          <>
+                            <label>洞察内容</label>
+                            <Input.TextArea
+                              value={selectedComponent.insight}
+                              autoSize={{ minRows: 3, maxRows: 6 }}
+                              onChange={(event) => updateComponent({ insight: event.target.value })}
+                            />
+                          </>
+                        )}
+                      </div>
+                    )
+                  },
+                  {
+                    key: 'data',
+                    label: (
+                      <span className="dashboard-inspector-group-label">
+                        <strong>数据与业务绑定</strong>
+                        <small>{selectedComponent.query ? '已连接' : '待配置'}</small>
+                      </span>
+                    ),
+                    children: renderComponentDataEditor(selectedComponent)
+                  },
+                  {
+                    key: 'style',
+                    label: (
+                      <span className="dashboard-inspector-group-label">
+                        <strong>组件样式</strong>
+                        <small>视觉表现</small>
+                      </span>
+                    ),
+                    children: renderComponentStyleEditor(selectedComponent)
+                  },
+                  {
+                    key: 'layout-query',
+                    label: (
+                      <span className="dashboard-inspector-group-label">
+                        <strong>布局与查询</strong>
+                        <small>24 列网格</small>
+                      </span>
+                    ),
+                    children: (
+                      <div className="dashboard-inspector-form dashboard-layout-query-editor">
+                        <div className="dashboard-layout-inputs">
+                          {(['x', 'y', 'w', 'h'] as const).map((field) => (
+                            <label key={field}>
+                              <span>{field.toUpperCase()}</span>
+                              <InputNumber
+                                min={field === 'w'
+                                  ? dashboardLayoutProfiles[selectedComponent.type].minimumWidth
+                                  : field === 'h'
+                                    ? dashboardLayoutProfiles[selectedComponent.type].minimumHeight
+                                    : 0}
+                                max={field === 'x' || field === 'w' ? 24 : 20}
+                                value={selectedComponent.layout[field]}
+                                onChange={(value) => updateLayout(field, value)}
+                              />
+                            </label>
+                          ))}
+                        </div>
+                        <Text type="secondary">
+                          保存前会检查组件越界、重叠、查询字段与图表编码。
+                        </Text>
+                        {selectedComponent.query && renderQueryEditor(selectedComponent.query)}
+                      </div>
+                    )
+                  }
+                ]}
+              />
+            )}
           </div>
         </aside>
       </div>

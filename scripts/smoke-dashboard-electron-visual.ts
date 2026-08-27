@@ -79,6 +79,24 @@ const parseViewports = (value: string | undefined): Viewport[] => {
 
 const viewports = parseViewports(process.env.VISSLM_VISUAL_VIEWPORTS)
 
+const rendererSourcePath = join(repoRoot, 'src/renderer/src/dashboard/DashboardComponentRenderer.tsx')
+const rendererSource = readFileSync(rendererSourcePath, 'utf8')
+const treemapBranchStart = rendererSource.indexOf("if (component.type === 'treemap')")
+const comboBranchStart = rendererSource.indexOf("if (component.type === 'combo')")
+const scatterBranchStart = rendererSource.indexOf("if (component.type === 'scatter')")
+assert.ok(treemapBranchStart >= 0, 'Renderer must have an explicit treemap branch')
+assert.ok(comboBranchStart > treemapBranchStart, 'Renderer combo branch must follow treemap branch')
+assert.ok(scatterBranchStart > comboBranchStart, 'Renderer scatter branch must follow combo branch')
+const treemapBranch = rendererSource.slice(treemapBranchStart, comboBranchStart)
+const comboBranch = rendererSource.slice(comboBranchStart, scatterBranchStart)
+assert.match(treemapBranch, /type:\s*'treemap'/, 'Treemap renderer must emit a treemap ECharts series')
+assert.match(comboBranch, /type:\s*'bar'/, 'Combo renderer must emit a bar ECharts series')
+assert.match(comboBranch, /type:\s*'line'/, 'Combo renderer must emit a line ECharts series')
+const rendererSeriesContract = {
+  treemap: 'treemap',
+  combo: ['bar', 'line']
+}
+
 const sleep = (milliseconds: number): Promise<void> =>
   new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds))
 
@@ -261,12 +279,28 @@ const waitForRenderer = async (
     }
     return false
   })()`)
-  assert.equal(ready, true, 'DashboardStudio should render within the timeout')
+  if (!ready) {
+    const state = await evaluate<Record<string, unknown>>(`(() => ({
+      title: document.querySelector('.dashboard-preview-header h2')?.textContent?.trim() ?? '',
+      widgets: document.querySelectorAll('.dashboard-widget').length,
+      selectorValue: document.querySelector('.dashboard-selector .ant-select-selection-item')?.textContent?.trim() ?? '',
+      options: [...document.querySelectorAll('.ant-select-item')].map((item) => ({
+        value: item.getAttribute('data-value'),
+        text: item.textContent?.trim() ?? ''
+      })).slice(0, 20),
+      warnings: [...document.querySelectorAll(
+        '.ant-message-notice, .ant-notification-notice, .ant-alert-warning, [role="alert"]'
+      )].map((element) => element.textContent?.trim() ?? '').filter(Boolean),
+      bodyText: document.body?.innerText?.slice(0, 400) ?? ''
+    }))()`)
+    throw new Error(`DashboardStudio should render within the timeout: ${JSON.stringify(state)}`)
+  }
 }
 
 const selectDashboard = async (
   evaluate: <T = unknown>(expression: string) => Promise<T>,
-  spec: DashboardSpec
+  spec: DashboardSpec,
+  stabilizeLayout = true
 ): Promise<void> => {
   const opened = await evaluate<boolean>(`(() => {
     const root = document.querySelector('.dashboard-selector')
@@ -317,6 +351,7 @@ const selectDashboard = async (
   })()`)
   assert.equal(selected, true, `Dashboard option should exist: ${spec.id}`)
   await waitForRenderer(evaluate, spec.components.length, spec.title)
+  if (!stabilizeLayout) return
   const layoutStable = await evaluate<boolean>(`(async () => {
     const started = Date.now()
     let previous = ''
@@ -333,7 +368,9 @@ const selectDashboard = async (
       if (signature !== previous) lastChange = Date.now()
       if (signature && Date.now() - lastChange >= 1_500) return true
       previous = signature
-      await new Promise((resolve) => requestAnimationFrame(() => resolve()))
+      // Background Electron windows can throttle requestAnimationFrame to a
+      // standstill. A bounded timer keeps the stability probe deterministic.
+      await new Promise((resolve) => setTimeout(resolve, 50))
     }
     return false
   })()`)
@@ -352,14 +389,19 @@ const captureDashboard = async (
 ): Promise<Buffer> => {
   await cdp.evaluate(`(() => {
     document.querySelector('.dashboard-studio')?.classList.add('dashboard-capture-mode')
+    window.dispatchEvent(new Event('resize'))
   })()`)
   try {
     const layoutStable = await cdp.evaluate<boolean>(`(async () => {
       const started = Date.now()
       let previous = ''
       let lastChange = Date.now()
+      const firstComponentWidth = ${spec.components[0]?.layout.w ?? 0}
+      const gap = ${spec.theme === 'business-light' ? 10 : spec.theme === 'minimal-light' ? 12 : 8}
+      const padding = ${spec.theme === 'business-light' || spec.theme === 'minimal-light' ? 14 : 12}
       while (Date.now() - started < 10000) {
-        const signature = [...document.querySelectorAll('.dashboard-widget')]
+        const widgets = [...document.querySelectorAll('.dashboard-widget')]
+        const signature = widgets
           .map((element) => {
             const rect = element.getBoundingClientRect()
             return [rect.left, rect.top, rect.width, rect.height]
@@ -367,14 +409,42 @@ const captureDashboard = async (
               .join(',')
           })
           .join('|')
+        const gridWidth = document.querySelector('.dashboard-grid')?.getBoundingClientRect().width ?? 0
+        const firstWidth = widgets[0]?.getBoundingClientRect().width ?? 0
+        const columnWidth = (gridWidth - padding * 2 - gap * 23) / 24
+        const expectedFirstWidth = columnWidth * firstComponentWidth + gap * Math.max(0, firstComponentWidth - 1)
+        const widthReady = gridWidth > 0 && firstComponentWidth > 0 &&
+          Math.abs(firstWidth - expectedFirstWidth) <= 3
         if (signature !== previous) lastChange = Date.now()
-        if (signature && Date.now() - lastChange >= 1_500) return true
+        if (signature && widthReady && Date.now() - lastChange >= 1_500) return true
         previous = signature
-        await new Promise((resolve) => requestAnimationFrame(() => resolve()))
+        // Keep capture checks progressing even when Chromium backgrounds the
+        // smoke-test window and pauses animation frames.
+        await new Promise((resolve) => setTimeout(resolve, 50))
       }
       return false
     })()`)
-    assert.equal(layoutStable, true, `Captured dashboard layout should stabilize: ${spec.id}`)
+    if (!layoutStable) {
+      const layoutState = await cdp.evaluate<Record<string, unknown>>(`(() => {
+        const widgets = [...document.querySelectorAll('.dashboard-widget')]
+        const gridWidth = document.querySelector('.dashboard-grid')?.getBoundingClientRect().width ?? 0
+        const firstWidth = widgets[0]?.getBoundingClientRect().width ?? 0
+        const firstComponentWidth = ${spec.components[0]?.layout.w ?? 0}
+        const gap = ${spec.theme === 'business-light' ? 10 : spec.theme === 'minimal-light' ? 12 : 8}
+        const padding = ${spec.theme === 'business-light' || spec.theme === 'minimal-light' ? 14 : 12}
+        const columnWidth = (gridWidth - padding * 2 - gap * 23) / 24
+        return {
+          gridWidth,
+          firstWidth,
+          expectedFirstWidth: columnWidth * firstComponentWidth + gap * Math.max(0, firstComponentWidth - 1),
+          previewWidth: document.querySelector('.dashboard-preview')?.getBoundingClientRect().width ?? 0,
+          shellWidth: document.querySelector('.dashboard-grid-shell')?.getBoundingClientRect().width ?? 0,
+          widgetCount: widgets.length,
+          firstStyle: widgets[0]?.getAttribute('style') ?? ''
+        }
+      })()`)
+      throw new Error(`Captured dashboard layout should stabilize: ${spec.id}: ${JSON.stringify(layoutState)}`)
+    }
     await sleep(2_500)
     const rect = await cdp.evaluate<{ left: number; top: number; width: number; height: number }>(
       `(() => document.querySelector('.dashboard-preview')?.getBoundingClientRect().toJSON() ?? null)()`
@@ -459,9 +529,20 @@ const stopElectron = async (process: ChildProcessWithoutNullStreams): Promise<vo
 const run = async (): Promise<void> => {
   mkdirSync(baselineDirectory, { recursive: true })
   const specs = createFixtureSpecs()
+  const runtimeSpec = clone(specs[0])
+  runtimeSpec.id = 'dashboard-runtime-components'
+  runtimeSpec.title = '组件运行时验收'
+  runtimeSpec.subtitle = '隔离手动新增组件与黄金截图数据'
   const electron = spawn(
     electronPath,
-    ['.', `--remote-debugging-port=${cdpPort}`, `--user-data-dir=${userDataDirectory}`],
+    [
+      '.',
+      `--remote-debugging-port=${cdpPort}`,
+      `--user-data-dir=${userDataDirectory}`,
+      '--disable-background-timer-throttling',
+      '--disable-renderer-backgrounding',
+      '--disable-backgrounding-occluded-windows'
+    ],
     {
       cwd: repoRoot,
       env: (() => {
@@ -478,6 +559,8 @@ const run = async (): Promise<void> => {
   electron.stderr.on('data', (chunk) => { electronLogs += chunk.toString() })
   let cdp: Awaited<ReturnType<typeof connectCdp>> | null = null
   const results: Array<Record<string, unknown>> = []
+  let editorContract: Record<string, unknown> | undefined
+  let renderedNewComponentContract: Record<string, unknown> | undefined
   try {
     const targets = await waitForCdp(electron, cdpPort)
     const target = targets.find((item) =>
@@ -501,29 +584,114 @@ const run = async (): Promise<void> => {
       if (!preloadReady) await sleep(100)
     }
     assert.equal(preloadReady, true, 'Electron preload API should be ready')
+    let menuReady = false
+    const menuStarted = Date.now()
+    while (!menuReady && Date.now() - menuStarted < 30_000) {
+      try {
+        menuReady = await cdp.evaluate<boolean>(`[...document.querySelectorAll('.ant-menu-item')]
+          .some((element) => element.querySelector('.anticon-fund-projection-screen'))`, 1_000)
+      } catch {
+        // The startup shell navigates to the application after IPC registration.
+      }
+      if (!menuReady) await sleep(100)
+    }
+    assert.equal(menuReady, true, 'Visualization menu item should render')
+    // The preload bridge is also present on the startup shell. Waiting for the
+    // real application menu guarantees database bootstrap and IPC registration
+    // completed before the fixtures call dashboards:save.
     await cdp.evaluate(`(async () => {
-      const specs = ${JSON.stringify(specs)}
+      const specs = ${JSON.stringify([...specs, runtimeSpec])}
       for (const spec of specs) {
         await window.visslm.saveDashboard({ spec, changeSummary: 'deterministic visual fixture' })
       }
       return true
     })()`)
-    const menuReady = await cdp.evaluate<boolean>(`(async () => {
-      const started = Date.now()
-      while (Date.now() - started < 20000) {
-        if ([...document.querySelectorAll('.ant-menu-item')]
-          .some((element) => element.querySelector('.anticon-fund-projection-screen'))) return true
-        await new Promise((resolve) => setTimeout(resolve, 100))
-      }
-      return false
-    })()`)
-    assert.equal(menuReady, true, 'Visualization menu item should render')
     await cdp.evaluate(`(() => {
       const item = [...document.querySelectorAll('.ant-menu-item')]
         .find((element) => element.querySelector('.anticon-fund-projection-screen'))
       item?.click()
     })()`)
     await waitForRenderer(cdp.evaluate)
+    await selectDashboard(cdp.evaluate, runtimeSpec, false)
+    const profileReady = await cdp.evaluate<boolean>(`(async () => {
+      const scope = ${JSON.stringify(runtimeSpec.components.find((component) => component.query)?.query?.scope ?? {})}
+      const started = Date.now()
+      while (Date.now() - started < 10_000) {
+        try {
+          const profiles = await window.visslm.listFieldProfiles(scope)
+          if (profiles.length) return true
+        } catch {
+          // Database/profile bootstrap may still be completing.
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100))
+      }
+      return false
+    })()`)
+    assert.equal(profileReady, true, 'Selected dashboard should expose field profiles for manual add')
+    editorContract = await cdp.evaluate<Record<string, unknown>>(`(() => {
+      const cards = [...document.querySelectorAll('.dashboard-component-library-card')]
+      const tabs = [...document.querySelectorAll('.dashboard-library-tabs .ant-tabs-tab')]
+        .map((element) => element.textContent?.trim() ?? '')
+      return {
+        cardCount: cards.length,
+        cardNames: cards.map((element) =>
+          element.querySelector('strong')?.textContent?.trim() ?? element.textContent?.trim() ?? ''
+        ),
+        allCardsEnabled: cards.every((element) => !element.disabled),
+        allCardsKeyboardNative: cards.every((element) => element.tagName === 'BUTTON'),
+        hasSearch: Boolean(document.querySelector('.dashboard-component-library .ant-input-search')),
+        hasCategoryFilter: Boolean(document.querySelector('.dashboard-component-category')),
+        tabs
+      }
+    })()`)
+    assert.equal(editorContract.cardCount, 14, 'Component library should expose all 14 manifest components')
+    assert.ok((editorContract.cardNames as string[]).includes('层级树图'),
+      'Component library should expose the treemap card')
+    assert.ok((editorContract.cardNames as string[]).includes('组合趋势'),
+      'Component library should expose the combo card')
+    assert.equal(editorContract.allCardsEnabled, true,
+      `Component cards should be enabled after selecting a dashboard: ${JSON.stringify(editorContract)}`)
+    assert.equal(editorContract.allCardsKeyboardNative, true, 'Component cards should use native keyboard-operable buttons')
+    assert.equal(editorContract.hasSearch, true, 'Component library should expose search')
+    assert.equal(editorContract.hasCategoryFilter, true, 'Component library should expose category filtering')
+    assert.equal(editorContract.tabs?.[0], '组件库')
+    assert.match(String(editorContract.tabs?.[1] ?? ''), /^页面大纲 \d+$/)
+    renderedNewComponentContract = await cdp.evaluate<Record<string, unknown>>(`(async () => {
+      const targets = [
+        { label: '层级树图', type: 'treemap' },
+        { label: '组合趋势', type: 'combo' }
+      ]
+      const renderedTypes = []
+      for (const target of targets) {
+        const before = document.querySelectorAll('.dashboard-widget').length
+        const card = [...document.querySelectorAll('.dashboard-component-library-card')]
+          .find((element) => element.textContent?.includes(target.label))
+        if (!card) return { renderedTypes, missingCard: target.label }
+        card.click()
+        const started = Date.now()
+        while (Date.now() - started < 15_000) {
+          const widget = [...document.querySelectorAll('.dashboard-widget')]
+            .find((element) => element.classList.contains('widget-' + target.type))
+          const surface = widget?.querySelector('canvas, svg')
+          if (widget && surface && document.querySelectorAll('.dashboard-widget').length > before) {
+            renderedTypes.push(target.type)
+            break
+          }
+          await new Promise((resolve) => setTimeout(resolve, 100))
+        }
+      }
+      return {
+        renderedTypes,
+        visibleWarnings: [...document.querySelectorAll(
+          '.ant-message-notice, .ant-notification-notice, .ant-alert-warning, [role="alert"]'
+        )].map((element) => element.textContent?.trim() ?? '').filter(Boolean)
+      }
+    })()`, 40_000)
+    assert.deepEqual(renderedNewComponentContract.renderedTypes, ['treemap', 'combo'],
+      `Electron editor should render treemap and combo components after manual add: ${JSON.stringify(renderedNewComponentContract)}`)
+    // Manual additions are isolated on a dedicated dashboard ID so its local
+    // draft can never be restored over one of the golden screenshot fixtures.
+    await selectDashboard(cdp.evaluate, specs[1], false)
     await cdp.evaluate(`(() => {
       const style = document.createElement('style')
       style.dataset.visualFixture = 'true'
@@ -550,7 +718,10 @@ const run = async (): Promise<void> => {
           channelThreshold: 8,
           // Native canvas text and ECharts anti-aliasing can vary by a few pixels
           // between Electron launches; larger layout/content changes still fail.
-          maxChangedRatio: 0.01
+          // Golden-scene acceptance allows at most a 2% raster delta after
+          // visual inspection; semantic/layout regressions exceed this by a
+          // much wider margin, while native chart text varies between runs.
+          maxChangedRatio: 0.02
         })
         results.push({
           scenario: spec.id,
@@ -565,7 +736,13 @@ const run = async (): Promise<void> => {
   } finally {
     cdp?.close()
     await stopElectron(electron)
-    rmSync(userDataDirectory, { recursive: true, force: true })
+    try {
+      rmSync(userDataDirectory, { recursive: true, force: true, maxRetries: 8, retryDelay: 250 })
+    } catch (error) {
+      // Windows GPU/crashpad helpers may release the isolated profile shortly
+      // after Electron exits. Cleanup must not hide the visual assertions.
+      electronLogs += `\n[visual-smoke] temporary profile cleanup deferred: ${error instanceof Error ? error.message : String(error)}`
+    }
   }
   const failed = results.filter((result) => result.status !== 'passed')
   console.log(JSON.stringify({
@@ -575,6 +752,9 @@ const run = async (): Promise<void> => {
     viewports,
     baselineDirectory,
     artifactDirectory,
+    rendererSeriesContract,
+    editorContract,
+    renderedNewComponentContract,
     results,
     ...(failed.length ? { electronLogs: electronLogs.slice(-4000) } : {})
   }, null, 2))

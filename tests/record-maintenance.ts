@@ -16,10 +16,6 @@ import {
   RECORD_NORMALIZER_VERSION,
   RECORD_VECTOR_INDEX_VERSION
 } from '../src/main/record-maintenance-constants'
-import {
-  buildRequirementSemanticCard,
-  type RequirementSemanticCard
-} from '../src/main/requirements/semantic-card'
 import type {
   RecordDetail,
   RecordMaintenanceTaskSnapshot,
@@ -27,8 +23,6 @@ import type {
 } from '../src/shared/types'
 
 const FALLBACK_MODEL_VERSION = 'local-hash-v1'
-const SEMANTIC_ANALYZER_VERSION = 'record-maintenance-test-analyzer-v1'
-const SEMANTIC_MODEL_SIGNATURE = 'record-maintenance-test-model-v1'
 const TERMINAL_STATUSES = new Set<RecordMaintenanceTaskStatus>([
   'stopped', 'completed', 'completed_with_errors', 'failed'
 ])
@@ -131,33 +125,6 @@ const waitForTask = async (
   throw new Error(`maintenance task did not finish: ${taskId}`)
 }
 
-const persistReadySemanticCard = (db: AppDatabase, record: RecordDetail): void => {
-  const source = buildRequirementSemanticCard(record)
-  const card: RequirementSemanticCard = {
-    ...source,
-    functionalObject: record.name,
-    action: 'add_capability',
-    matchingText: source.evidence,
-    fieldAssessments: {
-      ...source.fieldAssessments,
-      functionalObject: { value: record.name, confidence: 1, evidence: source.evidence },
-      action: { value: 'add_capability', confidence: 1, evidence: source.evidence }
-    },
-    analysisStatus: 'ai_adjudicated',
-    analysisSummary: 'record maintenance regression fixture'
-  }
-  const contentHash = db.getRecordContentHash(record.uid)
-  assert.ok(contentHash)
-  assert.equal(db.claimRequirementSemanticCard({
-    recordUid: record.uid,
-    contentHash,
-    analyzerVersion: SEMANTIC_ANALYZER_VERSION,
-    modelSignature: SEMANTIC_MODEL_SIGNATURE
-  }), true)
-  db.completeRequirementSemanticCard(record.uid, card)
-  assert.equal(db.getRequirementSemanticCardState(record.uid)?.status, 'ready')
-}
-
 const testMigrationDefaultsAndReadOnlyPreviews = async (): Promise<void> => {
   await withDatabase(async ({ db, knowledge, service }) => {
     const first = addRecord(db, { uid: 'preview-first' })
@@ -181,7 +148,6 @@ const testMigrationDefaultsAndReadOnlyPreviews = async (): Promise<void> => {
     assert.equal(all.cleanPendingCount, 0)
     assert.equal(all.lexicalPendingCount, 0)
     assert.equal(all.vectorPendingCount, 2)
-    assert.equal(all.semanticInvalidationCount, 0)
     assert.equal(all.modelVersion, FALLBACK_MODEL_VERSION)
     assert.equal(service.getTask(), null)
 
@@ -191,7 +157,6 @@ const testMigrationDefaultsAndReadOnlyPreviews = async (): Promise<void> => {
     })
     assert.equal(selected.scope, 'selected')
     assert.equal(selected.totalCount, 1)
-    assert.equal(selected.semanticInvalidationCount, 0)
     assert.equal(selected.vectorPendingCount, 1)
     assert.equal(service.getTask(), null)
     assert.deepEqual(db.getRecord(first.uid, false)?.raw, beforeRaw)
@@ -332,41 +297,6 @@ const testRecordVectorReindexIsTransactional = async (): Promise<void> => {
       .map((row) => ({ id: row.chunk.id, vector: [...row.vector] }))
     assert.deepEqual(afterChunks, beforeChunks)
     assert.deepEqual(afterVectors, beforeVectors)
-  })
-}
-
-const testSemanticInvalidationAndMaintenanceStatus = async (): Promise<void> => {
-  await withDatabase(async ({ db, knowledge, service }) => {
-    const record = addRecord(db, {
-      uid: 'semantic-invalidation-record',
-      raw: {
-        IssueType: 'Enhancement',
-        _valm_Description: 'semantic original evidence',
-        _valm_Module: 'maintenance'
-      }
-    })
-    persistReadySemanticCard(db, record)
-    seedRecordVector(db, record, knowledge.modelVersion, 'semantic-existing-vector')
-    const readyPreview = service.preview({ scope: 'selected', recordUids: [record.uid] })
-    assert.equal(readyPreview.semanticInvalidationCount, 0)
-    assert.equal(readyPreview.cleanPendingCount, 0)
-    assert.equal(readyPreview.lexicalPendingCount, 0)
-    assert.equal(readyPreview.vectorPendingCount, 0)
-
-    const changedRaw = {
-      IssueType: 'Enhancement',
-      _valm_Description: 'semantic changed evidence',
-      _valm_Module: 'maintenance'
-    }
-    db.updateRecordRawAndNormalizedText(record.uid, changedRaw, 'changed normalized evidence')
-    const invalidated = service.preview({ scope: 'selected', recordUids: [record.uid] })
-    assert.equal(invalidated.semanticInvalidationCount, 1)
-    assert.equal(invalidated.cleanPendingCount, 0)
-    assert.equal(invalidated.lexicalPendingCount, 0)
-    // A physical vector from the old content must not mask a pending rebuild.
-    assert.equal(invalidated.vectorPendingCount, 1)
-    assert.equal(db.getRequirementSemanticCardState(record.uid)?.status, 'ready')
-    assert.equal(db.getRecordMaintenanceState(record.uid, knowledge.modelVersion).overallStatus, 'pending')
   })
 }
 
@@ -572,7 +502,6 @@ const main = async (): Promise<void> => {
     await testStoppedTaskPersistsPartialItems()
     await testPartialFailurePersistsFailureDetails()
     await testEmbeddingInfrastructureFailureFailsTaskWithoutPerRecordExplosion()
-    await testSemanticInvalidationAndMaintenanceStatus()
     console.log(JSON.stringify({
       ok: true,
       contract: 'record-maintenance',
@@ -580,7 +509,7 @@ const main = async (): Promise<void> => {
         'migration defaults and read-only all/selected previews',
         'non-destructive normalized cleaning and records FTS refresh',
         'record vector replacement only after successful embedding',
-        'semantic invalidation and maintenance status reporting',
+        'maintenance status tracks clean, lexical and vector work only',
         'stopped task persistence with pending items',
         'partial failure details and failed vector state persistence',
         'embedding infrastructure failure is task-scoped and preserves old vectors'

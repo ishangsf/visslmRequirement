@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { HybridRequirementCandidate } from './hybrid-retrieval'
-import type { RequirementMatchCard } from './semantic-card'
+import type { RequirementMatchCard } from './requirement-match-card'
 
 export interface RequirementRerankItem {
   recordUid: string

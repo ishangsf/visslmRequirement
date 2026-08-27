@@ -109,7 +109,6 @@ export type FeatureModuleKey =
   | 'visualization'
   | 'projects'
   | 'data'
-  | 'semanticization'
   | 'chat'
   | 'sync'
   | 'push'
@@ -140,7 +139,6 @@ export const DEFAULT_FEATURE_MODULE_SETTINGS: FeatureModuleSettings = {
   visualization: true,
   projects: true,
   data: true,
-  semanticization: true,
   chat: true,
   sync: true,
   push: false
@@ -151,7 +149,6 @@ export const DEFAULT_FEATURE_NAVIGATION_ORDER: FeatureNavigationOrder = [
   'visualization',
   'projects',
   'data',
-  'semanticization',
   'chat',
   'sync',
   'push'
@@ -252,10 +249,6 @@ export interface RecordRow {
   pushMessage: string
   pushedAt: string
   pushedUid: string
-  semanticStatus: RequirementSemanticizationStatus
-  semanticStatusReason: RequirementSemanticizationStatusReason
-  semanticError: string
-  semanticUpdatedAt: string
 }
 
 export interface RecordReleaseValue {
@@ -308,7 +301,6 @@ export interface RecordDetail extends RecordRow {
   matchingText: string
   maintenance: RecordMaintenanceState
   fieldLabels?: Record<string, string>
-  semanticAnalysisTrace?: RequirementSemanticizationAnalysisTrace
 }
 
 export type RecordMaintenanceScope = 'all' | 'selected'
@@ -371,7 +363,6 @@ export interface RecordMaintenancePreview {
   cleanPendingCount: number
   lexicalPendingCount: number
   vectorPendingCount: number
-  semanticInvalidationCount: number
   modelVersion: string
   normalizerVersion: string
   lexicalVersion: string
@@ -449,211 +440,22 @@ export interface RecordQuery {
   nodeType?: string
   excludeProjectAssetProjectId?: string
   releaseText?: string
-  semanticStatus?: RequirementSemanticizationStatus
 }
 
 /** Asset-center filters allowed when exporting the complete filtered result. */
 export type RecordExportQuery = Pick<
   RecordQuery,
-  'search' | 'projectId' | 'nodeType' | 'releaseText' | 'semanticStatus'
+  'search' | 'projectId' | 'nodeType' | 'releaseText'
 >
 
-export type RequirementSemanticizationStatus = 'pending' | 'processing' | 'ready' | 'failed'
-
-export type RequirementSemanticizationStatusReason =
-  | 'missing'
-  | 'content_changed'
-  | 'analyzer_changed'
-  | 'model_changed'
-  | 'processing'
-  | 'ready'
-  | 'failed'
-
-export type RequirementSemanticizationScope = 'selected' | 'all_unready'
-
-/** Internal quality route for record-level semanticization. */
-export type RequirementSemanticizationQualityMode = 'standard' | 'strict'
-
-export type RequirementSemanticizationTaskStatus =
-  | 'queued'
-  | 'running'
-  | 'pausing'
-  | 'paused'
-  | 'stopping'
-  | 'stopped'
-  | 'completed'
-
-export type RequirementSemanticizationStage =
-  | 'queued'
-  | 'initial'
-  | 'independent'
-  | 'adjudication'
-  | 'persisting'
-  | 'idle'
-
-export type RequirementSemanticizationControl = 'pause' | 'resume' | 'stop'
-
-export type RequirementSemanticizationAnalysisStage = 'initial' | 'independent' | 'adjudication' | 'persisting'
-
-export type RequirementSemanticizationTraceEventKind =
-  | 'stage_started'
-  | 'stage_completed'
-  | 'retry'
-  | 'validation_passed'
-  | 'validation_failed'
-  | 'model_error'
-  | 'divergence'
-
-export interface RequirementSemanticizationTraceField {
-  value: string
-  confidence: number
-  evidence: string
-}
-
 /** Safe numeric model telemetry; hidden reasoning/content is intentionally excluded. */
-export interface RequirementSemanticizationModelUsage {
+export interface ModelUsage {
   promptTokens?: number
   completionTokens?: number
   promptDurationMs?: number
   completionDurationMs?: number
   totalDurationMs?: number
   loadDurationMs?: number
-}
-
-export interface RequirementSemanticizationDivergenceField {
-  field: string
-  initial: RequirementSemanticizationTraceField
-  independent: RequirementSemanticizationTraceField
-}
-
-export interface RequirementSemanticizationDivergence {
-  hasDivergence: boolean
-  fields: RequirementSemanticizationDivergenceField[]
-}
-
-export interface RequirementSemanticizationTraceEvent {
-  id: string
-  recordUid: string
-  stage: RequirementSemanticizationAnalysisStage
-  kind: RequirementSemanticizationTraceEventKind
-  timestamp: string
-  message: string
-  attempt?: number
-  maxAttempts?: number
-  summary?: string
-  fields?: Record<string, RequirementSemanticizationTraceField>
-  divergence?: RequirementSemanticizationDivergence
-}
-
-export interface RequirementSemanticizationTraceStage {
-  status: 'running' | 'completed' | 'failed'
-  startedAt: string
-  completedAt?: string
-  attempts: number
-  summary?: string
-  fields?: Record<string, RequirementSemanticizationTraceField>
-  modelUsage?: RequirementSemanticizationModelUsage
-}
-
-export interface RequirementSemanticizationAnalysisTrace {
-  version: 1
-  recordUid: string
-  analyzerVersion: string
-  modelSignature: string
-  /** Whether this task requested the model's deep-thinking mode. */
-  deepThinking?: boolean
-  /** Quality route used by this task; omitted for traces written by older builds. */
-  qualityMode?: RequirementSemanticizationQualityMode
-  outcome?: 'completed' | 'failed' | 'stopped'
-  events: RequirementSemanticizationTraceEvent[]
-  stages: Partial<Record<RequirementSemanticizationAnalysisStage, RequirementSemanticizationTraceStage>>
-  divergence?: RequirementSemanticizationDivergence
-  finalAdjudication?: {
-    completedAt: string
-    summary: string
-    fields: Record<string, RequirementSemanticizationTraceField>
-  }
-  completedAt?: string
-}
-
-export interface RequirementSemanticizationStartInput {
-  recordUids?: string[]
-  scope?: RequirementSemanticizationScope
-  force?: boolean
-  deepThinking?: boolean
-  /** Defaults to standard; deepThinking=true remains a backwards-compatible strict alias. */
-  qualityMode?: RequirementSemanticizationQualityMode
-}
-
-export interface RequirementSemanticizationStartResult {
-  jobId: string
-  accepted: number
-  skipped: number
-  available: number
-}
-
-export interface RequirementSemanticizationCurrentRecord {
-  uid: string
-  itemId: string
-  name: string
-  index: number
-}
-
-export interface RequirementSemanticizationRecentItem {
-  uid: string
-  itemId: string
-  name: string
-  status: 'ready' | 'failed'
-  error?: string
-  durationMs?: number
-}
-
-/** A currently in-flight record shown alongside the legacy single-focus fields. */
-export interface RequirementSemanticizationActiveRecord {
-  uid: string
-  itemId: string
-  name: string
-  /** Stable one-based position in the accepted candidate list. */
-  index: number
-  stage: RequirementSemanticizationStage
-  startedAt: string
-}
-
-export interface RequirementSemanticizationTaskSnapshot {
-  jobId: string
-  status: RequirementSemanticizationTaskStatus
-  currentStage: RequirementSemanticizationStage
-  total: number
-  available: number
-  completed: number
-  succeeded: number
-  failed: number
-  remaining: number
-  currentRecord?: RequirementSemanticizationCurrentRecord
-  startedAt: string
-  updatedAt: string
-  message: string
-  recentItems: RequirementSemanticizationRecentItem[]
-  /** Defaults to true for snapshots created before this field existed. */
-  deepThinking?: boolean
-  qualityMode?: RequirementSemanticizationQualityMode
-  /** Provider-aware bounded worker-pool size selected for this task. */
-  maxConcurrency?: number
-  /** Number of records currently claimed and in flight. */
-  activeCount?: number
-  activeRecords?: RequirementSemanticizationActiveRecord[]
-  /** Monotonic task metrics; omitted by older snapshots. */
-  elapsedMs?: number
-  recordsPerMinute?: number
-  estimatedRemainingMs?: number
-  /** Structured audit result only; model hidden reasoning is never included. */
-  analysisTrace?: RequirementSemanticizationAnalysisTrace
-}
-
-export interface RequirementSemanticizationProgress extends RequirementSemanticizationTaskSnapshot {
-  /** Retained for existing record-level progress consumers. */
-  recordUid?: string
-  recordStatus?: 'processing' | 'ready' | 'failed'
 }
 
 export interface RecordPage {
@@ -1030,8 +832,10 @@ export interface ChatMessage {
   assistantIntent?: AssistantIntentDecision
   /** Persisted structured execution facts for this assistant turn. */
   taskTrace?: AssistantTaskTrace
-  /** Confirmed plan and actual source scope used for this assistant turn. */
+  /** Actual execution facts retained for evidence and artifact provenance. */
   executionSummary?: AssistantExecutionSummary
+  /** Business-facing choices shown only when the assistant truly needs a user decision. */
+  clarificationOptions?: AssistantClarificationOption[]
   /** Persisted, safe execution activities for this completed assistant turn. */
   executionLog?: AssistantExecutionLog
   /** Session-level scope carried forward explicitly and restored with history. */
@@ -1291,6 +1095,9 @@ export type AssistantIntentResultMode =
   | 'dashboard'
   | 'artifact'
 
+/** User-selected reasoning policy for the assistant's final answer only. */
+export type AssistantThinkingMode = 'auto' | 'on' | 'off'
+
 export interface AssistantIntentDecision {
   taskType: AssistantIntentTaskType
   skillId: ExpertId
@@ -1302,6 +1109,17 @@ export interface AssistantIntentDecision {
   needsClarification: boolean
   clarificationQuestion?: string
   reason: string
+}
+
+export type AssistantClarificationOptionAction = 'submit' | 'compose'
+
+export interface AssistantClarificationOption {
+  id: string
+  label: string
+  description?: string
+  /** Text to submit immediately or place in the composer, depending on action. */
+  prompt: string
+  action: AssistantClarificationOptionAction
 }
 
 /** Actual execution agents are separate from the UI-facing expert mentions. */
@@ -1345,6 +1163,8 @@ export interface ChatRequest {
    * for callers that intentionally request the general data assistant.
    */
   chatMode?: 'plain' | 'auto' | 'expert'
+  /** Optional final-answer reasoning policy; omitted requests remain compatible and default to auto. */
+  thinkingMode?: AssistantThinkingMode
   /** Internal IDs extracted for automatic direct data analysis; the model still receives question verbatim. */
   extractedRequirementIds?: string[]
   entrypoint?: 'chat' | 'dashboard'
@@ -1371,6 +1191,8 @@ export interface ChatResponse {
   /** The planner stopped safely and is asking the user to disambiguate scope/source/fields. */
   needsClarification?: boolean
   clarificationQuestion?: string
+  /** Two or three concrete, business-language choices for the user decision. */
+  clarificationOptions?: AssistantClarificationOption[]
   /** Validated control decision selected before any Auto-mode evidence access. */
   assistantIntent?: AssistantIntentDecision
   taskTrace?: AssistantTaskTrace
@@ -1553,58 +1375,6 @@ export interface AssistantRunHistoryStats {
   totalMatchedCount: number
 }
 
-export type AssistantPlanFilterOperator =
-  | 'equals'
-  | 'not_equals'
-  | 'contains'
-  | 'not_contains'
-  | 'is_empty'
-  | 'not_empty'
-  | 'gt'
-  | 'gte'
-  | 'lt'
-  | 'lte'
-
-export interface AssistantPlanFilter {
-  field: string
-  operator: AssistantPlanFilterOperator
-  value?: string
-}
-
-/** Renderer-owned edits accepted by the main-process plan confirmation boundary. */
-export interface AssistantPlanPatch {
-  searchTerms?: string[]
-  fields?: string[]
-  scope?: {
-    projectIds?: string[]
-    nodeTypes?: string[]
-    baseFilters?: AssistantPlanFilter[]
-  }
-  filters?: AssistantPlanFilter[]
-  limit?: number
-  resultMode?: AssistantIntentResultMode
-}
-
-export interface ConfirmAgentPlanError {
-  field: string
-  code: string
-  message: string
-}
-
-export interface ConfirmAgentPlanWarning {
-  field: string
-  code: string
-  message: string
-}
-
-export interface ConfirmAgentPlanResult {
-  status: 'approved' | 'invalid' | 'not_found'
-  runId: string
-  effectiveSummary?: AssistantExecutionSummary
-  errors?: ConfirmAgentPlanError[]
-  warnings?: ConfirmAgentPlanWarning[]
-}
-
 export type CancelAgentRunStatus = 'cancel_requested' | 'not_found' | 'invalid'
 
 export interface CancelAgentRunResult {
@@ -1652,16 +1422,6 @@ export interface AppApi {
   getRecordMaintenanceTask(): Promise<RecordMaintenanceTaskSnapshot | null>
   stopRecordMaintenance(): Promise<RecordMaintenanceTaskSnapshot | null>
   onRecordMaintenanceProgress(callback: (snapshot: RecordMaintenanceTaskSnapshot) => void): () => void
-  startRequirementSemanticization(
-    input: RequirementSemanticizationStartInput
-  ): Promise<RequirementSemanticizationStartResult>
-  getRequirementSemanticizationTask(): Promise<RequirementSemanticizationTaskSnapshot | null>
-  controlRequirementSemanticization(
-    action: RequirementSemanticizationControl
-  ): Promise<RequirementSemanticizationTaskSnapshot | null>
-  onRequirementSemanticizationProgress(
-    callback: (progress: RequirementSemanticizationProgress) => void
-  ): () => void
   getStats(): Promise<DashboardStats>
   getSyncConfig(): Promise<SyncScopeConfig | null>
   saveSyncConfig(config: SyncScopeConfig): Promise<void>
@@ -1671,7 +1431,6 @@ export interface AppApi {
   listCollectionRequestLogs(page?: number, pageSize?: number): Promise<CollectionRequestLogPage>
   askAgent(request: ChatRequest): Promise<ChatResponse>
   cancelAgentRun(runId: string): Promise<CancelAgentRunResult>
-  confirmAgentPlan(runId: string, patch?: AssistantPlanPatch): Promise<ConfirmAgentPlanResult>
   previewAssistantArtifact(input: AssistantArtifactInput): Promise<AssistantArtifactPreview>
   commitAssistantArtifact(preview: AssistantArtifactPreview): Promise<AssistantArtifact>
   listAssistantArtifacts(limit?: number): Promise<AssistantArtifact[]>

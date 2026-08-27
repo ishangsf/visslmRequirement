@@ -1,8 +1,15 @@
 import { ArrowUpOutlined, BulbOutlined } from '@ant-design/icons'
 import { Empty, Progress } from 'antd'
+import { TreemapChart } from 'echarts/charts'
+import * as echarts from 'echarts/core'
 import { memo, useMemo } from 'react'
 import type { DashboardComponentSpec, DashboardThemeId } from '../../../shared/dashboard'
 import LightweightECharts from '../components/LightweightECharts'
+
+// LightweightECharts owns the common chart registrations.  Treemap is a
+// dashboard-only P1 chart, so register the optional series at this boundary
+// without broadening the shared bridge bundle.
+echarts.use([TreemapChart])
 
 type ChartThemeTokens = {
   textColor: string
@@ -48,7 +55,7 @@ const chartThemeTokens: Record<DashboardThemeId, ChartThemeTokens> = {
     tooltipBackground: 'rgba(35, 54, 56, 0.96)',
     tooltipBorder: 'rgba(97, 181, 169, 0.52)',
     tooltipTextColor: '#f4fffd',
-    pieBorderColor: '#ffffff',
+    pieBorderColor: 'rgba(46, 155, 144, 0.12)',
     palette: ['#2e9b90', '#e0a15b', '#7089d3', '#cf7184', '#82aa76', '#4a9cbb']
   }
 }
@@ -203,6 +210,124 @@ const buildChartOption = (
     }
   }
 
+  if (component.type === 'treemap') {
+    return {
+      ...common,
+      tooltip: {
+        ...common.tooltip,
+        trigger: 'item',
+        formatter: '{b}<br/>{c}'
+      },
+      series: [{
+        type: 'treemap',
+        roam: false,
+        nodeClick: false,
+        breadcrumb: { show: false },
+        squareRatio: 1.15,
+        data: component.data.map((item) => ({ name: item.name, value: item.value })),
+        label: {
+          show: true,
+          color: theme.tooltipTextColor,
+          fontSize: componentStyle.bodyFontSize ?? 10,
+          overflow: 'truncate'
+        },
+        upperLabel: { show: false },
+        itemStyle: {
+          borderColor: theme.tooltipBackground,
+          borderWidth: 1,
+          gapWidth: 3
+        },
+        emphasis: {
+          label: { color: theme.tooltipTextColor },
+          itemStyle: { borderColor: theme.tooltipBorder, borderWidth: 2 }
+        }
+      }]
+    }
+  }
+
+  if (component.type === 'combo') {
+    const compact = component.layout.w <= 10
+    const valueName = component.encoding?.value ?? '指标'
+    const secondaryName = component.encoding?.secondaryValue ?? '对比指标'
+    const comboSecondaryValues = secondaryValues ?? component.data.map(() => 0)
+    const axisLabel = {
+      color: theme.textColor,
+      fontSize: componentStyle.bodyFontSize ?? 10,
+      interval: compact || names.length > 8 ? 'auto' : 0,
+      rotate: compact || names.length > 8 ? 28 : 0,
+      hideOverlap: true
+    }
+    const valueAxis = {
+      type: 'value',
+      axisLine: { show: false },
+      axisTick: { show: false },
+      splitLine: { show: showGrid, lineStyle: { color: theme.gridColor } },
+      axisLabel: { color: theme.textColor, fontSize: componentStyle.bodyFontSize ?? 10 }
+    }
+    return {
+      ...common,
+      tooltip: {
+        ...common.tooltip,
+        trigger: 'axis',
+        axisPointer: { type: 'cross' }
+      },
+      legend: {
+        show: showLegend,
+        top: 0,
+        right: 4,
+        itemWidth: 10,
+        itemHeight: 8,
+        textStyle: { color: theme.textColor, fontSize: componentStyle.bodyFontSize ?? 10 },
+        data: [valueName, secondaryName]
+      },
+      grid: {
+        left: compact ? 8 : 12,
+        right: compact ? 8 : 16,
+        top: showLegend ? 24 : 8,
+        bottom: compact || names.length > 8 ? 30 : 14,
+        containLabel: true
+      },
+      xAxis: {
+        type: 'category',
+        data: names,
+        boundaryGap: true,
+        axisLine: { lineStyle: { color: theme.gridColor } },
+        axisTick: { show: false },
+        axisLabel
+      },
+      yAxis: [
+        { ...valueAxis, name: compact ? undefined : valueName },
+        {
+          ...valueAxis,
+          name: compact ? undefined : secondaryName,
+          splitLine: { show: false },
+          axisLabel: { color: theme.textColor, fontSize: componentStyle.bodyFontSize ?? 10 }
+        }
+      ],
+      series: [
+        {
+          name: valueName,
+          type: 'bar',
+          yAxisIndex: 0,
+          data: values,
+          barMaxWidth: compact ? 14 : 20,
+          itemStyle: { color: accent, borderRadius: [4, 4, 0, 0] }
+        },
+        {
+          name: secondaryName,
+          type: 'line',
+          yAxisIndex: 1,
+          data: comboSecondaryValues,
+          smooth: true,
+          symbol: 'circle',
+          symbolSize: compact ? 5 : 6,
+          lineStyle: { width: lineWidth, color: theme.palette[1] },
+          itemStyle: { color: theme.palette[1] }
+        }
+      ]
+    }
+  }
+
   if (component.type === 'scatter') {
     const axis = {
       type: 'value',
@@ -346,12 +471,20 @@ function DashboardComponentRendererView({
   )
 
   if (!component.data.length) {
-    return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无数据" />
+    return (
+      <div role="status" aria-label={`${component.title}暂无数据`}>
+        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无数据" />
+      </div>
+    )
   }
 
   if (component.type === 'kpi') {
     return (
-      <div className="viz-kpi">
+      <div
+        className="viz-kpi"
+        role="img"
+        aria-label={`${component.title}：${formatNumber(first.value)}${component.unit ?? ''}`}
+      >
         <div className="viz-kpi-value" style={{ color: component.accent, fontSize: component.style?.valueFontSize }}>
           {formatNumber(first.value)}
           <small>{component.unit}</small>
@@ -366,12 +499,19 @@ function DashboardComponentRendererView({
 
   if (component.type === 'progress') {
     return (
-      <div className="viz-progress">
+      <div
+        className="viz-progress"
+        role="meter"
+        aria-label={`${component.title}完成率 ${Math.max(0, Math.min(100, first.value))}%`}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={Math.max(0, Math.min(100, first.value))}
+      >
         <Progress
           percent={Math.max(0, Math.min(100, first.value))}
           strokeColor={component.accent ?? '#54dfa6'}
           railColor="rgba(126, 151, 185, 0.15)"
-          format={(value) => <span style={{ fontSize: component.style?.valueFontSize }}>{value}%</span>}
+          format={() => null}
         />
         <div className="viz-progress-labels">
           <span>当前覆盖</span>
@@ -384,9 +524,14 @@ function DashboardComponentRendererView({
   if (component.type === 'ranking') {
     const max = Math.max(...component.data.map((item) => item.value), 1)
     return (
-      <div className="viz-ranking" style={{ fontSize: component.style?.bodyFontSize }}>
+      <div
+        className="viz-ranking"
+        style={{ fontSize: component.style?.bodyFontSize }}
+        role="list"
+        aria-label={`${component.title}排行`}
+      >
         {component.data.map((item, index) => (
-          <div className="viz-ranking-row" key={`${item.name}-${index}`}>
+          <div className="viz-ranking-row" key={`${item.name}-${index}`} role="listitem">
             <span className={`viz-ranking-index rank-${index + 1}`}>{index + 1}</span>
             <span className="viz-ranking-name" title={item.name}>{item.name}</span>
             <span className="viz-ranking-track">
@@ -406,7 +551,7 @@ function DashboardComponentRendererView({
 
   if (component.type === 'insight') {
     return (
-      <div className="viz-insight">
+      <div className="viz-insight" role="note" aria-label={`${component.title}洞察`}>
         <span className="viz-insight-icon"><BulbOutlined /></span>
         <p style={{ fontSize: component.style?.bodyFontSize }}>{component.insight}</p>
       </div>
@@ -415,9 +560,9 @@ function DashboardComponentRendererView({
 
   if (component.type === 'table') {
     return (
-      <div className="viz-table" style={{ fontSize: component.style?.bodyFontSize }}>
+      <div className="viz-table" style={{ fontSize: component.style?.bodyFontSize }} role="table" aria-label={`${component.title}明细`}>
         {component.data.map((item) => (
-          <div key={item.name}>
+          <div key={item.name} role="row">
             <span>{item.name}</span>
             <strong>{formatNumber(item.value)}</strong>
           </div>
@@ -427,13 +572,24 @@ function DashboardComponentRendererView({
   }
 
   return (
-    <LightweightECharts
-      key={`${component.id}-${component.layout.w}-${component.layout.h}`}
-      option={chartOption}
-      notMerge
-      lazyUpdate
-      style={{ width: '100%', height: '100%' }}
-    />
+    <div
+      className="dashboard-chart-visual"
+      style={{ width: '100%', height: '100%', minHeight: 0 }}
+      role="img"
+      aria-label={`${component.title}图表，${component.data.length}项数据。${component.data
+        .slice(0, 3)
+        .map((item) => `${item.name}${formatNumber(item.value)}${component.unit ?? ''}`)
+        .join('；')}`}
+    >
+      <LightweightECharts
+        key={`${component.id}-${component.layout.w}-${component.layout.h}`}
+        option={chartOption}
+        notMerge
+        lazyUpdate
+        aria-hidden="true"
+        style={{ width: '100%', height: '100%' }}
+      />
+    </div>
   )
 }
 

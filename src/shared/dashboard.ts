@@ -1,4 +1,10 @@
-import type { FilterOperator, QuerySpec } from './query-spec'
+import type {
+  FilterOperator,
+  QueryAggregation,
+  QueryCalculation,
+  QuerySpec,
+  TimeGrain
+} from './query-spec'
 
 export type DashboardComponentType =
   | 'kpi'
@@ -13,6 +19,8 @@ export type DashboardComponentType =
   | 'funnel'
   | 'radar'
   | 'scatter'
+  | 'treemap'
+  | 'combo'
 
 export type DashboardThemeId =
   | 'technology-dark'
@@ -34,6 +42,66 @@ export interface DashboardLayout {
   y: number
   w: number
   h: number
+}
+
+export type DashboardSlotRole =
+  | 'headline'
+  | 'trend'
+  | 'comparison'
+  | 'breakdown'
+  | 'diagnosis'
+  | 'detail'
+  | 'insight'
+
+export type DashboardMetricSource = 'catalog' | 'inferred' | 'user'
+
+export interface DashboardMetricDefinition {
+  id: string
+  label: string
+  description?: string
+  measureId: string
+  field?: string
+  aggregation: QueryAggregation
+  calculation?: QueryCalculation
+  unit?: string
+  format?: 'number' | 'percent' | 'duration' | 'currency'
+  positiveDirection?: 'up' | 'down' | 'neutral'
+  source: DashboardMetricSource
+  confidence: number
+}
+
+export interface DashboardAnalysisQuestion {
+  id: string
+  question: string
+  metricIds: string[]
+  dimensionFields: string[]
+  timeGrain?: TimeGrain
+  preferredComponentTypes: DashboardComponentType[]
+  slotRole: DashboardSlotRole
+  priority: number
+  required: boolean
+}
+
+export interface DashboardAnalysisBlueprint {
+  version: '1.0'
+  request: string
+  audience: string
+  objective: string
+  scopeDescription: string
+  metrics: DashboardMetricDefinition[]
+  questions: DashboardAnalysisQuestion[]
+  assumptions: string[]
+  unresolvedAmbiguities: string[]
+  generatedAt: string
+}
+
+export interface DashboardSemanticBinding {
+  questionId: string
+  metricIds: string[]
+  dimensionFields: string[]
+  titleMode: 'auto' | 'custom'
+  titleTemplate?: string
+  confidence: number
 }
 
 export interface DashboardDataPoint {
@@ -59,6 +127,8 @@ export interface DashboardComponentSpec {
   accent?: string
   insight?: string
   style?: DashboardComponentStyle
+  semanticBinding?: DashboardSemanticBinding
+  slotRole?: DashboardSlotRole
 }
 
 export interface DashboardComponentStyle {
@@ -88,6 +158,8 @@ export interface DashboardSpec {
   viewport?: { width: 1920; height: 1080; columns: 24; rowHeight: number }
   theme: DashboardThemeId
   globalFilters?: DashboardFilter[]
+  /** Optional P0 semantic sidecar. Legacy v1 dashboards remain valid without it. */
+  analysisBlueprint?: DashboardAnalysisBlueprint
   updatedAt: string
   components: DashboardComponentSpec[]
 }
@@ -251,9 +323,11 @@ export interface VisualizationRunInput {
 }
 
 export type VisualizationToolName =
+  | 'plan-analysis'
   | 'profile-fields'
   | 'model-compose'
   | 'validate-dashboard'
+  | 'validate-semantics'
   | 'execute-query'
   | 'apply-patch'
   | 'repair-attempt'
@@ -273,13 +347,27 @@ export interface VisualizationRun extends VisualizationRunInput {
   createdAt: string
 }
 
+export type DashboardComponentDataShape =
+  | 'single-value'
+  | 'category-value'
+  | 'time-series'
+  | 'dual-measure'
+  | 'table'
+  | 'detail'
+  | 'text'
+
 export interface DashboardComponentDefinition {
+  manifestVersion: '1.0'
   type: DashboardComponentType
   name: string
   description: string
   category: '指标' | '趋势' | '比较' | '构成' | '明细' | '洞察'
   minimumSize: { w: number; h: number }
-  supportedDataShapes: Array<'single-value' | 'category-value' | 'time-series' | 'table'>
+  preferredSize: { w: number; h: number }
+  supportedDataShapes: DashboardComponentDataShape[]
+  compatibleSlotRoles: DashboardSlotRole[]
+  supportsManualAdd: boolean
+  requiresQuery: boolean
 }
 
 export const compareDashboardSpecValues = (
@@ -292,7 +380,8 @@ export const compareDashboardSpecValues = (
     'subtitle',
     'theme',
     'businessContext',
-    'globalFilters'
+    'globalFilters',
+    'analysisBlueprint'
   ]
   for (const field of comparableFields) {
     if (JSON.stringify(from[field]) !== JSON.stringify(to[field])) {

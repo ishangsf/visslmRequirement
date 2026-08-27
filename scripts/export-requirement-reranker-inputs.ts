@@ -2,7 +2,7 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
-import { buildRequirementSemanticCard } from '../src/main/requirements/semantic-card'
+import { buildRequirementSourceView } from '../src/main/requirements/requirement-match-card'
 import type { RecordDetail } from '../src/shared/types'
 
 interface Options {
@@ -92,7 +92,7 @@ const main = async (): Promise<void> => {
     const missing = requestedIds.filter((itemId) => !records.has(itemId.toLocaleUpperCase()))
     if (missing.length) throw new Error(`Database records are missing: ${missing.join(', ')}`)
     const base = records.get(options.baseItemId.toLocaleUpperCase())!
-    const baseCard = buildRequirementSemanticCard(base)
+    const baseCard = buildRequirementSourceView(base)
     const pairs = options.candidateItemIds.map((candidateItemId) => {
       const candidate = records.get(candidateItemId.toLocaleUpperCase())!
       return {
@@ -100,13 +100,13 @@ const main = async (): Promise<void> => {
         queryId: options.baseItemId,
         candidateItemId,
         query: baseCard.matchingText,
-        candidate: buildRequirementSemanticCard(candidate).matchingText
+        candidate: buildRequirementSourceView(candidate).matchingText
       }
     })
     await mkdir(dirname(options.output), { recursive: true })
     await writeFile(options.output, `${JSON.stringify({
       schemaVersion: '1.0',
-      provenance: 'Generated from a local VISSLM data-center database using the production semantic-card builder.',
+      provenance: 'Generated from a local VISSLM data-center database using the production cleaned-source builder.',
       pairs
     }, null, 2)}\n`, 'utf8')
     console.log(JSON.stringify({ output: options.output, queryCount: 1, pairCount: pairs.length }))

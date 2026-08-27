@@ -260,6 +260,22 @@ const testKnowledgeAndMixedUseDeclaredSources = async (): Promise<void> => {
   })
   assert.equal(mixed.client.calls.length, 1)
   assert.equal(mixed.client.calls.some((call) => Array.isArray(call.tools) && call.tools.length > 0), false)
+
+  const localMixed = await resolveWithRecordingClient(
+    decisionResponse({
+      taskType: 'knowledge_qa',
+      skillId: 'knowledge-base',
+      sourceMode: 'knowledge',
+      resolvedQuestion: '结合本地需求记录和知识库的部署规范说明审批流程',
+      resultMode: 'answer'
+    }),
+    request('请结合本地需求记录和知识库的部署规范说明审批流程')
+  )
+  assertDecisionCore(localMixed.decision, {
+    taskType: 'mixed_analysis',
+    sourceMode: 'mixed'
+  })
+  assert.equal(localMixed.client.calls.length, 1)
 }
 
 const testKnowledgeQuestionRoutesWithOneClosedThinkingCall = async (): Promise<void> => {
@@ -337,14 +353,17 @@ const testLengthClassifierResponseRetriesOnce = async (): Promise<void> => {
   assertIntentClassifierBudgets(client.calls, [900, 1800])
 }
 
-const testClassifierRetryIsCappedAtOne = async (): Promise<void> => {
+const testClassifierRetryIsCappedAtOneAndFallsBack = async (): Promise<void> => {
   const client = new ScriptedIntentClient([
     emptyModelResponse(),
     emptyModelResponse()
   ])
   const router = new AssistantIntentRouter(settings, client)
 
-  await assert.rejects(router.resolve(request('请处理一下')))
+  const decision = await router.resolve(request('请处理一下'))
+  assert.equal(decision.needsClarification, true)
+  assert.match(decision.clarificationQuestion ?? '', /目标|对象/u)
+  assert.doesNotMatch(decision.clarificationQuestion ?? '', /任务类型|数据来源|结果形式/u)
   assert.equal(client.calls.length, 2, 'an invalid retry response must not cause a third classifier call')
   assertIntentClassifierBudgets(client.calls, [900, 1800])
 }
@@ -364,7 +383,8 @@ const testAmbiguousIntentStopsWithClarification = async (): Promise<void> => {
   )
 
   assert.equal(decision.needsClarification, true)
-  assert.match(decision.clarificationQuestion ?? '', /范围|交付/u)
+  assert.match(decision.clarificationQuestion ?? '', /目标|对象/u)
+  assert.doesNotMatch(decision.clarificationQuestion ?? '', /任务类型|数据来源|结果形式|交付形式/u)
   assert.equal(client.calls.length, 1)
   assert.equal(client.calls.some((call) => Array.isArray(call.tools) && call.tools.length > 0), false)
   assert.doesNotMatch(textOfCalls(client.calls), /inspect_fields|query_records|knowledge\.search|execute_query/u)
@@ -454,6 +474,26 @@ const testOrdinaryListStaysFlat = async (): Promise<void> => {
     resultMode: 'list'
   })
   assert.deepEqual(entityNames(decision), [])
+}
+
+const testComparativeFollowUpNormalizesToAnswer = async (): Promise<void> => {
+  const history: ChatHistoryTurn[] = [{
+    role: 'user',
+    content: '请查询周顺峰和陈立的需求记录。'
+  }]
+  const { decision } = await resolveWithRecordingClient(
+    decisionResponse({
+      taskType: 'record_query',
+      skillId: 'general',
+      sourceMode: 'records',
+      resolvedQuestion: '哪个人的需求数量更多？',
+      resultMode: 'grouped_list',
+      groupEntities: ['周顺峰', '陈立']
+    }),
+    request('哪个人的需求数量更多？', history)
+  )
+  assert.equal(decision.resultMode, 'answer', 'a comparative follow-up should deliver a conclusion, not only a grouped dump')
+  assert.deepEqual(decision.groupEntities, ['周顺峰', '陈立'])
 }
 
 const testHistoryCanGroundResolutionWithoutUidLeak = async (): Promise<void> => {
@@ -593,7 +633,11 @@ const testGroupedDecisionProducesSeparateDataViewGroups = async (): Promise<void
       executionEvents.indexOf('intent-decision') < executionEvents.indexOf('database-inspect'),
       'the intent decision must precede the first database access'
     )
-    assert.ok(callInputs.length >= 1, 'the answer model may run only after structured grouped data exists')
+    assert.equal(
+      callInputs.length,
+      0,
+      'records-only grouped answers use deterministic verified rendering after structured grouped data exists'
+    )
     const modelPrompt = textOfCalls(callInputs)
     assert.doesNotMatch(modelPrompt, /"recordUids"/u, 'full UID indexes belong to ChatDataView, not model prompts')
     for (const fixture of groupedRecordFixtures) {
@@ -698,11 +742,12 @@ const main = async (): Promise<void> => {
   await testKnowledgeQuestionRoutesWithOneClosedThinkingCall()
   await testEmptyClassifierResponseRetriesOnce()
   await testLengthClassifierResponseRetriesOnce()
-  await testClassifierRetryIsCappedAtOne()
+  await testClassifierRetryIsCappedAtOneAndFallsBack()
   await testAmbiguousIntentStopsWithClarification()
   await testMultiturnGroupingUsesGroundedHistory()
   await testInventedGroupEntityFailsClosed()
   await testOrdinaryListStaysFlat()
+  await testComparativeFollowUpNormalizesToAnswer()
   await testHistoryCanGroundResolutionWithoutUidLeak()
   await testGroupedDecisionProducesSeparateDataViewGroups()
   await testConversationDecisionDoesNotTouchDatabase()
@@ -717,11 +762,12 @@ const main = async (): Promise<void> => {
       'GJB5000B knowledge questions route to knowledge with one closed-thinking call',
       'empty classifier responses retry once with the expanded budget',
       'length-truncated classifier responses retry once with the expanded budget',
-      'classifier retries are capped at one additional call',
+      'classifier retries are capped and degrade to a concrete clarification',
       'ambiguous intent stops with clarification and no tools',
       'multiturn grouping inherits only grounded entities',
       'invented entities fail closed',
       'ordinary lists remain flat',
+      'comparative follow-ups deliver an answer while retaining grounded entities',
       'history may ground resolution without leaking UID indexes',
       'grouped decisions produce separate grounded data-view groups',
       'conversation decisions avoid database and knowledge status access',

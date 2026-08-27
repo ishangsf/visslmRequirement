@@ -36,6 +36,7 @@ export default defineConfig({
       rollupOptions: {
         input: {
           index: resolve(__dirname, 'src/main/index.ts'),
+          'database-bootstrap-worker': resolve(__dirname, 'src/main/database-bootstrap-worker.ts'),
           'embedding-worker': resolve(__dirname, 'src/main/embedding-worker.ts')
         },
         output: {

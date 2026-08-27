@@ -5,23 +5,17 @@ import { tmpdir } from 'node:os'
 
 import { AppDatabase } from '../../src/main/database'
 import { RequirementAnalysisAgent } from '../../src/main/experts/requirement-analysis-agent'
-import type { KnowledgeRecordMatch } from '../../src/main/knowledge'
-import type { KnowledgeService } from '../../src/main/knowledge'
+import type { KnowledgeRecordMatch, KnowledgeService } from '../../src/main/knowledge'
 import type { ModelChatInput, ModelResponse } from '../../src/main/model-client'
 import {
   HybridRequirementRetriever,
   type HybridRequirementCandidate,
   type RequirementDenseRetriever
 } from '../../src/main/requirements/hybrid-retrieval'
-import { buildRequirementSemanticCard, buildRequirementSourceView } from '../../src/main/requirements/semantic-card'
-import type { RequirementSemanticCard } from '../../src/main/requirements/semantic-card'
+import { buildRequirementSourceView } from '../../src/main/requirements/requirement-match-card'
 import type { ModelSettings, RecordDetail } from '../../src/shared/types'
 
 const TEST_MODEL_VERSION = 'test-current-index-v1'
-const semanticContext = {
-  analyzerVersion: 'current-index-semantic-v1',
-  modelSignature: 'current-index-model-v1'
-}
 
 type RecordFixture = {
   uid: string
@@ -60,6 +54,7 @@ const addVectorIndex = (
   modelVersion = TEST_MODEL_VERSION
 ): void => {
   const chunkId = `requirement-test-chunk:${modelVersion}:${record.uid}`
+  const content = record.normalizedText ?? record.description
   db.replaceKnowledgeRecordChunks(
     record.uid,
     [{
@@ -68,11 +63,11 @@ const addVectorIndex = (
       sourceType: 'record',
       sourceName: record.name,
       sourceHash: `requirement-test-hash:${record.uid}`,
-      content: record.normalizedText ?? record.description,
+      content,
       chunkIndex: 0,
       location: 'test',
       charStart: 0,
-      charEnd: (record.normalizedText ?? record.description).length
+      charEnd: content.length
     }],
     [{
       chunkId,
@@ -82,36 +77,14 @@ const addVectorIndex = (
   )
 }
 
-const persistReadySemanticCard = (db: AppDatabase, record: RecordDetail): RequirementSemanticCard => {
-  const source = buildRequirementSemanticCard(record)
-  const card: RequirementSemanticCard = {
-    ...source,
-    functionalObject: record.name,
-    matchingText: source.evidence,
-    fieldAssessments: {
-      ...source.fieldAssessments,
-      functionalObject: { value: record.name, confidence: 0.95, evidence: source.evidence.slice(0, 32) }
-    },
-    analysisStatus: 'ai_adjudicated',
-    analysisSummary: '当前索引测试预置的 AI 语义卡片'
-  }
-  const contentHash = db.getRecordContentHash(record.uid)
-  assert.ok(contentHash)
-  assert.equal(db.claimRequirementSemanticCard({ recordUid: record.uid, contentHash, ...semanticContext }), true)
-  db.completeRequirementSemanticCard(record.uid, card)
-  return card
-}
-
 const createControlledDenseRetriever = (
   db: AppDatabase,
   indexedUids: string[]
-): RequirementDenseRetriever & { calls: string[]; allowedCalls: string[][] } => {
+): RequirementDenseRetriever & { allowedCalls: string[][] } => {
   const indexed = new Set(indexedUids)
-  const calls: string[] = []
   const allowedCalls: string[][] = []
   return {
     modelVersion: TEST_MODEL_VERSION,
-    calls,
     allowedCalls,
     async listRequirementIndexedRecords(): Promise<RecordDetail[]> {
       return [...indexed].map((uid) => {
@@ -121,11 +94,10 @@ const createControlledDenseRetriever = (
       })
     },
     async rankRequirementRecordMatches(
-      question: string,
+      _question: string,
       limit = 100,
       allowedRecordUids?: ReadonlySet<string>
     ): Promise<KnowledgeRecordMatch[]> {
-      calls.push(question)
       allowedCalls.push([...(allowedRecordUids ?? [])].sort())
       return [...indexed]
         .filter((uid) => !allowedRecordUids || allowedRecordUids.has(uid))
@@ -147,6 +119,26 @@ const createControlledDenseRetriever = (
   }
 }
 
+const sourceCandidate = (
+  db: AppDatabase,
+  uid: string,
+  score = 80
+): HybridRequirementCandidate => {
+  const record = db.getRecord(uid, false)
+  assert.ok(record, `candidate fixture was not persisted: ${uid}`)
+  const card = buildRequirementSourceView(record)
+  // Keep this fixture independent of optional score dimensions. The matcher
+  // must be able to consume a source-only card without any generated fields.
+  return {
+    record,
+    card,
+    denseScore: score,
+    lexicalScore: score - 3,
+    retrievalScore: score / 100,
+    snippet: record.description
+  } as HybridRequirementCandidate
+}
+
 const retrieveCandidates = async (
   db: AppDatabase,
   dense: RequirementDenseRetriever,
@@ -154,28 +146,26 @@ const retrieveCandidates = async (
   excludedUids: Set<string>
 ): Promise<HybridRequirementCandidate[]> => {
   const base = db.getRecord(baseUid, false)
-  assert.ok(base, `base fixture record was not persisted: ${baseUid}`)
-  const contentHash = db.getRecordContentHash(baseUid)
-  assert.ok(contentHash)
-  const baseCard = db.getReadyRequirementSemanticCard({ recordUid: baseUid, contentHash, ...semanticContext })
-  assert.ok(baseCard, `base semantic card was not persisted: ${baseUid}`)
-  return new HybridRequirementRetriever(db, dense, semanticContext).retrieve(
-    baseCard,
+  assert.ok(base, `base fixture was not persisted: ${baseUid}`)
+  return new HybridRequirementRetriever(db, dense).retrieve(
+    buildRequirementSourceView(base),
     excludedUids
   )
 }
 
-const retrieveUids = async (
-  db: AppDatabase,
-  dense: RequirementDenseRetriever,
-  baseUid: string,
-  excludedUids: Set<string>
-): Promise<string[]> => {
-  const candidates = await retrieveCandidates(db, dense, baseUid, excludedUids)
-  return candidates.map((candidate) => candidate.record.uid)
+const assertSourceOnlyCard = (
+  candidate: HybridRequirementCandidate,
+  record: RecordDetail
+): void => {
+  assert.deepEqual(candidate.card, buildRequirementSourceView(record))
+  assert.deepEqual(Object.keys(candidate.card).sort(), [
+    'evidence', 'lexicalTerms', 'matchingText', 'module', 'productDomain',
+    'requirementType', 'sourceDescription', 'sourceTitle'
+  ].sort())
+  assert.ok(candidate.card.evidence.includes(record.name))
 }
 
-const testCurrentIndexScopeAndSingleBaseExclusion = async (db: AppDatabase): Promise<void> => {
+const testCurrentIndexScopeAndSourceOnlyRecall = async (db: AppDatabase): Promise<void> => {
   const base = addRecord(db, {
     uid: 'base-single-uid',
     projectId: 'project-base',
@@ -194,13 +184,13 @@ const testCurrentIndexScopeAndSingleBaseExclusion = async (db: AppDatabase): Pro
     description: '其他项目的发布节点支持导出订单明细。',
     module: '订单管理'
   })
-  const indexedPendingSemantic = addRecord(db, {
-    uid: 'indexed-pending-semantic-uid',
+  const indexedSourceOnly = addRecord(db, {
+    uid: 'indexed-source-only-uid',
     projectId: 'project-other',
     nodeType: 'Requirement',
-    itemId: 'INDEXED-PENDING-SEMANTIC',
-    name: '已有向量但未语义化的订单需求',
-    description: '订单管理页面支持查询订单明细，但尚未生成 AI 语义卡片。',
+    itemId: 'INDEXED-SOURCE-ONLY',
+    name: '已有向量的订单需求',
+    description: '订单管理页面支持查询订单明细，只有完整原文可供匹配。',
     module: '订单管理'
   })
   const unindexedLexical = addRecord(db, {
@@ -212,81 +202,45 @@ const testCurrentIndexScopeAndSingleBaseExclusion = async (db: AppDatabase): Pro
     description: '订单管理页面支持导出订单明细，词法内容与基准高度重合。',
     module: '订单管理'
   })
-  const unindexedStructured = addRecord(db, {
-    uid: 'unindexed-structured-uid',
-    projectId: 'project-structured',
-    nodeType: 'Task',
-    itemId: 'UNINDEXED-STRUCTURED',
-    name: '订单管理同模块结构化命中',
-    description: '订单管理页面处理相关配置。',
-    module: '订单管理'
-  })
   const staleModelMatch = addRecord(db, {
     uid: 'stale-model-uid',
     projectId: 'project-stale',
     nodeType: 'Requirement',
     itemId: 'STALE-MODEL',
     name: '订单明细导出旧索引',
-    description: '订单管理页面支持导出订单明细，只有旧 embedding 版本建立过索引。',
+    description: '订单管理页面支持导出订单明细，但只有旧 embedding 版本建立过索引。',
     module: '订单管理'
   })
   addVectorIndex(db, indexedCrossScope)
-  addVectorIndex(db, indexedPendingSemantic)
+  addVectorIndex(db, indexedSourceOnly)
   addVectorIndex(db, staleModelMatch, 'test-legacy-index-v1')
-  persistReadySemanticCard(db, base)
-  persistReadySemanticCard(db, indexedCrossScope)
 
-  const indexedRows = db.listKnowledgeVectorRows(TEST_MODEL_VERSION)
-  assert.deepEqual(
-    indexedRows.map(({ chunk }) => chunk.recordUid).sort(),
-    [indexedCrossScope.uid, indexedPendingSemantic.uid],
-    'fixture must contain ready and pending-semantic current-index records'
-  )
   const indexedDetails = db.listKnowledgeIndexedRecordDetails(TEST_MODEL_VERSION)
   assert.deepEqual(
     indexedDetails.map((record) => record.uid).sort(),
-    [indexedCrossScope.uid, indexedPendingSemantic.uid],
-    'current index details must exclude records that only have an older model version'
+    [indexedCrossScope.uid, indexedSourceOnly.uid],
+    'only current-model indexed records are eligible for matching'
   )
-
   const dense = createControlledDenseRetriever(db, indexedDetails.map((record) => record.uid))
   const candidates = await retrieveCandidates(db, dense, base.uid, new Set([base.uid]))
   const candidateUids = candidates.map((candidate) => candidate.record.uid)
-  const candidateByUid = new Map(candidates.map((candidate) => [candidate.record.uid, candidate]))
 
   assert.deepEqual(
     candidateUids,
-    [indexedCrossScope.uid, indexedPendingSemantic.uid],
-    'hybrid recall must include every current-index candidate, regardless of semantic-card readiness'
+    [indexedCrossScope.uid, indexedSourceOnly.uid],
+    'full current index must be recalled from cleaned source records'
   )
   assert.deepEqual(
     dense.allowedCalls,
-    [[indexedCrossScope.uid, indexedPendingSemantic.uid]],
-    'Dense must receive the complete current embedding-index candidate set, not only ready-card records'
+    [[indexedCrossScope.uid, indexedSourceOnly.uid]],
+    'Dense must receive the complete current-index UID set'
   )
-  assert.ok(!candidateUids.includes(base.uid), 'the single base UID must be excluded')
-  assert.ok(!candidateUids.includes(unindexedLexical.uid), 'an unindexed lexical match must be excluded')
-  assert.ok(!candidateUids.includes(unindexedStructured.uid), 'an unindexed structured match must be excluded')
-  assert.ok(!candidateUids.includes(staleModelMatch.uid), 'a lexical/structured match indexed only by an older model version must be excluded')
-  assert.ok(candidateUids.includes(indexedCrossScope.uid), 'an indexed record from another project/node type remains eligible')
-
-  const readyCandidate = candidateByUid.get(indexedCrossScope.uid)
-  assert.ok(readyCandidate)
-  assert.equal(readyCandidate.card.analysisStatus, 'ai_adjudicated', 'ready candidates must retain their AI semantic card')
-  assert.equal(readyCandidate.card.functionalObject, indexedCrossScope.name, 'ready candidates must expose card-enhanced fields')
-  assert.ok(readyCandidate.lexicalScore > 0, 'ready candidates must remain eligible for BM25 recall')
-  assert.ok(readyCandidate.structuralScore > 0, 'structured recall must be available for ready candidates')
-
-  const sourceOnlyCandidate = candidateByUid.get(indexedPendingSemantic.uid)
-  assert.ok(sourceOnlyCandidate)
-  assert.equal(sourceOnlyCandidate.card.analysisStatus, 'source_only', 'unsemanticized indexed candidates must receive a source-only source view')
-  assert.deepEqual(
-    sourceOnlyCandidate.card,
-    buildRequirementSourceView(indexedPendingSemantic),
-    'source-only candidate view must contain only readable source data'
-  )
-  assert.ok(sourceOnlyCandidate.lexicalScore > 0, 'source-only candidates must remain eligible for BM25 recall')
-  assert.equal(sourceOnlyCandidate.structuralScore, 0, 'structured recall must not score candidates without ready AI cards')
+  assert.ok(!candidateUids.includes(base.uid), 'the base UID must be excluded')
+  assert.ok(!candidateUids.includes(unindexedLexical.uid), 'an unindexed lexical hit must be excluded')
+  assert.ok(!candidateUids.includes(staleModelMatch.uid), 'an older-model index must be excluded')
+  assertSourceOnlyCard(candidates[0]!, indexedCrossScope)
+  assertSourceOnlyCard(candidates[1]!, indexedSourceOnly)
+  assert.ok(candidates.every((candidate) => candidate.lexicalScore > 0), 'source-only records remain eligible for lexical recall')
 }
 
 const mathTypeSettings: ModelSettings = {
@@ -297,7 +251,7 @@ const mathTypeSettings: ModelSettings = {
   thinking: false
 }
 
-const testMathTypeCurrentIndexCandidateFlowsToReview = async (db: AppDatabase): Promise<void> => {
+const testCurrentIndexCandidateFlowsToReview = async (db: AppDatabase): Promise<void> => {
   const base = addRecord(db, {
     uid: 'mathtype-base-uid',
     projectId: 'project-mathtype',
@@ -328,15 +282,11 @@ const testMathTypeCurrentIndexCandidateFlowsToReview = async (db: AppDatabase): 
   addVectorIndex(db, base)
   addVectorIndex(db, indexedCandidate)
 
-  assert.equal(db.getRequirementSemanticCardState(base.uid), null, 'the base fixture must have no AI semantic card')
-  assert.equal(db.getRequirementSemanticCardState(indexedCandidate.uid), null, 'VISSLM-TSIS-79 fixture must have no AI semantic card')
-  assert.equal(db.getRequirementSemanticCardState(unindexedCandidate.uid), null, 'unindexed fixture must have no AI semantic card')
-
   const dense = createControlledDenseRetriever(db, [base.uid, indexedCandidate.uid])
   const rerankerInputs: HybridRequirementCandidate[][] = []
   const reranker = {
     modelId: 'current-index-regression-reranker',
-    async rerank(_base: RequirementSemanticCard, candidates: HybridRequirementCandidate[]) {
+    async rerank(_base: HybridRequirementCandidate['card'], candidates: HybridRequirementCandidate[]) {
       rerankerInputs.push(candidates)
       return candidates.map((candidate, index) => ({
         recordUid: candidate.record.uid,
@@ -348,20 +298,14 @@ const testMathTypeCurrentIndexCandidateFlowsToReview = async (db: AppDatabase): 
   const modelClient = {
     async chat(input: ModelChatInput): Promise<ModelResponse> {
       modelInputs.push(input)
-      const content = input.messages.at(-1)?.content ?? '{}'
-      const payload = JSON.parse(content) as {
-        summary?: string
-        requirement?: { evidence?: string; semanticCardStatus?: string; evidenceSegments?: Array<{ id: string }> }
-        candidates?: Array<{ recordUid: string; evidence?: string; semanticCardStatus?: string; evidenceSegments?: Array<{ id: string }> }>
+      const payload = JSON.parse(input.messages.at(-1)?.content ?? '{}') as {
+        requirement?: { evidence?: string; evidenceSegments?: Array<{ id: string }> }
+        candidates?: Array<{ recordUid: string; evidence?: string; evidenceSegments?: Array<{ id: string }> }>
       }
-      assert.equal(payload.requirement?.semanticCardStatus, 'source_only', 'batch explanation must receive an unready base as source-only')
-      assert.ok(payload.requirement?.evidence?.includes('导入 MathType 公式'), 'batch explanation must receive the base readable source evidence')
-      assert.equal(payload.candidates?.length, 1, 'batch explanation should receive the indexed candidate after base exclusion')
-      assert.equal(payload.candidates?.[0]?.recordUid, indexedCandidate.uid, 'batch explanation must receive the indexed candidate')
-      assert.equal(payload.candidates?.[0]?.semanticCardStatus, 'source_only', 'batch explanation must receive the source-only card status')
-      assert.ok(payload.candidates?.[0]?.evidence?.includes('MathType OLE'), 'batch explanation must receive the candidate readable source evidence')
-      const baseEvidence = payload.requirement?.evidenceSegments?.[0]?.id ?? ''
-      const candidateEvidence = payload.candidates?.[0]?.evidenceSegments?.[0]?.id ?? ''
+      assert.ok(payload.requirement?.evidence?.includes('导入 MathType 公式'))
+      assert.equal(payload.candidates?.length, 1)
+      assert.equal(payload.candidates?.[0]?.recordUid, indexedCandidate.uid)
+      assert.ok(payload.candidates?.[0]?.evidence?.includes('MathType OLE'))
       return {
         message: {
           role: 'assistant',
@@ -369,10 +313,11 @@ const testMathTypeCurrentIndexCandidateFlowsToReview = async (db: AppDatabase): 
             summary: 'MathType 当前索引候选回归通过',
             items: [{
               recordUid: indexedCandidate.uid,
+              relation: 'partial_overlap',
               similarities: ['都涉及 MathType 公式能力'],
               differences: ['基准关注导入，候选关注在线编辑与 OLE 对象'],
-              baseEvidence,
-              candidateEvidence
+              baseEvidence: payload.requirement?.evidenceSegments?.[0]?.id ?? 'B001',
+              candidateEvidence: payload.candidates?.[0]?.evidenceSegments?.[0]?.id ?? 'C001'
             }]
           })
         }
@@ -385,27 +330,20 @@ const testMathTypeCurrentIndexCandidateFlowsToReview = async (db: AppDatabase): 
     mathTypeSettings,
     undefined,
     {
-      retriever: new HybridRequirementRetriever(db, dense, semanticContext),
+      retriever: new HybridRequirementRetriever(db, dense),
       reranker,
-      modelClient,
-      semanticContext
+      modelClient
     }
   ).ask({ question: '分析需求编号 4072' })
 
-  assert.equal(rerankerInputs.length, 1, 'Cross-Encoder should receive one hybrid candidate batch')
+  assert.equal(rerankerInputs.length, 1)
   assert.deepEqual(rerankerInputs[0]?.map((candidate) => candidate.record.uid), [indexedCandidate.uid])
-  assert.equal(rerankerInputs[0]?.[0]?.card.analysisStatus, 'source_only', 'Cross-Encoder must receive the source-only candidate card')
-  assert.deepEqual(modelInputs.map((input) => JSON.parse(input.messages.at(-1)?.content ?? '{}').candidates.map((candidate: { recordUid: string }) => candidate.recordUid)), [
-    [indexedCandidate.uid]
-  ], 'the indexed candidate must receive one batch explanation')
-  assert.ok(response.sources.some((source) => source.itemId === 'VISSLM-TSIS-79'), 'VISSLM-TSIS-4072 must recall VISSLM-TSIS-79')
-  assert.ok(!response.sources.some((source) => source.itemId === 'VISSLM-TSIS-79-UNINDEXED'), 'unindexed MathType candidates must not be recalled')
-  assert.ok(!response.sources.some((source) => source.itemId === 'VISSLM-TSIS-4072'), 'the base requirement UID must remain excluded')
-  assert.deepEqual(
-    dense.allowedCalls,
-    [[base.uid, indexedCandidate.uid]],
-    'MathType Dense scope must contain all current-index readable records, including the source-only candidate'
-  )
+  assertSourceOnlyCard(rerankerInputs[0]![0]!, indexedCandidate)
+  assert.equal(modelInputs.length, 1, 'one current-index base uses one batch explanation call')
+  assert.ok(response.sources.some((source) => source.itemId === 'VISSLM-TSIS-79'))
+  assert.ok(!response.sources.some((source) => source.itemId === unindexedCandidate.itemId))
+  assert.ok(!response.sources.some((source) => source.itemId === base.itemId))
+  assert.deepEqual(dense.allowedCalls, [[base.uid, indexedCandidate.uid]])
 }
 
 const testMultipleBaseUidExclusion = async (db: AppDatabase): Promise<void> => {
@@ -436,22 +374,15 @@ const testMultipleBaseUidExclusion = async (db: AppDatabase): Promise<void> => {
     description: '其他项目的里程碑支持处理库存明细。',
     module: '库存管理'
   })
+  addVectorIndex(db, baseOne)
+  addVectorIndex(db, baseTwo)
   addVectorIndex(db, indexedCandidate)
-  persistReadySemanticCard(db, baseOne)
-  persistReadySemanticCard(db, baseTwo)
-  persistReadySemanticCard(db, indexedCandidate)
-
-  const dense = createControlledDenseRetriever(db, [
-    baseOne.uid,
-    baseTwo.uid,
-    indexedCandidate.uid
-  ])
+  const dense = createControlledDenseRetriever(db, [baseOne.uid, baseTwo.uid, indexedCandidate.uid])
   const excludedUids = new Set([baseOne.uid, baseTwo.uid])
-  const firstCandidateUids = await retrieveUids(db, dense, baseOne.uid, excludedUids)
-  const secondCandidateUids = await retrieveUids(db, dense, baseTwo.uid, excludedUids)
-
-  assert.deepEqual(firstCandidateUids, [indexedCandidate.uid], 'all requested base UIDs must be excluded for the first base')
-  assert.deepEqual(secondCandidateUids, [indexedCandidate.uid], 'all requested base UIDs must be excluded for the second base')
+  const first = await retrieveCandidates(db, dense, baseOne.uid, excludedUids)
+  const second = await retrieveCandidates(db, dense, baseTwo.uid, excludedUids)
+  assert.deepEqual(first.map((candidate) => candidate.record.uid), [indexedCandidate.uid])
+  assert.deepEqual(second.map((candidate) => candidate.record.uid), [indexedCandidate.uid])
 }
 
 const main = async (): Promise<void> => {
@@ -459,17 +390,17 @@ const main = async (): Promise<void> => {
   let db: AppDatabase | null = null
   try {
     db = new AppDatabase(join(directory, 'current-index.db'), join(directory, 'assets'))
-    await testCurrentIndexScopeAndSingleBaseExclusion(db)
-    await testMathTypeCurrentIndexCandidateFlowsToReview(db)
+    await testCurrentIndexScopeAndSourceOnlyRecall(db)
+    await testCurrentIndexCandidateFlowsToReview(db)
     await testMultipleBaseUidExclusion(db)
     console.log(JSON.stringify({
       ok: true,
       checks: [
-        'single base UID exclusion',
-        'multiple base UID exclusion',
-        'current-index records recalled with ready-card and source-only-card paths',
-        'unindexed, lexical-only, structured-only, and stale-model records excluded',
-        'current-index source-only candidate reaches Cross-Encoder and batch explanation'
+        'single and multiple base UID exclusion',
+        'all current-index records recalled as source-only cards',
+        'unindexed and stale-model records excluded',
+        'source-only current-index candidate reaches Cross-Encoder and batch explanation',
+        'explanation payload carries cleaned source evidence'
       ]
     }))
   } finally {

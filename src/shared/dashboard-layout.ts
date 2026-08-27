@@ -1,7 +1,8 @@
 import type {
   DashboardComponentSpec,
   DashboardComponentType,
-  DashboardLayout
+  DashboardLayout,
+  DashboardSlotRole
 } from './dashboard'
 
 interface LayoutProfile {
@@ -13,6 +14,16 @@ interface LayoutProfile {
 
 export const dashboardGridColumns = 24
 export const dashboardGridRows = 20
+
+export const dashboardSlotRoleOrder: Record<DashboardSlotRole, number> = {
+  headline: 10,
+  trend: 20,
+  comparison: 30,
+  breakdown: 40,
+  diagnosis: 50,
+  detail: 60,
+  insight: 70
+}
 
 export const dashboardLayoutProfiles: Record<DashboardComponentType, LayoutProfile> = {
   kpi: { minimumWidth: 4, preferredWidth: 6, minimumHeight: 2, preferredHeight: 3 },
@@ -26,7 +37,9 @@ export const dashboardLayoutProfiles: Record<DashboardComponentType, LayoutProfi
   gauge: { minimumWidth: 6, preferredWidth: 8, minimumHeight: 4, preferredHeight: 5 },
   funnel: { minimumWidth: 7, preferredWidth: 9, minimumHeight: 4, preferredHeight: 5 },
   radar: { minimumWidth: 7, preferredWidth: 9, minimumHeight: 4, preferredHeight: 5 },
-  scatter: { minimumWidth: 8, preferredWidth: 10, minimumHeight: 4, preferredHeight: 5 }
+  scatter: { minimumWidth: 8, preferredWidth: 10, minimumHeight: 4, preferredHeight: 5 },
+  treemap: { minimumWidth: 7, preferredWidth: 9, minimumHeight: 4, preferredHeight: 5 },
+  combo: { minimumWidth: 9, preferredWidth: 12, minimumHeight: 4, preferredHeight: 5 }
 }
 
 const rowCost = (components: DashboardComponentSpec[]): number => {
@@ -107,6 +120,28 @@ export const arrangeDashboardComponents = (
   })
 }
 
+/**
+ * Compiles semantic story roles into the existing deterministic 24-column grid.
+ * Legacy components without a role retain their relative order after bound items.
+ */
+export const arrangeDashboardComponentsByStory = (
+  components: DashboardComponentSpec[]
+): DashboardComponentSpec[] => {
+  const ordered = components
+    .map((component, index) => ({ component, index }))
+    .sort((left, right) => {
+      const leftRank = left.component.slotRole
+        ? dashboardSlotRoleOrder[left.component.slotRole]
+        : Number.MAX_SAFE_INTEGER
+      const rightRank = right.component.slotRole
+        ? dashboardSlotRoleOrder[right.component.slotRole]
+        : Number.MAX_SAFE_INTEGER
+      return leftRank - rightRank || left.index - right.index
+    })
+    .map(({ component }) => component)
+  return arrangeDashboardComponents(ordered)
+}
+
 export const dashboardRowCount = (components: DashboardComponentSpec[]): number =>
   Math.max(1, ...components.map((component) => component.layout.y + component.layout.h))
 
@@ -118,6 +153,30 @@ const overlaps = (
   left.x + left.w > right.x &&
   left.y < right.y + right.h &&
   left.y + left.h > right.y
+
+export const findFirstAvailableDashboardLayout = (
+  components: DashboardComponentSpec[],
+  type: DashboardComponentType
+): DashboardLayout | null => {
+  const profile = dashboardLayoutProfiles[type]
+  const sizes = [
+    { w: profile.preferredWidth, h: profile.preferredHeight },
+    { w: profile.minimumWidth, h: profile.minimumHeight }
+  ].filter((size, index, all) =>
+    all.findIndex((candidate) => candidate.w === size.w && candidate.h === size.h) === index
+  )
+  for (const { w, h } of sizes) {
+    for (let y = 0; y <= dashboardGridRows - h; y += 1) {
+      for (let x = 0; x <= dashboardGridColumns - w; x += 1) {
+        const candidate = { x, y, w, h }
+        if (!components.some((component) => overlaps(candidate, component.layout))) {
+          return candidate
+        }
+      }
+    }
+  }
+  return null
+}
 
 export interface DashboardLayoutSwapResult {
   targetId: string

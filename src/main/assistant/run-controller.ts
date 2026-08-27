@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { randomUUID } from 'node:crypto'
-import type { CancelAgentRunResult, RequirementSemanticizationModelUsage } from '../../shared/types'
+import type { CancelAgentRunResult, ModelUsage } from '../../shared/types'
 
 /** A renderer-owned object that can notify us when its IPC endpoint is gone. */
 export interface AssistantRunOwner {
@@ -90,7 +90,7 @@ const nonNegativeFiniteNumber = (value: unknown): number | undefined => (
  * calls outside an assistant run never leak into run history, while nested
  * agent calls inside one run are all included exactly once by ModelClient.chat.
  */
-export const recordAssistantRunUsage = (usage?: RequirementSemanticizationModelUsage): void => {
+export const recordAssistantRunUsage = (usage?: ModelUsage): void => {
   const context = getAssistantRunContext()
   if (!context || !usage) return
 

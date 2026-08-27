@@ -1,6 +1,6 @@
 import type { ModelChatInput, ModelResponse } from '../model-client'
 import type { HybridRequirementCandidate } from './hybrid-retrieval'
-import type { RequirementMatchCard } from './semantic-card'
+import type { RequirementMatchCard } from './requirement-match-card'
 import {
   REQUIREMENT_MATCH_RELATIONS,
   type RequirementMatchRelation
@@ -110,21 +110,12 @@ const EXPLANATION_SYSTEM_PROMPT = [
   '只输出符合 JSON schema 的 JSON，不输出 Markdown、解释文字、思维过程或隐藏推理。'
 ].join('\n')
 
-const CARD_FIELDS: readonly (keyof RequirementMatchCard)[] = [
+const SOURCE_FIELDS: readonly (keyof RequirementMatchCard)[] = [
+  'sourceTitle',
+  'sourceDescription',
   'requirementType',
   'productDomain',
-  'module',
-  'functionalObject',
-  'action',
-  'currentState',
-  'targetState',
-  'trigger',
-  'input',
-  'output',
-  'behavior',
-  'constraints',
-  'acceptance',
-  'businessScene'
+  'module'
 ]
 
 export interface RequirementMatchEvidenceSegment {
@@ -200,12 +191,11 @@ export const requirementMatchEvidenceSegments = (
 }
 
 const cardPayload = (card: RequirementMatchCard, prefix: 'B' | 'C'): Record<string, unknown> => {
-  const fields = Object.fromEntries(CARD_FIELDS.map((field) => [
+  const fields = Object.fromEntries(SOURCE_FIELDS.map((field) => [
     field,
     typeof card[field] === 'string' ? promptText(card[field], PROMPT_FIELD_MAX_CHARS) : card[field]
   ]))
   return {
-    semanticCardStatus: card.analysisStatus,
     ...fields,
     evidence: promptText(card.evidence, PROMPT_EVIDENCE_MAX_CHARS),
     evidenceSegments: requirementMatchEvidenceSegments(

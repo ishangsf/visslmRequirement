@@ -1,7 +1,7 @@
 import {
-  semanticTextSimilarity,
+  textSimilarity,
   type RequirementMatchCard
-} from './semantic-card'
+} from './requirement-match-card'
 import type { HybridRequirementCandidate } from './hybrid-retrieval'
 
 export const REQUIREMENT_MATCH_RELATIONS = [
@@ -18,10 +18,7 @@ export type RequirementMatchRelation = typeof REQUIREMENT_MATCH_RELATIONS[number
 export const REQUIREMENT_MATCH_DECISION_PATHS = [
   'exact_text',
   'near_duplicate_text',
-  'semantic_card',
-  'deterministic_score',
-  'ai_review',
-  'unavailable'
+  'deterministic_score'
 ] as const
 
 export type RequirementMatchDecisionPath = typeof REQUIREMENT_MATCH_DECISION_PATHS[number]
@@ -40,28 +37,16 @@ export const REQUIREMENT_MATCH_RELATION_SCORE_RANGES: Record<
   unrelated: { min: 0, max: 24 }
 }
 
+/** Dimensions that can be calculated from cleaned source text and retrieval signals. */
 export const REQUIREMENT_MATCH_DIMENSIONS = [
   'semantic',
   'keyword',
   'domain',
-  'object',
-  'functionalObject',
-  'action',
-  'currentState',
-  'targetState',
-  'trigger',
-  'input',
-  'output',
-  'behavior',
-  'constraints',
-  'acceptance',
-  'businessScene',
   'requirementType',
   'productDomain',
   'module',
   'dense',
   'lexical',
-  'structural',
   'reranker'
 ] as const
 
@@ -71,28 +56,15 @@ export const REQUIREMENT_MATCH_DEFAULT_WEIGHTS: Readonly<Record<RequirementMatch
   semantic: 0.20,
   keyword: 0.10,
   domain: 0.05,
-  object: 0.05,
-  action: 0.05,
+  requirementType: 0,
+  productDomain: 0,
+  module: 0,
   // Cross-Encoder output is an uncalibrated ordering signal. It is retained
   // on each ranked candidate, but must not become a percentage or relation by
   // default.
   reranker: 0,
-  functionalObject: 0,
-  currentState: 0,
-  targetState: 0,
-  trigger: 0,
-  input: 0,
-  output: 0,
-  behavior: 0,
-  constraints: 0,
-  acceptance: 0,
-  businessScene: 0,
-  requirementType: 0,
-  productDomain: 0,
-  module: 0,
   dense: 0,
-  lexical: 0,
-  structural: 0
+  lexical: 0
 }
 
 export interface RequirementScoreRange {
@@ -103,13 +75,10 @@ export interface RequirementScoreRange {
 export interface RequirementMatchScoringSignals {
   denseScore?: number
   lexicalScore?: number
-  structuralScore?: number
   rerankerScore?: number
   semanticScore?: number
   keywordScore?: number
   domainScore?: number
-  objectScore?: number
-  actionScore?: number
   /** Optional deterministic dimension values supplied by the caller. */
   dimensionScores?: Partial<Record<RequirementMatchDimension, number>>
   /** Input range for caller-supplied values; the default range is 0..100. */
@@ -140,23 +109,16 @@ export interface RequirementMatchScoreResult extends RequirementMatchDecision {
   dimensionDetails: RequirementMatchScoreDimension[]
   validDimensions: RequirementMatchDimension[]
   totalWeight: number
+  /** Stable result fields; source-only matching has no inferred object/action. */
   objectSimilarity: number
   actionComparison: 'same' | 'different' | 'unknown'
   decisionPath: RequirementMatchDecisionPath
   confidenceBasis: string[]
 }
 
-const TEXT_DIMENSIONS: readonly RequirementMatchDimension[] = [
-  'functionalObject',
-  'currentState',
-  'targetState',
-  'trigger',
-  'input',
-  'output',
-  'behavior',
-  'constraints',
-  'acceptance',
-  'businessScene',
+type RequirementTextDimension = 'requirementType' | 'productDomain' | 'module'
+
+const TEXT_DIMENSIONS: readonly RequirementTextDimension[] = [
   'requirementType',
   'productDomain',
   'module'
@@ -190,8 +152,6 @@ export const clampRequirementScore = (value: unknown): number => (
   normalizeRequirementScore(value) ?? 0
 )
 
-// Short aliases keep orchestration code readable while the longer names remain
-// explicit at module boundaries.
 export const normalizeScore = normalizeRequirementScore
 export const clampScore = clampRequirementScore
 
@@ -233,21 +193,18 @@ export interface RequirementMatchRelationContext {
   sameAction?: boolean
 }
 
-/**
- * Classify a deterministic final score. Optional card-comparison context makes
- * the classifier conservative without inferring any business meaning from raw
- * text: action and object values must already be present in semantic cards.
- */
+/** Classify a deterministic source/retrieval score into a user-facing relation. */
 export const classifyRequirementRelation = (
   score: number,
   context: RequirementMatchRelationContext = {}
 ): RequirementMatchRelation => {
   const normalized = clampRequirementScore(score)
   const relation = relationFromScore(normalized)
+  // Context remains accepted for callers that provide it, but no model-derived
+  // action/object is read by the source-only implementation.
   const objectSimilarity = isFiniteNumber(context.objectSimilarity)
     ? Math.max(0, Math.min(1, context.objectSimilarity))
     : undefined
-
   if (context.actionKnown && context.sameAction === true && objectSimilarity !== undefined && objectSimilarity < 0.5) {
     return requirementMatchRelationRank(relation) > requirementMatchRelationRank('same_pattern')
       ? 'same_pattern'
@@ -276,9 +233,13 @@ const candidateUidOf = (
   candidate: RequirementMatchCard | HybridRequirementCandidate
 ): string | undefined => isHybridRequirementCandidate(candidate) ? candidate.record.uid : undefined
 
+const isRequirementTextDimension = (
+  dimension: RequirementMatchDimension
+): dimension is RequirementTextDimension => TEXT_DIMENSIONS.includes(dimension as RequirementTextDimension)
+
 const textValueOf = (card: RequirementMatchCard, dimension: RequirementMatchDimension): string => {
-  if (!TEXT_DIMENSIONS.includes(dimension)) return ''
-  return String(card[dimension as keyof RequirementMatchCard] ?? '').trim()
+  if (!isRequirementTextDimension(dimension)) return ''
+  return String(card[dimension] ?? '').trim()
 }
 
 const textDimensionScore = (
@@ -289,20 +250,7 @@ const textDimensionScore = (
   const left = textValueOf(base, dimension)
   const right = textValueOf(candidate, dimension)
   if (!left || !right) return undefined
-  return normalizeRequirementScore(semanticTextSimilarity(left, right), { min: 0, max: 1 })
-}
-
-const objectSimilarityOf = (
-  base: RequirementMatchCard,
-  candidate: RequirementMatchCard
-): number => semanticTextSimilarity(base.functionalObject, candidate.functionalObject)
-
-const actionComparisonOf = (
-  base: RequirementMatchCard,
-  candidate: RequirementMatchCard
-): RequirementMatchScoreResult['actionComparison'] => {
-  if (base.action === 'unknown' || candidate.action === 'unknown') return 'unknown'
-  return base.action === candidate.action ? 'same' : 'different'
+  return normalizeRequirementScore(textSimilarity(left, right), { min: 0, max: 1 })
 }
 
 const normalizedSourceValue = (value: string): string => value
@@ -332,43 +280,20 @@ const sourceFieldSimilarity = (left: string, right: string): {
   const intersection = [...leftTerms].filter((term) => rightTerms.has(term)).length
   const terms = intersection / Math.max(1, new Set([...leftTerms, ...rightTerms]).size)
   const coverage = Math.min(a.length, b.length) / Math.max(a.length, b.length)
-  const char = semanticTextSimilarity(a, b)
+  const char = textSimilarity(a, b)
   return { char, coverage, terms, combined: char * 0.55 + coverage * 0.2 + terms * 0.25 }
 }
 
-const sourceEvidenceSection = (
-  card: RequirementMatchCard,
-  label: string,
-  nextLabels: readonly string[] = []
-): string => {
-  const lines = card.evidence.split(/\r?\n/)
-  const start = lines.findIndex((line) => line.trim().startsWith(label))
-  if (start < 0) return ''
-  const values: string[] = [lines[start]!.trim().slice(label.length).trim()]
-  for (let index = start + 1; index < lines.length; index += 1) {
-    const line = lines[index]!.trim()
-    if (nextLabels.some((nextLabel) => line.startsWith(nextLabel))) break
-    if (line) values.push(line)
-  }
-  return values.filter(Boolean).join('\n').trim()
-}
-
-const sourceTitleOf = (card: RequirementMatchCard): string => (
-  card.sourceTitle?.trim() || sourceEvidenceSection(card, '名称：', [
-    '明确需求类型：', '明确产品域：', '明确模块：', '描述：'
-  ])
-)
-
-const sourceDescriptionOf = (card: RequirementMatchCard): string => (
-  card.sourceDescription?.trim() || sourceEvidenceSection(card, '描述：')
-)
+const sourceTitleOf = (card: RequirementMatchCard): string => card.sourceTitle.trim()
+const sourceDescriptionOf = (card: RequirementMatchCard): string => card.sourceDescription.trim()
 
 export interface RequirementMatchConfirmation {
   relation: Extract<RequirementMatchRelation, 'duplicate' | 'highly_similar'>
-  decisionPath: Extract<RequirementMatchDecisionPath, 'exact_text' | 'near_duplicate_text' | 'semantic_card'>
+  decisionPath: Extract<RequirementMatchDecisionPath, 'exact_text' | 'near_duplicate_text'>
   confidenceBasis: string[]
 }
 
+/** Confirm only exact/near duplicates from the cleaned source title/description. */
 const sourceConfirmationOf = (
   base: RequirementMatchCard,
   candidate: RequirementMatchCard
@@ -415,63 +340,15 @@ const sourceConfirmationOf = (
   }
 }
 
-const semanticCardConfirmationOf = (
-  base: RequirementMatchCard,
-  candidate: RequirementMatchCard
-): RequirementMatchConfirmation | null => {
-  if (base.analysisStatus !== 'ai_adjudicated' || candidate.analysisStatus !== 'ai_adjudicated') return null
-  if (base.action === 'unknown' || candidate.action === 'unknown' || base.action !== candidate.action) return null
-
-  const fields: Array<{ name: keyof RequirementMatchCard; weight: number }> = [
-    { name: 'functionalObject', weight: 0.30 },
-    { name: 'action', weight: 0.20 },
-    { name: 'behavior', weight: 0.20 },
-    { name: 'currentState', weight: 0.10 },
-    { name: 'targetState', weight: 0.15 },
-    { name: 'constraints', weight: 0.05 }
-  ]
-  const values = fields.map(({ name, weight }) => ({
-    name,
-    weight,
-    left: String(base[name] ?? '').trim(),
-    right: String(candidate[name] ?? '').trim()
-  }))
-  const mandatory = values.filter((item) => ['functionalObject', 'action', 'behavior'].includes(item.name as string))
-  if (mandatory.some((item) => !item.left || !item.right)) return null
-
-  // The denominator is the full fixed business-dimension weight. Missing
-  // fields therefore lower confidence instead of amplifying one populated
-  // dimension through re-normalization.
-  const confidence = values.reduce((sum, item) => {
-    if (!item.left || !item.right) return sum
-    const similarity = item.name === 'action'
-      ? (item.left === item.right ? 1 : 0)
-      : semanticTextSimilarity(item.left, item.right)
-    return sum + similarity * item.weight
-  }, 0)
-  const comparedWeight = values.reduce((sum, item) => (
-    item.left && item.right ? sum + item.weight : sum
-  ), 0)
-  if (comparedWeight < 0.65 || confidence < 0.82) return null
-  return {
-    relation: confidence >= 0.9 && comparedWeight >= 0.8 ? 'duplicate' : 'highly_similar',
-    decisionPath: 'semantic_card',
-    confidenceBasis: [
-      `ready 语义卡片关键维度一致性 ${confidence.toFixed(2)}`,
-      `已比较业务维度权重 ${comparedWeight.toFixed(2)}`
-    ]
-  }
-}
-
 export const requirementMatchConfirmationOf = (
   base: RequirementMatchCard,
   candidate: RequirementMatchCard
-): RequirementMatchConfirmation | null => sourceConfirmationOf(base, candidate) ?? semanticCardConfirmationOf(base, candidate)
+): RequirementMatchConfirmation | null => sourceConfirmationOf(base, candidate)
 
 export const isDeterministicRequirementMatch = (
   score: Pick<RequirementMatchScoreResult, 'decisionPath' | 'relation'>
 ): boolean => (
-  (score.decisionPath === 'exact_text' || score.decisionPath === 'near_duplicate_text' || score.decisionPath === 'semantic_card') &&
+  (score.decisionPath === 'exact_text' || score.decisionPath === 'near_duplicate_text') &&
   (score.relation === 'duplicate' || score.relation === 'highly_similar')
 )
 
@@ -492,16 +369,9 @@ const defaultSignalOf = (
       ? candidate.lexicalScore
       : undefined
   }
-  if (dimension === 'structural') {
-    if (isFiniteNumber(signals.structuralScore)) return signals.structuralScore
-    return isHybridRequirementCandidate(candidate) && isFiniteNumber(candidate.structuralScore)
-      ? candidate.structuralScore
-      : undefined
-  }
   if (dimension === 'semantic') return signals.semanticScore
   if (dimension === 'keyword') return signals.keywordScore
   if (dimension === 'domain') return signals.domainScore
-  if (dimension === 'object') return signals.objectScore
   if (dimension === 'reranker') return signals.rerankerScore
   return undefined
 }
@@ -516,8 +386,8 @@ const lexicalTermSimilarity = (left: RequirementMatchCard, right: RequirementMat
 
 const domainSimilarity = (left: RequirementMatchCard, right: RequirementMatchCard): number | undefined => {
   const values: number[] = []
-  if (left.productDomain && right.productDomain) values.push(semanticTextSimilarity(left.productDomain, right.productDomain))
-  if (left.module && right.module) values.push(semanticTextSimilarity(left.module, right.module))
+  if (left.productDomain && right.productDomain) values.push(textSimilarity(left.productDomain, right.productDomain))
+  if (left.module && right.module) values.push(textSimilarity(left.module, right.module))
   return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : undefined
 }
 
@@ -533,10 +403,6 @@ const scoreForDimension = (
     const explicit = explicitScores[dimension]
     return normalizeRequirementScore(explicit, signals.dimensionRanges?.[dimension] ?? SCORE_RANGE_0_TO_100)
   }
-  if (dimension === 'action') {
-    if (base.action === 'unknown' || candidateCard.action === 'unknown') return undefined
-    return base.action === candidateCard.action ? 100 : 0
-  }
   if (dimension === 'semantic') {
     const denseSignal = defaultSignalOf(candidate, 'dense', signals)
     if (denseSignal !== undefined) {
@@ -547,7 +413,7 @@ const scoreForDimension = (
     }
     if (!base.matchingText || !candidateCard.matchingText) return undefined
     return normalizeRequirementScore(
-      semanticTextSimilarity(base.matchingText, candidateCard.matchingText),
+      textSimilarity(base.matchingText, candidateCard.matchingText),
       { min: 0, max: 1 }
     )
   }
@@ -559,14 +425,7 @@ const scoreForDimension = (
     const similarity = domainSimilarity(base, candidateCard)
     return similarity === undefined ? undefined : normalizeRequirementScore(similarity, { min: 0, max: 1 })
   }
-  if (dimension === 'object') {
-    if (!base.functionalObject || !candidateCard.functionalObject) return undefined
-    return normalizeRequirementScore(
-      semanticTextSimilarity(base.functionalObject, candidateCard.functionalObject),
-      { min: 0, max: 1 }
-    )
-  }
-  if (TEXT_DIMENSIONS.includes(dimension)) return textDimensionScore(base, candidateCard, dimension)
+  if (isRequirementTextDimension(dimension)) return textDimensionScore(base, candidateCard, dimension)
   const signal = defaultSignalOf(candidate, dimension, signals)
   return normalizeRequirementScore(signal, signals.dimensionRanges?.[dimension] ?? SCORE_RANGE_0_TO_100)
 }
@@ -597,83 +456,12 @@ const downgradeDecision = (
   }
 }
 
-/** Apply only card-provided action/object rules; it never reads raw requirement IDs or text patterns. */
+/** No source-only fields are eligible for inferred action/object rules. */
 export const applyRequirementMatchHardRules = (
-  base: RequirementMatchCard,
-  candidate: RequirementMatchCard,
+  _base: RequirementMatchCard,
+  _candidate: RequirementMatchCard,
   decision: RequirementMatchDecision
-): RequirementMatchDecision => {
-  const objectSimilarity = objectSimilarityOf(base, candidate)
-  const actionKnown = base.action !== 'unknown' && candidate.action !== 'unknown'
-  let current = {
-    relation: decision.relation,
-    finalScore: clampRequirementScore(decision.finalScore),
-    downgradeReasons: [...decision.downgradeReasons]
-  }
-
-  if ((base.action === 'add_capability' && candidate.action === 'fix_defect') ||
-      (base.action === 'fix_defect' && candidate.action === 'add_capability')) {
-    current = downgradeDecision(current, 'topic_only', 39, '功能新增与缺陷修复属于不同需求动作')
-  }
-  if ((base.action === 'rename_label') !== (candidate.action === 'rename_label')) {
-    current = downgradeDecision(current, 'topic_only', 39, '文案修改与其他业务动作不能视为同一需求')
-  }
-  if (actionKnown && base.action !== candidate.action) {
-    current = objectSimilarity >= 0.55
-      ? downgradeDecision(current, 'partial_overlap', 69, '功能对象相近但需求动作不同')
-      : downgradeDecision(current, 'topic_only', 39, '需求动作和功能对象均不一致')
-  }
-  if (actionKnown && base.action === candidate.action && objectSimilarity < 0.5) {
-    current = downgradeDecision(current, 'same_pattern', 59, '需求动作相同但功能对象不同')
-  }
-  return current
-}
-
-/**
- * Apply the relation adjudicated by the batch explanation to a deterministic
- * score. The model supplies only the relation; the local score remains the
- * source of the percentage and is clamped to that relation's interval.
- */
-export const constrainRequirementMatchToRelation = (
-  base: RequirementMatchCard,
-  candidate: RequirementMatchCard,
-  score: RequirementMatchScoreResult,
-  relation: RequirementMatchRelation
-): RequirementMatchScoreResult => {
-  const range = REQUIREMENT_MATCH_RELATION_SCORE_RANGES[relation]
-  const boundedScore = clampRequirementScore(Math.max(range.min, Math.min(range.max, score.finalScore)))
-  const constrained: RequirementMatchDecision = {
-    relation,
-    finalScore: boundedScore,
-    downgradeReasons: relation === score.relation
-      ? [...score.downgradeReasons]
-      : [...score.downgradeReasons, `批量 AI 复核关系为 ${relation}，本地分数限制在对应区间`],
-    decisionPath: isDeterministicRequirementMatch(score) ? score.decisionPath : 'ai_review',
-    confidenceBasis: isDeterministicRequirementMatch(score)
-      ? [...score.confidenceBasis, 'AI 复核补充审计，不覆盖已独立成立的确定性路径']
-      : ['一次批量 AI 关系复核约束本地确定性分数']
-  }
-  const ruled = applyRequirementMatchHardRules(base, candidate, constrained)
-  return { ...score, ...ruled }
-}
-
-/** A failed review may never leave a formal relation visible to the caller. */
-export const downgradeRequirementMatchForUnavailableReview = (
-  score: RequirementMatchScoreResult
-): RequirementMatchScoreResult => {
-  if (isDeterministicRequirementMatch(score) || !['duplicate', 'highly_similar'].includes(score.relation)) return score
-  return {
-    ...score,
-    ...downgradeDecision(
-      score,
-      'partial_overlap',
-      REQUIREMENT_MATCH_RELATION_SCORE_RANGES.partial_overlap.max,
-      'AI 语义复核不可用，正式匹配关系已降级为非正式关系'
-    ),
-    decisionPath: 'unavailable',
-    confidenceBasis: [...score.confidenceBasis, 'AI 语义复核不可用，未形成正式关系置信依据']
-  }
-}
+): RequirementMatchDecision => decision
 
 export const scoreRequirementMatch = (
   base: RequirementMatchCard,
@@ -689,7 +477,7 @@ export const scoreRequirementMatch = (
     const score = scoreForDimension(base, candidate, candidateCard, dimension, signals)
     const configuredWeight = hasOwn(configuredWeights, dimension)
       ? configuredWeights[dimension]
-    : REQUIREMENT_MATCH_DEFAULT_WEIGHTS[dimension]
+      : REQUIREMENT_MATCH_DEFAULT_WEIGHTS[dimension]
     if (score === undefined || !isFiniteNumber(configuredWeight) || configuredWeight <= 0) continue
     const normalizedScore = clampRequirementScore(score)
     dimensions[dimension] = normalizedScore
@@ -701,14 +489,8 @@ export const scoreRequirementMatch = (
     ? weighted.reduce((sum, item) => sum + item.score * item.weight, 0) / totalWeight
     : 0
   const finalScore = clampRequirementScore(rawFinalScore)
-  const objectSimilarity = objectSimilarityOf(base, candidateCard)
-  const actionComparison = actionComparisonOf(base, candidateCard)
   const initialDecision: RequirementMatchDecision = {
-    relation: classifyRequirementRelation(finalScore, {
-      objectSimilarity,
-      actionKnown: actionComparison !== 'unknown',
-      sameAction: actionComparison === 'same'
-    }),
+    relation: classifyRequirementRelation(finalScore),
     finalScore,
     downgradeReasons: []
   }
@@ -725,7 +507,7 @@ export const scoreRequirementMatch = (
     )
   }
   let decisionPath: RequirementMatchDecisionPath = 'deterministic_score'
-  let confidenceBasis: string[] = ['本地多维确定性评分']
+  let confidenceBasis: string[] = ['本地清洗原文与检索信号确定性评分']
   const confirmation = requirementMatchConfirmationOf(base, candidateCard)
   if (confirmation) {
     const range = REQUIREMENT_MATCH_RELATION_SCORE_RANGES[confirmation.relation]
@@ -749,8 +531,8 @@ export const scoreRequirementMatch = (
     dimensionDetails: weightedDimensionDetails(weighted, totalWeight || 1),
     validDimensions: weighted.map((item) => item.dimension),
     totalWeight: roundScore(totalWeight),
-    objectSimilarity: roundScore(objectSimilarity * 100) / 100,
-    actionComparison,
+    objectSimilarity: 0,
+    actionComparison: 'unknown',
     decisionPath,
     confidenceBasis
   }

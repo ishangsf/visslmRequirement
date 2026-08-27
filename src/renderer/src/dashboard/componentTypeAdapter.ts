@@ -1,4 +1,5 @@
 import type {
+  DashboardComponentDataShape,
   DashboardComponentSpec,
   DashboardComponentType,
   DashboardLayout
@@ -11,20 +12,15 @@ import {
   validateDashboardLayout
 } from '../../../shared/dashboard-layout'
 
-export type DashboardComponentDataShape =
-  | 'single-value'
-  | 'category-value'
-  | 'time-series'
-  | 'dual-measure'
-  | 'detail'
-  | 'text'
+export type { DashboardComponentDataShape } from '../../../shared/dashboard'
 
 const categoryTypes = new Set<DashboardComponentType>([
   'bar',
   'pie',
   'ranking',
   'funnel',
-  'radar'
+  'radar',
+  'treemap'
 ])
 
 export const dashboardComponentDataShape = (
@@ -33,7 +29,7 @@ export const dashboardComponentDataShape = (
   if (['kpi', 'progress', 'gauge'].includes(type)) return 'single-value'
   if (categoryTypes.has(type)) return 'category-value'
   if (type === 'line') return 'time-series'
-  if (type === 'scatter') return 'dual-measure'
+  if (type === 'scatter' || type === 'combo') return 'dual-measure'
   if (type === 'table') return 'detail'
   return 'text'
 }
@@ -42,25 +38,29 @@ const cloneQuery = (query: QuerySpec): QuerySpec =>
   JSON.parse(JSON.stringify(query)) as QuerySpec
 
 const isCategoryProfile = (profile: FieldProfile): boolean =>
-  profile.role === 'dimension' ||
-  profile.inferredType === 'string' ||
-  profile.inferredType === 'enum' ||
-  profile.inferredType === 'boolean'
+  profile.sensitivity !== 'sensitive' && (
+    profile.role === 'dimension' ||
+    profile.inferredType === 'string' ||
+    profile.inferredType === 'enum' ||
+    profile.inferredType === 'boolean'
+  )
 
 const profileMap = (profiles: FieldProfile[]): Map<string, FieldProfile> =>
   new Map(profiles.map((profile) => [profile.field, profile]))
 
 const findCategoryDimension = (
   query: QuerySpec,
-  profiles: FieldProfile[]
+  profiles: FieldProfile[],
+  strictCategory = false
 ): QueryDimension | undefined => {
   const byField = profileMap(profiles)
   const dimensions = query.dimensions ?? []
-  const existing = dimensions.find((dimension) => {
+  const existingCategory = dimensions.find((dimension) => {
     const profile = byField.get(dimension.field)
-    return !profile || isCategoryProfile(profile)
-  }) ?? dimensions[0]
-  if (existing) return { ...existing }
+    return Boolean(profile && isCategoryProfile(profile))
+  })
+  if (existingCategory) return { ...existingCategory }
+  if (!strictCategory && dimensions[0]) return { ...dimensions[0] }
   const profile = profiles.find(isCategoryProfile)
   return profile ? { field: profile.field } : undefined
 }
@@ -137,8 +137,45 @@ const adaptQuery = (
     return { query: nextQuery, encoding: { value: primary.id } }
   }
 
+  if (targetType === 'combo') {
+    const dimension = findTimeDimension(query, profiles)
+    if (!dimension) {
+      return { error: '组合图需要一个时间或分类维度，但当前数据范围没有可用维度。' }
+    }
+    query.dimensions = [dimension]
+    let secondary = query.measures.find((measure) =>
+      measure.id === component.encoding?.secondaryValue && measure.id !== primary.id
+    ) ?? query.measures.find((measure) => measure.id !== primary.id)
+    if (!secondary) {
+      const numericProfile = profiles.find((profile) =>
+        profile.sensitivity !== 'sensitive' &&
+        profile.inferredType === 'number' &&
+        profile.field !== primary.field
+      )
+      if (!numericProfile) {
+        return { error: '组合图需要两个不同指标，当前数据范围没有可用的第二个数值字段。' }
+      }
+      secondary = {
+        id: uniqueMeasureId(query.measures),
+        field: numericProfile.field,
+        aggregation: 'sum'
+      }
+      query.measures = [...query.measures, secondary]
+    }
+    query.limit = Math.min(query.limit ?? 60, 60)
+    query.sort = validSort(query)
+    return {
+      query,
+      encoding: {
+        label: dimension.field,
+        value: primary.id,
+        secondaryValue: secondary.id
+      }
+    }
+  }
+
   if (shape === 'category-value' || shape === 'dual-measure') {
-    const dimension = findCategoryDimension(query, profiles)
+    const dimension = findCategoryDimension(query, profiles, targetType === 'treemap')
     if (!dimension) {
       return { error: '目标图表需要分类维度，但当前数据范围没有可用维度。请先在高级查询中添加维度。' }
     }
@@ -159,7 +196,9 @@ const adaptQuery = (
     ) ?? query.measures.find((measure) => measure.id !== primary.id)
     if (!secondary) {
       const numericProfile = profiles.find((profile) =>
-        profile.inferredType === 'number' && profile.field !== primary.field
+        profile.sensitivity !== 'sensitive' &&
+        profile.inferredType === 'number' &&
+        profile.field !== primary.field
       )
       if (!numericProfile) {
         return { error: '散点图需要两个不同指标，但当前数据范围只有一个可用指标。' }
@@ -205,7 +244,9 @@ const adaptQuery = (
     ranking: 20,
     funnel: 12,
     radar: 10,
-    line: 60
+    line: 60,
+    treemap: 20,
+    combo: 60
   }
   query.limit = limits[targetType] ?? query.limit
   query.sort = validSort(query)

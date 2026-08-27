@@ -642,6 +642,252 @@ const newConversationChecks = await evaluate(`(async () => {
     })()
   };
 })()`)
+const thinkingModeChecks = await evaluate(`(async () => {
+  const sleep = (duration) => new Promise((resolve) => setTimeout(resolve, duration))
+  const select = document.querySelector('.assistant-thinking-mode-select')
+  const combobox = select?.querySelector('[role="combobox"][aria-label="回答思考模式"]')
+  const isVisible = (element) => {
+    if (!element) return false
+    const style = getComputedStyle(element)
+    const rect = element.getBoundingClientRect()
+    return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' &&
+      rect.width > 0 && rect.height > 0
+  }
+  const selectionLabel = () => (
+    select?.querySelector('.ant-select-selection-item, .ant-select-content')?.textContent?.trim() ?? ''
+  )
+  const selectIsDisabled = () => Boolean(
+    select?.classList.contains('ant-select-disabled') ||
+    select?.getAttribute('aria-disabled') === 'true' ||
+    select?.querySelector('input')?.disabled
+  )
+  const optionNodes = () => {
+    const roots = [...document.querySelectorAll('.assistant-thinking-mode-dropdown, .ant-select-dropdown')]
+      .filter(isVisible)
+    const root = roots[roots.length - 1]
+    return [...(root?.querySelectorAll('.ant-select-item-option, [role="option"]') ?? [])]
+  }
+  const optionInfo = (node) => ({
+    label: node.querySelector('.assistant-thinking-mode-option strong')?.textContent?.trim() ||
+      node.querySelector('.ant-select-item-option-content')?.textContent?.trim() ||
+      node.textContent?.trim() || '',
+    value: node.getAttribute('data-value') || node.getAttribute('value') ||
+      node.getAttribute('data-option-key') || '',
+    disabled: node.getAttribute('aria-disabled') === 'true' ||
+      node.classList.contains('ant-select-item-option-disabled')
+  })
+  const openOptions = async () => {
+    if (!select) return []
+    const trigger = select.querySelector('.ant-select-content, .ant-select-selector') ?? select
+    trigger.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, view: window }))
+    trigger.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }))
+    trigger.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }))
+    trigger.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }))
+    await sleep(100)
+    if (!optionNodes().length) {
+      trigger.dispatchEvent(
+        new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window })
+      )
+      await sleep(100)
+    }
+    return optionNodes().map(optionInfo)
+  }
+  const closeOptions = () => {
+    select?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+  }
+  const chooseMode = async (label) => {
+    const options = await openOptions()
+    const option = optionNodes().find((node) => optionInfo(node).label === label)
+    const info = option ? optionInfo(option) : options.find((item) => item.label === label)
+    if (!option || info?.disabled) {
+      closeOptions()
+      return {
+        label,
+        found: Boolean(info),
+        disabled: Boolean(info?.disabled),
+        selected: selectionLabel(),
+        persisted: localStorage.getItem('visslm:assistant-thinking-mode:v1')
+      }
+    }
+    option.click()
+    await sleep(120)
+    return {
+      label,
+      found: true,
+      disabled: false,
+      selected: selectionLabel(),
+      persisted: localStorage.getItem('visslm:assistant-thinking-mode:v1')
+    }
+  }
+  const setQuestion = async (value) => {
+    const input = document.querySelector('.composer textarea')
+    const setter = input && Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set
+    setter?.call(input, value)
+    input?.dispatchEvent(new Event('input', { bubbles: true }))
+    input?.dispatchEvent(new Event('change', { bubbles: true }))
+    await sleep(120)
+  }
+  const waitForIdle = async () => {
+    const started = Date.now()
+    while (document.querySelector('.message-bubble.thinking') && Date.now() - started < 2500) {
+      await sleep(40)
+    }
+    await sleep(80)
+  }
+
+  const accessible = Boolean(
+    select &&
+    combobox?.getAttribute('aria-label') === '回答思考模式' &&
+    isVisible(select) &&
+    isVisible(combobox)
+  )
+  const modelAvailable = Boolean(document.querySelector('.composer-model-state.online'))
+  const initialValue = selectionLabel()
+  const optionSnapshot = await openOptions()
+  closeOptions()
+  const requiredLabels = ['自动', '开启', '关闭']
+  const optionLabelsPresent = requiredLabels.every((label) => optionSnapshot.some((item) => item.label === label))
+  const optionValues = Object.fromEntries(optionSnapshot.map((item) => [item.label, item.value]))
+
+  const originalApi = window.visslm
+  const originalWindowDescriptor = Object.getOwnPropertyDescriptor(window, 'visslm')
+  const originalAskDescriptor = originalApi
+    ? Object.getOwnPropertyDescriptor(originalApi, 'askAgent')
+    : undefined
+  const calls = []
+  let holdNext = false
+  let releasePending
+  const fakeResponse = { answer: 'UI smoke response', sources: [], dataViews: [], events: [] }
+  const fakeAskAgent = async (request) => {
+    calls.push({ question: request?.question ?? '', thinkingMode: request?.thinkingMode })
+    if (holdNext) {
+      return await new Promise((resolve) => { releasePending = resolve })
+    }
+    return fakeResponse
+  }
+  let probeInstalled = false
+  let restoreProbe = () => {}
+  try {
+    if (originalApi) {
+      try {
+        Object.defineProperty(originalApi, 'askAgent', {
+          configurable: true,
+          writable: true,
+          value: fakeAskAgent
+        })
+        probeInstalled = originalApi.askAgent === fakeAskAgent
+        if (probeInstalled) {
+          restoreProbe = originalAskDescriptor
+            ? () => Object.defineProperty(originalApi, 'askAgent', originalAskDescriptor)
+            : () => { delete originalApi.askAgent }
+        }
+      } catch {
+        probeInstalled = false
+      }
+    }
+    if (!probeInstalled && originalApi && originalWindowDescriptor) {
+      try {
+        const proxy = new Proxy(originalApi, {
+          get(target, property, receiver) {
+            return property === 'askAgent' ? fakeAskAgent : Reflect.get(target, property, receiver)
+          }
+        })
+        if (originalWindowDescriptor.configurable === false) {
+          if (originalWindowDescriptor.writable !== true) throw new Error('window.visslm cannot be replaced')
+          window.visslm = proxy
+        } else {
+          Object.defineProperty(window, 'visslm', {
+            configurable: true,
+            writable: true,
+            value: proxy
+          })
+        }
+        probeInstalled = window.visslm?.askAgent === fakeAskAgent
+        if (probeInstalled) {
+          restoreProbe = originalWindowDescriptor.configurable === false
+            ? () => { window.visslm = originalApi }
+            : () => Object.defineProperty(window, 'visslm', originalWindowDescriptor)
+        }
+      } catch {
+        probeInstalled = false
+      }
+    }
+
+    const selectionResults = []
+    for (const label of requiredLabels) {
+      const selection = await chooseMode(label)
+      selectionResults.push(selection)
+      if (selection.disabled) continue
+      if (probeInstalled && modelAvailable) {
+        await setQuestion('思考模式 UI smoke：' + label)
+        const before = calls.length
+        document.querySelector('.chat-send-button')?.click()
+        const started = Date.now()
+        while (calls.length === before && Date.now() - started < 2500) await sleep(40)
+        await waitForIdle()
+      }
+    }
+
+    const payloadByLabel = Object.fromEntries(
+      calls
+        .filter((call) => call.question.startsWith('思考模式 UI smoke：'))
+        .map((call) => [call.question.replace('思考模式 UI smoke：', ''), call.thinkingMode])
+    )
+    const expectedValues = { 自动: 'auto', 开启: 'on', 关闭: 'off' }
+    const selectionsApplied = requiredLabels.every((label) => {
+      const selection = selectionResults.find((item) => item.label === label)
+      return selection?.disabled === true || (
+        selection?.selected === label && selection?.persisted === expectedValues[label]
+      )
+    })
+    const payloadProbeSkipped = !modelAvailable || !probeInstalled
+    const selectablePayloadsMatch = payloadProbeSkipped || requiredLabels.every((label) => {
+        const selection = selectionResults.find((item) => item.label === label)
+        return selection?.disabled === true || payloadByLabel[label] === expectedValues[label]
+      })
+
+    let runningControlDisabled = false
+    let runningProbeCompleted = false
+    if (!payloadProbeSkipped && probeInstalled) {
+      holdNext = true
+      await setQuestion('思考模式 UI smoke：运行中锁定')
+      document.querySelector('.chat-send-button')?.click()
+      const started = Date.now()
+      while (!selectIsDisabled() && Date.now() - started < 1500) await sleep(40)
+      runningControlDisabled = selectIsDisabled()
+      runningProbeCompleted = calls.some((call) => call.question === '思考模式 UI smoke：运行中锁定')
+      holdNext = false
+      releasePending?.(fakeResponse)
+      await waitForIdle()
+    }
+
+    const onOptionDisabled = optionSnapshot.some((item) => item.label === '开启' && item.disabled)
+    const explicitUnsupportedCopy = /明确不支持思考模式|暂不能开启回答思考模式/u.test(document.body.textContent ?? '')
+    return {
+      controlPresent: Boolean(select),
+      controlAccessible: accessible,
+      controlAriaLabel: combobox?.getAttribute('aria-label') ?? '',
+      initialValue,
+      optionSnapshot,
+      optionLabelsPresent,
+      optionValues,
+      selectionResults,
+      selectionsApplied,
+      askAgentProbeInstalled: probeInstalled,
+      askAgentThinkingModes: calls.map((call) => call.thinkingMode),
+      askAgentThinkingModeByLabel: payloadByLabel,
+      selectablePayloadsMatch,
+      runningProbeCompleted,
+      runningControlDisabled,
+      onOptionDisabled,
+      unsupportedOnGuard: !explicitUnsupportedCopy || onOptionDisabled,
+      payloadProbeSkipped
+    }
+  } finally {
+    restoreProbe()
+  }
+})()`)
 const simplificationChecks = await evaluate(`(() => {
   const oldEmptyStateSelectors = [
     '.chat-welcome-status-grid',
@@ -946,6 +1192,12 @@ const requiredChecks = {
   messageContainerAccessible: historyUiChecks.messageContainerAccessible,
   expertButtonAccessible: historyUiChecks.expertButtonAccessible,
   sendButtonAccessible: historyUiChecks.sendButtonAccessible,
+  thinkingModeControlAccessible: thinkingModeChecks.controlAccessible,
+  thinkingModeOptionsPresent: thinkingModeChecks.optionLabelsPresent,
+  thinkingModeSelectionsApplied: thinkingModeChecks.selectionsApplied,
+  thinkingModePayloadsMatch: thinkingModeChecks.selectablePayloadsMatch,
+  thinkingModeRunningDisabled: thinkingModeChecks.payloadProbeSkipped || thinkingModeChecks.runningControlDisabled,
+  thinkingModeUnsupportedOnGuard: thinkingModeChecks.unsupportedOnGuard,
   completedTaskDetailsCollapsed: taskDetailChecks.completedTaskDetailsCollapsed,
   completedTaskDetailsEntry: taskDetailChecks.completedTaskDetailsEntry,
   completedTaskDetailsExpandable: taskDetailChecks.completedTaskDetailsExpandable,
@@ -988,6 +1240,7 @@ console.log(JSON.stringify({
   ...simplificationChecks,
   ...focusChecks,
   ...conversationChecks,
+  ...thinkingModeChecks,
   ...runningTaskChecks,
   ...latestChecks,
   ...messagePresentationChecks,

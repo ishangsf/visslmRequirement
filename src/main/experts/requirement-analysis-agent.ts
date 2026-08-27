@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto'
 import type {
   ChatDataRow,
   ChatDataView,
@@ -10,9 +9,7 @@ import type {
 } from '../../shared/types'
 import type { AgentEvent, AgentMatchProgress, AgentProgress } from '../../shared/expert-types'
 import {
-  AppDatabase,
-  type RequirementMatchCache,
-  type RequirementMatchCacheInput
+  AppDatabase
 } from '../database'
 import { KnowledgeService } from '../knowledge'
 import { ModelClient } from '../model-client'
@@ -22,7 +19,6 @@ import {
 } from '../requirements/hybrid-retrieval'
 import {
   createRequirementReranker,
-  REQUIREMENT_RERANKER_MODEL_VERSION,
   type RequirementRerankItem,
   type RequirementReranker
 } from '../requirements/cross-encoder-reranker'
@@ -31,21 +27,12 @@ import {
   removeRequirementNoise,
   toRequirementPlainText,
   type RequirementMatchCard
-} from '../requirements/semantic-card'
+} from '../requirements/requirement-match-card'
 import {
-  REQUIREMENT_SEMANTIC_ANALYZER_VERSION,
-  requirementSemanticModelSignature
-} from '../requirements/semanticization-service'
-import {
-  REQUIREMENT_MATCH_DIMENSIONS,
   REQUIREMENT_MATCH_RELATIONS,
-  scoreFitsRequirementRelation,
-  constrainRequirementMatchToRelation,
-  downgradeRequirementMatchForUnavailableReview,
   isDeterministicRequirementMatch,
   REQUIREMENT_MATCH_DECISION_PATHS,
   scoreRequirementCandidate,
-  type RequirementMatchDimension,
   type RequirementMatchRelation,
   type RequirementMatchScoreResult
 } from '../requirements/requirement-match-scoring'
@@ -63,7 +50,6 @@ const HYBRID_CANDIDATE_LIMIT = 50
 const RERANK_CANDIDATE_LIMIT = 20
 const EXPLANATION_CANDIDATE_LIMIT = 10
 const ANSWER_RESULT_LIMIT = 8
-const MATCH_STRATEGY_VERSION = 'requirement-match-v4-multipath-confidence'
 const EXPLANATION_TIMEOUT_MS = 120_000
 const EXPLANATION_MAX_CONTEXT = 32_768
 
@@ -76,9 +62,6 @@ interface RequirementAnalysisAgentOptions {
   reranker?: RequirementReranker
   retriever?: Pick<HybridRequirementRetriever, 'retrieve'>
   modelClient?: RequirementMatchExplanationModelClient
-  semanticContext?: { analyzerVersion: string; modelSignature: string }
-  embeddingModelVersion?: string
-  matchModelSignature?: string
 }
 
 interface RequirementProfile {
@@ -105,7 +88,7 @@ interface ExplanationMergeResult {
 interface MatchedCandidate extends RankedCandidate {
   score: RequirementMatchScoreResult
   explanation: MatchExplanationState
-  explanationStatus: 'live_verified' | 'cache_verified' | 'unavailable'
+  explanationStatus: 'live_verified' | 'unavailable'
 }
 
 interface RequirementAnalysisEntry {
@@ -138,31 +121,7 @@ const emptyMatchProgress = (): AgentMatchProgress => ({
   scoredTotal: 0,
   explanationDone: 0,
   explanationTotal: 0,
-  cacheHits: 0,
   isolated: 0
-})
-
-const hashText = (value: string): string => createHash('sha256').update(value).digest('hex')
-const hashJson = (value: unknown): string => hashText(JSON.stringify(value))
-const normalizeQuestion = (value: string): string => value.trim().replace(/\s+/gu, ' ')
-
-/**
- * Cache identity is intentionally broader than matching evidence. It tracks
- * the source record as stored so normalized-text or raw-payload changes
- * invalidate an explanation even when the business embedding text is stable.
- */
-const requirementRecordSourceHash = (record: RecordDetail): string => hashJson({
-  version: 'requirement-record-source-v1',
-  uid: record.uid,
-  projectId: record.projectId,
-  nodeType: record.nodeType,
-  itemId: record.itemId,
-  parentId: record.parentId,
-  name: record.name,
-  description: record.description,
-  lastModifyTime: record.lastModifyTime,
-  normalizedText: record.normalizedText ?? '',
-  raw: record.raw
 })
 
 const requirementDisplayName = (record: RecordDetail, card?: RequirementMatchCard): string => (
@@ -172,8 +131,7 @@ const requirementDisplayName = (record: RecordDetail, card?: RequirementMatchCar
 const requirementDisplayDescription = (record: RecordDetail, card?: RequirementMatchCard): string => {
   const source = card?.sourceDescription || record.description
   const cleaned = removeRequirementNoise(toRequirementPlainText(source))
-  if (cleaned) return cleaned
-  return removeRequirementNoise(toRequirementPlainText(card?.behavior)) || '暂无描述'
+  return cleaned || '暂无描述'
 }
 
 const truncate = (value: string, maxLength: number): string => {
@@ -183,27 +141,6 @@ const truncate = (value: string, maxLength: number): string => {
 
 const evidenceExcerpt = (value: string, maxLength = 240): string => (
   value.trim().slice(0, Math.max(2, maxLength))
-)
-
-const normalizedEvidence = (value: string): string => value
-  .toLocaleLowerCase()
-  .replace(/[\s\p{P}\p{S}]+/gu, '')
-
-const evidenceSupported = (quote: string, source: string): boolean => {
-  const normalizedQuote = normalizedEvidence(quote)
-  const normalizedSource = normalizedEvidence(source)
-  return normalizedQuote.length >= 2 && normalizedSource.includes(normalizedQuote)
-}
-
-const clampNumber = (value: unknown, min: number, max: number): number | null => {
-  const number = Number(value)
-  return Number.isFinite(number) && number >= min && number <= max ? number : null
-}
-
-const safeRelation = (value: unknown): RequirementMatchRelation | null => (
-  typeof value === 'string' && (REQUIREMENT_MATCH_RELATIONS as readonly string[]).includes(value)
-    ? value as RequirementMatchRelation
-    : null
 )
 
 const fallbackExplanation = (
@@ -234,149 +171,6 @@ const validateRerankerOutput = (
   }
   if (seen.size !== expected.size) throw new Error('Cross-Encoder 未覆盖全部候选 UID')
   return [...output].sort((left, right) => right.score - left.score || left.recordUid.localeCompare(right.recordUid))
-}
-
-const cacheResultOf = (
-  score: RequirementMatchScoreResult,
-  explanation: MatchExplanationState
-): Record<string, unknown> => ({
-  relation: score.relation,
-  finalScore: score.finalScore,
-  downgradeReasons: score.downgradeReasons,
-  dimensions: score.dimensions,
-  dimensionDetails: score.dimensionDetails,
-  validDimensions: score.validDimensions,
-  totalWeight: score.totalWeight,
-  objectSimilarity: score.objectSimilarity,
-  actionComparison: score.actionComparison,
-  decisionPath: score.decisionPath,
-  confidenceBasis: score.confidenceBasis,
-  explanation: {
-    sharedEvidence: explanation.sharedEvidence,
-    difference: explanation.difference,
-    baseEvidence: explanation.baseEvidence,
-    candidateEvidence: explanation.candidateEvidence
-  }
-})
-
-const safeCachedExplanation = (
-  value: unknown,
-  base: RequirementProfile,
-  candidate: RankedCandidate
-): MatchExplanationState | null => {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
-  const item = value as Record<string, unknown>
-  const sharedEvidence = typeof item.sharedEvidence === 'string' ? item.sharedEvidence.trim() : ''
-  const difference = typeof item.difference === 'string' ? item.difference.trim() : ''
-  const baseEvidence = typeof item.baseEvidence === 'string' ? item.baseEvidence.trim() : ''
-  const candidateEvidence = typeof item.candidateEvidence === 'string' ? item.candidateEvidence.trim() : ''
-  if (!sharedEvidence || !difference || !baseEvidence || !candidateEvidence) return null
-  if (!evidenceSupported(baseEvidence, base.card.evidence) ||
-      !evidenceSupported(candidateEvidence, candidate.card.evidence)) return null
-  return { sharedEvidence, difference, baseEvidence, candidateEvidence }
-}
-
-const parsedCachedResult = (
-  cached: RequirementMatchCache,
-  base: RequirementProfile,
-  candidate: RankedCandidate
-): { score: RequirementMatchScoreResult; explanation: MatchExplanationState } | null => {
-  try {
-    const parsed = JSON.parse(cached.resultJson) as Record<string, unknown>
-    const relation = safeRelation(parsed.relation)
-    const finalScore = clampNumber(parsed.finalScore, 0, 100)
-    if (!relation || finalScore === null || !scoreFitsRequirementRelation(relation, finalScore)) return null
-    const explanation = safeCachedExplanation(parsed.explanation, base, candidate)
-    if (!explanation) return null
-    if (!parsed.dimensions || typeof parsed.dimensions !== 'object' || Array.isArray(parsed.dimensions)) return null
-    const allowedDimensions = new Set<string>(REQUIREMENT_MATCH_DIMENSIONS)
-    const dimensions: RequirementMatchScoreResult['dimensions'] = {}
-    for (const [key, value] of Object.entries(parsed.dimensions as Record<string, unknown>)) {
-      if (!allowedDimensions.has(key)) return null
-      const score = clampNumber(value, 0, 100)
-      if (score === null) return null
-      dimensions[key as RequirementMatchDimension] = score
-    }
-    if (!Object.keys(dimensions).length) return null
-    const validDimensions = Array.isArray(parsed.validDimensions)
-      ? parsed.validDimensions.filter((item): item is RequirementMatchDimension => (
-          typeof item === 'string' && allowedDimensions.has(item)
-        ))
-      : []
-    if (!Array.isArray(parsed.validDimensions) || validDimensions.length !== parsed.validDimensions.length) return null
-    if (new Set(validDimensions).size !== validDimensions.length) return null
-    if (validDimensions.some((dimension) => dimensions[dimension] === undefined)) return null
-    if (Object.keys(dimensions).some((dimension) => !validDimensions.includes(dimension as RequirementMatchDimension))) return null
-
-    if (!Array.isArray(parsed.dimensionDetails) || parsed.dimensionDetails.length !== validDimensions.length) return null
-    const dimensionDetails = parsed.dimensionDetails.flatMap((item): RequirementMatchScoreResult['dimensionDetails'] => {
-      if (!item || typeof item !== 'object' || Array.isArray(item)) return []
-      const detail = item as Record<string, unknown>
-      const dimension = typeof detail.dimension === 'string' && allowedDimensions.has(detail.dimension)
-        ? detail.dimension as RequirementMatchDimension
-        : null
-      const score = clampNumber(detail.score, 0, 100)
-      const weight = Number(detail.weight)
-      const contribution = clampNumber(detail.contribution, 0, 100)
-      if (!dimension || score === null || !Number.isFinite(weight) || weight <= 0 || contribution === null) return []
-      return [{ dimension, score, weight, contribution }]
-    })
-    if (!validDimensions.length || dimensionDetails.length !== parsed.dimensionDetails.length ||
-        new Set(dimensionDetails.map((item) => item.dimension)).size !== dimensionDetails.length ||
-        dimensionDetails.some((item) => !validDimensions.includes(item.dimension))) return null
-    const totalWeight = Number(parsed.totalWeight)
-    const objectSimilarity = Number(parsed.objectSimilarity)
-    if (!Number.isFinite(totalWeight) || totalWeight <= 0 || !Number.isFinite(objectSimilarity) || objectSimilarity < 0 || objectSimilarity > 1) return null
-    const dimensionDetailByName = new Map(dimensionDetails.map((item) => [item.dimension, item]))
-    if (validDimensions.some((dimension) => {
-      const detail = dimensionDetailByName.get(dimension)
-      const score = dimensions[dimension]
-      return !detail || score === undefined || Math.abs(detail.score - score) > 0.01
-    })) return null
-    const detailWeight = dimensionDetails.reduce((sum, item) => sum + item.weight, 0)
-    if (Math.abs(detailWeight - totalWeight) > 0.01) return null
-    if (dimensionDetails.some((item) => (
-      Math.abs(item.contribution - item.score * item.weight / totalWeight) > 0.05
-    ))) return null
-    const actionComparison = parsed.actionComparison === 'same' || parsed.actionComparison === 'different'
-      ? parsed.actionComparison
-      : parsed.actionComparison === 'unknown'
-        ? 'unknown'
-        : null
-    if (!actionComparison) return null
-    const decisionPath = typeof parsed.decisionPath === 'string' &&
-      REQUIREMENT_MATCH_DECISION_PATHS.includes(parsed.decisionPath as typeof REQUIREMENT_MATCH_DECISION_PATHS[number])
-      ? parsed.decisionPath as RequirementMatchScoreResult['decisionPath']
-      : null
-    const confidenceBasis = Array.isArray(parsed.confidenceBasis)
-      ? parsed.confidenceBasis.filter((item): item is string => typeof item === 'string' && Boolean(item.trim()))
-      : null
-    if (!decisionPath || !confidenceBasis || !Array.isArray(parsed.confidenceBasis) ||
-        confidenceBasis.length !== parsed.confidenceBasis.length) return null
-    const downgradeReasons = Array.isArray(parsed.downgradeReasons)
-      ? parsed.downgradeReasons.filter((item): item is string => typeof item === 'string' && Boolean(item.trim()))
-      : null
-    if (!downgradeReasons || downgradeReasons.length !== (Array.isArray(parsed.downgradeReasons) ? parsed.downgradeReasons.length : -1)) return null
-    return {
-      score: {
-        recordUid: candidate.record.uid,
-        relation,
-        finalScore,
-        downgradeReasons,
-        dimensions,
-        dimensionDetails,
-        validDimensions,
-        totalWeight,
-        objectSimilarity,
-        actionComparison,
-        decisionPath,
-        confidenceBasis
-      },
-      explanation
-    }
-  } catch {
-    return null
-  }
 }
 
 export const extractRequirementAnalysisIds = (
@@ -453,9 +247,6 @@ export class RequirementAnalysisAgent {
   private readonly retriever: Pick<HybridRequirementRetriever, 'retrieve'>
   private readonly reranker: RequirementReranker
   private readonly modelClient: RequirementMatchExplanationModelClient
-  private readonly semanticContext: { analyzerVersion: string; modelSignature: string }
-  private readonly matchModelSignature: string
-  private readonly embeddingModelVersion: string
   private progressState: RequirementProgressState = {
     totalRequirements: 0,
     currentRequirement: 0,
@@ -474,24 +265,7 @@ export class RequirementAnalysisAgent {
     private readonly onProgress?: (event: AgentStatusEvent) => void,
     options: RequirementAnalysisAgentOptions = {}
   ) {
-    this.semanticContext = options.semanticContext ?? {
-      analyzerVersion: REQUIREMENT_SEMANTIC_ANALYZER_VERSION,
-      modelSignature: requirementSemanticModelSignature(settings)
-    }
-    this.matchModelSignature = options.matchModelSignature ?? hashJson({
-      provider: settings.provider,
-      source: settings.source,
-      baseUrl: settings.baseUrl.replace(/\/+$/, ''),
-      model: settings.model,
-      thinking: settings.thinking,
-      strategy: MATCH_STRATEGY_VERSION
-    })
-    this.embeddingModelVersion = options.embeddingModelVersion ?? (
-      typeof (knowledge as { modelVersion?: unknown }).modelVersion === 'string'
-        ? String((knowledge as { modelVersion: string }).modelVersion)
-        : 'unknown'
-    )
-    this.retriever = options.retriever ?? new HybridRequirementRetriever(db, knowledge, this.semanticContext)
+    this.retriever = options.retriever ?? new HybridRequirementRetriever(db, knowledge)
     this.reranker = options.reranker ?? createRequirementReranker()
     this.modelClient = options.modelClient ?? new ModelClient(settings)
   }
@@ -554,13 +328,9 @@ export class RequirementAnalysisAgent {
   ): Promise<RequirementAnalysisEntry> {
     const row = this.db.findRecordByItemId(requestedItemId)
     if (!row) return { requestedItemId, formal: [], references: [], error: '数据中心不存在该需求编号' }
-    const record = this.db.getRecord(row.uid, false, this.semanticContext)
+    const record = this.db.getRecord(row.uid, false)
     if (!record) return { requestedItemId, formal: [], references: [], error: '对应记录详情无法读取' }
-    const contentHash = this.db.getRecordContentHash(record.uid)
-    const readyCard = contentHash
-      ? this.db.getReadyRequirementSemanticCard({ recordUid: record.uid, contentHash, ...this.semanticContext })
-      : null
-    const card = readyCard ?? buildRequirementSourceView(record)
+    const card = buildRequirementSourceView(record)
     const base: RequirementProfile = { record, card }
     if (!card.evidence.trim()) return {
       requestedItemId,
@@ -571,10 +341,9 @@ export class RequirementAnalysisAgent {
     }
 
     try {
-      if (!readyCard) this.progress('recall', `${record.itemId} 未有有效 AI 语义卡片，本次使用完整清洗原文参与召回`)
-      this.progress('recall', `${record.itemId}：Dense、BM25、ready 结构化字段三路召回开始`)
+      this.progress('recall', `${record.itemId}：Dense、BM25 两路召回开始`)
       const candidates = (await this.retriever.retrieve(card, excludedUids)).slice(0, HYBRID_CANDIDATE_LIMIT)
-      this.progress('recall', `${record.itemId}：三路召回与 RRF 完成，共 ${candidates.length} 条候选`, candidates.length, HYBRID_CANDIDATE_LIMIT)
+      this.progress('recall', `${record.itemId}：Dense/BM25 两路召回与 RRF 完成，共 ${candidates.length} 条候选`, candidates.length, HYBRID_CANDIDATE_LIMIT)
       if (!candidates.length) return { requestedItemId, base, formal: [], references: [], reviewSummary: '全库混合召回未发现候选记录。' }
 
       this.progress('rerank', `${record.itemId}：Cross-Encoder 正在重排 ${candidates.length} 条候选`, 0, candidates.length)
@@ -596,7 +365,7 @@ export class RequirementAnalysisAgent {
         left.candidate.record.uid.localeCompare(right.candidate.record.uid)
       ))
       const selected = scored.slice(0, EXPLANATION_CANDIDATE_LIMIT)
-      this.progress('score', `${record.itemId}：已完成 ${scored.length} 条候选多维业务评分，前 ${selected.length} 条进入批量 AI 语义复核`, scored.length, Math.max(1, scored.length))
+      this.progress('score', `${record.itemId}：已完成 ${scored.length} 条候选确定性评分，前 ${selected.length} 条进入批量 AI 关系解释`, scored.length, Math.max(1, scored.length))
       const explained = await this.explainAndMerge(question, base, selected)
       const matched = explained.matches
       const visible = matched.filter((candidate) => (
@@ -605,16 +374,15 @@ export class RequirementAnalysisAgent {
       const warnings = matched
         .filter((candidate) => candidate.explanationStatus === 'unavailable')
         .map((candidate) => isDeterministicRequirementMatch(candidate.score)
-          ? `UID ${candidate.record.uid} 的 AI 说明暂不可用，正式关系已由${candidate.score.decisionPath === 'semantic_card' ? '高质量语义卡片' : '清洗原文近重复'}路径独立确认`
-          : `UID ${candidate.record.uid} 的 AI 语义复核暂不可用，已降级为非正式关系并保留召回审计`)
-      const cacheCount = matched.filter((candidate) => candidate.explanationStatus === 'cache_verified').length
+          ? `UID ${candidate.record.uid} 的 AI 说明暂不可用，正式关系已由清洗原文近重复路径独立确认`
+          : `UID ${candidate.record.uid} 的 AI 关系解释暂不可用，已保留确定性评分与召回审计`)
       return {
         requestedItemId,
         base,
         formal: visible.filter((candidate) => FORMAL_RELATIONS.has(candidate.score.relation)),
         references: visible.filter((candidate) => REFERENCE_RELATIONS.has(candidate.score.relation)),
         reviewSummary: [
-          `多路径置信融合完成；一次批量 AI 语义复核${cacheCount ? `，缓存命中 ${cacheCount} 条` : ''}`,
+          'Dense/BM25 经 RRF、Cross-Encoder 与确定性评分完成；一次批量 AI 关系解释已执行',
           explained.summary ? `AI 总结：${truncate(explained.summary, 240)}` : ''
         ].filter(Boolean).join('；'),
         reviewWarnings: warnings
@@ -630,148 +398,42 @@ export class RequirementAnalysisAgent {
     }
   }
 
-  private cacheContext(
-    question: string,
-    base: RequirementProfile,
-    candidate: RankedCandidate
-  ): RequirementMatchCacheInput {
-    const baseContentHash = requirementRecordSourceHash(base.record)
-    const candidateContentHash = requirementRecordSourceHash(candidate.record)
-    const baseCardHash = hashJson(base.card)
-    const candidateCardHash = hashJson(candidate.card)
-    const queryHash = hashText(normalizeQuestion(question))
-    const cacheKey = hashJson({
-      strategyVersion: MATCH_STRATEGY_VERSION,
-      baseRecordUid: base.record.uid,
-      candidateRecordUid: candidate.record.uid,
-      queryHash,
-      baseContentHash,
-      candidateContentHash,
-      baseCardHash,
-      candidateCardHash,
-      analyzerVersion: this.semanticContext.analyzerVersion,
-      semanticModelSignature: this.semanticContext.modelSignature,
-      embeddingModelVersion: this.embeddingModelVersion,
-      rerankerVersion: REQUIREMENT_RERANKER_MODEL_VERSION,
-      explanationModelSignature: this.matchModelSignature
-    })
-    return {
-      cacheKey,
-      baseRecordUid: base.record.uid,
-      candidateRecordUid: candidate.record.uid,
-      queryHash,
-      baseContentHash,
-      candidateContentHash,
-      baseCardHash,
-      candidateCardHash,
-      analyzerVersion: this.semanticContext.analyzerVersion,
-      semanticModelSignature: this.semanticContext.modelSignature,
-      embeddingModelVersion: this.embeddingModelVersion,
-      rerankerVersion: REQUIREMENT_RERANKER_MODEL_VERSION,
-      strategyVersion: MATCH_STRATEGY_VERSION,
-      explanationModelSignature: this.matchModelSignature,
-      result: {},
-      resultStatus: 'live_verified'
-    }
-  }
-
-  private readCache(
-    context: RequirementMatchCacheInput,
-    base: RequirementProfile,
-    candidate: RankedCandidate,
-    currentScore: RequirementMatchScoreResult
-  ): { score: RequirementMatchScoreResult; explanation: MatchExplanationState } | null {
-    try {
-      const cached = this.db.getRequirementMatchCache(context.cacheKey)
-      if (!cached || cached.resultStatus !== 'live_verified' && cached.resultStatus !== 'cache_verified') return null
-      if (cached.baseRecordUid !== context.baseRecordUid || cached.candidateRecordUid !== context.candidateRecordUid ||
-          cached.queryHash !== context.queryHash || cached.baseContentHash !== context.baseContentHash ||
-          cached.candidateContentHash !== context.candidateContentHash || cached.baseCardHash !== context.baseCardHash ||
-          cached.candidateCardHash !== context.candidateCardHash || cached.analyzerVersion !== context.analyzerVersion ||
-          cached.semanticModelSignature !== context.semanticModelSignature || cached.embeddingModelVersion !== context.embeddingModelVersion ||
-          cached.rerankerVersion !== context.rerankerVersion || cached.strategyVersion !== context.strategyVersion ||
-          cached.explanationModelSignature !== context.explanationModelSignature) return null
-      const parsed = parsedCachedResult(cached, base, candidate)
-      if (!parsed) return null
-      // Recall and reranking are intentionally recomputed for every query. A
-      // cache hit may reuse only the already validated AI relation and
-      // explanation. The percentage is recalculated from this query's local
-      // score and constrained to the cached relation interval.
-      return {
-        score: isDeterministicRequirementMatch(currentScore)
-          ? currentScore
-          : constrainRequirementMatchToRelation(base.card, candidate.card, currentScore, parsed.score.relation),
-        explanation: parsed.explanation
-      }
-    } catch {
-      return null
-    }
-  }
-
-  private saveCache(
-    context: RequirementMatchCacheInput,
-    score: RequirementMatchScoreResult,
-    explanation: MatchExplanationState
-  ): void {
-    try {
-      this.db.saveRequirementMatchCache({ ...context, result: cacheResultOf(score, explanation), resultStatus: 'live_verified' })
-    } catch {
-      // Cache persistence is an optimization; it cannot invalidate a verified result.
-    }
-  }
-
   private async explainAndMerge(
     question: string,
     base: RequirementProfile,
     selected: Array<{ candidate: RankedCandidate; score: RequirementMatchScoreResult }>
   ): Promise<ExplanationMergeResult> {
     if (!selected.length) return { matches: [] }
-    const contexts = selected.map(({ candidate }) => this.cacheContext(question, base, candidate))
-    const cached = new Map<string, { score: RequirementMatchScoreResult; explanation: MatchExplanationState }>()
-    selected.forEach(({ candidate }, index) => {
-      const value = this.readCache(contexts[index]!, base, candidate, selected[index]!.score)
-      if (value) cached.set(candidate.record.uid, value)
-    })
-    const pending = selected.filter(({ candidate }) => !cached.has(candidate.record.uid))
-    this.progress('explain', `${base.record.itemId}：待 AI 解释 ${pending.length} 条，已复核缓存命中 ${cached.size} 条`, cached.size, selected.length)
+    this.progress('explain', `${base.record.itemId}：待 AI 解释 ${selected.length} 条`, 0, selected.length)
     const liveExplanations = new Map<string, RequirementMatchExplanation>()
     let explanationSummary = ''
-    if (pending.length) {
-      try {
-        const explanationBatch = await explainRequirementMatches(
-          this.modelClient,
-          { question, base: base.card, candidates: pending.map(({ candidate }) => candidate) },
-          {
-            think: this.settings.thinking,
-            forceThinking: this.settings.thinking,
-            temperature: 0,
-            // Ollama uses -1 for an unlimited generation budget. Deep-thinking
-            // models can otherwise consume the whole budget before emitting
-            // their structured answer; the request timeout remains the safety
-            // boundary for a stalled model.
-            numPredict: this.settings.source === 'local' && this.settings.thinking
-              ? -1
-              : Math.max(2_400, pending.length * 260),
-            numCtx: EXPLANATION_MAX_CONTEXT,
-            timeoutMs: EXPLANATION_TIMEOUT_MS
-          }
-        )
-        explanationSummary = explanationBatch.summary
-        explanationBatch.items.forEach((explanation) => liveExplanations.set(explanation.recordUid, explanation))
-        this.progress('explain', `${base.record.itemId}：一次批量 AI 语义复核已通过 UID、关系和证据校验`, selected.length, selected.length)
-      } catch (error) {
-        const explanationError = error instanceof Error ? error.message : String(error)
-        this.progress('explain', `${base.record.itemId}：AI 解释不可用，保留确定性评分（${explanationError}）`, selected.length, selected.length)
-      }
+    try {
+      const explanationBatch = await explainRequirementMatches(
+        this.modelClient,
+        { question, base: base.card, candidates: selected.map(({ candidate }) => candidate) },
+        {
+          think: this.settings.thinking,
+          forceThinking: this.settings.thinking,
+          temperature: 0,
+          // Ollama uses -1 for an unlimited generation budget. Deep-thinking
+          // models can otherwise consume the whole budget before emitting
+          // their structured answer; the request timeout remains the safety
+          // boundary for a stalled model.
+          numPredict: this.settings.source === 'local' && this.settings.thinking
+            ? -1
+            : Math.max(2_400, selected.length * 260),
+          numCtx: EXPLANATION_MAX_CONTEXT,
+          timeoutMs: EXPLANATION_TIMEOUT_MS
+        }
+      )
+      explanationSummary = explanationBatch.summary
+      explanationBatch.items.forEach((explanation) => liveExplanations.set(explanation.recordUid, explanation))
+      this.progress('explain', `${base.record.itemId}：一次批量 AI 关系解释已通过 UID、关系和证据校验`, selected.length, selected.length)
+    } catch (error) {
+      const explanationError = error instanceof Error ? error.message : String(error)
+      this.progress('explain', `${base.record.itemId}：AI 解释不可用，保留确定性评分（${explanationError}）`, selected.length, selected.length)
     }
     const matches = selected.map(({ candidate, score }) => {
-      const cachedValue = cached.get(candidate.record.uid)
-      if (cachedValue) return {
-        ...candidate,
-        score: cachedValue.score,
-        explanation: cachedValue.explanation,
-        explanationStatus: 'cache_verified' as const
-      }
       const modelExplanation = liveExplanations.get(candidate.record.uid)
       const explanation = modelExplanation
         ? {
@@ -781,21 +443,9 @@ export class RequirementAnalysisAgent {
             candidateEvidence: modelExplanation.candidateEvidence
           }
         : fallbackExplanation(base, candidate)
-      const reviewedScore = modelExplanation
-        ? isDeterministicRequirementMatch(score)
-          ? score
-          : constrainRequirementMatchToRelation(base.card, candidate.card, score, modelExplanation.relation)
-        : downgradeRequirementMatchForUnavailableReview(score)
-      if (modelExplanation) {
-        this.saveCache(
-          contexts.find((context) => context.candidateRecordUid === candidate.record.uid)!,
-          reviewedScore,
-          explanation
-        )
-      }
       return {
         ...candidate,
-        score: reviewedScore,
+        score,
         explanation,
         explanationStatus: modelExplanation ? 'live_verified' as const : 'unavailable' as const
       }
@@ -824,18 +474,13 @@ export class RequirementAnalysisAgent {
       this.progressState.match.scoredCurrent = Math.max(this.progressState.match.scoredCurrent ?? 0, stageCurrent)
       this.progressState.match.scoredTotal = Math.max(this.progressState.match.scoredTotal ?? 0, stageTotal)
     }
-    const explanationStart = message.match(/待 AI 解释 (\d+) 条，已复核缓存命中 (\d+) 条/u)
+    const explanationStart = message.match(/待 AI 解释 (\d+) 条/u)
     if (stage === 'explain' && explanationStart) {
       const pending = Number(explanationStart[1])
-      const cacheHits = Number(explanationStart[2])
-      this.progressState.match.explanationTotal = Math.max(
-        this.progressState.match.explanationTotal ?? 0,
-        pending + cacheHits
-      )
-      this.progressState.match.explanationDone = Math.max(this.progressState.match.explanationDone ?? 0, cacheHits)
-      this.progressState.match.cacheHits = Math.max(this.progressState.match.cacheHits ?? 0, cacheHits)
+      this.progressState.match.explanationTotal = Math.max(this.progressState.match.explanationTotal ?? 0, pending)
+      this.progressState.match.explanationDone = 0
     }
-    if (stage === 'explain' && /批量 AI 解释已通过|AI 解释总结已生成/u.test(message)) {
+    if (stage === 'explain' && /批量 AI 关系解释已通过|AI 解释总结已生成/u.test(message)) {
       this.progressState.match.explanationDone = this.progressState.match.explanationTotal ?? stageCurrent
     }
     const stageBase: Record<string, number> = {
@@ -887,28 +532,26 @@ export class RequirementAnalysisAgent {
     const dataViews: ChatDataView[] = total ? [{
       id: `requirement-analysis:${requestedItemIds.join(',')}`,
       title: '需求分析精准匹配结果',
-      description: 'Dense/BM25/结构化召回经 RRF 合并后，由 Cross-Encoder 排序，再通过清洗原文、语义卡片和一次批量 AI 语义复核进行多路径置信融合。',
+      description: '完整清洗原文经 Dense/BM25 两路召回与 RRF 合并后，由 Cross-Encoder 排序、确定性评分，并通过一次批量 AI 关系解释补充证据。',
       total,
       fields: [
         'description', 'module', 'requirementType', 'relation', 'matchScore', 'scoreDetails',
         'sharedEvidence', 'difference', 'evidence', 'denseScore', 'lexicalScore',
-        'structuralScore', 'rerankerScore',
-        'semanticStatus', 'explanationStatus'
+        'rerankerScore', 'explanationStatus'
       ],
       fieldLabels: {
         description: '描述', module: '模块', requirementType: '需求类型', relation: '匹配关系',
         matchScore: '综合匹配度', scoreDetails: '评分明细', sharedEvidence: '相似点',
         difference: '主要差异', evidence: '原文证据', denseScore: '向量召回分',
-        lexicalScore: 'BM25 召回分', structuralScore: '结构化召回分',
-        rerankerScore: 'Cross-Encoder 重排分', semanticStatus: '语义资产状态',
-        explanationStatus: 'AI 复核状态'
+        lexicalScore: 'BM25 召回分', rerankerScore: 'Cross-Encoder 重排分',
+        explanationStatus: 'AI 解释状态'
       },
       groups
     }] : []
     const foundCount = entries.filter((entry) => entry.base).length
     return {
       answer: [
-        `需求分析完成：已处理 ${foundCount}/${requestedItemIds.length} 个编号。匹配流程为“Dense/BM25/结构化召回 → RRF → Cross-Encoder 排序 → 清洗原文/语义卡片/AI 语义复核多路径置信融合”。`,
+        `需求分析完成：已处理 ${foundCount}/${requestedItemIds.length} 个编号。匹配流程为“完整清洗原文 → Dense/BM25 两路召回 → RRF → Cross-Encoder 排序 → 确定性评分 → 批量 AI 关系解释”。`,
         ...entries.map((entry) => this.answerSection(entry)),
         dataViews.length ? '结果已整理为结构化表格；综合匹配度是程序评分结果，不代表统计概率。' : ''
       ].filter(Boolean).join('\n\n'),
@@ -951,18 +594,12 @@ export class RequirementAnalysisAgent {
         evidence: `基准：${candidate.explanation.baseEvidence}；候选：${candidate.explanation.candidateEvidence}`,
         denseScore: `${candidate.denseScore.toFixed(1)}%`,
         lexicalScore: `${candidate.lexicalScore.toFixed(1)}%`,
-        structuralScore: `${candidate.structuralScore.toFixed(1)}%`,
         rerankerScore: `${candidate.rerankerScore.toFixed(1)}%`,
-        semanticStatus: candidate.card.analysisStatus === 'ai_adjudicated'
-          ? 'AI 语义卡片已就绪'
-          : '未语义化，使用完整原文匹配',
-        explanationStatus: candidate.explanationStatus === 'cache_verified'
-          ? '已复核缓存命中'
-          : candidate.explanationStatus === 'live_verified'
-            ? '实时 AI 语义复核已校验'
+        explanationStatus: candidate.explanationStatus === 'live_verified'
+            ? '实时 AI 关系解释已校验'
             : isDeterministicRequirementMatch(candidate.score)
               ? 'AI 说明暂不可用，确定性路径已独立确认'
-              : 'AI 语义复核暂不可用，正式关系已降级并保留召回审计'
+              : 'AI 关系解释暂不可用，已保留确定性评分与召回审计'
       }
     }
   }
@@ -974,10 +611,7 @@ export class RequirementAnalysisAgent {
       `#### ${record.itemId} · ${requirementDisplayName(record, card)}`,
       `- **描述**：${truncate(requirementDisplayDescription(record, card), 320)}`,
       `- **模块**：${card.module || '未标注'}`,
-      `- **需求类型**：${card.requirementType || '未标注'}`,
-      `- **语义资产状态**：${card.analysisStatus === 'ai_adjudicated'
-        ? 'AI 语义卡片已就绪'
-        : '未语义化，本次使用完整清洗原文继续匹配'}`
+      `- **需求类型**：${card.requirementType || '未标注'}`
     ]
     if (entry.error) return [...header, `- **匹配结果**：${entry.error}。`].join('\n')
     const render = (candidate: MatchedCandidate, index: number): string[] => [

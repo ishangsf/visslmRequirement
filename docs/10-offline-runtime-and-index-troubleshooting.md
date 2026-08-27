@@ -201,7 +201,7 @@ npm run package
 - `build/installer.nsh`：NSIS 安装阶段的 VC++ 注册表检查、离线静默安装和安装后复核。
 - `src/main/runtime-dependencies.ts`：启动阶段 Windows、VC++、ONNX 文件和 native load 诊断。
 - `scripts/prepare-runtime-dependencies.mjs`、`scripts/verify-runtime-dependencies.mjs`：发布资源准备与只读校验。
-- `src/main/requirements/semantic-card.ts`：按字段显示名解析需求业务文本，并兼容历史 alias。
+- `src/main/requirements/requirement-match-card.ts`：按字段显示名构建需求匹配原文，并兼容历史 alias。
 - `src/main/database.ts`：按 `nodeType` 提供字段显示名，字段定义变化参与语义/向量源 hash。
 - `src/main/record-maintenance.ts`、`src/main/knowledge.ts`：embedding 运行时前置检查和索引批任务的失败边界。
 

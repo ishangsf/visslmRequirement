@@ -225,7 +225,7 @@ const testMainEmitsRunScopedSafeActivities = (): void => {
   }
   assertHas(
     mainSource,
-    /new OllamaAgent\([\s\S]{0,900}confirmExecutionSummary,\s*emitActivity\s*\)/,
+    /new OllamaAgent\([\s\S]{0,900}\(content\)\s*=>\s*answerStream\.push\(content\),\s*emitActivity\s*\)/,
     '专业 Agent 的安全 activity 回调必须接入主进程'
   )
   const ollamaConstructionStart = mainSource.lastIndexOf('const agent = new OllamaAgent(')
@@ -275,7 +275,7 @@ const testRendererConsumesStructuredLog = (): void => {
   assertNoForbiddenText(
     JSON.stringify({
       activity: makeActivity(workLogForStatus('query', 'reasoning_content=hidden'), 1),
-      rendererPayload: { summary: '正在按已确认计划查询数据中心记录。' }
+      rendererPayload: { summary: '正在根据用户问题查询数据中心记录。' }
     }),
     'renderer 可见 activity payload'
   )
@@ -317,28 +317,14 @@ const testRendererConsumesStructuredLog = (): void => {
   checks.push('renderer accepts only active structured activities, orders them, and safely falls back to legacy status')
 }
 
-const testPlanConfirmationVisibility = (): void => {
-  const planCard = extractBetween(
-    rendererSource,
-    'function AssistantExecutionPlanCard({',
-    'const semanticTaskStatusLabels'
-  )
-  assertHas(planCard, /pending:\s*boolean/, '计划卡必须显式区分待确认与已确认')
-  assertHas(planCard, /const canEdit = pending && !expired/, '确认前计划必须可编辑且确认后锁定')
-  assertHas(planCard, /agent-plan-editors/, '确认前计划卡必须呈现完整可编辑字段')
-  assertHas(planCard, /canEdit\s*&&\s*editing/, '完整编辑器只能在确认前显示')
-  assertHas(planCard, /pending\s*&&\s*!expired[\s\S]{0,2500}确认并执行/, '确认前必须提供确认并执行动作')
-  assertHas(
-    planCard,
-    /(?:<details|aria-expanded|agent-plan-(?:compact|summary)-toggle|执行思路摘要|展开执行计划|查看执行计划)/,
-    '确认后默认必须是紧凑摘要，并提供展开入口'
-  )
-  assertHas(
-    planCard,
-    /\)\s*:\s*\(\s*<details[^>]+(?:agent-confirmed-scope|agent-plan-(?:compact|summary))/,
-    '紧凑摘要的展开入口必须位于已确认分支'
-  )
-  checks.push('confirmation card keeps a full editable pending plan and collapsible confirmed summary')
+const testClarificationChoicesReplacePlanConfirmation = (): void => {
+  assert.doesNotMatch(rendererSource, /AssistantExecutionPlanCard|confirmAgentPlan|agent-plan-card|确认并执行/u)
+  assert.doesNotMatch(mainSource, /agent:confirm-plan|AssistantPlanConfirmationController|requiresConfirmation/u)
+  assertHas(rendererSource, /message\.clarificationOptions\?\.length/, '澄清消息必须支持业务选项')
+  assertHas(rendererSource, /option\.action === ['"]submit['"][\s\S]{0,180}send\(option\.prompt\)/, '立即执行选项必须重新提交明确问题')
+  assertHas(rendererSource, /setQuestion\(option\.prompt\)/, '补充型选项必须进入输入框')
+  assertHas(mainSource, /buildAssistantClarificationOptions/, '主进程必须为真实澄清生成业务选项')
+  checks.push('normal execution has no plan confirmation card and true ambiguity is handled with selectable business questions')
 }
 
 const testTerminalStatesAndPrivacyBoundaries = (): void => {
@@ -399,7 +385,7 @@ const main = (): void => {
   testWorkLogCoversAuditablePhases()
   testMainEmitsRunScopedSafeActivities()
   testRendererConsumesStructuredLog()
-  testPlanConfirmationVisibility()
+  testClarificationChoicesReplacePlanConfirmation()
   testTerminalStatesAndPrivacyBoundaries()
   console.log(JSON.stringify({ ok: true, checks }))
 }

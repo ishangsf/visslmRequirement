@@ -43,7 +43,8 @@ const categoryTypes = new Set<DashboardComponentType>([
   'ranking',
   'funnel',
   'radar',
-  'scatter'
+  'scatter',
+  'treemap'
 ])
 
 const profileCatalog = (profiles: FieldProfile[]): Map<string, FieldProfile> =>
@@ -61,7 +62,9 @@ const findCategoryProfile = (profiles: FieldProfile[]): FieldProfile | undefined
 
 const numericProfiles = (profiles: FieldProfile[]): FieldProfile[] =>
   profiles.filter((profile) =>
-    profile.inferredType === 'number' && profile.role !== 'identifier'
+    profile.inferredType === 'number' &&
+    profile.role !== 'identifier' &&
+    profile.sensitivity !== 'sensitive'
   )
 
 const uniqueId = (preferred: string, used: Set<string>): string => {
@@ -189,6 +192,32 @@ const repairDimensions = (
     return [time]
   }
 
+  if (component.type === 'combo') {
+    const existingTime = valid.find((dimension) =>
+      catalog.get(dimension.field.toLocaleLowerCase())?.inferredType === 'date'
+    )
+    if (existingTime) {
+      const time = { ...existingTime, timeGrain: existingTime.timeGrain ?? 'month' as const }
+      if (!existingTime.timeGrain) actions.push(`组合图时间维度调整为 ${time.field}（按月）`)
+      return [time]
+    }
+    const existingCategory = valid.find((dimension) => {
+      const profile = catalog.get(dimension.field.toLocaleLowerCase())
+      return profile?.role === 'dimension' ||
+        Boolean(profile && ['string', 'enum', 'boolean'].includes(profile.inferredType))
+    })
+    if (existingCategory) return [{ field: existingCategory.field }]
+    const time = findTimeProfile(profiles)
+    if (time) {
+      actions.push(`为组合图补充时间维度 ${time.field}（按月）`)
+      return [{ field: time.field, timeGrain: 'month' }]
+    }
+    const category = findCategoryProfile(profiles)
+    if (!category) throw new Error('组合图需要日期或分类字段，但当前数据范围没有可用维度')
+    actions.push(`为组合图补充分组维度 ${category.field}`)
+    return [{ field: category.field }]
+  }
+
   if (categoryTypes.has(component.type)) {
     const existing = valid.find((dimension) => {
       const profile = catalog.get(dimension.field.toLocaleLowerCase())
@@ -238,6 +267,59 @@ const repairQuery = (
     const { calculation: _calculation, comparison: _comparison, ...safe } = measure
     return safe
   })
+  let resultMeasures = safeMeasures
+  if (component.type === 'scatter') {
+    const numeric = numericProfiles(profiles)
+    const numericFields = new Set(numeric.map((profile) => profile.field))
+    const selected: QueryMeasure[] = []
+    const usedFields = new Set<string>()
+    for (const measure of safeMeasures) {
+      if (!measure.field || !numericFields.has(measure.field) || usedFields.has(measure.field)) continue
+      selected.push(measure)
+      usedFields.add(measure.field)
+      if (selected.length === 2) break
+    }
+    for (const profile of numeric) {
+      if (selected.length === 2) break
+      if (usedFields.has(profile.field)) continue
+      selected.push({
+        id: uniqueId(profile.field, new Set(selected.map((measure) => measure.id))),
+        field: profile.field,
+        aggregation: 'sum'
+      })
+      usedFields.add(profile.field)
+      actions.push(`为散点图补充数值指标 ${profile.field}`)
+    }
+    if (selected.length !== 2) {
+      throw new Error('散点图需要两个不同的安全数值字段，但当前数据范围不足')
+    }
+    resultMeasures = selected
+  } else if (component.type === 'combo') {
+    const signatures = new Set<string>()
+    const selected = safeMeasures.filter((measure) => {
+      const signature = `${measure.field ?? ''}:${measure.aggregation}`
+      if (signatures.has(signature)) return false
+      signatures.add(signature)
+      return true
+    }).slice(0, 2)
+    const usedFields = new Set(selected.flatMap((measure) => measure.field ? [measure.field] : []))
+    const usedIds = new Set(selected.map((measure) => measure.id))
+    for (const profile of numericProfiles(profiles)) {
+      if (selected.length === 2) break
+      if (usedFields.has(profile.field)) continue
+      selected.push({
+        id: uniqueId(profile.field, usedIds),
+        field: profile.field,
+        aggregation: 'sum'
+      })
+      usedFields.add(profile.field)
+      actions.push(`为组合图补充第二指标 ${profile.field}`)
+    }
+    if (selected.length !== 2) {
+      throw new Error('组合图需要两个不同的指标，但当前数据范围不足')
+    }
+    resultMeasures = selected
+  }
 
   const filters = sourceQuery.filters?.filter((filter) =>
     catalog.has(filter.field.toLocaleLowerCase())
@@ -259,7 +341,7 @@ const repairQuery = (
       ...(baseFilters?.length ? { baseFilters } : { baseFilters: undefined })
     },
     ...(dimensions?.length ? { dimensions } : {}),
-    measures: safeMeasures,
+    measures: resultMeasures,
     ...(filters?.length ? { filters } : {}),
     limit: component.type === 'pie'
       ? Math.min(sourceQuery.limit ?? 6, 6)
@@ -272,36 +354,22 @@ const repairQuery = (
   const preferredPrimary = component.encoding?.value
     ? idMap.get(component.encoding.value)
     : undefined
-  const primary = safeMeasures.find((measure) => measure.id === preferredPrimary) ?? safeMeasures[0]
+  const primary = resultMeasures.find((measure) => measure.id === preferredPrimary) ?? resultMeasures[0]
   if (!primary) throw new Error('当前数据范围无法构建可用指标')
 
   const preferredSecondary = component.encoding?.secondaryValue
   let secondary = preferredSecondary
-    ? safeMeasures.find((measure) => measure.id === idMap.get(preferredSecondary))
+    ? resultMeasures.find((measure) => measure.id === idMap.get(preferredSecondary))
     : undefined
-  secondary = secondary?.id !== primary.id
+  secondary = secondary && secondary.id !== primary.id
     ? secondary
-    : safeMeasures.find((measure) => measure.id !== primary.id)
-
-  if (component.type === 'scatter' && !secondary) {
-    const usedFields = new Set(safeMeasures.flatMap((measure) => measure.field ? [measure.field] : []))
-    const numeric = numericProfiles(profiles).find((profile) => !usedFields.has(profile.field))
-      ?? numericProfiles(profiles)[0]
-    if (!numeric) throw new Error('散点图需要第二个数值指标，但当前数据范围没有可用数值字段')
-    secondary = {
-      id: uniqueId('secondary', new Set(safeMeasures.map((measure) => measure.id))),
-      field: numeric.field,
-      aggregation: 'sum'
-    }
-    query.measures = [...safeMeasures, secondary]
-    actions.push(`为散点图补充第二指标 ${numeric.field}`)
-  }
+    : resultMeasures.find((measure) => measure.id !== primary.id)
 
   const label = query.dimensions?.[0]?.field
   const encoding = {
     ...(label ? { label } : {}),
     value: primary.id,
-    ...((component.type === 'scatter' || component.type === 'bar' || component.type === 'line') && secondary
+    ...((component.type === 'scatter' || component.type === 'combo' || component.type === 'bar' || component.type === 'line') && secondary
       ? { secondaryValue: secondary.id }
       : {})
   }

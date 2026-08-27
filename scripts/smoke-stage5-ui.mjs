@@ -82,7 +82,7 @@ try {
   await openPage('可视化大屏', '.dashboard-studio')
   const qualityChecks = await evaluate(`(async () => {
     const qualityButton = [...document.querySelectorAll('.dashboard-studio-actions button')]
-      .find((element) => element.textContent?.trim() === '质量');
+      .find((element) => element.textContent?.trim() === '检查');
     qualityButton?.click();
     const started = Date.now();
     while (!document.querySelector('.dashboard-quality') && Date.now() - started < 15000) {

@@ -92,6 +92,46 @@ const checks = await evaluate(`(async () => {
   dashboardMenuItem?.click()
   await waitFor('.dashboard-studio')
   await waitFor('.dashboard-widget')
+  const studioBody = document.querySelector('.dashboard-studio-body')
+  const workbenchRail = document.querySelector('.dashboard-workbench-rail')
+  const previewShell = document.querySelector('.dashboard-preview-shell')
+  const libraryPanel = document.querySelector('.dashboard-library')
+  const inspectorPanel = document.querySelector('.dashboard-inspector')
+  const workbenchRailVisible = isVisibleInViewport(workbenchRail)
+  const canvasUsesAvailableWidth = Boolean(studioBody && previewShell && workbenchRail) &&
+    Math.abs(
+      previewShell.getBoundingClientRect().width -
+      (studioBody.getBoundingClientRect().width - workbenchRail.getBoundingClientRect().width)
+    ) <= 2
+  const libraryInitiallyOnDemand = studioBody?.classList.contains('is-library-open') === false &&
+    libraryPanel?.getAttribute('aria-hidden') === 'true'
+  const componentRailButton = [...document.querySelectorAll('.dashboard-workbench-rail button')]
+    .find((button) => button.textContent?.includes('组件'))
+  componentRailButton?.click()
+  await new Promise((resolve) => setTimeout(resolve, 240))
+  const libraryPanelOpensAsOverlay = Boolean(libraryPanel) &&
+    libraryPanel?.getAttribute('aria-hidden') === 'false' &&
+    libraryPanel.getBoundingClientRect().width >= 280
+  const componentDescriptionsUseTwoLines = [...document.querySelectorAll(
+    '.dashboard-component-library-card-copy small'
+  )].every((description) => getComputedStyle(description).webkitLineClamp === '2')
+  document.querySelector('button[aria-label="关闭左侧面板"]')?.click()
+  await new Promise((resolve) => setTimeout(resolve, 200))
+  const focusButton = [...document.querySelectorAll('.dashboard-workbench-rail button')]
+    .find((button) => button.textContent?.includes('专注'))
+  focusButton?.click()
+  await new Promise((resolve) => setTimeout(resolve, 200))
+  const focusModeHidesPanels = studioBody?.classList.contains('is-focus-mode') === true &&
+    libraryPanel?.getAttribute('aria-hidden') === 'true' &&
+    inspectorPanel?.getAttribute('aria-hidden') === 'true'
+  focusButton?.click()
+  await new Promise((resolve) => setTimeout(resolve, 200))
+  if (!studioBody?.classList.contains('is-inspector-open')) {
+    [...document.querySelectorAll('.dashboard-workbench-rail button')]
+      .find((button) => button.textContent?.includes('属性'))
+      ?.click()
+    await new Promise((resolve) => setTimeout(resolve, 240))
+  }
 
   const rectOf = (element) => {
     const rect = element?.getBoundingClientRect()
@@ -163,16 +203,23 @@ const checks = await evaluate(`(async () => {
   gridShell?.append(placeholderProbe)
   gridShell?.classList.add('is-drop-valid')
   const validPlaceholderStyle = getComputedStyle(placeholderProbe)
+  const validPlaceholderSnapshot = {
+    opacity: validPlaceholderStyle.opacity,
+    backgroundColor: validPlaceholderStyle.backgroundColor
+  }
   gridShell?.classList.remove('is-drop-valid')
   gridShell?.classList.add('is-drop-invalid')
   const invalidPlaceholderStyle = getComputedStyle(placeholderProbe)
+  const invalidPlaceholderSnapshot = {
+    backgroundColor: invalidPlaceholderStyle.backgroundColor
+  }
   gridShell?.classList.remove('is-drop-invalid')
   placeholderProbe.remove()
-  const validDropPlaceholderUsesStateColor = validPlaceholderStyle.opacity === '1' &&
-    validPlaceholderStyle.backgroundColor !== 'rgb(255, 0, 0)' &&
-    validPlaceholderStyle.backgroundColor !== 'rgba(255, 0, 0, 0.2)'
-  const invalidDropPlaceholderHasDistinctState = invalidPlaceholderStyle.backgroundColor !==
-    validPlaceholderStyle.backgroundColor
+  const validDropPlaceholderUsesStateColor = validPlaceholderSnapshot.opacity === '1' &&
+    validPlaceholderSnapshot.backgroundColor !== 'rgb(255, 0, 0)' &&
+    validPlaceholderSnapshot.backgroundColor !== 'rgba(255, 0, 0, 0.2)'
+  const invalidDropPlaceholderHasDistinctState = invalidPlaceholderSnapshot.backgroundColor !==
+    validPlaceholderSnapshot.backgroundColor
   const dataEditor = document.querySelector('.dashboard-component-data-editor')
   const dataEditorBackground = dataEditor
     ? getComputedStyle(dataEditor).backgroundColor
@@ -212,7 +259,7 @@ const checks = await evaluate(`(async () => {
     Math.abs(studioBodyHeightAfterBlur - studioBodyHeightAfterRestore) <= 1
 
   const qualityButton = [...document.querySelectorAll('button')]
-    .find((button) => button.textContent?.trim() === '质量' && isVisibleInViewport(button))
+    .find((button) => button.textContent?.trim() === '检查' && isVisibleInViewport(button))
   qualityButton?.click()
   const qualityScore = await waitForVisible('.dashboard-quality-score')
   const qualityDrawer = qualityScore?.closest('.ant-drawer')
@@ -346,6 +393,12 @@ const checks = await evaluate(`(async () => {
     ['auto', 'scroll'].includes(getComputedStyle(provenanceDrawerBody).overflowY)
 
   return {
+    workbenchRailVisible,
+    canvasUsesAvailableWidth,
+    libraryInitiallyOnDemand,
+    libraryPanelOpensAsOverlay,
+    componentDescriptionsUseTwoLines,
+    focusModeHidesPanels,
     resizerAccessible,
     inspectorDragResizeWorks,
     inspectorKeyboardResizeWorks,

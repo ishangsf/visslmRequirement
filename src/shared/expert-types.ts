@@ -28,7 +28,6 @@ export interface AgentMatchProgress {
   scoredTotal?: number
   explanationDone?: number
   explanationTotal?: number
-  cacheHits?: number
   isolated?: number
 }
 
@@ -112,11 +111,6 @@ export type AgentEvent =
       replace?: boolean
       /** Alias for clients that call replacement a reset. */
       reset?: boolean
-    }
-  | {
-      type: 'plan'
-      summary: AssistantExecutionSummary
-      requiresConfirmation: true
     }
   | ({ type: 'activity' } & AssistantActivity)
   | { type: 'artifact'; artifactId: string; version: number; dashboard: DashboardSpec }

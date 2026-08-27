@@ -1,10 +1,11 @@
 import type { DashboardComponentSpec, DashboardSpec } from '../../shared/dashboard'
+import { validateDashboardSemanticConsistency } from '../../shared/dashboard-semantics'
 import { dashboardLayoutProfiles } from '../../shared/dashboard-layout'
 import type { QueryEngine } from '../analytics/query-engine'
 
 const componentTypes = new Set([
   'kpi', 'bar', 'line', 'pie', 'ranking', 'table', 'progress', 'insight',
-  'gauge', 'funnel', 'radar', 'scatter'
+  'gauge', 'funnel', 'radar', 'scatter', 'treemap', 'combo'
 ])
 const themes = new Set([
   'technology-dark',
@@ -23,6 +24,18 @@ const styleRanges = {
   padding: [4, 20],
   lineWidth: [1, 8]
 } as const
+
+const hasCompleteDashboardShape = (
+  spec: Partial<DashboardSpec>
+): spec is DashboardSpec => Boolean(
+  spec.schemaVersion === '1.0' &&
+  typeof spec.id === 'string' && spec.id.trim() &&
+  typeof spec.title === 'string' && spec.title.trim() &&
+  typeof spec.subtitle === 'string' &&
+  themes.has(String(spec.theme)) &&
+  typeof spec.updatedAt === 'string' &&
+  Array.isArray(spec.components) && spec.components.length > 0
+)
 
 export interface DashboardValidationOptions {
   allowInlineData?: boolean
@@ -144,9 +157,40 @@ export const validateDashboardSpec = (
       if (['kpi', 'progress', 'gauge'].includes(component.type) && dimensionFields.size > 0) {
         errors.push(`组件 ${component.id} 是单值组件，不能包含维度`)
       }
-      if (['bar', 'line', 'pie', 'ranking', 'funnel', 'radar', 'scatter'].includes(component.type) &&
+      if (['bar', 'line', 'pie', 'ranking', 'funnel', 'radar', 'scatter', 'treemap', 'combo'].includes(component.type) &&
           dimensionFields.size === 0) {
         errors.push(`组件 ${component.id} 至少需要一个维度`)
+      }
+      if (['scatter', 'combo'].includes(component.type)) {
+        const secondaryValue = component.encoding.secondaryValue
+        if (!secondaryValue) {
+          errors.push(`组件 ${component.id} 必须配置第二指标映射`)
+        } else if (!measureIds.has(secondaryValue)) {
+          errors.push(`组件 ${component.id} 的 encoding.secondaryValue 必须引用 measure.id`)
+        } else if (secondaryValue === component.encoding.value) {
+          errors.push(`组件 ${component.id} 的两个指标映射必须不同`)
+        }
+        if (component.query.measures.length !== 2) {
+          errors.push(`组件 ${component.id} 类型 ${component.type} 必须恰好包含两个指标`)
+        }
+        if (component.type === 'scatter' && component.query.measures.length === 2) {
+          const scatterFields = component.query.measures.map((measure) => measure.field?.trim())
+          if (scatterFields.some((field) => !field)) {
+            errors.push(`组件 ${component.id} 的 scatter 两个指标都必须指定字段`)
+          } else if (new Set(scatterFields).size !== 2) {
+            errors.push(`组件 ${component.id} 的 scatter 两个指标字段必须不同`)
+          }
+          if (queryEngine) {
+            const profiles = new Map(queryEngine.profile(component.query.scope)
+              .map((profile) => [profile.field, profile]))
+            for (const field of scatterFields) {
+              const profile = field ? profiles.get(field) : undefined
+              if (!profile || profile.sensitivity === 'sensitive' || profile.inferredType !== 'number') {
+                errors.push(`组件 ${component.id} 的 scatter 指标必须来自安全 number 字段`)
+              }
+            }
+          }
+        }
       }
     }
   }
@@ -158,6 +202,34 @@ export const validateDashboardSpec = (
         if (!catalog.has(filter.field.toLocaleLowerCase())) {
           errors.push(`全局筛选器 ${filter.id} 引用了不存在的字段: ${filter.field}`)
         }
+      }
+    }
+  }
+  if (spec.analysisBlueprint) {
+    const blueprint = spec.analysisBlueprint
+    if (blueprint.version !== '1.0') errors.push('analysisBlueprint.version 必须是 1.0')
+    if (!blueprint.request?.trim()) errors.push('analysisBlueprint.request 不能为空')
+    if (!blueprint.audience?.trim()) errors.push('analysisBlueprint.audience 不能为空')
+    if (!blueprint.objective?.trim()) errors.push('analysisBlueprint.objective 不能为空')
+    if (!blueprint.scopeDescription?.trim()) errors.push('analysisBlueprint.scopeDescription 不能为空')
+    if (!Array.isArray(blueprint.metrics) || !blueprint.metrics.length) {
+      errors.push('analysisBlueprint.metrics 至少包含一个指标')
+    }
+    if (!Array.isArray(blueprint.questions) || !blueprint.questions.length) {
+      errors.push('analysisBlueprint.questions 至少包含一个业务问题')
+    }
+    for (const component of spec.components as DashboardComponentSpec[]) {
+      if (!component.slotRole) {
+        errors.push(`组件 ${component.id} 缺少 slotRole`)
+      }
+    }
+    if (hasCompleteDashboardShape(spec)) {
+      try {
+        errors.push(...validateDashboardSemanticConsistency(spec)
+          .filter((issue) => issue.severity === 'error')
+          .map((issue) => `语义一致性 ${issue.code}: ${issue.message}`))
+      } catch (error) {
+        errors.push(`语义一致性校验失败: ${error instanceof Error ? error.message : String(error)}`)
       }
     }
   }

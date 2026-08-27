@@ -33,6 +33,42 @@ const server = createServer(async (request, response) => {
     return
   }
 
+  if (request.method === 'GET' && path === '/compatible/models') {
+    captured.push({ method: 'GET', path })
+    response.setHeader('Content-Type', 'application/json')
+    response.end(JSON.stringify({ data: [{ id: 'gpt-5.6-sol' }] }))
+    return
+  }
+
+  if (request.method === 'POST' && path === '/compatible/chat/completions') {
+    const body = JSON.parse(await readBody(request)) as Record<string, unknown>
+    captured.push({ method: 'POST', path, body })
+    const hasTools = Array.isArray(body.tools) && body.tools.length > 0
+    response.setHeader('Content-Type', 'application/json')
+    response.end(JSON.stringify({
+      id: hasTools ? 'compatible_tool' : 'compatible_text',
+      choices: [{
+        finish_reason: hasTools ? 'tool_calls' : 'stop',
+        message: hasTools
+          ? {
+              role: 'assistant',
+              content: null,
+              tool_calls: [{
+                id: 'compatible_call_1',
+                type: 'function',
+                function: { name: 'capability_probe', arguments: '{"ok":true}' }
+              }]
+            }
+          : {
+              role: 'assistant',
+              content: body.response_format ? '{"ok":true}' : 'OK'
+            }
+      }],
+      usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 }
+    }))
+    return
+  }
+
   if (request.method !== 'POST' || path !== '/raw/responses') {
     response.statusCode = 404
     response.end(JSON.stringify({ error: 'not found' }))
@@ -93,9 +129,45 @@ try {
     apiKey: 'rawchat-test-key'
   }
   const client = new ModelClient(settings)
-  const probe = await client.test(true)
-  assert.equal(probe.ok, true)
-  assert.ok(probe.message.includes('最小问答测试通过'))
+  const timeoutDescriptor = Object.getOwnPropertyDescriptor(AbortSignal, 'timeout')
+  assert.ok(timeoutDescriptor)
+  const timeoutCalls: number[] = []
+  Object.defineProperty(AbortSignal, 'timeout', {
+    configurable: true,
+    enumerable: timeoutDescriptor.enumerable,
+    writable: true,
+    value: (milliseconds: number) => {
+      timeoutCalls.push(Math.round(milliseconds))
+      return new AbortController().signal
+    }
+  })
+  try {
+    const rawTimeoutStart = timeoutCalls.length
+    const probe = await client.test(true, true)
+    assert.equal(probe.ok, true)
+    assert.ok(probe.message.includes('最小问答测试通过'))
+    assert.deepEqual(
+      timeoutCalls.slice(rawTimeoutStart),
+      [15_000, 180_000, 180_000, 180_000],
+      'RawChat connection remains short while all three active probes use the extended chat timeout'
+    )
+
+    const compatibleTimeoutStart = timeoutCalls.length
+    const compatibleProbe = await new ModelClient({
+      ...settings,
+      provider: 'openai-compatible',
+      baseUrl: `${origin}/compatible`
+    }).test(true, true)
+    assert.equal(compatibleProbe.ok, true)
+    assert.ok(compatibleProbe.message.includes('最小问答测试通过'))
+    assert.deepEqual(
+      timeoutCalls.slice(compatibleTimeoutStart),
+      [15_000, 15_000, 15_000, 15_000],
+      'non-RawChat providers retain the short active-probe timeout'
+    )
+  } finally {
+    Object.defineProperty(AbortSignal, 'timeout', timeoutDescriptor)
+  }
 
   const invalidProbe = await new ModelClient({
     ...settings,
@@ -160,7 +232,13 @@ try {
     ))
   ))
   assert.ok(probeRequest)
-  const toolRequest = captured.find((request) => Array.isArray(request.body?.tools))
+  const toolRequest = captured.find((request) => (
+    request.path === '/raw/responses' &&
+    Array.isArray(request.body?.tools) &&
+    request.body.tools.some((item) => (
+      typeof item === 'object' && item !== null && (item as Record<string, unknown>).name === 'probe_tool'
+    ))
+  ))
   assert.ok(toolRequest)
   assert.deepEqual(toolRequest.body?.tools, [{
     type: 'function',
@@ -212,6 +290,8 @@ try {
     verified: [
       'RawChat URL detection',
       'Responses models probe',
+      'RawChat active probes use extended timeout',
+      'non-RawChat active probes retain short timeout',
       'Responses text format',
       'flattened function tools',
       'function_call parsing',

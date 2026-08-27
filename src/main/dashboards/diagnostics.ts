@@ -23,7 +23,9 @@ export const diagnoseDashboard = (
     (message) => {
       const componentId = componentIds.find((id) => message.includes(`组件 ${id}`))
       return {
-        code: 'spec-validation',
+        code: message.startsWith('语义一致性') || message.includes('semanticBinding') || message.includes('slotRole')
+          ? 'semantic-validation'
+          : 'spec-validation',
         severity: 'error',
         message,
         ...(componentId ? { componentId } : {})

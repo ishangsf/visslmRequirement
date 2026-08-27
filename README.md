@@ -35,7 +35,7 @@ VISSLM Agent 是一个面向 Windows 的数据智能工作台，用于采集 VIS
 - 通用数据助手通过工具调用检索本地记录、字段、统计结果和知识库内容，不直接执行任意 SQL 或代码；规划字段查询时同时参考平台显示名、声明类型和采集值观察类型。
 - 回答可以附带来源引用、查询数据表和记录详情；无证据时会明确说明未检索到结果。
 - `@需求分析专家` 支持一个或多个需求编号定位数据中心记录；编号先做精确查找，不把自然语言相似度当作编号定位依据。
-- 需求分析会先清洗原始需求文本并构建语义卡片，再执行 Dense、本地 FTS5/BM25 和结构化字段的 RRF 混合召回（大索引先做粗向量候选预筛，最终保留前 50 条），由本地 Cross-Encoder 重排后交给 AI 做业务关系初审和独立复核（前 20 条）。
+- 需求分析会清洗原始需求文本，再执行完整原文 Dense 与本地 FTS5/BM25 的 RRF 混合召回（大索引先做粗向量候选预筛，最终保留前 50 条），由本地 Cross-Encoder 重排、程序确定性评分，并对前 10 条候选进行一次批量 AI 关系解释。
 - 复核只允许 `duplicate`、`highly_similar`、`partial_overlap`、`same_pattern`、`topic_only`、`unrelated` 六类关系；结果按“正式匹配”和“参考关联需求”分组，并校验原始证据。必要阶段失败时不回退到向量分，也不输出未经验证的候选结论。
 - 通过 `@数据可视化专家` 或“可视化大屏”入口生成结构化 Dashboard。
 - 支持字段画像、数据范围、指标聚合、趋势分析、全局筛选器、组件数据口径和受限自定义公式。
@@ -215,7 +215,7 @@ npm run knowledge:smoke
 npm run smoke:agent-requirement-analysis
 ```
 
-该命令是需求编号分析的窄范围 smoke 入口，覆盖多编号分组、原文清洗、全量 Dense/BM25/结构化混合召回、Cross-Encoder Top20 重排、确定性评分、Top10 一次批量 AI 解释、UID/证据严格校验、持久化缓存和失败关闭。运行真实匹配前应执行 `npm run prepare:model`，使本地 embedding 和 Cross-Encoder 资源可用；未就绪的语义卡片不会触发查询时 AI 生成，系统继续使用完整清洗原文参与召回和匹配。Dense、FTS5 和结构化召回都只在当前 embedding `modelVersion` 已建立向量索引的记录 UID 集合内运行。
+该命令是需求编号分析的窄范围 smoke 入口，覆盖多编号分组、原文清洗、全量 Dense/BM25 混合召回、Cross-Encoder Top20 重排、确定性评分、Top10 一次批量 AI 解释、UID/证据严格校验和失败关闭。运行真实匹配前应执行 `npm run prepare:model`，使本地 embedding 和 Cross-Encoder 资源可用。Dense 与 FTS5 只在当前 embedding `modelVersion` 已建立向量索引的记录 UID 集合内运行。
 
 自动化回归和性能基准命令：
 
@@ -269,7 +269,6 @@ UI 回归脚本通过 Electron CDP 检查实际页面。请先用支持 `--remot
 ```powershell
 $env:VISSLM_CDP_PORT='9223'
 node .\scripts\smoke-stage5-ui.mjs
-node .\scripts\smoke-asset-center-ui.mjs
 node .\scripts\smoke-data-visualization-handoff.mjs
 node .\scripts\smoke-chat-mention.mjs
 node .\scripts\smoke-push-config-ui.mjs
@@ -289,7 +288,7 @@ src/
 │  ├─ knowledge.ts               # 文档解析、OCR、embedding、向量检索
 │  ├─ ollama.ts                  # 通用数据助手与工具调用
 │  ├─ model-client.ts            # Ollama/在线模型适配
-│  ├─ requirements/              # 需求语义卡片、混合召回和本地重排
+│  ├─ requirements/              # 需求原文匹配、混合召回和本地重排
 │  └─ experts/                   # 专家路由和可视化生成
 ├─ preload/                      # 安全暴露给渲染进程的 IPC API
 ├─ renderer/src/                 # React 页面和 Dashboard 工作台

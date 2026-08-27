@@ -4,8 +4,8 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { AppDatabase } from '../src/main/database'
 import { KnowledgeService, type KnowledgeSearchHit } from '../src/main/knowledge'
+import { ModelClient, type ModelChatInput, type ModelResponse } from '../src/main/model-client'
 import { OllamaAgent } from '../src/main/ollama'
-import type { ModelChatInput, ModelResponse } from '../src/main/model-client'
 import {
   assertAssistantAgentToolAllowed,
   assistantExecutionAgentRegistry,
@@ -384,6 +384,7 @@ const testTaskTraceContract = (): void => {
 
 const testConversationDoesNotInvokeEvidenceAgents = async (): Promise<void> => {
   const { directory, db } = await newDatabase('assistant-orchestrator-conversation-')
+  let restoreModelChat = (): void => undefined
   try {
     const route = resolveAssistantExecutionRoute('conversation', 'conversation')
     assert.deepEqual(route.agents.map((agent) => agent.id), ['conversation'])
@@ -403,12 +404,27 @@ const testConversationDoesNotInvokeEvidenceAgents = async (): Promise<void> => {
     const agent = new OllamaAgent(db, settings, knowledge)
     const dataCenterAgentCalls = spyExecutionAgentMethod(agent, 'dataCenterAgent', 'executePlan')
     const knowledgeBaseAgentCalls = spyExecutionAgentMethod(agent, 'knowledgeBaseAgent', 'search')
-    installAnswerModel(agent, calls, '你好，我是通用对话 Agent。')
+    const modelClientPrototype = ModelClient.prototype as unknown as Record<string, unknown>
+    const originalChatDescriptor = Object.getOwnPropertyDescriptor(modelClientPrototype, 'chat')
+    if (!originalChatDescriptor || typeof originalChatDescriptor.value !== 'function') {
+      throw new Error('ModelClient.prototype.chat is unavailable')
+    }
+    Object.defineProperty(modelClientPrototype, 'chat', {
+      configurable: true,
+      writable: true,
+      value: async (input: ModelChatInput): Promise<ModelResponse> => {
+        calls.push(input)
+        return answerResponse('你好，我是通用对话 Agent。')
+      }
+    })
+    restoreModelChat = () => Object.defineProperty(modelClientPrototype, 'chat', originalChatDescriptor)
 
-    const result = await agent.ask(requestWithDecision(
+    const conversationRequest = requestWithDecision(
       '你好，你是谁？',
       decision({ taskType: 'conversation', sourceMode: 'conversation' })
-    ))
+    )
+    conversationRequest.thinkingMode = 'on'
+    const result = await agent.ask(conversationRequest)
     assert.equal(knowledgeCalls.length, 0)
     assert.equal(inspectSpy.count(), 0)
     assert.equal(listNodeTypesSpy.count(), 0)
@@ -419,11 +435,14 @@ const testConversationDoesNotInvokeEvidenceAgents = async (): Promise<void> => {
     assert.deepEqual(result.sources, [])
     assert.deepEqual(result.dataViews, [])
     assert.equal(calls.length, 1)
+    assert.equal(calls[0]?.think, true, 'conversation final answer should enable thinking when mode is on')
+    assert.equal(calls[0]?.forceThinking, true, 'conversation final answer should forward the on policy')
     assert.ok(result.taskTrace)
     assert.equal(result.taskTrace?.status, 'completed')
     assert.equal(result.taskTrace?.primaryAgent, 'conversation')
     assert.deepEqual(result.taskTrace?.invokedAgents, ['conversation'])
   } finally {
+    restoreModelChat()
     await closeDatabase(directory, db)
   }
 }
@@ -467,7 +486,7 @@ const testRecordsInvokeDataCenterOnly = async (): Promise<void> => {
     assert.ok(result.dataViews.length > 0)
     assert.deepEqual(result.dataViews[0]?.recordUids, ['orchestrator-record-001'])
     assert.ok(result.sources.every((source) => source.sourceType === 'record'))
-    assert.equal(calls.length, 1)
+    assert.equal(calls.length, 0, 'records-only grouped answers use deterministic verified rendering')
     assert.ok(result.taskTrace)
     assert.equal(result.taskTrace?.status, 'completed')
     assert.equal(result.taskTrace?.primaryAgent, 'data-center')
@@ -530,6 +549,128 @@ const testKnowledgeInvokesKnowledgeBaseOnly = async (): Promise<void> => {
     assert.deepEqual(result.taskTrace?.invokedAgents, ['knowledge-base'])
   } finally {
     await closeDatabase(directory, db)
+  }
+}
+
+const testKnowledgePlanningAndEvidenceAnswerThinkingContract = async (): Promise<void> => {
+  const thinkingCases: Array<{
+    label: string
+    includeThinkingMode: boolean
+    thinkingMode?: unknown
+    expectedFinalThinking: boolean
+  }> = [
+    { label: 'legacy', includeThinkingMode: false, expectedFinalThinking: false },
+    { label: 'auto', includeThinkingMode: true, thinkingMode: 'auto', expectedFinalThinking: false },
+    { label: 'on', includeThinkingMode: true, thinkingMode: 'on', expectedFinalThinking: true },
+    { label: 'off', includeThinkingMode: true, thinkingMode: 'off', expectedFinalThinking: false },
+    { label: 'invalid', includeThinkingMode: true, thinkingMode: 'invalid-runtime-value', expectedFinalThinking: false }
+  ]
+
+  for (const thinkingCase of thinkingCases) {
+    const { directory, db } = await newDatabase(`assistant-orchestrator-knowledge-thinking-${thinkingCase.label}-`)
+    const question = '请根据编排规范文档回答'
+    const knowledgeCalls: Array<{ query: string; limit?: number; sourceType?: string }> = []
+    const modelCalls: ModelChatInput[] = []
+    const knowledge = {
+      modelVersion: 'assistant-orchestrator-model',
+      search: async (
+        query: string,
+        limit?: number,
+        options?: { sourceType?: string }
+      ) => {
+        knowledgeCalls.push({ query, limit, sourceType: options?.sourceType })
+        return [documentHit()]
+      }
+    } as unknown as KnowledgeService
+    const prototype = ModelClient.prototype as unknown as Record<string, unknown>
+    const originalChatDescriptor = Object.getOwnPropertyDescriptor(prototype, 'chat')
+    if (!originalChatDescriptor || typeof originalChatDescriptor.value !== 'function') {
+      await closeDatabase(directory, db)
+      throw new Error('ModelClient.prototype.chat is unavailable')
+    }
+
+    Object.defineProperty(prototype, 'chat', {
+      configurable: true,
+      writable: true,
+      value: async (input: ModelChatInput): Promise<ModelResponse> => {
+        modelCalls.push(input)
+        // The source planner is the only assistant stage with a structured
+        // output format in this knowledge-only flow. The answer stage is
+        // intentionally identified from ModelChatInput, not prompt text.
+        if (input.format !== undefined) {
+          return answerResponse(JSON.stringify({
+            sourceMode: 'knowledge',
+            needsClarification: false,
+            intent: 'search_content',
+            explanation: '使用文档证据回答',
+            searchTerms: [],
+            searchMode: 'any',
+            filters: [],
+            fields: [],
+            resultMode: 'answer',
+            limit: 8,
+            evidenceLimit: 8
+          }))
+        }
+        return answerResponse('文档明确支持该结论。[1]')
+      }
+    })
+
+    try {
+      const request: ChatRequest = {
+        question,
+        projectId: 'assistant-orchestrator-project',
+        chatMode: 'auto',
+        entrypoint: 'chat'
+      }
+      if (thinkingCase.includeThinkingMode) {
+        // Keep the invalid-value case as a runtime contract test while
+        // preserving the compile-time AssistantThinkingMode type above.
+        const runtimeRequest = request as unknown as Record<string, unknown>
+        runtimeRequest.thinkingMode = thinkingCase.thinkingMode
+      }
+      const agent = new OllamaAgent(db, { ...settings, thinking: true }, knowledge)
+      const result = await agent.ask(request)
+
+      const planningCalls = modelCalls.filter((input) => input.format !== undefined)
+      const evidenceAnswerCalls = modelCalls.filter((input) => input.format === undefined)
+      assert.equal(planningCalls.length, 1, `${thinkingCase.label} knowledge routing must perform one structured planning call`)
+      assert.equal(evidenceAnswerCalls.length, 1, `${thinkingCase.label} knowledge evidence must perform one final answer call`)
+      const planningCall = planningCalls[0]
+      const evidenceAnswerCall = evidenceAnswerCalls[0]
+      assert.ok(planningCall)
+      assert.ok(evidenceAnswerCall)
+      assert.equal(planningCall.think, true, `${thinkingCase.label} planning may use model thinking`)
+      assert.equal(planningCall.forceThinking, true, `${thinkingCase.label} planning must preserve its thinking opt-in`)
+      assert.equal(
+        evidenceAnswerCall.think,
+        thinkingCase.expectedFinalThinking,
+        `${thinkingCase.label} evidence answer must honor its final-thinking policy`
+      )
+      assert.equal(
+        evidenceAnswerCall.forceThinking,
+        thinkingCase.expectedFinalThinking,
+        `${thinkingCase.label} evidence answer wrapper must forward its final-thinking policy`
+      )
+      assert.deepEqual(knowledgeCalls, [{
+        query: question,
+        limit: 8,
+        sourceType: 'document'
+      }])
+      assert.equal(result.sources.length, 1)
+      assert.equal(result.sources[0]?.sourceType, 'document')
+      assert.match(
+        result.answer,
+        /\[编排规范文档\.md · 第 1 页\]\(#knowledge-document=orchestrator-guide&chunk=orchestrator-guide-0\)/u,
+        `${thinkingCase.label} knowledge answer must retain a chunk-specific verifiable citation`
+      )
+      assert.equal(result.taskTrace?.status, 'completed')
+      assert.equal(result.taskTrace?.primaryAgent, 'knowledge-base')
+      assert.deepEqual(result.taskTrace?.invokedAgents, ['knowledge-base'])
+    } finally {
+      Object.defineProperty(prototype, 'chat', originalChatDescriptor)
+      await closeDatabase(directory, db)
+    }
   }
 }
 
@@ -690,6 +831,7 @@ const main = async (): Promise<void> => {
   await testConversationDoesNotInvokeEvidenceAgents()
   await testRecordsInvokeDataCenterOnly()
   await testKnowledgeInvokesKnowledgeBaseOnly()
+  await testKnowledgePlanningAndEvidenceAnswerThinkingContract()
   await testMixedInvokesBothAndPreservesProvenance()
   await testClarificationStopsBeforeEveryExecutor()
   await testFailureDoesNotFabricateCompletedTrace()
@@ -698,9 +840,10 @@ const main = async (): Promise<void> => {
     checks: [
       'execution registry declares stable source-aware agents and rejects illegal routes',
       'completed clarification and failed task traces have stable structures',
-      'conversation invokes no evidence executor',
+      'conversation invokes no evidence executor and honors on thinking mode',
       'records invoke data-center only',
       'knowledge invokes knowledge-base only with document evidence',
+      'knowledge planning enables thinking while final evidence answers honor thinking policies and retain verifiable citations',
       'mixed invokes both executors and preserves provenance',
       'clarification stops before database, index and execution agents',
       'executor failure cannot masquerade as completed'

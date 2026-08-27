@@ -5,7 +5,7 @@ import type {
   ModelCapabilityReport,
   ModelCapabilityStatus,
   ModelSettings,
-  RequirementSemanticizationModelUsage
+  ModelUsage
 } from '../shared/types'
 import {
   AssistantRunCancelledError,
@@ -30,7 +30,7 @@ export interface ModelMessage {
 export interface ModelResponse {
   message?: ModelMessage
   done_reason?: string
-  usage?: RequirementSemanticizationModelUsage
+  usage?: ModelUsage
 }
 
 /**
@@ -275,9 +275,8 @@ const modelRequestSemaphoreFor = (settings: Pick<ModelSettings, 'source' | 'prov
   const key = `${settings.source}\u0000${settings.provider}\u0000${trimBaseUrl(settings.baseUrl)}`
   const existing = modelRequestSemaphores.get(key)
   if (existing) return existing
-  // Project agreement extraction already has a tested two-request local
-  // pipeline. Keep that endpoint-wide contract while semanticization itself
-  // remains single-flight through its worker/stage routing.
+  // Project agreement extraction has a tested two-request local pipeline;
+  // retain that endpoint-wide concurrency contract for all model clients.
   const limit = settings.source === 'local' || settings.provider === 'ollama' ? 2 : 4
   const semaphore = new ModelRequestSemaphore(limit)
   modelRequestSemaphores.set(key, semaphore)
@@ -438,8 +437,8 @@ const finiteNumber = (value: unknown): number | undefined => {
   return value
 }
 
-const ollamaUsage = (chunk: Record<string, unknown>): RequirementSemanticizationModelUsage | undefined => {
-  const usage: RequirementSemanticizationModelUsage = {
+const ollamaUsage = (chunk: Record<string, unknown>): ModelUsage | undefined => {
+  const usage: ModelUsage = {
     promptTokens: finiteNumber(chunk.prompt_eval_count),
     completionTokens: finiteNumber(chunk.eval_count),
     promptDurationMs: finiteNumber(chunk.prompt_eval_duration)
@@ -458,10 +457,10 @@ const ollamaUsage = (chunk: Record<string, unknown>): RequirementSemanticization
   return Object.values(usage).some((value) => value !== undefined) ? usage : undefined
 }
 
-const rawChatUsage = (value: unknown): RequirementSemanticizationModelUsage | undefined => {
+const rawChatUsage = (value: unknown): ModelUsage | undefined => {
   if (typeof value !== 'object' || value === null) return undefined
   const usage = value as Record<string, unknown>
-  const normalized: RequirementSemanticizationModelUsage = {
+  const normalized: ModelUsage = {
     promptTokens: finiteNumber(usage.prompt_tokens ?? usage.input_tokens),
     completionTokens: finiteNumber(usage.completion_tokens ?? usage.output_tokens)
   }
@@ -670,7 +669,7 @@ interface OpenAiStreamState {
   toolCalls: Map<number, { id?: string; name: string; arguments: string }>
   done: boolean
   doneReason?: string
-  usage?: RequirementSemanticizationModelUsage
+  usage?: ModelUsage
 }
 
 const parseStreamJson = (data: string, provider: string): Record<string, unknown> => {
@@ -882,7 +881,7 @@ const readOpenAiStream = async (
       if (finishReason) state.doneReason = finishReason
       const usage = asRecord(choice.usage) ?? asRecord(payload.usage)
       if (usage) {
-        const normalized: RequirementSemanticizationModelUsage = {
+        const normalized: ModelUsage = {
           promptTokens: finiteNumber(usage.prompt_tokens ?? usage.input_tokens),
           completionTokens: finiteNumber(usage.completion_tokens ?? usage.output_tokens)
         }
@@ -891,7 +890,7 @@ const readOpenAiStream = async (
     }
     const topLevelUsage = asRecord(payload.usage)
     if (topLevelUsage) {
-      const normalized: RequirementSemanticizationModelUsage = {
+      const normalized: ModelUsage = {
         promptTokens: finiteNumber(topLevelUsage.prompt_tokens ?? topLevelUsage.input_tokens),
         completionTokens: finiteNumber(topLevelUsage.completion_tokens ?? topLevelUsage.output_tokens)
       }
@@ -908,7 +907,7 @@ interface RawChatStreamState {
   toolCalls: Map<string, { id?: string; name: string; arguments: string }>
   done: boolean
   doneReason?: string
-  usage?: RequirementSemanticizationModelUsage
+  usage?: ModelUsage
 }
 
 const rawChatStreamResponse = (state: RawChatStreamState): ModelResponse => ({
@@ -1000,7 +999,7 @@ interface AnthropicStreamState {
   toolCalls: Map<number, { id?: string; name: string; arguments: string }>
   done: boolean
   doneReason?: string
-  usage?: RequirementSemanticizationModelUsage
+  usage?: ModelUsage
 }
 
 const anthropicStreamResponse = (state: AnthropicStreamState): ModelResponse => ({
@@ -1255,7 +1254,7 @@ export class ModelClient {
         // An HTTP rejection happens before any streamed content is emitted and
         // is safe to retry. A transport failure during an active stream may
         // already have delivered visible deltas, so retrying it would duplicate
-        // assistant output. Semanticization is non-streaming and keeps the full
+        // assistant output. Structured non-streaming callers keep the full
         // transient-network retry path.
         const retryable = httpError?.retryable ?? (!input.stream && isTransientModelNetworkError(error))
         if (!retryable || retryIndex >= transportRetryLimit) throw error
@@ -1326,7 +1325,7 @@ export class ModelClient {
         think: false,
         temperature: 0,
         numPredict: 32,
-        timeoutMs: 15_000
+        timeoutMs: this.usesRawChatResponses() ? defaultChatTimeoutMs : 15_000
       })
       const content = response.message?.content?.trim()
       return content
@@ -1346,7 +1345,7 @@ export class ModelClient {
         think: false,
         temperature: 0,
         numPredict: 64,
-        timeoutMs: 15_000,
+        timeoutMs: this.usesRawChatResponses() ? defaultChatTimeoutMs : 15_000,
         format: structuredProbeFormat
       })
       const parsed = parseProbeObject(response.message?.content)
@@ -1369,7 +1368,10 @@ export class ModelClient {
         think: false,
         temperature: 0,
         numPredict: 96,
-        timeoutMs: 15_000
+        // RawChat Codex reasoning models can take tens of seconds even for
+        // this tiny tool probe. Keep the short guard for other providers,
+        // while matching the normal chat ceiling for this endpoint only.
+        timeoutMs: this.usesRawChatResponses() ? defaultChatTimeoutMs : 15_000
       })
       const call = response.message?.tool_calls?.find((item) => item.function.name === 'capability_probe')
       if (call?.function.arguments.ok === true) {
@@ -1578,7 +1580,7 @@ export class ModelClient {
     let content = ''
     let done = false
     let doneReason: string | undefined
-    let usage: RequirementSemanticizationModelUsage | undefined
+    let usage: ModelUsage | undefined
     let lineNumber = 0
     const toolCalls: NonNullable<ModelMessage['tool_calls']> = []
 

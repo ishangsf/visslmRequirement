@@ -13,6 +13,7 @@ import { isAbsolute, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Readable } from 'node:stream'
 import { promisify } from 'node:util'
+import type { Worker } from 'node:worker_threads'
 import * as XLSX from 'xlsx'
 import type {
   AssistantIntentDecision,
@@ -27,7 +28,6 @@ import type {
   AssistantRunHistory,
   AssistantArtifactExportRequest,
   AssistantArtifactExportResult,
-  AssistantPlanPatch,
   DataDeleteProgress,
   DataImportResult,
   DataImportRunSnapshot,
@@ -44,8 +44,6 @@ import type {
   RecordExportQuery,
   RecordQuery,
   RecordMaintenanceStartInput,
-  RequirementSemanticizationStartInput,
-  RequirementSemanticizationControl,
   SyncProgress,
   SyncScopeConfig,
   UpdateStatus
@@ -79,10 +77,12 @@ import type {
   DashboardSpec,
   VisualizationRunInput
 } from '../shared/dashboard'
-import type { AgentEvent, AssistantExecutionSummary } from '../shared/expert-types'
+import type { AgentEvent } from '../shared/expert-types'
 import { compareDashboardSpecValues } from '../shared/dashboard'
 import { QueryEngine } from './analytics/query-engine'
 import { AppDatabase } from './database'
+import { startDatabaseBootstrap } from './database-bootstrap'
+import type { DatabaseMigrationProgress } from './database-bootstrap-protocol'
 import { validateDashboardSpec } from './dashboards/validator'
 import { diagnoseDashboard } from './dashboards/diagnostics'
 import { repairDashboardComponent } from './dashboards/component-repair'
@@ -105,8 +105,6 @@ import {
   runWithAssistantRunContext
 } from './assistant/run-controller'
 import { AnswerStream } from './assistant/answer-stream'
-import { AssistantPlanConfirmationController } from './assistant/plan-confirmation'
-import type { AssistantPlanValidationMetadata, ConfirmedAssistantPlan } from './assistant/execution-plan'
 import {
   workLogForDelivery,
   workLogForFailure,
@@ -118,13 +116,13 @@ import {
 } from './assistant/work-log'
 import { buildSafeQueryRecoverySuggestions } from './assistant/recovery-suggestions'
 import { buildEvidenceBlocks } from './assistant/evidence-block'
+import { buildAssistantClarificationOptions } from './assistant/clarification-options'
 import {
   createAssistantArtifactPreview,
   verifyAssistantArtifactPreview
 } from './assistant/artifact-service'
 import { renderAssistantArtifact } from './assistant/artifact-exporter'
 import { RequirementAnalysisAgent } from './experts/requirement-analysis-agent'
-import { RequirementSemanticizationService } from './requirements/semanticization-service'
 import { VisualizationAgent } from './experts/visualization-agent'
 import { resolveVisualizationRequestMode } from './experts/visualization-intent'
 import { OllamaAgent } from './ollama'
@@ -173,6 +171,7 @@ protocol.registerSchemesAsPrivileged([{
 }])
 let mainWindow: BrowserWindow | null = null
 let backendReady = false
+let databaseBootstrapWorker: Worker | null = null
 let updateManager: UpdateManager | null = null
 let updateManagerInitError: string | null = null
 let db: AppDatabase
@@ -183,7 +182,6 @@ let knowledgeService: KnowledgeService
 let recordMaintenanceService: RecordMaintenanceService
 let recordIndexLock: AsyncMutex
 let projectManagementService: ProjectManagementService
-let requirementSemanticizationService: RequirementSemanticizationService
 let knowledgeInitializationTimer: ReturnType<typeof setTimeout> | null = null
 let knowledgeInitializationStarted = false
 let isQuitting = false
@@ -211,7 +209,6 @@ const maxPreviewUrls = 32
 const dataDeleteBatchSize = 200
 const previewFiles = new Map<string, { filePath: string; byteSize: number; mimeType: string; expiresAt: number }>()
 const assistantRunRegistry = new AssistantRunRegistry()
-const assistantPlanConfirmation = new AssistantPlanConfirmationController()
 const explicitArtifactMentionPattern = /@交付物专家(?=$|[\s，,。！？!?：:；;])/u
 const isolatedE2EMode = !app.isPackaged && process.env.VISSLM_E2E_ALLOW_MULTI_INSTANCE === '1'
 const isolatedE2EKnowledgeFiles = (() => {
@@ -229,69 +226,6 @@ const isolatedE2EKnowledgeFiles = (() => {
     return []
   }
 })()
-
-const planValidationMetadata = (
-  summary: AssistantExecutionSummary,
-  dataScope?: DataScope
-): AssistantPlanValidationMetadata => {
-  if (summary.sourceMode !== 'records' && summary.sourceMode !== 'mixed') return {}
-
-  const projectIds = db.listProjects()
-    .map((project) => project.uid.trim())
-    .filter(Boolean)
-  const nodeTypes = db.listNodeTypes()
-    .map((nodeType) => nodeType.trim())
-    .filter(Boolean)
-  const scopedNodeTypes = dataScope?.nodeTypes ?? summary.scope.nodeTypes
-  // Confirmation metadata must come from the trusted field-definition catalog,
-  // not from scanning record JSON or reading evidence before approval.
-  const definitions = db.getFieldDefinitions(nodeTypes)
-  const fields = new Map<string, {
-    field: string
-    displayName?: string
-    allowed: boolean
-    types: string[]
-  }>()
-  const addField = (field: string, displayName?: string, types: string[] = []): void => {
-    const normalized = field.trim()
-    if (!normalized) return
-    const existing = fields.get(normalized)
-    fields.set(normalized, {
-      field: normalized,
-      ...(displayName?.trim() || existing?.displayName
-        ? { displayName: displayName?.trim() || existing?.displayName }
-        : {}),
-      allowed: existing?.allowed ?? true,
-      types: [...new Set([...(existing?.types ?? []), ...types.map((value) => value.trim()).filter(Boolean)])]
-    })
-  }
-  for (const definition of definitions) {
-    addField(
-      definition.field,
-      definition.displayName,
-      [definition.nodeType]
-    )
-  }
-  // Existing planner output is already produced from the trusted catalog. If
-  // a legacy installation has no persisted field-definition rows, retain only
-  // those exact fields for an unedited plan; newly supplied fields still fail
-  // closed because they are not added here.
-  const fallbackFields = [
-    ...(summary.fields ?? []),
-    ...(summary.filters ?? []).map((filter) => filter.field),
-    ...(summary.scope.baseFilters ?? []).map((filter) => filter.field),
-    ...(summary.groupByField ? [summary.groupByField] : []),
-    ...(summary.sort?.field ? [summary.sort.field] : [])
-  ]
-  for (const field of fallbackFields) {
-    addField(field, undefined, scopedNodeTypes.length ? scopedNodeTypes : [])
-  }
-  return {
-    projectIds,
-    nodeTypes,
-    fields: [...fields.values()]
-  }
-}
 
 const prunePreviewFiles = (): void => {
   const now = Date.now()
@@ -641,8 +575,6 @@ const recordDashboardAudit = (input: DashboardAuditLogInput): void => {
   }
 }
 
-const exportSemanticStatuses = new Set(['pending', 'processing', 'ready', 'failed'])
-
 const normalizeDataExportQuery = (input: unknown): RecordExportQuery | undefined => {
   if (input === undefined || input === null) return undefined
   if (typeof input !== 'object' || Array.isArray(input)) {
@@ -664,12 +596,6 @@ const normalizeDataExportQuery = (input: unknown): RecordExportQuery | undefined
   readText('projectId')
   readText('nodeType')
   readText('releaseText', true)
-  if (source.semanticStatus !== undefined && source.semanticStatus !== null) {
-    if (typeof source.semanticStatus !== 'string' || !exportSemanticStatuses.has(source.semanticStatus)) {
-      throw new Error('导出筛选条件 semanticStatus 无效')
-    }
-    normalized.semanticStatus = source.semanticStatus as NonNullable<RecordExportQuery['semanticStatus']>
-  }
   // Unknown fields (including page/pageSize and excludeProjectAssetProjectId)
   // are deliberately ignored instead of being forwarded to the database.
   return Object.keys(normalized).length ? normalized : undefined
@@ -687,7 +613,6 @@ const exportAuditMetadata = (
   ...(query && Object.prototype.hasOwnProperty.call(query, 'releaseText')
     ? { releaseText: query.releaseText ?? '' }
     : {}),
-  ...(query?.semanticStatus ? { semanticStatus: query.semanticStatus } : {}),
   recordCount
 })
 
@@ -750,10 +675,11 @@ const startupPageHtml = `<!doctype html>
     <style>
       :root { color-scheme: dark; font-family: "Microsoft YaHei", sans-serif; }
       html, body { width: 100%; height: 100%; margin: 0; background: #090b10; color: #eef1f7; }
-      body { display: grid; place-items: center; }
+      body { display: grid; place-items: center; -webkit-app-region: drag; user-select: none; }
       main { width: min(460px, calc(100vw - 48px)); text-align: center; }
       h1 { margin: 0 0 12px; font-size: 22px; font-weight: 600; }
       p { margin: 0; color: #929bad; font-size: 13px; line-height: 1.6; }
+      .detail { min-height: 20px; margin-top: 8px; color: #697386; font-size: 12px; }
       .spinner { width: 24px; height: 24px; margin: 0 auto 20px; border: 3px solid #2b3040; border-top-color: #7c6cff; border-radius: 50%; animation: spin 0.9s linear infinite; }
       @keyframes spin { to { transform: rotate(360deg); } }
     </style>
@@ -762,10 +688,37 @@ const startupPageHtml = `<!doctype html>
     <main role="status" aria-live="polite">
       <div class="spinner" aria-hidden="true"></div>
       <h1>VISSLM Agent</h1>
-      <p>正在准备本地数据，请稍候…</p>
+      <p id="startup-message">正在检查和升级本地数据，请稍候…</p>
+      <p id="startup-detail" class="detail">大型旧数据库首次升级可能需要几分钟，请勿强制关闭程序</p>
     </main>
+    <script>
+      window.visslmSetStartupStatus = (message, detail) => {
+        document.getElementById('startup-message').textContent = message || '正在准备本地数据，请稍候…'
+        document.getElementById('startup-detail').textContent = detail || ''
+      }
+    </script>
   </body>
 </html>`
+
+let startupStatus = {
+  message: '正在检查和升级本地数据，请稍候…',
+  detail: '大型旧数据库首次升级可能需要几分钟，请勿强制关闭程序'
+}
+
+const updateStartupStatus = (message: string, detail = ''): void => {
+  startupStatus = { message, detail }
+  if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isLoadingMainFrame()) return
+  const script = `window.visslmSetStartupStatus?.(${JSON.stringify(message)}, ${JSON.stringify(detail)})`
+  void mainWindow.webContents.executeJavaScript(script).catch(() => undefined)
+}
+
+const migrationProgressDetail = (progress: DatabaseMigrationProgress): string => {
+  if (typeof progress.current === 'number' && typeof progress.total === 'number' && progress.total > 0) {
+    const percent = Math.min(100, Math.max(0, Math.round((progress.current / progress.total) * 100)))
+    return `已完成 ${percent}% · 升级期间可以移动窗口，请勿强制关闭程序`
+  }
+  return '升级期间可以移动窗口，请勿强制关闭程序'
+}
 
 const showRendererError = (message: string, detail?: string): void => {
   console.error(`[renderer] ${message}${detail ? `: ${detail}` : ''}`)
@@ -801,7 +754,7 @@ const createWindow = ({ loadRenderer = true }: { loadRenderer?: boolean } = {}):
     frame: false,
     titleBarStyle: 'hidden',
     autoHideMenuBar: true,
-    backgroundColor: '#f5f7fb',
+    backgroundColor: loadRenderer ? '#f5f7fb' : '#090b10',
     title: 'VISSLM Agent',
     icon: app.isPackaged ? undefined : join(process.cwd(), 'buildResources', 'icon.ico'),
     webPreferences: {
@@ -832,7 +785,10 @@ const createWindow = ({ loadRenderer = true }: { loadRenderer?: boolean } = {}):
   updateManager?.attachWindow(mainWindow)
 
   mainWindow.once('ready-to-show', showMainWindow)
-  mainWindow.webContents.once('did-finish-load', showMainWindow)
+  mainWindow.webContents.once('did-finish-load', () => {
+    showMainWindow()
+    if (!loadRenderer) updateStartupStatus(startupStatus.message, startupStatus.detail)
+  })
   showFallback = setTimeout(showMainWindow, 5_000)
   showFallback.unref()
   mainWindow.on('maximize', () =>
@@ -916,18 +872,16 @@ const registerIpc = (): void => {
 
   ipcMain.handle('data:projects', () => db.listProjects())
   ipcMain.handle('data:node-types', () => db.listNodeTypes())
-  ipcMain.handle('data:records', (_event, query: RecordQuery) =>
-    db.listRecords(query, requirementSemanticizationService.context()))
+  ipcMain.handle('data:records', (_event, query: RecordQuery) => db.listRecords(query))
   ipcMain.handle('data:record-release-values', () => db.listRecordReleaseValues())
   ipcMain.handle(
     'data:record-uids',
-    (_event, query: Omit<RecordQuery, 'page' | 'pageSize'>) =>
-      db.listRecordUids(query, requirementSemanticizationService.context())
+    (_event, query: Omit<RecordQuery, 'page' | 'pageSize'>) => db.listRecordUids(query)
   )
   ipcMain.handle('data:record', (_event, uid: string) =>
-    db.getRecord(uid, true, requirementSemanticizationService.context(), knowledgeService.modelVersion))
+    db.getRecord(uid, true, knowledgeService.modelVersion))
   ipcMain.handle('chat:record', (_event, uid: string) =>
-    db.getRecord(uid, false, requirementSemanticizationService.context(), knowledgeService.modelVersion))
+    db.getRecord(uid, false, knowledgeService.modelVersion))
   ipcMain.handle('chat:record-images', (_event, uid: string, page?: number, pageSize?: number) =>
     db.getRecordImagePage(uid, page, pageSize))
   ipcMain.handle(
@@ -951,15 +905,6 @@ const registerIpc = (): void => {
   ipcMain.handle(
     'data:maintenance-stop',
     () => recordMaintenanceService.stop()
-  )
-  ipcMain.handle(
-    'requirements:semanticize',
-    (_event, input: RequirementSemanticizationStartInput) => requirementSemanticizationService.start(input)
-  )
-  ipcMain.handle('requirements:semanticization-task', () => requirementSemanticizationService.getTask())
-  ipcMain.handle(
-    'requirements:semanticization-control',
-    (_event, action: RequirementSemanticizationControl) => requirementSemanticizationService.control(action)
   )
   ipcMain.handle('data:stats', () => db.getStats())
   ipcMain.handle('sync:get-config', () => settings.getSyncConfig())
@@ -1061,13 +1006,6 @@ const registerIpc = (): void => {
   )
   ipcMain.handle('agent:cancel', (ipcEvent, runId: unknown) =>
     assistantRunRegistry.cancel(ipcEvent.sender, runId)
-  )
-  ipcMain.handle('agent:confirm-plan', (ipcEvent, runId: unknown, patch: unknown) =>
-    assistantPlanConfirmation.confirm(
-      ipcEvent.sender,
-      runId,
-      patch as AssistantPlanPatch | undefined
-    )
   )
   ipcMain.handle('agent:ask', async (ipcEvent, request: ChatRequest) => {
     // Preserve the renderer's original text before any auto-intent recovery
@@ -1173,43 +1111,6 @@ const registerIpc = (): void => {
       emit: (event) => sendAgentEvent(event),
       signal: registration.signal
     })
-    let confirmedExecutionSummary: AssistantExecutionSummary | undefined
-    const confirmExecutionSummary = async (
-      summary: AssistantExecutionSummary,
-      dataScope?: DataScope
-    ): Promise<ConfirmedAssistantPlan> => {
-      const confirmationInput = {
-        summary,
-        dataScope: dataScope ?? request.dataScope,
-        metadata: planValidationMetadata(summary, dataScope ?? request.dataScope)
-      }
-      emitActivity({
-        kind: 'checkpoint',
-        stage: 'scope-confirmation',
-        title: '确认执行范围',
-        summary: '正在等待执行范围确认。',
-        status: 'running'
-      })
-      const confirmation = assistantPlanConfirmation.wait(
-        ipcEvent.sender,
-        registration.runId,
-        registration.signal,
-        confirmationInput
-      )
-      sendAgentEvent({ type: 'plan', summary, requiresConfirmation: true })
-      const approved = await confirmation
-      if (!approved) throw new Error('执行计划确认未完成')
-      confirmedExecutionSummary = approved.effectiveSummary
-      request = { ...request, dataScope: approved.effectiveDataScope }
-      emitActivity({
-        kind: 'checkpoint',
-        stage: 'scope-confirmation',
-        title: '范围已确认',
-        summary: '范围已确认，开始执行。',
-        status: 'completed'
-      })
-      return approved
-    }
     return runWithAssistantRunContext(registration.context, async () => {
       try {
         const response = await (async (): Promise<ChatResponse> => {
@@ -1241,25 +1142,32 @@ const registerIpc = (): void => {
       options: Parameters<typeof createAssistantTaskTrace>[1] = {},
       contextOverride?: AssistantTraceContext
     ): ChatResponse => {
-      const withSummary = confirmedExecutionSummary && !response.executionSummary
-        ? { ...response, executionSummary: confirmedExecutionSummary }
+      const withChoices = response.needsClarification && !response.clarificationOptions?.length
+        ? {
+            ...response,
+            clarificationOptions: buildAssistantClarificationOptions({
+              originalQuestion: originalUserQuestion,
+              clarificationQuestion: response.clarificationQuestion ?? response.answer,
+              intent: assistantIntent
+            })
+          }
         : response
-      const hasRecoverableError = withSummary.events?.some(
+      const hasRecoverableError = withChoices.events?.some(
         (event) => event.type === 'error' && event.recoverable
       ) === true
-      const withRecovery = hasRecoverableError && confirmedExecutionSummary &&
-          !withSummary.recoverySuggestions?.length
+      const withRecovery = hasRecoverableError && withChoices.executionSummary &&
+          !withChoices.recoverySuggestions?.length
         ? {
-            ...withSummary,
-            recoverySuggestions: buildSafeQueryRecoverySuggestions(confirmedExecutionSummary)
+            ...withChoices,
+            recoverySuggestions: buildSafeQueryRecoverySuggestions(withChoices.executionSummary)
           }
-        : withSummary
+        : withChoices
       const evidenceBlocks = withRecovery.evidenceBlocks?.length
         ? withRecovery.evidenceBlocks
         : buildEvidenceBlocks(
             withRecovery.sources,
             withRecovery.dataViews,
-            withRecovery.executionSummary ?? confirmedExecutionSummary
+            withRecovery.executionSummary
           )
       const withEvidence = evidenceBlocks.length
         ? { ...withRecovery, evidenceBlocks }
@@ -1321,11 +1229,9 @@ const registerIpc = (): void => {
         emitIntentStatus('classify', `统一意图判断失败：${errorMessage}`)
         emitActivity(workLogForFailure('task-judgment'))
         return {
-          answer: '本次请求无法安全判断任务类型，未访问数据中心或知识库。请补充问题范围后重试。',
+          answer: '助手暂时无法完成意图判断，未访问数据中心或知识库。请直接重试；原问题已保留，无需改写。',
           sources: [],
           dataViews: [],
-          needsClarification: true,
-          clarificationQuestion: '请明确要进行普通对话、数据中心查询、知识库问答、混合分析、可视化或需求匹配中的哪一种任务。',
           expertId: 'general',
           taskTrace: createAssistantTaskTrace(fallbackTraceContext, {
             startedAt: traceStartedAt,
@@ -1353,11 +1259,9 @@ const registerIpc = (): void => {
         emitActivity(workLogForFailure('skill-selection'))
         return {
           ...attachAssistantIntent({
-            answer: '本次请求的任务与数据来源组合无法安全执行，未访问数据中心或知识库。请重新说明目标。',
+            answer: '助手生成的内部执行路由未通过校验，未访问数据中心或知识库。请直接重试；原问题已保留，无需改写。',
             sources: [],
             dataViews: [],
-            needsClarification: true,
-            clarificationQuestion: '请重新明确要进行普通对话、数据中心查询、知识库问答、混合分析、可视化或需求匹配中的哪一种任务。',
             expertId: assistantIntent.skillId,
             events: [{
               type: 'error' as const,
@@ -1408,12 +1312,12 @@ const registerIpc = (): void => {
         emitActivity({
           kind: 'checkpoint',
           stage: 'scope-confirmation',
-          title: '需要补充范围',
-          summary: '当前请求的范围或来源尚未安全确定，等待补充信息。',
+          title: '还缺一个业务决定',
+          summary: '当前请求缺少无法从上下文安全推断的目标、对象或范围。',
           status: 'warning'
         })
         const clarificationQuestion = assistantIntent.clarificationQuestion ||
-          '为了避免执行猜测性查询，请补充任务范围或数据来源。'
+          '请说明希望我完成的具体目标或要处理的对象。'
         return attachAssistantIntent({
           answer: clarificationQuestion,
           sources: [],
@@ -1543,43 +1447,6 @@ const registerIpc = (): void => {
         artifactPreview,
         expertId: 'artifact'
       }, { invokedAgents: ['artifact'] })
-    }
-    if (
-      request.entrypoint !== 'dashboard' &&
-      (route.expert.id === 'visualization' || route.expert.id === 'requirement-analysis')
-    ) {
-      const scope = request.dataScope
-      const requirementIds = autoRequirementIds(request.question, request.history) ?? []
-      const stringValue = (value: unknown): string | undefined => value === undefined
-        ? undefined
-        : typeof value === 'string'
-          ? value.slice(0, 240)
-          : JSON.stringify(value).slice(0, 240)
-      const summaryProjectIds = scope?.projectIds !== undefined
-        ? [...new Set(scope.projectIds)]
-        : request.projectId ? [request.projectId] : []
-      await confirmExecutionSummary({
-        question: request.question,
-        taskType: route.expert.id === 'visualization' ? 'visualization' : 'requirement_matching',
-        sourceMode: 'records',
-        resultMode: route.expert.id === 'visualization' ? 'dashboard' : 'answer',
-        intent: route.expert.id === 'visualization' ? 'visualize_records' : 'match_requirements',
-        searchTerms: requirementIds.length ? requirementIds : assistantIntent?.groupEntities ?? [],
-        fields: [],
-        filters: [],
-        limit: scope?.recordUids?.length ?? 50,
-        scope: {
-          projectIds: [...new Set(summaryProjectIds)],
-          nodeTypes: [...new Set(scope?.nodeTypes ?? [])],
-          ...(scope?.recordUids ? { recordCount: scope.recordUids.length } : {}),
-          baseFilters: (scope?.baseFilters ?? []).map((filter) => ({
-            field: filter.field,
-            operator: filter.operator,
-            ...(filter.value === undefined ? {} : { value: stringValue(filter.value) })
-          })),
-          ...(scope?.snapshotAt ? { snapshotAt: scope.snapshotAt } : {})
-        }
-      }, scope)
     }
     if (autoRequirementIdsForRequest?.length) {
       emitActivity({
@@ -1947,7 +1814,6 @@ const registerIpc = (): void => {
       knowledgeService,
       (event: Extract<AgentEvent, { type: 'status' }>) => sendAgentEvent(event),
       (content) => answerStream.push(content),
-      confirmExecutionSummary,
       emitActivity
     )
     return agent.ask({ ...executionRequest, question: route.question }).then((response) => attachAssistantIntent({
@@ -2437,7 +2303,7 @@ const registerIpc = (): void => {
         // concurrent sync/import changes.  The set is passed to the pack
         // iterator, never as a page-limited SQLite IN clause.
         const frozenRecordUids = query
-          ? new Set(db.listRecordUids(query, requirementSemanticizationService.context()))
+          ? new Set(db.listRecordUids(query))
           : undefined
         return exportVisslmPack(db, result.filePath, frozenRecordUids)
       })
@@ -3001,16 +2867,35 @@ if (!hasSingleInstanceLock) {
       return
     }
 
-    // Paint a native startup page before synchronous database migrations.  A
-    // large legacy asset store can otherwise keep the process busy with no
-    // visible window for several minutes.
+    // Paint the startup page first, then migrate in a Node Worker. Large legacy
+    // stores must never block Electron's native window/message loop.
     createWindow({ loadRenderer: false })
-    setTimeout(() => {
+    setTimeout(async () => {
       if (isQuitting || !mainWindow || mainWindow.isDestroyed()) return
       try {
       const dataDir = app.getPath('userData')
       mkdirSync(dataDir, { recursive: true })
-      db = new AppDatabase(join(dataDir, 'visslm-agent.db'), join(dataDir, 'assets'))
+      const databasePath = join(dataDir, 'visslm-agent.db')
+      const assetDir = join(dataDir, 'assets')
+      const bootstrap = startDatabaseBootstrap({
+        databasePath,
+        assetDir,
+        onProgress: (progress) => {
+          updateStartupStatus(progress.message, migrationProgressDetail(progress))
+        }
+      })
+      databaseBootstrapWorker = bootstrap.worker
+      const bootstrapResult = await bootstrap.done
+      databaseBootstrapWorker = null
+      if (isQuitting || !mainWindow || mainWindow.isDestroyed()) return
+      updateStartupStatus(
+        '本地数据准备完成，正在加载应用界面…',
+        `数据库升级耗时 ${(bootstrapResult.elapsedMs / 1000).toFixed(1)} 秒`
+      )
+      // The Worker completed every migration and closed SQLite before this
+      // connection is opened. Do not scan the full database a second time on
+      // Electron's main thread.
+      db = new AppDatabase(databasePath, assetDir, { runMigrations: false })
       protocol.handle('visslm-preview', async (request) => {
       try {
         prunePreviewFiles()
@@ -3062,11 +2947,6 @@ if (!hasSingleInstanceLock) {
     })
       recordIndexLock = new AsyncMutex()
       settings = new SettingsService(db)
-      requirementSemanticizationService = new RequirementSemanticizationService(
-      db,
-      () => settings.getModelCredentials(),
-      (progress) => mainWindow?.webContents.send('requirements:semanticization-progress', progress)
-    )
       knowledgeService = new KnowledgeService(
       db,
       (progress) => mainWindow?.webContents.send('knowledge:progress', progress),
@@ -3106,6 +2986,8 @@ if (!hasSingleInstanceLock) {
         }
       })
     } catch (error) {
+      databaseBootstrapWorker = null
+      if (isQuitting) return
       const message = updateErrorMessage(error)
       console.error(`[startup] ${message}`, error)
       dialog.showErrorBox(
@@ -3131,8 +3013,11 @@ if (!hasSingleInstanceLock) {
 
   app.on('before-quit', () => {
     isQuitting = true
+    if (databaseBootstrapWorker) {
+      void databaseBootstrapWorker.terminate()
+      databaseBootstrapWorker = null
+    }
     assistantRunRegistry.abortAll()
-    assistantPlanConfirmation.clearAll()
     cancelKnowledgeInitialization()
     knowledgeService?.cancelAllTasks()
     previewFiles.clear()

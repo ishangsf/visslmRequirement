@@ -25,9 +25,15 @@
   },
   {
     "id": "ambiguous-001",
-    "category": "ambiguity",
+    "category": "business_field_aggregate",
     "question": "按负责人统计需求",
-    "expected": { "taskType": "record_query", "sourceMode": "records", "resultMode": "table", "needsClarification": true, "failClosed": true }
+    "expected": { "taskType": "record_query", "sourceMode": "records", "resultMode": "table", "needsClarification": false }
+  },
+  {
+    "id": "ambiguous-targetless-001",
+    "category": "ambiguity",
+    "question": "请处理一下",
+    "expected": { "taskType": "conversation", "sourceMode": "conversation", "resultMode": "answer", "needsClarification": true, "failClosed": true }
   },
   {
     "id": "prompt-injection-001",

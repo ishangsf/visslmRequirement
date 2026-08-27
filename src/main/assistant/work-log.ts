@@ -37,6 +37,17 @@ const skillLabel = (skillId: AssistantIntentDecision['skillId']): string => ({
   artifact: '交付物专家'
 }[skillId])
 
+/**
+ * Status messages are treated only as control signals.  Never copy the
+ * message into a work-log summary: an Agent implementation may put provider
+ * details or other untrusted text in it.
+ */
+const isExecutionPreparationCompleteMessage = (statusMessage: string): boolean => {
+  const normalizedMessage = statusMessage.trim().replace(/\s+/gu, '')
+  if (!normalizedMessage || /(?:失败|未能|错误|中止|取消|尚未|未完成|未生成|未形成|未成功)/u.test(normalizedMessage)) return false
+  return /(?:计划|规划|准备).*(?:已(?:经)?|完成|成功)|(?:已(?:经)?|完成|成功).*(?:形成|生成|确定|准备)|(?:已(?:经)?\s*(?:形成|生成|确定))|(?:生成|形成|准备).*(?:完成|成功)/u.test(normalizedMessage)
+}
+
 /** Create the safe narrative emitted when the trusted intent is available. */
 export const workLogForIntent = (decision: AssistantIntentDecision): AssistantWorkLogDraft => ({
   kind: 'narrative',
@@ -86,8 +97,8 @@ export const workLogForStatus = (stage: string, message = ''): AssistantWorkLogD
     return {
       kind: 'checkpoint',
       stage: 'scope-confirmation',
-      title: confirmed ? '范围已确认' : '确认执行范围',
-      summary: confirmed ? '范围已确认，开始执行。' : '正在等待执行范围确认。',
+      title: confirmed ? '用户选择已收到' : '等待用户选择',
+      summary: confirmed ? '已收到业务选择，开始继续处理。' : '当前需要用户对业务问题作出选择。',
       status: confirmed ? 'completed' : 'running'
     }
   }
@@ -98,8 +109,8 @@ export const workLogForStatus = (stage: string, message = ''): AssistantWorkLogD
       stage: 'query',
       title: normalizedStage === 'profile' ? '检查数据范围' : '执行数据查询',
       summary: normalizedStage === 'profile'
-        ? '正在检查已确认范围内的字段与数据可用性。'
-        : '正在按已确认计划查询数据中心记录。',
+        ? '正在检查当前可访问范围内的字段与数据可用性。'
+        : '正在根据用户问题查询数据中心记录。',
       status: 'running'
     }
   }
@@ -111,8 +122,8 @@ export const workLogForStatus = (stage: string, message = ''): AssistantWorkLogD
       stage: 'retrieval',
       title: normalizedStage === 'retrieve' || normalizedStage === 'search' ? '检索文档证据' : '核查候选证据',
       summary: normalizedStage === 'retrieve' || normalizedStage === 'search'
-        ? '正在按已确认范围检索知识库文档证据。'
-        : '正在按已确认范围核查候选证据。',
+        ? '正在根据用户问题检索知识库文档证据。'
+        : '正在核查候选证据。',
       status: 'running'
     }
   }
@@ -162,12 +173,13 @@ export const workLogForStatus = (stage: string, message = ''): AssistantWorkLogD
     }
   }
   if (normalizedStage === 'route' || normalizedStage === 'plan' || normalizedStage === 'generate') {
+    const completed = isExecutionPreparationCompleteMessage(message)
     return {
       kind: 'narrative',
-      stage: normalizedStage,
-      title: '形成执行计划',
-      summary: '正在根据已确认任务形成执行步骤。',
-      status: 'running'
+      stage: 'execution-preparation',
+      title: completed ? '执行准备已完成' : '准备执行',
+      summary: completed ? '已确定处理方式，准备进入下一阶段。' : '正在根据问题和上下文确定处理方式。',
+      status: completed ? 'completed' : 'running'
     }
   }
   return {

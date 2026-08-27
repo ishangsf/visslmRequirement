@@ -2,8 +2,7 @@ import type {
   ChatDataRow,
   ChatDataView,
   ChatSource,
-  FieldDefinitionNormalizedType,
-  AssistantPlanFilter
+  FieldDefinitionNormalizedType
 } from '../../../shared/types'
 import type { DataScope, FilterSpec } from '../../../shared/query-spec'
 import { AppDatabase, type FieldQueryFilter, type FieldQueryResult } from '../../database'
@@ -62,7 +61,7 @@ export interface DataCenterQueryPlan {
   metric?: 'record_count' | 'image_count' | 'count_by_type' | 'count_by_project'
   sort?: { field: string; direction: 'asc' | 'desc' }
   limit: number
-  /** Effective scope after plan confirmation.  Omitted for legacy callers. */
+  /** Effective query scope. Omitted for legacy callers. */
   scope?: DataScope
 }
 
@@ -149,7 +148,7 @@ const compactModelToolFieldValue = (value: string | string[]): string | string[]
   return String(compacted ?? '')
 }
 
-const scopeFilterToDatabaseFilter = (filter: FilterSpec | AssistantPlanFilter): {
+const scopeFilterToDatabaseFilter = (filter: FilterSpec | DataCenterQueryPlan['filters'][number]): {
   field: string
   operator:
     | 'equals'
@@ -193,6 +192,40 @@ const normalizeGroupTerm = (value: string): string => value
   .trim()
   .toLocaleLowerCase()
 
+const normalizeRecordTypeTerm = (value: unknown): string => String(value ?? '')
+  .normalize('NFKC')
+  .toLocaleLowerCase()
+  .replace(/[\s，,。！？!?：:；;、]+/gu, '')
+
+/**
+ * Broad record nouns identify the business collection, not a full-text
+ * constraint. In particular, a count of "需求" / "需求记录" must count the
+ * complete authorized record set rather than the subset whose text happens
+ * to contain that noun.
+ */
+export const isGenericRecordTypeTerm = (value: unknown): boolean => {
+  const normalized = normalizeRecordTypeTerm(value)
+  return /^(?:(?:当前|本地)?(?:数据中心)?(?:全部|所有)?(?:的)?(?:需求(?:记录)?|记录))$/u.test(normalized)
+}
+
+/**
+ * Models sometimes echo the question grammar as a search term (for example
+ * "一共有多少条" or "当前数据中心"). These words are still query
+ * scaffolding, not a record-text constraint, when deciding whether a count
+ * is unconstrained.
+ */
+export const isRecordCountScaffoldingTerm = (value: unknown): boolean => {
+  const normalized = normalizeRecordTypeTerm(value)
+  if (!normalized) return false
+  return /^(?:(?:当前|本地)?数据中心|当前|本地|全部|所有|的|需求记录|需求|记录|一共有|一共|总共有|总共|共有|有|多少|几|数量|总数|数一下|数一数|算一下|算一算|统计一下|统计|条|个|项|是|吗|呢|请问|请|麻烦|帮我|帮忙|想知道|告诉我)+$/u.test(normalized)
+}
+
+const isUnconstrainedRecordCountPlan = (plan: DataCenterQueryPlan): boolean => (
+  plan.intent === 'count_matching' &&
+  plan.filters.length === 0 &&
+  plan.searchTerms.every((term) => isRecordCountScaffoldingTerm(term))
+)
+
 export class DataCenterAgent {
   constructor(private readonly db: AppDatabase) {}
 
@@ -233,10 +266,17 @@ export class DataCenterAgent {
   }
 
   executePlan(projectId: string | undefined, plan: DataCenterQueryPlan): DataCenterExecution {
+    // Keep direct/legacy callers safe even when a planner has mistaken the
+    // collection noun for a full-text term. The returned aggregate result is
+    // still rendered against the original plan by renderVerifiedAnswer, which
+    // also handles this canonicalization for its human-facing wording.
+    const effectivePlan = isUnconstrainedRecordCountPlan(plan)
+      ? { ...plan, intent: 'total' as const, searchTerms: [] }
+      : plan
     let toolName: string
     let args: Record<string, unknown>
     let result: unknown
-    const scope = plan.scope
+    const scope = effectivePlan.scope
     const scopeProjectIds = scope?.projectIds
     const scopeNodeTypes = scope?.nodeTypes
     const scopeRecordUids = scope?.recordUids
@@ -249,76 +289,76 @@ export class DataCenterAgent {
       ...(scopeProjectIds !== undefined && scopeProjectIds.length === 0 ? { scope_all_projects: true } : {}),
       ...(scopeNodeTypes !== undefined && scopeNodeTypes.length === 0 ? { scope_all_node_types: true } : {})
     }
-    if (plan.intent === 'schema_inspection') {
+    if (effectivePlan.intent === 'schema_inspection') {
       toolName = 'inspect_fields'
       args = {
         project_id: projectId,
-        node_type: plan.nodeType,
-        limit: plan.limit,
+        node_type: effectivePlan.nodeType,
+        limit: effectivePlan.limit,
         ...scopeArguments
       }
       result = this.executeTool(toolName, args, projectId)
-    } else if (plan.intent === 'total') {
+    } else if (effectivePlan.intent === 'total') {
       toolName = 'aggregate_records'
       args = {
-        metric: plan.metric ?? 'record_count',
+        metric: effectivePlan.metric ?? 'record_count',
         project_id: projectId,
-        filters: plan.filters,
+        filters: effectivePlan.filters,
         ...scopeArguments
       }
       result = this.executeTool(toolName, args, projectId)
-    } else if (plan.intent === 'field_aggregate') {
+    } else if (effectivePlan.intent === 'field_aggregate') {
       toolName = 'aggregate_by_field'
       args = {
-        field: plan.groupByField,
+        field: effectivePlan.groupByField,
         project_id: projectId,
-        node_type: plan.nodeType,
-        limit: plan.limit,
+        node_type: effectivePlan.nodeType,
+        limit: effectivePlan.limit,
         split_multi_value: true,
-        filters: plan.filters,
+        filters: effectivePlan.filters,
         ...scopeArguments
       }
       result = this.executeTool(toolName, args, projectId)
     } else {
       toolName = 'query_records_by_fields'
       assertAssistantAgentToolAllowed('data-center', toolName)
-      const effectiveSearchTerms = plan.resultMode === 'grouped_list'
-        ? [...plan.searchTerms, ...plan.groupEntities]
+      const effectiveSearchTerms = effectivePlan.resultMode === 'grouped_list'
+        ? [...effectivePlan.searchTerms, ...effectivePlan.groupEntities]
             .map((term) => String(term).trim())
             .filter(Boolean)
             .filter((term, index, terms) => (
               terms.findIndex((candidate) => normalizeGroupTerm(candidate) === normalizeGroupTerm(term)) === index
             ))
             .slice(0, 12)
-        : plan.searchTerms
+        : effectivePlan.searchTerms
       args = {
         project_id: projectId,
-        node_type: plan.nodeType,
+        node_type: effectivePlan.nodeType,
         ...scopeArguments,
         search_terms: effectiveSearchTerms,
-        search_mode: plan.searchMode,
-        filters: plan.filters,
-        fields: plan.fields,
-        sort: plan.sort,
-        limit: plan.limit,
-        result_mode: plan.resultMode,
-        group_entities: plan.groupEntities
+        search_mode: effectivePlan.searchMode,
+        filters: effectivePlan.filters,
+        fields: effectivePlan.fields,
+        sort: effectivePlan.sort,
+        limit: effectivePlan.limit,
+        result_mode: effectivePlan.resultMode,
+        group_entities: effectivePlan.groupEntities
       }
       result = this.db.queryRecordsByFields({
         ...(scopeProjectIds === undefined
           ? { projectId }
           : scopeProjectIds.length ? { projectIds: scopeProjectIds } : {}),
         ...(scopeNodeTypes === undefined
-          ? { nodeType: plan.nodeType }
+          ? { nodeType: effectivePlan.nodeType }
           : scopeNodeTypes.length ? { nodeTypes: scopeNodeTypes } : {}),
         ...(scopeRecordUids === undefined ? {} : { recordUids: scopeRecordUids }),
         searchTerms: effectiveSearchTerms,
-        searchMode: plan.searchMode,
+        searchMode: effectivePlan.searchMode,
         baseFilters: scopeBaseFilters,
-        filters: plan.filters,
-        fields: plan.fields,
-        sort: plan.sort,
-        limit: plan.limit
+        filters: effectivePlan.filters,
+        fields: effectivePlan.fields,
+        sort: effectivePlan.sort,
+        limit: effectivePlan.limit
       })
     }
     assertAssistantAgentToolAllowed('data-center', toolName)
@@ -595,6 +635,45 @@ export class DataCenterAgent {
       values: record.values ?? {}
     })
 
+    if (toolName === 'aggregate_records' && result && typeof result === 'object' && !Array.isArray(result)) {
+      const aggregate = result as { metric?: unknown; value?: unknown }
+      const metric = String(aggregate.metric ?? args.metric ?? '')
+      const total = Number(aggregate.value)
+      // A record-count aggregate is both the authoritative number and a
+      // useful evidence view. Populate the view from the same authorized
+      // scope so users can inspect the returned UID snapshot without turning
+      // the count itself into a Top-K/full-text query.
+      if (metric !== 'record_count' || !Number.isFinite(total) || total < 0) return null
+      const query = this.executeTool('query_records_by_fields', {
+        ...args,
+        search_terms: [],
+        search_mode: 'any',
+        fields: [],
+        limit: 50
+      }, selectedProjectId) as FieldQueryResult
+      const returnedCount = Number.isFinite(Number(query.returnedCount))
+        ? Math.max(0, Math.trunc(Number(query.returnedCount)))
+        : query.records.length
+      const recordUids = compactRecordUids(
+        query.recordUids ?? query.records.map((record) => record.source.uid)
+      )
+      return {
+        id: 'record-aggregate:record-count',
+        title: '记录总量统计',
+        description: `当前授权范围共 ${Math.max(0, Math.trunc(total))} 条记录，当前展示 ${returnedCount} 条${Math.max(0, Math.trunc(total)) > returnedCount ? '，可分页查看其余记录' : ''}`,
+        total: Math.max(0, Math.trunc(total)),
+        loadedRows: returnedCount,
+        isPreview: Math.max(0, Math.trunc(total)) > returnedCount,
+        fields: [],
+        recordUids,
+        groups: [{
+          name: '统计范围',
+          count: Math.max(0, Math.trunc(total)),
+          rows: query.records.map(toRow)
+        }]
+      }
+    }
+
     if (toolName === 'aggregate_by_field' && result && typeof result === 'object') {
       const aggregate = result as {
         field?: string
@@ -667,25 +746,31 @@ export class DataCenterAgent {
           matchedTerms?: string[]
         }>
       }
-      if (!query.records?.length) return null
+      const records = Array.isArray(query.records) ? query.records : []
+      const groupEntities = Array.isArray(args.group_entities)
+        ? args.group_entities.map((entity) => String(entity).trim()).filter(Boolean).slice(0, 12)
+        : []
+      const groupedResult = args.result_mode === 'grouped_list' && groupEntities.length > 0
+      // A grouped query is also a useful empty result: preserve one explicit
+      // zero-count group per requested entity so the UI can distinguish
+      // "nothing matched for this entity" from a missing data view. Keep the
+      // legacy null behavior for ordinary empty queries.
+      if (!records.length && !groupedResult) return null
       const fields = query.fields ?? []
-      const matchedCount = Number(query.matchedCount ?? query.records.length)
-      const returnedCountValue = Number(query.returnedCount ?? query.records.length)
+      const matchedCount = Number(query.matchedCount ?? records.length)
+      const returnedCountValue = Number(query.returnedCount ?? records.length)
       const returnedCount = Math.min(
         matchedCount,
-        query.records.length,
-        Number.isFinite(returnedCountValue) ? Math.max(0, returnedCountValue) : query.records.length
+        records.length,
+        Number.isFinite(returnedCountValue) ? Math.max(0, returnedCountValue) : records.length
       )
       const recordUids = compactRecordUids(
-        query.recordUids ?? query.records.map((record) => record.source.uid)
+        query.recordUids ?? records.map((record) => record.source.uid)
       )
       const fieldLabels = query.fieldLabels ?? this.db.getFieldDisplayNames(
         String(args.node_type ?? '').trim(),
         fields
       )
-      const groupEntities = Array.isArray(args.group_entities)
-        ? args.group_entities.map((entity) => String(entity).trim()).filter(Boolean).slice(0, 12)
-        : []
       const recordUidsByTerm = query.recordUidsByTerm && typeof query.recordUidsByTerm === 'object'
         ? query.recordUidsByTerm
         : undefined
@@ -698,10 +783,10 @@ export class DataCenterAgent {
         if (!matchingEntry) return undefined
         return compactRecordUids(matchingEntry[1])
       }
-      const grouped = args.result_mode === 'grouped_list' && groupEntities.length
+      const grouped = groupedResult
         ? groupEntities.map((entity) => {
             const key = normalizeGroupValue(entity)
-            const rows = query.records!.filter((record) => {
+            const rows = records.filter((record) => {
               const searchable = [
                 record.source.name,
                 record.source.itemId,
@@ -714,7 +799,7 @@ export class DataCenterAgent {
             const visibleUids = mappedUids ? new Set(mappedUids) : undefined
             const groupRecordUids = mappedUids ?? compactRecordUids(rows.map((row) => row.source.uid))
             const groupRows = visibleUids
-              ? query.records!.filter((record) => visibleUids.has(record.source.uid))
+              ? records.filter((record) => visibleUids.has(record.source.uid))
               : rows
             return {
               name: entity,
@@ -723,7 +808,7 @@ export class DataCenterAgent {
               rows: groupRows.map(toRow)
             }
           })
-        : [{ name: '查询结果', count: matchedCount, rows: query.records.map(toRow) }]
+        : [{ name: '查询结果', count: matchedCount, rows: records.map(toRow) }]
       return {
         id: `field-query:${fields.join(',') || 'records'}`,
         title: args.result_mode === 'grouped_list' && groupEntities.length ? '分组属性查询数据' : '属性查询数据',
@@ -788,18 +873,55 @@ export class DataCenterAgent {
     modelAnswer: string
   ): string {
     if (plan.intent === 'count_matching' && result && typeof result === 'object') {
+      const aggregateValue = Number((result as { value?: unknown }).value)
+      if (isUnconstrainedRecordCountPlan(plan) && Number.isFinite(aggregateValue)) {
+        return `当前授权范围内的需求记录共有 **${aggregateValue}** 条。`
+      }
       const query = result as { matchedCount?: number }
       const matchedCount = Number(query.matchedCount ?? 0)
-      const terms = plan.searchTerms.length ? `检索词：${plan.searchTerms.join('、')}` : ''
-      const filters = plan.filters.length
-        ? `字段过滤：${plan.filters.map((filter) =>
-            `${filter.field} ${filter.operator}${filter.value === undefined ? '' : ` ${filter.value}`}`
-          ).join('；')}`
-        : ''
-      return [
-        `根据本轮查询条件，共命中 **${matchedCount}** 条记录。`,
-        [terms, filters].filter(Boolean).join('；')
-      ].filter(Boolean).join('\n\n')
+      if (plan.resultMode === 'answer' && plan.groupEntities.length >= 2) {
+        const groupedResult = result as {
+          recordUidsByTerm?: Record<string, unknown>
+          records?: Array<{ matchedTerms?: string[]; source?: { name?: string; itemId?: string } }>
+        }
+        const normalizeGroup = (value: unknown): string => String(value ?? '')
+          .normalize('NFKC')
+          .toLocaleLowerCase()
+          .replace(/[^\p{L}\p{N}]+/gu, '')
+        const groupedCounts = plan.groupEntities.map((entity) => {
+          const normalizedEntity = normalizeGroup(entity)
+          const entry = Object.entries(groupedResult.recordUidsByTerm ?? {})
+            .find(([term]) => normalizeGroup(term) === normalizedEntity)
+          if (entry && Array.isArray(entry[1])) return { entity, count: entry[1].length }
+          const count = (groupedResult.records ?? []).filter((record) => {
+            const terms = (record.matchedTerms ?? []).map(normalizeGroup)
+            if (terms.includes(normalizedEntity)) return true
+            const sourceText = `${record.source?.name ?? ''} ${record.source?.itemId ?? ''}`
+            return normalizeGroup(sourceText).includes(normalizedEntity)
+          }).length
+          return { entity, count }
+        })
+        const highest = Math.max(...groupedCounts.map((group) => group.count))
+        const leaders = groupedCounts.filter((group) => group.count === highest)
+        if (leaders.length > 1) {
+          return `按当前授权范围统计，${leaders.map((group) => `“${group.entity}”`).join('、')}并列较多，均为 **${highest}** 条。`
+        }
+        const leader = leaders[0]
+        if (leader) {
+          const comparison = groupedCounts
+            .filter((group) => group.entity !== leader.entity)
+            .map((group) => `“${group.entity}”${group.count}条`)
+            .join('、')
+          return `按当前授权范围统计，“${leader.entity}”的需求数量更多，共 **${leader.count}** 条${comparison ? `；对比${comparison}` : ''}。`
+        }
+      }
+      if (Number.isFinite(matchedCount) && matchedCount <= 0) {
+        return '本轮查询条件下没有找到相关记录。'
+      }
+      const subject = plan.searchTerms.length === 1
+        ? `与“${plan.searchTerms[0]}”相关的记录`
+        : '符合当前问题条件的记录'
+      return `${subject}共有 **${matchedCount}** 条。`
     }
 
     if (plan.intent === 'record_lookup' && result && typeof result === 'object') {

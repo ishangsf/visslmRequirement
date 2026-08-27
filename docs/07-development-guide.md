@@ -179,7 +179,6 @@ node .\scripts\smoke-app.mjs
 ```powershell
 $env:VISSLM_CDP_PORT='9223'
 node .\scripts\smoke-stage5-ui.mjs
-node .\scripts\smoke-asset-center-ui.mjs
 node .\scripts\smoke-data-visualization-handoff.mjs
 node .\scripts\smoke-chat-mention.mjs
 node .\scripts\smoke-push-config-ui.mjs

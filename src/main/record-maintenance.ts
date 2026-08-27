@@ -137,9 +137,6 @@ export class RecordMaintenanceService {
           }
         }
 
-        if (snapshot.operation === 'clean' || snapshot.operation === 'rebuild_indexes' || snapshot.operation === 'optimize') {
-          this.db.invalidateRequirementMatchCacheForRecords(targets.map((target) => target.uid))
-        }
         if (snapshot.operation === 'optimize') this.db.optimizeRecordMaintenance()
         let changed = false
         const vectorBatch: RecordMaintenanceTarget[] = []

@@ -1,7 +1,10 @@
 import { strict as assert } from 'node:assert'
 import { QueryEngine } from '../src/main/analytics/query-engine'
 import type { AnalyticsRecord, AppDatabase } from '../src/main/database'
-import { repairDashboardComponent } from '../src/main/dashboards/component-repair'
+import {
+  adaptDashboardComponentQuery,
+  repairDashboardComponent
+} from '../src/main/dashboards/component-repair'
 import type { DashboardComponentSpec, DashboardSpec } from '../src/shared/dashboard'
 import type { DataScope } from '../src/shared/query-spec'
 
@@ -106,11 +109,47 @@ const scatter = dashboard([component({
   },
   encoding: { label: 'category', value: 'amount', secondaryValue: 'removed' }
 })])
+const adaptedScatter = adaptDashboardComponentQuery(scatter, 'scatter', engine).component
+assert.equal(adaptedScatter.query!.measures.length, 2)
 const repairedScatter = repairDashboardComponent(scatter, 'scatter', engine).spec.components[0]
 assert.equal(repairedScatter.query!.measures.length, 2)
 assert.ok(repairedScatter.encoding?.secondaryValue)
 assert.notEqual(repairedScatter.encoding?.value, repairedScatter.encoding?.secondaryValue)
 assert.ok(repairedScatter.data.every((item) => Number.isFinite(item.secondaryValue)))
+
+const treemap = dashboard([component({
+  id: 'treemap',
+  type: 'treemap',
+  query: {
+    source: 'records',
+    scope,
+    dimensions: [{ field: 'removedCategory' }],
+    measures: [{ id: 'records', aggregation: 'count' }]
+  },
+  encoding: { label: 'removedCategory', value: 'records' }
+})])
+const repairedTreemap = repairDashboardComponent(treemap, 'treemap', engine).spec.components[0]
+assert.ok(['status', 'category'].includes(repairedTreemap.query!.dimensions![0].field))
+assert.equal(repairedTreemap.encoding?.label, repairedTreemap.query!.dimensions![0].field)
+
+const combo = dashboard([component({
+  id: 'combo',
+  type: 'combo',
+  query: {
+    source: 'records',
+    scope,
+    dimensions: [{ field: 'lastModifyTime', timeGrain: 'month' }],
+    measures: [{ id: 'records', aggregation: 'count' }]
+  },
+  encoding: { label: 'lastModifyTime', value: 'records' }
+})])
+const repairedCombo = repairDashboardComponent(combo, 'combo', engine).spec.components[0]
+assert.equal(repairedCombo.query!.measures.length, 2)
+assert.equal(repairedCombo.query!.dimensions![0].field, 'lastModifyTime')
+assert.equal(repairedCombo.query!.dimensions![0].timeGrain, 'month')
+assert.ok(repairedCombo.encoding?.secondaryValue)
+assert.notEqual(repairedCombo.encoding?.value, repairedCombo.encoding?.secondaryValue)
+assert.ok(repairedCombo.data.every((item) => Number.isFinite(item.secondaryValue)))
 
 const target = component({
   id: 'layout-target',
@@ -211,6 +250,8 @@ console.log(JSON.stringify({
     'aggregation',
     'encoding',
     'scatter',
+    'treemap',
+    'combo',
     'layout',
     'partial-dashboard-sequential'
   ],

@@ -39,9 +39,9 @@ const deletingPhaseSource = around(mainProgressSource, "'deleting_records'", 900
 const rebuildingPhaseSource = around(mainProgressSource, "'rebuilding_index'", 500, 900)
 
 const dataPageStart = appSource.indexOf('function DataPage(')
-const semanticizationPageStart = appSource.indexOf('function SemanticizationPage(')
+const knowledgeBasePageStart = appSource.indexOf('function KnowledgeBasePage(')
 const dataPageSource = dataPageStart >= 0
-  ? appSource.slice(dataPageStart, semanticizationPageStart > dataPageStart ? semanticizationPageStart : undefined)
+  ? appSource.slice(dataPageStart, knowledgeBasePageStart > dataPageStart ? knowledgeBasePageStart : undefined)
   : ''
 const deleteProgressMarker = [
   'data-delete-progress-panel',

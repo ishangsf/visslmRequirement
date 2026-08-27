@@ -1,7 +1,7 @@
-import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import assert from 'node:assert/strict'
 
 import { AppDatabase } from '../src/main/database'
 import { RequirementAnalysisAgent } from '../src/main/experts/requirement-analysis-agent'
@@ -9,14 +9,7 @@ import type { KnowledgeService } from '../src/main/knowledge'
 import type { ModelChatInput, ModelResponse } from '../src/main/model-client'
 import type { RequirementReranker } from '../src/main/requirements/cross-encoder-reranker'
 import type { HybridRequirementCandidate } from '../src/main/requirements/hybrid-retrieval'
-import {
-  buildRequirementSemanticCard,
-  type RequirementSemanticCard
-} from '../src/main/requirements/semantic-card'
-import {
-  REQUIREMENT_SEMANTIC_ANALYZER_VERSION,
-  requirementSemanticModelSignature
-} from '../src/main/requirements/semanticization-service'
+import { buildRequirementSourceView } from '../src/main/requirements/requirement-match-card'
 import type { ModelSettings, RecordDetail } from '../src/shared/types'
 
 const settings: ModelSettings = {
@@ -25,11 +18,6 @@ const settings: ModelSettings = {
   baseUrl: 'http://127.0.0.1:11434',
   model: 'requirement-analysis-smoke-model',
   thinking: false
-}
-
-const semanticContext = {
-  analyzerVersion: REQUIREMENT_SEMANTIC_ANALYZER_VERSION,
-  modelSignature: requirementSemanticModelSignature(settings)
 }
 
 type ExplanationMode = 'valid' | 'different' | 'forbidden' | 'unknown-uid' | 'invalid-evidence'
@@ -71,58 +59,17 @@ const upsert = (db: AppDatabase, input: {
   return record
 }
 
-const aiCard = (record: RecordDetail): RequirementSemanticCard => {
-  const source = buildRequirementSemanticCard(record)
-  const functionalObject = '报表导出'
-  const action = 'add_capability' as const
-  return {
-    ...source,
-    functionalObject,
-    action,
-    matchingText: `${source.evidence}\n功能对象：${functionalObject}`,
-    fieldAssessments: {
-      ...source.fieldAssessments,
-      functionalObject: { value: functionalObject, confidence: 0.95, evidence: source.evidence },
-      action: { value: action, confidence: 0.95, evidence: source.evidence }
-    },
-    analysisStatus: 'ai_adjudicated',
-    analysisSummary: 'similarity smoke 的 AI 语义卡片'
-  }
-}
-
-const persistReadyCard = (db: AppDatabase, record: RecordDetail): RequirementSemanticCard => {
-  const contentHash = db.getRecordContentHash(record.uid)
-  assert.ok(contentHash, `record has no content hash: ${record.uid}`)
-  assert.equal(
-    db.claimRequirementSemanticCard({ recordUid: record.uid, contentHash, ...semanticContext }),
-    true,
-    `semantic-card claim failed: ${record.uid}`
-  )
-  const card = aiCard(record)
-  db.completeRequirementSemanticCard(record.uid, card)
-  assert.ok(
-    db.getReadyRequirementSemanticCard({ recordUid: record.uid, contentHash, ...semanticContext }),
-    `semantic card was not ready: ${record.uid}`
-  )
-  return card
-}
-
 const candidateFor = (db: AppDatabase, uid: string): HybridRequirementCandidate => {
   const record = db.getRecord(uid, false)
   assert.ok(record, `candidate was not persisted: ${uid}`)
-  const contentHash = db.getRecordContentHash(uid)
-  assert.ok(contentHash, `candidate has no content hash: ${uid}`)
-  const card = db.getReadyRequirementSemanticCard({ recordUid: uid, contentHash, ...semanticContext })
-  assert.ok(card, `candidate semantic card was not ready: ${uid}`)
   return {
     record,
-    card,
+    card: buildRequirementSourceView(record),
     denseScore: 96,
     lexicalScore: 94,
-    structuralScore: 92,
     retrievalScore: 1,
     snippet: record.description
-  }
+  } as HybridRequirementCandidate
 }
 
 const createReranker = (onInput?: (count: number) => void): RequirementReranker => ({
@@ -160,7 +107,7 @@ const explanationResponse = (
     candidateEvidence: mode === 'invalid-evidence'
       ? 'C999'
       : candidate.evidenceSegments?.[0]?.id ?? 'C001',
-    ...(mode === 'forbidden' ? { relation: 'duplicate', score: 99 } : {})
+    ...(mode === 'forbidden' ? { score: 99 } : {})
   }))
   return {
     message: {
@@ -194,7 +141,6 @@ const createAgent = (
   db: AppDatabase,
   candidates: HybridRequirementCandidate[],
   model: ExplanationModel,
-  matchModelSignature: string,
   onRerankInput?: (count: number) => void
 ): RequirementAnalysisAgent => new RequirementAnalysisAgent(
   db,
@@ -208,10 +154,7 @@ const createAgent = (
       }
     },
     reranker: createReranker(onRerankInput),
-    modelClient: model.client,
-    semanticContext,
-    matchModelSignature,
-    embeddingModelVersion: 'similarity-smoke-embedding-v1'
+    modelClient: model.client
   }
 )
 
@@ -225,7 +168,7 @@ const rowFor = (
 ) => rowsOf(response).find((row) => row.uid === uid)
 
 const main = async (): Promise<void> => {
-  const directory = await mkdtemp(join(tmpdir(), 'visslm-agent-similarity-v2-'))
+  const directory = await mkdtemp(join(tmpdir(), 'visslm-agent-similarity-source-only-'))
   let db: AppDatabase | null = null
   try {
     db = new AppDatabase(join(directory, 'agent.db'), join(directory, 'assets'))
@@ -247,10 +190,6 @@ const main = async (): Promise<void> => {
       name: '通用报表基准二',
       description: '报表页面支持导出订单明细，并保留字段与层级。'
     })
-    persistReadyCard(db, base)
-    persistReadyCard(db, genericBaseOne)
-    persistReadyCard(db, genericBaseTwo)
-
     const candidateUids: string[] = []
     for (let index = 0; index < 12; index += 1) {
       const candidate = upsert(db, {
@@ -259,27 +198,26 @@ const main = async (): Promise<void> => {
         name: `报表导出候选 ${index + 1}`,
         description: '报表页面支持导出订单明细，并保留字段与层级。'
       })
-      persistReadyCard(db, candidate)
       candidateUids.push(candidate.uid)
     }
     const candidates = candidateUids.map((uid) => candidateFor(db!, uid))
 
     let rerankerInputCount = 0
     const model = createExplanationModel('valid')
-    const agent = createAgent(db, candidates, model, 'similarity-smoke-explanation-v1', (count) => {
+    const agent = createAgent(db, candidates, model, (count) => {
       rerankerInputCount = count
     })
     const response = await agent.ask({ question: '分析需求编号 BASE-ALPHA' })
-    assert.equal(rerankerInputCount, 12, 'Cross-Encoder must receive the full retrieved candidate set')
+    assert.equal(rerankerInputCount, 12, 'Cross-Encoder must receive the full source-only candidate set')
     assert.equal(model.calls, 1, 'one base must use one batch explanation call')
     assert.equal(model.inputs[0]?.format && JSON.stringify(model.inputs[0].format).includes('relation'), true)
     assert.equal(model.inputs[0]?.format && JSON.stringify(model.inputs[0].format).includes('score'), false)
-    assert.equal(explanationPayload(model.inputs[0]!).candidates?.length, 10, 'only Top10 may enter explanation')
-    assert.ok(response.sources.length > 0, 'deterministic scoring must keep visible matches')
-    assert.equal(rowsOf(response).length, 10, 'visible results must be limited to deterministic Top20/AI Top10')
-    assert.match(response.answer, /一次批量 AI 语义复核/)
+    assert.equal(explanationPayload(model.inputs[0]!).candidates?.length, 10)
+    assert.ok(response.sources.length > 0)
+    assert.equal(rowsOf(response).length, 10)
+    assert.equal(explanationPayload(model.inputs[0]!).candidates?.[0]?.recordUid, candidates[0]!.record.uid)
     const baselineRow = rowFor(response, candidates[0]!.record.uid)
-    assert.ok(baselineRow, 'the highest-ranked candidate must remain visible')
+    assert.ok(baselineRow)
     const baselineDecision = {
       relation: baselineRow.values.relation,
       matchScore: baselineRow.values.matchScore
@@ -289,8 +227,7 @@ const main = async (): Promise<void> => {
     const changedExplanation = await createAgent(
       db,
       candidates,
-      changedExplanationModel,
-      'similarity-smoke-explanation-v2'
+      changedExplanationModel
     ).ask({ question: '分析需求编号 BASE-ALPHA' })
     const changedRow = rowFor(changedExplanation, candidates[0]!.record.uid)
     assert.ok(changedRow)
@@ -299,15 +236,14 @@ const main = async (): Promise<void> => {
       baselineDecision,
       'explanation text must not alter deterministic relation or score'
     )
-    assert.equal(changedExplanationModel.calls, 1, 'changed explanation signature still uses one batch call')
+    assert.equal(changedExplanationModel.calls, 1)
 
     for (const mode of ['forbidden', 'unknown-uid', 'invalid-evidence'] as const) {
       const invalidModel = createExplanationModel(mode)
       const invalidResponse = await createAgent(
         db,
         candidates,
-        invalidModel,
-        `similarity-smoke-invalid-${mode}`
+        invalidModel
       ).ask({ question: '分析需求编号 BASE-ALPHA' })
       const invalidRow = rowFor(invalidResponse, candidates[0]!.record.uid)
       assert.ok(invalidRow, `${mode} explanation failure must retain deterministic output`)
@@ -317,36 +253,36 @@ const main = async (): Promise<void> => {
         `${mode} explanation failure must not alter deterministic relation or score`
       )
       assert.equal(invalidModel.calls, 1, `${mode} must fail closed without a repair pass`)
-      assert.equal(invalidRow.values.explanationStatus, 'AI 语义复核暂不可用，正式关系已降级并保留召回审计')
     }
 
-    const cachedAgain = await agent.ask({ question: '分析需求编号 BASE-ALPHA' })
-    assert.equal(model.calls, 1, 'repeated verified input must hit persistent cache with zero model calls')
-    assert.equal(rowFor(cachedAgain, candidates[0]!.record.uid)?.values.explanationStatus, '已复核缓存命中')
+    const repeated = await agent.ask({ question: '分析需求编号 BASE-ALPHA' })
+    assert.equal(model.calls, 2, 'repeated source query must run a fresh batch explanation')
+    assert.ok(rowFor(repeated, candidates[0]!.record.uid))
     await agent.ask({ question: '请分析需求编号 BASE-ALPHA' })
-    assert.equal(model.calls, 2, 'query changes must invalidate the explanation cache')
+    assert.equal(model.calls, 3, 'changed wording must run a fresh batch explanation')
 
-    const genericCandidate = candidates[0]!
+    const genericCandidates = [candidateFor(db, candidates[0]!.record.uid)]
     const genericModel = createExplanationModel('valid')
     const genericResponse = await createAgent(
       db,
-      [genericCandidate],
-      genericModel,
-      'similarity-smoke-generic-v1'
+      genericCandidates,
+      genericModel
     ).ask({ question: '分析需求编号 GENERIC-BASE-ONE、GENERIC-BASE-TWO' })
-    assert.equal(genericModel.calls, 2, 'generic IDs must use the same one-batch branch independently')
+    assert.equal(genericModel.calls, 2, 'generic IDs must use the same source-only branch independently')
     assert.deepEqual(
       genericModel.inputs.map((input) => explanationPayload(input).candidates?.length),
       [1, 1]
     )
     assert.equal(genericResponse.sources.length, 2)
+    assert.ok(genericBaseOne && genericBaseTwo)
 
     console.log(JSON.stringify({
       ok: true,
       matchedCandidates: response.sources.map((source) => source.itemId),
       explanationCalls: model.calls,
-      cachedExplanationCalls: 1,
-      genericExplanationCalls: genericModel.calls
+      repeatedExplanationCalls: 2,
+      genericExplanationCalls: genericModel.calls,
+      sourceOnly: true
     }))
   } finally {
     db?.close()
