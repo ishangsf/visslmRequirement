@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, statSync } from 'node:fs'
 import { extname, join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { tmpdir } from 'node:os'
+import { Worker } from 'node:worker_threads'
 import iconv from 'iconv-lite'
 import * as mammoth from 'mammoth'
 import * as XLSX from 'xlsx'
@@ -17,6 +18,8 @@ import type {
 } from '../shared/types'
 import {
   AppDatabase,
+  type KnowledgeRecordChunkReplacement,
+  type KnowledgeRecordIndexRow,
   type KnowledgeChunkInput,
   type KnowledgeVectorInput
 } from './database'
@@ -27,20 +30,33 @@ import {
   TaskCancelledError,
   type BackgroundTaskHandle
 } from './background-task-runner'
+import {
+  EMBEDDING_MODEL_ID,
+  EMBEDDING_MODEL_VERSION,
+  EMBEDDING_WORKER_FILE_NAME,
+  type EmbeddingWorkerRequest,
+  type EmbeddingWorkerResponse
+} from './embedding-worker-protocol'
+
+export { EMBEDDING_MODEL_ID, EMBEDDING_MODEL_VERSION } from './embedding-worker-protocol'
 
 export const MAX_KNOWLEDGE_FILE_BYTES = 100 * 1024 * 1024
-export const EMBEDDING_MODEL_ID = 'Xenova/bge-small-zh-v1.5'
-export const EMBEDDING_MODEL_VERSION = 'bge-small-zh-v1.5-local-v1'
 const FALLBACK_MODEL_VERSION = 'local-hash-v1'
 const CHUNK_SIZE = 1000
 const CHUNK_OVERLAP = 20
-const EMBEDDING_DIMENSION = 384
 export const VECTOR_PREFILTER_THRESHOLD = 4_096
 export const VECTOR_PREFILTER_MAX_CANDIDATES = 2_048
 export const VECTOR_COARSE_STEP = 8
 export const KNOWLEDGE_MAX_CONCURRENT_TASKS = 2
 const SEARCH_RESULT_CACHE_TTL_MS = 15_000
 const SEARCH_RESULT_CACHE_MAX_ENTRIES = 64
+const RECORD_INDEX_EMBED_BATCH_SIZE = 32
+const RECORD_INDEX_RECORD_BATCH_SIZE = 32
+const RECORD_INDEX_MAX_COMMIT_CHUNKS = 256
+const RECORD_INDEX_MAX_CHUNKS_PER_RECORD = 4096
+const RECORD_INDEX_SNAPSHOT_PAGE_SIZE = 256
+const FALLBACK_EMBEDDING_DIMENSION = 384
+const MAX_EMBEDDING_WORKER_PENDING_REQUESTS = 64
 const OCR_RENDER_SCALE = 2.5
 const OCR_PAGE_SEGMENTATION_MODE = '3'
 const SUPPORTED_EXTENSIONS = new Set(['.docx', '.pdf', '.xlsx', '.xls', '.txt'])
@@ -64,6 +80,24 @@ export interface KnowledgeRecordMatch {
   score: number
   chunkId: string
   snippet: string
+}
+
+export interface KnowledgeRecordIndexResult {
+  uid: string
+  chunkCount?: number
+  error?: string
+}
+
+export interface KnowledgeRecordIndexBatchOptions {
+  onRecordComplete?: (result: KnowledgeRecordIndexResult) => void | Promise<void>
+  shouldStop?: () => boolean
+}
+
+export interface KnowledgeRecordIndexBatchResult {
+  results: KnowledgeRecordIndexResult[]
+  succeeded: number
+  failed: number
+  stopped: boolean
 }
 
 type KnowledgeVectorSearchRow = ReturnType<AppDatabase['listKnowledgeVectorRows']>[number] & {
@@ -518,14 +552,14 @@ interface ParsedDocument {
   pageCount: number
 }
 
-interface TransformerRuntime {
-  env: {
-    allowRemoteModels?: boolean
-    allowLocalModels?: boolean
-    localModelPath?: string
-    cacheDir?: string
-  }
-  pipeline: (task: string, model: string, options?: Record<string, unknown>) => Promise<unknown>
+type RecordIndexChunk = ReturnType<typeof chunkKnowledgePages>[number]
+
+interface RecordIndexWork {
+  row: KnowledgeRecordIndexRow
+  chunks: RecordIndexChunk[]
+  vectors: Array<Float32Array | undefined>
+  embeddingComplete: boolean
+  error?: string
 }
 
 const extensionFor = (filePath: string): string => extname(filePath).toLocaleLowerCase()
@@ -663,6 +697,173 @@ const modelRoot = (): string | null => {
     existsSync(join(candidate, 'config.json')) ||
     existsSync(join(candidate, ...modelParts, 'config.json'))
   ) ?? null
+}
+
+type PendingEmbeddingWorkerRequest = {
+  request: EmbeddingWorkerRequest
+  resolve: (response: EmbeddingWorkerResponse) => void
+  reject: (error: Error) => void
+}
+
+const embeddingWorkerError = (error: unknown, fallback: string): Error => {
+  if (error instanceof Error && error.message) return error
+  const message = String(error || '')
+  return new Error(message || fallback)
+}
+
+const embeddingWorkerPath = (): string => {
+  const candidates = [
+    join(dirname(fileURLToPath(import.meta.url)), EMBEDDING_WORKER_FILE_NAME),
+    join(process.cwd(), 'out', 'main', EMBEDDING_WORKER_FILE_NAME)
+  ]
+  return candidates.find((candidate) => existsSync(candidate)) ?? candidates[0]
+}
+
+/** Single production model worker with bounded, serialized requests. */
+class EmbeddingWorkerClient {
+  private readonly worker: Worker
+  private readonly pending = new Map<string, PendingEmbeddingWorkerRequest>()
+  private readonly queue: PendingEmbeddingWorkerRequest[] = []
+  private activeRequestId = ''
+  private failure: Error | null = null
+  private disposed = false
+  private prepared = false
+  private dimension = 0
+
+  constructor(private readonly modelRoot: string) {
+    const workerPath = embeddingWorkerPath()
+    if (!existsSync(workerPath)) {
+      throw new Error('本地 embedding Worker 未找到，请重新构建 VISSLM Agent')
+    }
+    this.worker = new Worker(workerPath)
+    this.worker.on('message', (message: unknown) => this.handleMessage(message))
+    this.worker.on('error', (error: Error) => this.fail(error))
+    this.worker.on('exit', (code: number) => {
+      if (!this.disposed) this.fail(new Error(`本地 embedding Worker 已退出（代码 ${code}）`))
+    })
+  }
+
+  get ready(): boolean {
+    return this.prepared && !this.disposed && !this.failure
+  }
+
+  async prepare(): Promise<void> {
+    const response = await this.enqueue({
+      requestId: randomUUID(),
+      type: 'prepare',
+      modelRoot: this.modelRoot
+    })
+    if (!response.ok) throw new Error(response.error)
+    if (response.type !== 'prepared' || response.modelVersion !== EMBEDDING_MODEL_VERSION) {
+      throw new Error('本地 embedding Worker 返回了无效的模型版本')
+    }
+    this.prepared = true
+  }
+
+  async embedMany(texts: string[]): Promise<Float32Array[]> {
+    if (!texts.length) return []
+    const response = await this.enqueue({ requestId: randomUUID(), type: 'embedMany', texts })
+    if (!response.ok) throw new Error(response.error)
+    if (response.type !== 'embeddings' || response.modelVersion !== EMBEDDING_MODEL_VERSION) {
+      throw new Error('本地 embedding Worker 返回了无效响应')
+    }
+    const dimension = Number(response.dimension)
+    if (!Number.isInteger(dimension) || dimension <= 0 || dimension > 65_536) {
+      throw new Error('本地 embedding Worker 返回了无效的向量维度')
+    }
+    if (this.dimension && this.dimension !== dimension) {
+      throw new Error(`本地 embedding Worker 向量维度发生变化：${this.dimension} -> ${dimension}`)
+    }
+    if (!Array.isArray(response.vectors) || response.vectors.length !== texts.length) {
+      throw new Error('本地 embedding Worker 返回的向量数量无效')
+    }
+    const vectors = response.vectors.map((buffer) => {
+      if (!(buffer instanceof ArrayBuffer) ||
+        buffer.byteLength !== dimension * Float32Array.BYTES_PER_ELEMENT) {
+        throw new Error('本地 embedding Worker 返回了无效的向量缓冲区')
+      }
+      const vector = new Float32Array(buffer)
+      if (Array.from(vector).some((value) => !Number.isFinite(value))) {
+        throw new Error('本地 embedding Worker 返回了非有限向量值')
+      }
+      return vector
+    })
+    this.dimension = dimension
+    return vectors
+  }
+
+  dispose(): void {
+    if (this.disposed) return
+    this.disposed = true
+    const error = new Error('本地 embedding Worker 已停止')
+    const pending = [...this.pending.values()]
+    this.pending.clear()
+    this.queue.length = 0
+    this.activeRequestId = ''
+    for (const request of pending) request.reject(error)
+    void this.worker.terminate().catch(() => undefined)
+  }
+
+  private enqueue(request: EmbeddingWorkerRequest): Promise<EmbeddingWorkerResponse> {
+    if (this.disposed) return Promise.reject(new Error('本地 embedding Worker 已停止'))
+    if (this.failure) return Promise.reject(this.failure)
+    if (this.pending.size >= MAX_EMBEDDING_WORKER_PENDING_REQUESTS) {
+      return Promise.reject(new Error('本地 embedding Worker 请求队列已满'))
+    }
+    return new Promise<EmbeddingWorkerResponse>((resolve, reject) => {
+      const pending: PendingEmbeddingWorkerRequest = { request, resolve, reject }
+      this.pending.set(request.requestId, pending)
+      this.queue.push(pending)
+      this.pump()
+    })
+  }
+
+  private pump(): void {
+    if (this.disposed || this.failure || this.activeRequestId || !this.queue.length) return
+    const next = this.queue.shift()
+    if (!next) return
+    this.activeRequestId = next.request.requestId
+    try {
+      this.worker.postMessage(next.request)
+    } catch (error) {
+      this.fail(error)
+    }
+  }
+
+  private handleMessage(message: unknown): void {
+    if (!message || typeof message !== 'object') {
+      this.fail(new Error('本地 embedding Worker 返回了无效响应'))
+      return
+    }
+    const candidate = message as { requestId?: unknown; ok?: unknown; error?: unknown }
+    if (typeof candidate.requestId !== 'string' || !candidate.requestId) {
+      this.fail(new Error('本地 embedding Worker 返回了无效请求 ID'))
+      return
+    }
+    const pending = this.pending.get(candidate.requestId)
+    if (!pending) return
+    this.pending.delete(candidate.requestId)
+    if (this.activeRequestId === candidate.requestId) this.activeRequestId = ''
+    if (candidate.ok === false) {
+      pending.reject(embeddingWorkerError(candidate.error, '本地 embedding Worker 请求失败'))
+    } else if (candidate.ok === true) {
+      pending.resolve(message as EmbeddingWorkerResponse)
+    } else {
+      pending.reject(new Error('本地 embedding Worker 返回了无效响应'))
+    }
+    this.pump()
+  }
+
+  private fail(error: unknown): void {
+    if (this.disposed) return
+    if (!this.failure) this.failure = embeddingWorkerError(error, '本地 embedding Worker 运行失败')
+    this.activeRequestId = ''
+    this.queue.length = 0
+    const pending = [...this.pending.values()]
+    this.pending.clear()
+    for (const request of pending) request.reject(this.failure)
+    void this.worker.terminate().catch(() => undefined)
+  }
 }
 
 class DocumentParser {
@@ -805,7 +1006,7 @@ class DocumentParser {
 }
 
 class EmbeddingService {
-  private extractor: ((texts: string[], options?: Record<string, unknown>) => Promise<any>) | null = null
+  private worker: EmbeddingWorkerClient | null = null
   private attempted = false
   private preparationPromise: Promise<void> | null = null
   private actualModelVersion = FALLBACK_MODEL_VERSION
@@ -816,7 +1017,7 @@ class EmbeddingService {
   }
 
   get available(): boolean {
-    return Boolean(this.extractor) || this.allowFallback()
+    return Boolean(this.worker?.ready) || this.allowFallback()
   }
 
   get unavailableReason(): string {
@@ -824,98 +1025,79 @@ class EmbeddingService {
   }
 
   async prepare(): Promise<void> {
-    await this.ensureExtractor()
+    await this.ensureWorker()
   }
 
   async embedMany(texts: string[]): Promise<Float32Array[]> {
     if (!texts.length) return []
-    await this.ensureExtractor()
-    if (this.extractor) {
+    await this.ensureWorker()
+    if (this.allowFallback()) return texts.map((text) => this.hashEmbedding(text))
+    if (this.worker) {
       try {
-        const result = await this.extractor(texts, { pooling: 'mean', normalize: true })
-        const rows = this.toRows(result, texts.length)
-        if (rows.length === texts.length) return rows
-        throw new Error('本地 embedding 模型返回的向量数量无效')
+        return await this.worker.embedMany(texts)
       } catch (error) {
-        console.warn('[knowledge] local embedding failed:', error)
-        this.extractor = null
-        this.actualModelVersion = FALLBACK_MODEL_VERSION
-        this.failureReason = error instanceof Error ? error.message : String(error)
+        console.warn('[knowledge] local embedding worker failed:', error)
+        this.markUnavailable(error)
       }
     }
-    if (this.allowFallback()) return texts.map((text) => this.hashEmbedding(text))
     return []
   }
 
-  private async ensureExtractor(): Promise<void> {
-    if (this.extractor || (this.attempted && !this.preparationPromise)) return
+  dispose(): void {
+    const worker = this.worker
+    this.worker = null
+    worker?.dispose()
+  }
+
+  private async ensureWorker(): Promise<void> {
+    if (this.allowFallback()) {
+      this.actualModelVersion = FALLBACK_MODEL_VERSION
+      this.failureReason = ''
+      return
+    }
+    if (this.worker?.ready || (this.attempted && !this.preparationPromise)) return
     if (this.preparationPromise) return this.preparationPromise
     this.attempted = true
-    this.preparationPromise = this.loadExtractor().finally(() => {
+    this.preparationPromise = this.loadWorker().finally(() => {
       this.preparationPromise = null
     })
     return this.preparationPromise
   }
 
-  private async loadExtractor(): Promise<void> {
+  private async loadWorker(): Promise<void> {
     const root = modelRoot()
     if (!root) {
       this.failureReason = '本地 embedding 模型资源未找到，请先执行 npm run prepare:model 完成资源准备'
       return
     }
+    let worker: EmbeddingWorkerClient | null = null
     try {
-      const runtime = await import('@huggingface/transformers') as unknown as TransformerRuntime
-      runtime.env.allowRemoteModels = false
-      runtime.env.allowLocalModels = true
-      runtime.env.localModelPath = root
-      runtime.env.cacheDir = join(root, 'cache')
-      const loaded = await runtime.pipeline('feature-extraction', EMBEDDING_MODEL_ID, {
-        dtype: 'q8',
-        local_files_only: true
-      })
-      if (typeof loaded !== 'function') throw new Error('embedding pipeline 不可用')
-      this.extractor = loaded as (texts: string[], options?: Record<string, unknown>) => Promise<any>
+      worker = new EmbeddingWorkerClient(root)
+      this.worker = worker
+      await worker.prepare()
       this.actualModelVersion = EMBEDDING_MODEL_VERSION
       this.failureReason = ''
     } catch (error) {
-      console.warn('[knowledge] local embedding model unavailable:', error)
+      worker?.dispose()
+      this.worker = null
       this.failureReason = error instanceof Error ? error.message : String(error)
     }
+  }
+
+  private markUnavailable(error: unknown): void {
+    const worker = this.worker
+    this.worker = null
+    this.actualModelVersion = FALLBACK_MODEL_VERSION
+    this.failureReason = error instanceof Error ? error.message : String(error)
+    worker?.dispose()
   }
 
   private allowFallback(): boolean {
     return process.env.VISSLM_KNOWLEDGE_TEST_FALLBACK === '1'
   }
 
-  private toRows(result: any, expected: number): Float32Array[] {
-    if (typeof result?.tolist === 'function') {
-      const values = result.tolist() as unknown
-      if (Array.isArray(values)) {
-        const rows = Array.isArray(values[0]) ? values : [values]
-        return rows.map((row) => this.normalizeRow(row as unknown[]))
-      }
-    }
-    const data = result?.data as ArrayLike<number> | undefined
-    const dims = result?.dims as number[] | undefined
-    if (!data || !dims?.length) return []
-    const dimension = Number(dims[dims.length - 1])
-    if (!dimension || data.length !== expected * dimension) return []
-    return Array.from({ length: expected }, (_, index) =>
-      this.normalizeRow(Array.from(data).slice(index * dimension, (index + 1) * dimension))
-    )
-  }
-
-  private normalizeRow(values: unknown[]): Float32Array {
-    const vector = new Float32Array(values.map((value) => Number(value) || 0))
-    let norm = 0
-    for (const value of vector) norm += value * value
-    const scale = norm > 0 ? 1 / Math.sqrt(norm) : 1
-    for (let index = 0; index < vector.length; index += 1) vector[index] *= scale
-    return vector
-  }
-
   private hashEmbedding(text: string): Float32Array {
-    const vector = new Float32Array(EMBEDDING_DIMENSION)
+    const vector = new Float32Array(FALLBACK_EMBEDDING_DIMENSION)
     const normalized = text.toLocaleLowerCase().replace(/\s+/g, ' ')
     const tokens = normalized.match(/[\p{L}\p{N}]+/gu) ?? []
     const units = tokens.length ? tokens : Array.from(normalized)
@@ -936,7 +1118,21 @@ class EmbeddingService {
       }
       vector[Math.abs(hash) % vector.length] += 0.35
     }
-    return this.normalizeRow(Array.from(vector))
+    let norm = 0
+    for (const value of vector) norm += value * value
+    const scale = norm > 0 ? 1 / Math.sqrt(norm) : 1
+    for (let index = 0; index < vector.length; index += 1) vector[index] *= scale
+    return vector
+  }
+}
+
+export class EmbeddingRuntimeUnavailableError extends Error {
+  constructor(readonly reason: string) {
+    super(
+      `本地向量运行时不可用：${reason || '未知错误'}。` +
+      '请重新运行 VISSLM Agent 安装程序修复 VC++ 2015–2022 x64 运行库和原生模型依赖。'
+    )
+    this.name = 'EmbeddingRuntimeUnavailableError'
   }
 }
 
@@ -981,6 +1177,14 @@ export class KnowledgeService {
     return this.embeddings.modelVersion
   }
 
+  /** Fail once before a record-maintenance batch mutates lexical/index state. */
+  async assertEmbeddingReady(): Promise<void> {
+    await this.embeddings.prepare()
+    if (!this.embeddings.available) {
+      throw new EmbeddingRuntimeUnavailableError(this.embeddings.unavailableReason)
+    }
+  }
+
   cancelTask(taskId: string): boolean {
     const normalized = taskId.trim()
     const cancelled = this.taskRunner.cancel(normalized)
@@ -999,6 +1203,7 @@ export class KnowledgeService {
 
   cancelAllTasks(): void {
     this.taskRunner.cancelAll()
+    this.embeddings.dispose()
   }
 
   async initialize(): Promise<void> {
@@ -1312,46 +1517,285 @@ export class KnowledgeService {
     return this.syncRecordIndexInternal()
   }
 
+  async rebuildRecordIndexesInLock(
+    recordUids: string[],
+    taskId = '',
+    operation: RecordMaintenanceOperation | '' = '',
+    options: KnowledgeRecordIndexBatchOptions = {}
+  ): Promise<KnowledgeRecordIndexBatchResult> {
+    const selected = [...new Set(recordUids.map((uid) => String(uid).trim()).filter(Boolean))]
+    if (!selected.length) return { results: [], succeeded: 0, failed: 0, stopped: false }
+    const activeTaskId = taskId || randomUUID()
+    const task = this.taskRunner.begin(activeTaskId)
+    const results: KnowledgeRecordIndexResult[] = []
+    let stopped = false
+    try {
+      await this.assertEmbeddingReady()
+      for (let index = 0; index < selected.length; index += RECORD_INDEX_RECORD_BATCH_SIZE) {
+        if (options.shouldStop?.()) {
+          stopped = true
+          break
+        }
+        await task.checkpoint()
+        const ids = selected.slice(index, index + RECORD_INDEX_RECORD_BATCH_SIZE)
+        const rows = this.db.listKnowledgeRecordIndexRowsByUids(ids)
+        const byUid = new Map(rows.map((row) => [row.uid, row]))
+        const missingResults: KnowledgeRecordIndexResult[] = []
+        const batchResults = new Map<string, KnowledgeRecordIndexResult>()
+        const existingRows = ids.flatMap((uid) => {
+          const row = byUid.get(uid)
+          if (row) return [row]
+          const result = { uid, error: '记录不存在或已被删除' }
+          missingResults.push(result)
+          batchResults.set(uid, result)
+          return []
+        })
+        for (const result of missingResults) {
+          await this.notifyRecordIndexComplete(options, result)
+        }
+        if (existingRows.length) {
+          const outcome = await this.rebuildRecordRowsInLock(
+            existingRows,
+            taskId,
+            operation,
+            options,
+            task
+          )
+          for (const result of outcome.results) batchResults.set(result.uid, result)
+          if (outcome.stopped) {
+            stopped = true
+          }
+        }
+        for (const uid of ids) {
+          const result = batchResults.get(uid)
+          if (result) results.push(result)
+        }
+        if (stopped) break
+      }
+    } finally {
+      task.dispose()
+    }
+    const succeeded = results.filter((result) => !result.error).length
+    return {
+      results,
+      succeeded,
+      failed: results.length - succeeded,
+      stopped
+    }
+  }
+
   async rebuildRecordIndexInLock(
     recordUid: string,
     taskId = '',
     operation: RecordMaintenanceOperation | '' = ''
   ): Promise<number> {
-    const activeTaskId = taskId || randomUUID()
-    const task = this.taskRunner.begin(activeTaskId)
-    try {
-      await this.embeddings.prepare()
-      if (!this.embeddings.available) throw new Error(this.embeddings.unavailableReason)
-      const row = this.db.getKnowledgeRecordIndexRow(recordUid)
-      if (!row) throw new Error('记录不存在或已被删除')
-      const pages: ParsedPage[] = [{ text: row.content, location: '采集记录' }]
-      const chunks = chunkKnowledgePages(pages)
+    const result = await this.rebuildRecordIndexesInLock([recordUid], taskId, operation)
+    const item = result.results[0]
+    if (!item) throw new Error(result.stopped ? '任务已停止' : '记录不存在或已被删除')
+    if (item.error) throw new Error(item.error)
+    return item.chunkCount ?? 0
+  }
+
+  private async rebuildRecordRowsInLock(
+    rows: readonly KnowledgeRecordIndexRow[],
+    taskId: string,
+    operation: RecordMaintenanceOperation | '',
+    options: KnowledgeRecordIndexBatchOptions,
+    task: BackgroundTaskHandle
+  ): Promise<{ results: KnowledgeRecordIndexResult[]; stopped: boolean }> {
+    const results: KnowledgeRecordIndexResult[] = []
+    let stopped = false
+    let prepared: RecordIndexWork[] = []
+    let preparedChunkCount = 0
+
+    const report = async (result: KnowledgeRecordIndexResult): Promise<void> => {
+      results.push(result)
+      await this.notifyRecordIndexComplete(options, result)
+    }
+
+    const reportFailure = async (uid: string, error: unknown): Promise<void> => {
+      const message = error instanceof Error ? error.message : String(error)
+      this.db.markRecordMaintenanceVectorFailed(uid, message, taskId, operation)
+      await report({ uid, error: message.slice(0, 2000) })
+    }
+
+    const flushPrepared = async (): Promise<void> => {
+      if (!prepared.length) return
+      const current = prepared
+      prepared = []
+      preparedChunkCount = 0
       await task.checkpoint()
-      const embeddings = await this.embeddings.embedMany(chunks.map((chunk) => chunk.text))
-      if (embeddings.length !== chunks.length) throw new Error(this.embeddings.unavailableReason)
-      const inputs: KnowledgeChunkInput[] = []
-      const vectors: KnowledgeVectorInput[] = []
-      chunks.forEach((chunk, chunkIndex) => {
-        const chunkId = randomUUID()
-        inputs.push({
-          id: chunkId,
-          recordUid: row.uid,
-          sourceType: 'record',
-          sourceName: row.name,
-          sourceHash: row.contentHash,
-          content: chunk.text,
-          chunkIndex,
-          location: chunk.location,
-          charStart: chunk.charStart,
-          charEnd: chunk.charEnd
-        })
-        vectors.push({ chunkId, vector: embeddings[chunkIndex], modelVersion: this.modelVersion })
-      })
-      this.db.replaceKnowledgeRecordChunks(row.uid, inputs, vectors, taskId, operation)
-      this.clearVectorCaches()
-      return inputs.length
-    } finally {
-      task.dispose()
+      await this.embedRecordWorks(current, task)
+      const replacements: KnowledgeRecordChunkReplacement[] = []
+      for (const work of current) {
+        if (work.error) continue
+        try {
+          const inputs: KnowledgeChunkInput[] = []
+          const vectors: KnowledgeVectorInput[] = []
+          work.chunks.forEach((chunk, chunkIndex) => {
+            const vector = work.vectors[chunkIndex]
+            if (!vector) throw new Error('本地 embedding 未返回完整的记录向量')
+            const chunkId = randomUUID()
+            inputs.push({
+              id: chunkId,
+              recordUid: work.row.uid,
+              sourceType: 'record',
+              sourceName: work.row.name,
+              sourceHash: work.row.contentHash,
+              content: chunk.text,
+              chunkIndex,
+              location: chunk.location,
+              charStart: chunk.charStart,
+              charEnd: chunk.charEnd
+            })
+            vectors.push({ chunkId, vector, modelVersion: this.modelVersion })
+          })
+          replacements.push({ recordUid: work.row.uid, chunks: inputs, vectors })
+        } catch (error) {
+          work.error = error instanceof Error ? error.message : String(error)
+        }
+      }
+      const databaseResults = replacements.length
+        ? this.db.replaceKnowledgeRecordChunksBatch(replacements, taskId, operation)
+        : []
+      const byUid = new Map(databaseResults.map((result) => [result.recordUid, result]))
+      if (replacements.length) this.clearVectorCaches()
+      for (const work of current) {
+        if (work.error) {
+          await reportFailure(work.row.uid, work.error)
+          continue
+        }
+        const databaseResult = byUid.get(work.row.uid)
+        if (!databaseResult) {
+          await reportFailure(work.row.uid, '记录向量索引未提交')
+          continue
+        }
+        if (databaseResult.error) {
+          await report({
+            uid: work.row.uid,
+            error: databaseResult.error
+          })
+          continue
+        }
+        await report({ uid: work.row.uid, chunkCount: databaseResult.chunkCount ?? 0 })
+      }
+    }
+
+    for (const row of rows) {
+      if (options.shouldStop?.()) {
+        stopped = true
+        break
+      }
+      await task.checkpoint()
+      let work: RecordIndexWork
+      try {
+        const chunks = chunkKnowledgePages([{ text: row.content, location: '采集记录' }])
+        if (chunks.length > RECORD_INDEX_MAX_CHUNKS_PER_RECORD) {
+          throw new Error(`单条记录向量分块不得超过 ${RECORD_INDEX_MAX_CHUNKS_PER_RECORD} 个`)
+        }
+        work = {
+          row,
+          chunks,
+          vectors: new Array<Float32Array | undefined>(chunks.length),
+          embeddingComplete: false
+        }
+      } catch (error) {
+        await reportFailure(row.uid, error)
+        continue
+      }
+      if (prepared.length && preparedChunkCount + work.chunks.length > RECORD_INDEX_MAX_COMMIT_CHUNKS) {
+        await flushPrepared()
+        if (options.shouldStop?.()) {
+          stopped = true
+          break
+        }
+      }
+      prepared.push(work)
+      preparedChunkCount += work.chunks.length
+      if (prepared.length >= RECORD_INDEX_RECORD_BATCH_SIZE) await flushPrepared()
+    }
+    if (!stopped) await flushPrepared()
+    return { results, stopped }
+  }
+
+  private async embedRecordWorks(works: RecordIndexWork[], task: BackgroundTaskHandle): Promise<void> {
+    type EmbeddingItem = { work: RecordIndexWork; chunkIndex: number }
+    let items: EmbeddingItem[] = []
+
+    const embedIsolated = async (work: RecordIndexWork): Promise<void> => {
+      work.vectors = new Array<Float32Array | undefined>(work.chunks.length)
+      for (let index = 0; index < work.chunks.length; index += RECORD_INDEX_EMBED_BATCH_SIZE) {
+        await task.checkpoint()
+        const batch = work.chunks.slice(index, index + RECORD_INDEX_EMBED_BATCH_SIZE)
+        const embeddings = await this.embeddings.embedMany(batch.map((chunk) => chunk.text))
+        if (embeddings.length !== batch.length) {
+          throw new Error(this.embeddings.unavailableReason || '本地 embedding 未返回完整向量')
+        }
+        for (let batchIndex = 0; batchIndex < batch.length; batchIndex += 1) {
+          work.vectors[index + batchIndex] = embeddings[batchIndex]
+        }
+      }
+      work.embeddingComplete = true
+    }
+
+    const flush = async (): Promise<void> => {
+      if (!items.length) return
+      const current = items
+      items = []
+      await task.checkpoint()
+      try {
+        const embeddings = await this.embeddings.embedMany(
+          current.map((item) => item.work.chunks[item.chunkIndex].text)
+        )
+        if (embeddings.length !== current.length) {
+          throw new Error(this.embeddings.unavailableReason || '本地 embedding 未返回完整向量')
+        }
+        for (let index = 0; index < current.length; index += 1) {
+          const item = current[index]
+          item.work.vectors[item.chunkIndex] = embeddings[index]
+        }
+      } catch (error) {
+        if (error instanceof TaskCancelledError) throw error
+        const affected = [...new Set(current.map((item) => item.work))]
+        if (affected.length === 1) {
+          const [work] = affected
+          if (work) work.error = error instanceof Error ? error.message : String(error)
+          return
+        }
+        for (const work of affected) {
+          if (work.error) continue
+          try {
+            await embedIsolated(work)
+          } catch (isolatedError) {
+            if (isolatedError instanceof TaskCancelledError) throw isolatedError
+            work.error = isolatedError instanceof Error ? isolatedError.message : String(isolatedError)
+          }
+        }
+      }
+    }
+
+    for (const work of works) {
+      if (work.error || work.embeddingComplete) continue
+      for (let chunkIndex = 0; chunkIndex < work.chunks.length; chunkIndex += 1) {
+        if (work.embeddingComplete || work.error) break
+        items.push({ work, chunkIndex })
+        if (items.length >= RECORD_INDEX_EMBED_BATCH_SIZE) await flush()
+      }
+    }
+    await flush()
+    for (const work of works) {
+      if (!work.error && !work.embeddingComplete) work.embeddingComplete = true
+    }
+  }
+
+  private async notifyRecordIndexComplete(
+    options: KnowledgeRecordIndexBatchOptions,
+    result: KnowledgeRecordIndexResult
+  ): Promise<void> {
+    try {
+      await options.onRecordComplete?.(result)
+    } catch (error) {
+      console.warn('[knowledge] record index completion callback failed:', error)
     }
   }
 
@@ -1737,75 +2181,83 @@ export class KnowledgeService {
     const task = this.taskRunner.begin(taskId)
     let current = 0
     let total = 0
+    let failedCount = 0
+    let firstFailureMessage = ''
     try {
-      const rows = this.db.listKnowledgeRecordIndexRows()
-      total = rows.length
-      const known = new Set(rows.map((row) => row.uid))
-      for (const uid of this.db.listKnowledgeIndexedRecordUids()) {
+      total = this.db.countKnowledgeRecordIndexRecords()
+      let recordCursor = ''
+      let deletedCursor = ''
+      let recordsDone = false
+      let deletedDone = false
+      const modelVersion = this.modelVersion
+      while (!recordsDone || !deletedDone) {
         await task.checkpoint()
-        if (!known.has(uid)) this.db.deleteKnowledgeRecordIndex(uid)
-      }
-      if (!rows.length) return
-      for (let index = 0; index < rows.length; index += 1) {
-        await task.checkpoint()
-        const row = rows[index]
-        if (
-          this.db.getKnowledgeRecordIndexHash(row.uid) === row.contentHash &&
-          this.db.getKnowledgeRecordIndexModelVersion(row.uid) === this.modelVersion
-        ) {
-          this.db.markRecordMaintenanceVectorReady(
-            row.uid,
-            this.modelVersion,
-            this.db.getKnowledgeRecordIndexChunkCount(row.uid, this.modelVersion)
-          )
-          continue
+        const snapshot = this.db.getKnowledgeRecordIndexSnapshot(modelVersion, {
+          recordCursor,
+          deletedCursor,
+          limit: RECORD_INDEX_SNAPSHOT_PAGE_SIZE,
+          includeRecords: !recordsDone,
+          includeDeleted: !deletedDone
+        })
+        if (!deletedDone && snapshot.deletedRecordUids.length) {
+          this.db.deleteKnowledgeRecordIndexes(snapshot.deletedRecordUids)
+          current += snapshot.deletedRecordUids.length
+          this.clearVectorCaches()
         }
-        const pages: ParsedPage[] = [{
-          // row.content is already restricted to business evidence. Keep
-          // identity and audit metadata out of embedding input.
-          text: row.content,
-          location: '采集记录'
-        }]
-        const chunks = chunkKnowledgePages(pages)
-        const embeddings = await this.embeddings.embedMany(chunks.map((chunk) => chunk.text))
-        if (embeddings.length !== chunks.length) throw new Error(this.embeddings.unavailableReason)
-        const inputs: KnowledgeChunkInput[] = []
-        const vectors: KnowledgeVectorInput[] = []
-        chunks.forEach((chunk, chunkIndex) => {
-          const chunkId = randomUUID()
-          inputs.push({
-            id: chunkId,
-            recordUid: row.uid,
-            sourceType: 'record',
-            sourceName: row.name,
-            sourceHash: row.contentHash,
-            content: chunk.text,
-            chunkIndex,
-            location: chunk.location,
-            charStart: chunk.charStart,
-            charEnd: chunk.charEnd
-          })
-          vectors.push({ chunkId, vector: embeddings[chunkIndex], modelVersion: this.modelVersion })
-        })
-        this.db.replaceKnowledgeRecordChunks(row.uid, inputs, vectors)
-        this.clearVectorCaches()
-        this.emit({
-          taskId,
-          phase: 'records',
-          message: `采集记录向量索引 ${index + 1}/${rows.length}`,
-          current: index + 1,
-          total: rows.length,
-          status: 'running'
-        })
-        current = index + 1
+        if (!recordsDone && snapshot.rows.length) {
+          const outcome = await this.rebuildRecordRowsInLock(
+            snapshot.rows,
+            '',
+            '',
+            {
+              shouldStop: () => task.signal.aborted,
+              onRecordComplete: (result) => {
+                current += 1
+                if (result.error) {
+                  failedCount += 1
+                  if (!firstFailureMessage) firstFailureMessage = result.error
+                }
+              }
+            },
+            task
+          )
+          if (outcome.stopped) break
+          if (outcome.results.length) {
+            this.emit({
+              taskId,
+              phase: 'records',
+              message: `采集记录向量索引已处理 ${current}/${total}`,
+              current,
+              total,
+              status: 'running'
+            })
+          }
+        }
+        if (!recordsDone) {
+          if (snapshot.hasMoreRecords && snapshot.nextRecordCursor) {
+            recordCursor = snapshot.nextRecordCursor
+          } else {
+            recordsDone = true
+          }
+        }
+        if (!deletedDone) {
+          if (snapshot.hasMoreDeletedRecords && snapshot.nextDeletedCursor) {
+            deletedCursor = snapshot.nextDeletedCursor
+          } else {
+            deletedDone = true
+          }
+        }
       }
+      if (failedCount) throw new Error(firstFailureMessage || '部分采集记录向量索引失败')
       this.emit({
         taskId,
         phase: 'done',
-        message: '采集记录向量索引已同步',
-        current: rows.length,
-        total: rows.length,
-        status: 'success'
+        message: failedCount
+          ? `采集记录向量索引已同步，${failedCount} 条记录失败`
+          : '采集记录向量索引已同步',
+        current: Math.max(current, total),
+        total: Math.max(total, current),
+        status: failedCount ? 'failed' : 'success'
       })
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)

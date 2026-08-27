@@ -17,7 +17,9 @@ export const pushForbiddenTargetFields: ReadonlySet<string> = new Set([
 const pushDefaultTargetFields: Readonly<Record<string, string>> = {
   Source: 'RequireBy',
   _valm_Description: 'UserStoryDescription',
-  _valm_ItemID: 'AcceptCriteria'
+  _valm_ItemID: 'AcceptCriteria',
+  RAO: 'Devs',
+  TSIS_ClarifyInfo: '_valm_Description'
 }
 
 export const defaultPushTargetField = (sourceField: string): string => (

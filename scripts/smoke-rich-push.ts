@@ -22,7 +22,9 @@ db.upsertRecord({
     _valm_Name: '推送图片测试',
     _valm_ItemID: 'TASK-PUSH-1',
     _valm_Description: '',
-    Source: '来源字段'
+    Source: '来源字段',
+    RAO: '开发人员字段',
+    TSIS_ClarifyInfo: '澄清信息字段'
   },
   normalizedText: '推送图片测试'
 })
@@ -40,7 +42,9 @@ db.updateRecordRawAndNormalizedText('push-record', {
   _valm_Name: '推送图片测试',
   _valm_ItemID: 'TASK-PUSH-1',
   _valm_Description: `<p><img alt="x" src="${token}"></p>`,
-  Source: '来源字段'
+  Source: '来源字段',
+  RAO: '开发人员字段',
+  TSIS_ClarifyInfo: '澄清信息字段'
 }, '推送图片测试')
 db.saveRecordImageReference({
   id: token.split('/').pop(),
@@ -117,6 +121,14 @@ const mappedPreview = service.preview({
     sourceField: 'Source',
     targetField: 'RequireBy'
   }, {
+    id: 'devs',
+    sourceField: 'RAO',
+    targetField: 'Devs'
+  }, {
+    id: 'clarify-info',
+    sourceField: 'TSIS_ClarifyInfo',
+    targetField: '_valm_Description'
+  }, {
     id: 'user-story-description',
     sourceField: '_valm_Description',
     targetField: 'UserStoryDescription'
@@ -128,15 +140,21 @@ const mappedPreview = service.preview({
 })
 assert.deepEqual(Object.keys(mappedPreview.requests[0].body).sort(), [
   'AcceptCriteria',
+  'Devs',
   'RequireBy',
+  '_valm_Description',
   'UserStoryDescription'
 ].sort())
 assert.equal(mappedPreview.requests[0].body.RequireBy, '来源字段')
+assert.equal(mappedPreview.requests[0].body.Devs, '开发人员字段')
+assert.equal(mappedPreview.requests[0].body._valm_Description, '澄清信息字段')
 assert.equal(mappedPreview.requests[0].body.UserStoryDescription, preview.requests[0].body._valm_Description)
 assert.equal(mappedPreview.requests[0].body.AcceptCriteria, 'TASK-PUSH-1')
 assert.equal('_valm_Name' in mappedPreview.requests[0].body, false)
-assert.equal('_valm_Description' in mappedPreview.requests[0].body, false)
 assert.equal('_valm_ItemID' in mappedPreview.requests[0].body, false)
+assert.equal('Source' in mappedPreview.requests[0].body, false)
+assert.equal('RAO' in mappedPreview.requests[0].body, false)
+assert.equal('TSIS_ClarifyInfo' in mappedPreview.requests[0].body, false)
 for (const sourceField of ['_valm_Uid', '_valm_NodeType']) {
   assert.throws(
     () => service.preview({

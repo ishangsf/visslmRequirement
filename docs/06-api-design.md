@@ -277,7 +277,7 @@ const preview = await window.visslm.previewPush({
 
 数据推送页面首次加载时会读取第一条记录的原始属性并生成同名映射；映射和表单配置以 `visslm:push-config-draft:v1` 保存在本地，切换导航后重新进入仍会恢复。未配置映射时的旧版 IPC 调用继续沿用兼容行为。
 
-默认映射规则为：`Source` → `RequireBy`、`_valm_Description` → `UserStoryDescription`、`_valm_ItemID` → `AcceptCriteria`，其他可推送属性默认使用同名目标。`_valm_ItemID` 仅允许作为源属性，`_valm_Uid` 与 `_valm_NodeType` 不允许作为源属性；`_valm_Uid`、`_valm_NodeType`、`_valm_ItemID` 均不允许作为目标属性。显式传入映射时，消息体只包含映射目标属性，因此 `_valm_ItemID` 的原键不会进入消息体。
+默认映射规则为：`Source` → `RequireBy`、`_valm_Description` → `UserStoryDescription`、`_valm_ItemID` → `AcceptCriteria`、`RAO` → `Devs`、`TSIS_ClarifyInfo` → `_valm_Description`，其他可推送属性默认使用同名目标。`_valm_ItemID` 仅允许作为源属性，`_valm_Uid` 与 `_valm_NodeType` 不允许作为源属性；`_valm_Uid`、`_valm_NodeType`、`_valm_ItemID` 均不允许作为目标属性。显式传入映射时，消息体只包含映射目标属性，因此 `_valm_ItemID` 的原键不会进入消息体。
 
 图片上传使用独立的网页登录会话：先 `GET /User/LogOn` 获取初始 `JSESSIONID`，再按平台 V2 登录编码协议 `POST /User/UPLogOn`，随后用同一 Cookie 会话和配对的 `ckCsrfToken` 调用 `FileCenterImg/UploadRichImg`。平台登录密码通过操作系统安全存储加密，渲染层只读取 `hasUploadPassword`，日志不输出密码或 Cookie 值。上传响应明确为 LogOn 页面时允许重新登录后重试一次；超时、普通 HTTP 错误或无法解析的响应不重放非幂等 POST。
 

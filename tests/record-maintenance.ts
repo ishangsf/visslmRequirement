@@ -471,6 +471,88 @@ const testPartialFailurePersistsFailureDetails = async (): Promise<void> => {
   })
 }
 
+const testEmbeddingInfrastructureFailureFailsTaskWithoutPerRecordExplosion = async (): Promise<void> => {
+  await withDatabase(async ({ db, lock }) => {
+    const records = [
+      addRecord(db, { uid: 'embedding-health-record-a' }),
+      addRecord(db, { uid: 'embedding-health-record-b' }),
+      addRecord(db, { uid: 'embedding-health-record-c' })
+    ]
+    const previousModel = 'embedding-health-previous-model-v1'
+    for (const record of records) {
+      seedRecordVector(
+        db,
+        record,
+        previousModel,
+        `embedding-health-old-${record.uid}`,
+        `old vector content for ${record.uid}`,
+        `old-source-${record.uid}`
+      )
+    }
+    const beforeVectors = records.map((record) => ({
+      uid: record.uid,
+      rows: recordVectorRows(db, record.uid, previousModel).map((row) => ({
+        id: row.chunk.id,
+        content: row.chunk.content,
+        vector: [...row.vector]
+      }))
+    }))
+
+    const modelVersion = 'embedding-health-current-model-v1'
+    let rebuildCalls = 0
+    const unavailableKnowledge = {
+      modelVersion,
+      async assertEmbeddingReady(): Promise<never> {
+        throw new Error('本地 embedding 不可用：onnxruntime_binding.node DLL 初始化失败')
+      },
+      async rebuildRecordIndexesInLock(): Promise<never> {
+        rebuildCalls += 1
+        throw new Error('本地 embedding 不可用：onnxruntime_binding.node DLL 初始化失败')
+      },
+      async rebuildRecordIndexInLock(): Promise<never> {
+        rebuildCalls += 1
+        throw new Error('本地 embedding 不可用：onnxruntime_binding.node DLL 初始化失败')
+      }
+    } as unknown as KnowledgeService
+    const service = new RecordMaintenanceService(db, unavailableKnowledge, lock)
+    const queued = service.start({ scope: 'all', operation: 'rebuild_indexes' })
+    const failed = await waitForTask(service, queued.taskId)
+
+    assert.equal(failed.status, 'failed', 'embedding health failure must fail the maintenance task')
+    assert.equal(
+      failed.current,
+      0,
+      'an infrastructure failure must leave all records unprocessed'
+    )
+    assert.equal(failed.succeeded, 0)
+    assert.equal(failed.failed, 0)
+    assert.deepEqual(
+      failed.failedItems,
+      [],
+      'one embedding infrastructure error must not become one failed item per record'
+    )
+    assert.ok(rebuildCalls <= 1, 'embedding health failure must be detected before repeated record work')
+
+    const items = db.getRecordMaintenanceItems(queued.taskId)
+    assert.equal(items.length, records.length)
+    assert.ok(
+      items.every((item) => item.status === 'pending'),
+      'records left behind by an infrastructure failure must remain pending'
+    )
+    for (const before of beforeVectors) {
+      assert.deepEqual(
+        recordVectorRows(db, before.uid, previousModel).map((row) => ({
+          id: row.chunk.id,
+          content: row.chunk.content,
+          vector: [...row.vector]
+        })),
+        before.rows,
+        `old vectors must be preserved for ${before.uid}`
+      )
+    }
+  })
+}
+
 const restoreEnvironment = (key: string, value: string | undefined): void => {
   if (value === undefined) delete process.env[key]
   else process.env[key] = value
@@ -489,6 +571,7 @@ const main = async (): Promise<void> => {
     await testRecordVectorReindexIsTransactional()
     await testStoppedTaskPersistsPartialItems()
     await testPartialFailurePersistsFailureDetails()
+    await testEmbeddingInfrastructureFailureFailsTaskWithoutPerRecordExplosion()
     await testSemanticInvalidationAndMaintenanceStatus()
     console.log(JSON.stringify({
       ok: true,
@@ -499,7 +582,8 @@ const main = async (): Promise<void> => {
         'record vector replacement only after successful embedding',
         'semantic invalidation and maintenance status reporting',
         'stopped task persistence with pending items',
-        'partial failure details and failed vector state persistence'
+        'partial failure details and failed vector state persistence',
+        'embedding infrastructure failure is task-scoped and preserves old vectors'
       ]
     }))
   } finally {

@@ -174,16 +174,66 @@ export interface RequirementBusinessSource {
   name?: unknown
   description?: unknown
   raw?: Record<string, unknown>
+  /**
+   * Node-type scoped platform field labels.  Different VISSLM deployments may
+   * expose the same business field under different property keys, so business
+   * text extraction must be able to resolve a semantic role from its display
+   * name instead of relying on the public-environment key alone.
+   */
+  fieldLabels?: Record<string, string>
 }
 
 const REQUIREMENT_DESCRIPTION_ALIASES = [
   '_valm_Description', 'description', 'Description', 'content', 'Content', '需求描述', '描述'
 ] as const
 
+const normalizeRequirementFieldLabel = (value: unknown): string => (
+  toRequirementPlainText(value)
+    .replace(/[\s_\-:：/\\（）()\[\]【】]/g, '')
+    .toLocaleLowerCase()
+)
+
+/**
+ * Resolve a deployment-specific property key through the field catalogue.
+ * Labels are matched exactly after conservative punctuation normalization so
+ * a generic field such as "处理人名称" is not mistaken for the requirement
+ * title merely because it contains "名称".
+ */
+export const requirementFieldByDisplayName = (
+  raw: Record<string, unknown>,
+  fieldLabels: Record<string, string> | undefined,
+  displayNameAliases: readonly string[]
+): string => {
+  if (!fieldLabels || !Object.keys(fieldLabels).length) return ''
+  const wanted = new Set(displayNameAliases.map(normalizeRequirementFieldLabel).filter(Boolean))
+  if (!wanted.size) return ''
+  const rawEntries = new Map(
+    Object.entries(raw).map(([key, value]) => [key.toLocaleLowerCase(), value])
+  )
+  for (const [field, displayName] of Object.entries(fieldLabels)) {
+    if (!wanted.has(normalizeRequirementFieldLabel(displayName))) continue
+    const direct = rawEntries.get(field.toLocaleLowerCase())
+    const text = toRequirementPlainText(direct)
+    if (text) return text
+  }
+  return ''
+}
+
+const requirementSemanticField = (
+  source: RequirementBusinessSource,
+  keyAliases: readonly string[],
+  displayNameAliases: readonly string[]
+): string => (
+  requirementRawField(source.raw ?? {}, keyAliases) ||
+  requirementFieldByDisplayName(source.raw ?? {}, source.fieldLabels, displayNameAliases)
+)
+
 const requirementDescriptionOf = (source: RequirementBusinessSource): string => (
   removeRequirementNoise(
     toRequirementPlainText(source.description) ||
-    requirementRawField(source.raw ?? {}, REQUIREMENT_DESCRIPTION_ALIASES)
+    requirementSemanticField(source, REQUIREMENT_DESCRIPTION_ALIASES, [
+      '需求描述', '详细描述', '描述', '需求内容', '内容', '正文'
+    ])
   )
 )
 
@@ -193,18 +243,28 @@ const requirementDescriptionOf = (source: RequirementBusinessSource): string => 
  * excluded because they are metadata rather than requirement evidence.
  */
 export const buildRequirementBusinessText = (source: RequirementBusinessSource): string => {
-  const title = toRequirementPlainText(source.name)
-  const raw = source.raw ?? {}
-  const requirementType = requirementRawField(raw, [
-    'IssueType', 'issueType', '_valm_IssueType', 'requirementType', '需求类型', '问题类型'
+  const mappedTitle = requirementSemanticField(source, [
+    '_valm_Name', 'requirementTitle', 'requirementName', 'title', '需求标题', '需求名称', '标题'
+  ], [
+    '需求标题', '需求名称', '标题', '主题', '名称'
   ])
-  const productDomain = requirementRawField(raw, [
+  const title = mappedTitle || toRequirementPlainText(source.name)
+  const requirementType = requirementSemanticField(source, [
+    'IssueType', 'issueType', '_valm_IssueType', 'requirementType', '需求类型', '问题类型'
+  ], [
+    '需求类型', '问题类型', '类型'
+  ])
+  const productDomain = requirementSemanticField(source, [
     '_valm_ProductDomain', '_valm_Product', 'productDomain', 'product', 'domain',
     '产品域', '产品领域', '产品'
+  ], [
+    '产品域', '产品领域', '所属产品', '产品'
   ])
-  const module = requirementRawField(raw, [
+  const module = requirementSemanticField(source, [
     '_valm_Module', '_valm_ModuleName', 'module', 'moduleName', 'Module', 'ModuleName',
     'featureModule', 'featureModuleName', 'requirementModule', '业务模块', '功能模块', '模块'
+  ], [
+    '业务模块', '功能模块', '需求模块', '所属模块', '模块'
   ])
   const description = requirementDescriptionOf(source)
   return [

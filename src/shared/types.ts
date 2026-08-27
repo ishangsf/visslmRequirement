@@ -760,6 +760,26 @@ export interface DataDeleteResult {
   message: string
 }
 
+export type DataDeleteProgressStatus = 'running' | 'completed' | 'failed'
+
+export type DataDeleteProgressPhase =
+  | 'preparing'
+  | 'deleting_records'
+  | 'rebuilding_index'
+  | 'completed'
+  | 'failed'
+
+export interface DataDeleteProgress {
+  taskId: string
+  status: DataDeleteProgressStatus
+  phase: DataDeleteProgressPhase
+  current: number
+  total: number
+  percent: number
+  message: string
+  detail?: string
+}
+
 export interface PushFieldMapping {
   id: string
   sourceField: string
@@ -971,6 +991,28 @@ export interface SyncPreviewRequest {
   error?: string
 }
 
+/** Stable, persistence-safe activity entry for a completed assistant turn. */
+export type AssistantExecutionLogKind = 'narrative' | 'tool' | 'checkpoint'
+
+export type AssistantExecutionLogStatus = 'running' | 'completed' | 'warning' | 'failed'
+
+export interface AssistantExecutionLogEntry {
+  activityId: string
+  sequence: number
+  kind: AssistantExecutionLogKind
+  stage: string
+  title?: string
+  summary: string
+  status: AssistantExecutionLogStatus
+  createdAt: string
+}
+
+/** Append-only execution facts retained with the assistant message. */
+export interface AssistantExecutionLog {
+  durationMs: number
+  entries: AssistantExecutionLogEntry[]
+}
+
 export interface ChatMessage {
   id: string
   role: 'user' | 'assistant'
@@ -990,6 +1032,8 @@ export interface ChatMessage {
   taskTrace?: AssistantTaskTrace
   /** Confirmed plan and actual source scope used for this assistant turn. */
   executionSummary?: AssistantExecutionSummary
+  /** Persisted, safe execution activities for this completed assistant turn. */
+  executionLog?: AssistantExecutionLog
   /** Session-level scope carried forward explicitly and restored with history. */
   dataScope?: DataScope
   dataScopeSummary?: string
@@ -1669,6 +1713,7 @@ export interface AppApi {
   resumeDataImportRun(id: string): Promise<DataImportResult>
   exportData(query?: RecordExportQuery): Promise<DataExportResult>
   deleteData(uids?: string[]): Promise<DataDeleteResult>
+  onDataDeleteProgress(callback: (progress: DataDeleteProgress) => void): () => void
   previewPush(config: PushConfig): Promise<PushResult>
   startPush(config: PushConfig): Promise<PushResult>
   listPushLogs(page?: number, pageSize?: number): Promise<PushLogPage>

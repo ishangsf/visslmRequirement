@@ -34,7 +34,14 @@ export default defineConfig({
     plugins: [externalizeDepsPlugin()],
     build: {
       rollupOptions: {
-        input: resolve(__dirname, 'src/main/index.ts')
+        input: {
+          index: resolve(__dirname, 'src/main/index.ts'),
+          'embedding-worker': resolve(__dirname, 'src/main/embedding-worker.ts')
+        },
+        output: {
+          entryFileNames: '[name].js',
+          chunkFileNames: 'chunks/[name]-[hash].js'
+        }
       }
     }
   },

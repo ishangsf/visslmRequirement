@@ -28,6 +28,7 @@ import type {
   AssistantArtifactExportRequest,
   AssistantArtifactExportResult,
   AssistantPlanPatch,
+  DataDeleteProgress,
   DataImportResult,
   DataImportRunSnapshot,
   DataReviewApplyInput,
@@ -149,6 +150,10 @@ import {
   isUnsupportedWindowsVersion,
   unsupportedWindowsMessage
 } from './platform-compat'
+import {
+  diagnoseRuntimeDependencies,
+  formatRuntimeDependencyDiagnosis
+} from './runtime-dependencies'
 import { isNavigationAbortedError } from './navigation-error'
 import { createProjectWorkbook } from './project-export'
 import {
@@ -203,6 +208,7 @@ const sourcePreviewRenderFormats: Record<string, NonNullable<KnowledgeDocumentPr
 const execFileAsync = promisify(execFile)
 const previewUrlTtlMs = 5 * 60 * 1000
 const maxPreviewUrls = 32
+const dataDeleteBatchSize = 200
 const previewFiles = new Map<string, { filePath: string; byteSize: number; mimeType: string; expiresAt: number }>()
 const assistantRunRegistry = new AssistantRunRegistry()
 const assistantPlanConfirmation = new AssistantPlanConfirmationController()
@@ -354,6 +360,19 @@ const scheduleKnowledgeInitialization = (): void => {
   knowledgeInitializationTimer.unref?.()
 }
 
+/**
+ * Queue record indexing behind the current dataset mutation without keeping
+ * the initiating IPC request open for model inference.  syncRecordIndex()
+ * acquires the shared record lock itself, so calling this while a mutation
+ * still owns the lock preserves write -> index ordering without deadlocking.
+ */
+const scheduleRecordIndexSync = (reason: string): void => {
+  if (!knowledgeService) return
+  void knowledgeService.syncRecordIndex().catch((error) => {
+    console.error(`[knowledge] background record index failed (${reason})`, error)
+  })
+}
+
 const updateErrorMessage = (error: unknown): string => {
   if (error instanceof Error && error.message.trim()) return error.message.trim()
   return String(error || '未知错误')
@@ -458,7 +477,7 @@ const runLegacyDataImport = async (
       checkpointSourceRowCount = parsed.rowCount
       checkpointParseErrorCount = parsed.parseErrorCount
       const result = mergeDataImportResults(batchResults)
-      await knowledgeService.syncRecordIndexInLock()
+      scheduleRecordIndexSync('legacy-import')
       projectManagementService.markMatchesStale()
       const newParseErrorCount = Math.max(0, parsed.parseErrorCount - seed.parseErrorCount)
       result.path = filePath
@@ -481,7 +500,8 @@ const runLegacyDataImport = async (
         (seed.batchCount > 0 ? `（累计 ${totalImportedRecordCount} 条记录）` : '') +
         (result.duplicates.length
           ? `，发现 ${result.duplicates.length} 条已有 _valm_ItemID，待审查覆盖`
-          : '')
+          : '') +
+        '，向量索引已转入后台更新'
       totalSkippedCount += newParseErrorCount
       db.finishDataImportRun(importRunId, 'success', {
         batchCount,
@@ -956,8 +976,9 @@ const registerIpc = (): void => {
     return recordIndexLock.runExclusive(async () => {
       const result = await syncService.run(config ?? settings.getSyncConfig() ?? undefined)
       if (result.ok) {
-        await knowledgeService.syncRecordIndexInLock()
+        scheduleRecordIndexSync('sync')
         projectManagementService.markMatchesStale()
+        result.message = `${result.message}，向量索引已转入后台更新`
       }
       return result
     })
@@ -970,8 +991,9 @@ const registerIpc = (): void => {
           ? await syncService.applyDataReviews(input.batchId, input.reviewIds)
           : db.applyImportDataReviews(input.batchId, input.reviewIds)
         if (result.updatedCount > 0) {
-          await knowledgeService.syncRecordIndexInLock()
+          scheduleRecordIndexSync('data-review')
           projectManagementService.markMatchesStale()
+          result.message = `${result.message}，向量索引已转入后台更新`
         }
         return result
       })
@@ -2473,10 +2495,10 @@ const registerIpc = (): void => {
     if (extension === '.visslmpack') {
       return recordIndexLock.runExclusive(async () => {
         const imported = await importVisslmPack(db, filePath)
-        await knowledgeService.syncRecordIndexInLock()
+        scheduleRecordIndexSync('visslm-pack-import')
         projectManagementService.markMatchesStale()
         imported.path = filePath
-        imported.message = `${imported.message}，资源包校验通过`
+        imported.message = `${imported.message}，资源包校验通过，向量索引已转入后台更新`
         return imported
       })
     }
@@ -2520,12 +2542,118 @@ const registerIpc = (): void => {
     return runLegacyDataImport(resumed.path, resumed.format, resumed.id, resumed)
   })
 
-  ipcMain.handle('data:delete', async (_event, uids?: string[]) => {
+  ipcMain.handle('data:delete', async (ipcEvent, uids?: string[]) => {
+    const taskId = randomUUID()
+    const sendProgress = (progress: DataDeleteProgress): void => {
+      try {
+        if (!ipcEvent.sender.isDestroyed()) {
+          ipcEvent.sender.send('data:delete-progress', progress)
+        }
+      } catch {
+        // The requesting renderer may close while a deletion is in progress.
+      }
+    }
+
     return recordIndexLock.runExclusive(async () => {
-      const result = db.deleteData(uids)
-      await knowledgeService.syncRecordIndexInLock()
-      projectManagementService.markMatchesStale()
-      return result
+      const deleteAll = uids === undefined
+      const selected = [...new Set(
+        (Array.isArray(uids) ? uids : [])
+          .filter((uid): uid is string => typeof uid === 'string')
+          .map((uid) => uid.trim())
+          .filter(Boolean)
+      )]
+      let recordUids: string[] = selected
+      let total = 0
+      let current = 0
+      let lastPercent = 0
+      let recordCount = 0
+      let imageCount = 0
+
+      const emit = (
+        phase: DataDeleteProgress['phase'],
+        status: DataDeleteProgress['status'],
+        message: string,
+        percent: number,
+        detail?: string
+      ): void => {
+        const safePercent = Math.max(0, Math.min(100, Math.trunc(percent)))
+        const monotonicPercent = Math.max(lastPercent, safePercent)
+        lastPercent = monotonicPercent
+        sendProgress({
+          taskId,
+          status,
+          phase,
+          current,
+          total,
+          percent: monotonicPercent,
+          message,
+          ...(detail ? { detail } : {})
+        })
+      }
+
+      try {
+        if (deleteAll) recordUids = db.listRecordUids({})
+        total = recordUids.length
+        // Capture the global DISTINCT image count before splitting deletion
+        // into batches; summing db.deleteData(batch) would double-count a
+        // shared image hash that crosses a batch boundary.
+        imageCount = db.countDataDeleteImages(deleteAll ? undefined : recordUids)
+        emit('preparing', 'running', `正在准备删除 ${total} 条记录`, 0)
+        await new Promise<void>((resolve) => setImmediate(resolve))
+
+        for (let offset = 0; offset < recordUids.length; offset += dataDeleteBatchSize) {
+          const batch = recordUids.slice(offset, offset + dataDeleteBatchSize)
+          const result = db.deleteData(batch)
+          recordCount += result.recordCount
+          current = Math.min(total, offset + batch.length)
+          const deletionPercent = total > 0
+            ? Math.min(90, Math.floor((current / total) * 90))
+            : 0
+          emit(
+            'deleting_records',
+            'running',
+            `正在删除记录（${current}/${total}）`,
+            deletionPercent,
+            `${recordCount} 条记录，${imageCount} 张图片`
+          )
+          if (current < total) {
+            await new Promise<void>((resolve) => setImmediate(resolve))
+          }
+        }
+
+        // The historical delete-all path also clears orphaned projects and
+        // review rows, so retain that cleanup after batched record deletion.
+        if (deleteAll) {
+          const cleanupResult = db.deleteData()
+          recordCount += cleanupResult.recordCount
+        } else if (!recordUids.length) {
+          // Preserve the existing no-selection result message and semantics.
+          const emptyResult = db.deleteData(recordUids)
+          recordCount = emptyResult.recordCount
+        }
+
+        emit('rebuilding_index', 'running', '正在排队更新知识库索引', 95)
+        await new Promise<void>((resolve) => setImmediate(resolve))
+        scheduleRecordIndexSync('data-delete')
+        projectManagementService.markMatchesStale()
+
+        emit(
+          'completed',
+          'completed',
+          `删除完成：${recordCount} 条记录，${imageCount} 张图片，向量索引已转入后台更新`,
+          100
+        )
+        return {
+          ok: true,
+          recordCount,
+          imageCount,
+          message: `已删除 ${recordCount} 条记录和 ${imageCount} 张图片，向量索引已转入后台更新`
+        }
+      } catch (error) {
+        const detail = updateErrorMessage(error)
+        emit('failed', 'failed', `删除失败：${detail}`, Math.min(99, lastPercent), detail)
+        throw error
+      }
     })
   })
   ipcMain.handle('knowledge:documents', (_event, query: KnowledgeDocumentQuery) =>
@@ -2855,6 +2983,20 @@ if (!hasSingleInstanceLock) {
       const message = unsupportedWindowsMessage(systemVersion)
       console.error(`[startup] ${message}`)
       dialog.showErrorBox('VISSLM Agent 无法启动', message)
+      app.quit()
+      return
+    }
+
+    const runtimeDependencies = diagnoseRuntimeDependencies({
+      windowsVersion: systemVersion
+    })
+    if (!runtimeDependencies.ok) {
+      const message = formatRuntimeDependencyDiagnosis(runtimeDependencies)
+      console.error(`[startup] ${message}`)
+      dialog.showErrorBox(
+        'VISSLM Agent 运行环境不完整',
+        `${message}\n\n安装包已内置离线修复资源；请重新运行完整安装包。`
+      )
       app.quit()
       return
     }

@@ -45,7 +45,7 @@ VISSLM Agent 是一个面向 Windows 的数据智能工作台，用于采集 VIS
 
 - 在“数据推送”中选择本地记录，预览将要发送的请求和消息体。
 - 支持目标节点类型、项目 UID、父节点、插入位置和源字段到目标字段的映射。
-- 首次进入时字段映射默认取第一条记录的全部可推送属性，其中 `Source` 默认映射到 `RequireBy`、`_valm_Description` 映射到 `UserStoryDescription`、`_valm_ItemID` 映射到 `AcceptCriteria`；配置会在切换导航后保留，未映射属性不会写入请求消息体。
+- 首次进入时字段映射默认取第一条记录的全部可推送属性，其中 `Source` 默认映射到 `RequireBy`、`_valm_Description` 映射到 `UserStoryDescription`、`_valm_ItemID` 映射到 `AcceptCriteria`、`RAO` 映射到 `Devs`、`TSIS_ClarifyInfo` 映射到 `_valm_Description`；配置会在切换导航后保留，未映射属性不会写入请求消息体。
 - 预览不会发送请求；真实推送使用 VISSLM `POST /alm/rest/items` 接口，并保留请求日志和逐条成功/失败状态。
 - 正文中的每个唯一图片资源在每次推送时都会先调用 `FileCenterImg/UploadRichImg`；同一条记录内内容相同的图片只上传一次并复用本次返回路径。上传成功后替换正文链接，最后才调用 `/rest/items` 创建记录；任何图片失败时都不会创建对应记录。
 - `_valm_ItemID` 仅允许作为源属性，默认映射到 `AcceptCriteria`，其原键不会进入消息体；`_valm_Uid`、`_valm_NodeType` 不允许作为源属性，三者均不允许作为目标属性。

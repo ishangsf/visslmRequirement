@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "file": "vc_redist.x64.exe",
+  "product": "Microsoft Visual C++ 2015-2022 Redistributable (x64)",
+  "fileVersion": "14.44.35211.0",
+  "source": "https://aka.ms/vs/17/release/14.44.35211/VC_redist.x64.exe",
+  "resolvedUrl": "https://download.visualstudio.microsoft.com/download/pr/a808f267-2249-4e43-87d5-cccfcfaf746b/CC0FF0EB1DC3F5188AE6300FAEF32BF5BEEBA4BDD6E8E445A9184072096B713B/VC_redist.x64.exe",
+  "size": 25635768,
+  "sha256": "cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b",
+  "authenticode": {
+    "status": "Valid",
+    "subject": "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US",
+    "thumbprint": "8F985BE8FD256085C90A95D3C74580511A1DB975"
+  }
+}

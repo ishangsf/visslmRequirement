@@ -127,6 +127,8 @@ import type {
   AssistantArtifact,
   AssistantArtifactOutputFormat,
   AssistantArtifactPreview,
+  AssistantExecutionLog,
+  AssistantExecutionLogEntry,
   AssistantArtifactType,
   AssistantPlanFilter,
   AssistantPlanFilterOperator,
@@ -144,6 +146,7 @@ import type {
   ChatSessionSummary,
   CollectionRequestLogRow,
   ConnectionResult,
+  DataDeleteProgress,
   DataImportResult,
   DataImportRunSnapshot,
   DataReviewApplyResult,
@@ -715,7 +718,7 @@ type AgentActivityEvent = {
 
 type AgentWorkLogEntry = {
   activityId: string
-  sequence?: number
+  sequence: number
   kind: AgentActivityKind
   stage: string
   title?: string
@@ -942,6 +945,14 @@ const safeAgentActivityTextOf = (value: unknown, maxLength = 240): string | unde
   return normalized
 }
 
+/** Keep persisted logs bounded while retaining the same privacy guard. */
+const truncatedAgentActivityTextOf = (value: unknown, maxLength = 240): string | undefined => {
+  if (typeof value !== 'string') return undefined
+  const normalized = value.replace(/\s+/g, ' ').trim()
+  if (!normalized || agentInternalTextPattern.test(normalized)) return undefined
+  return normalized.slice(0, maxLength)
+}
+
 const agentActivityEventOf = (event: AgentEvent): AgentActivityEvent | undefined => {
   const value: unknown = event
   if (!isRecordObject(value) || value.type !== 'activity') return undefined
@@ -997,13 +1008,18 @@ const agentWorkLogEntryOfStatus = (
 ): AgentWorkLogEntry | undefined => {
   const summary = safeAgentActivityTextOf(event.message)
   if (!summary) return undefined
+  const stage = safeAgentActivityTextOf(event.stage, 80) ?? 'execution'
+  const status: AgentActivityStatus = /(?:已确认|已完成|确认完成|校验通过|查询成功|检索完成|执行成功|已就绪)/u.test(summary)
+    ? 'completed'
+    : 'running'
   return {
     activityId: `status-${order}`,
+    sequence: order,
     kind: 'checkpoint',
-    stage: event.stage,
-    title: agentStageLabelOf(event.stage),
+    stage,
+    title: agentStageLabelOf(stage),
     summary,
-    status: 'running',
+    status,
     createdAt: new Date().toISOString(),
     source: 'status',
     order
@@ -1017,6 +1033,271 @@ const agentWorkLogEntriesSorted = (entries: AgentWorkLogEntry[]): AgentWorkLogEn
       : left.order - right.order
   ))
 )
+
+const agentWorkLogEntryIdentityMatches = (
+  left: AgentWorkLogEntry,
+  right: AgentWorkLogEntry
+): boolean => {
+  if (left.source !== right.source) return false
+  if (left.source !== 'activity') return left.activityId === right.activityId
+  return left.activityId === right.activityId || left.sequence === right.sequence
+}
+
+const agentWorkLogEntriesWithEntry = (
+  entries: AgentWorkLogEntry[],
+  entry: AgentWorkLogEntry,
+  maxEntries = 80
+): AgentWorkLogEntry[] => {
+  const existingIndex = entries.findIndex((item) => agentWorkLogEntryIdentityMatches(item, entry))
+  let nextEntries = entries
+
+  // Legacy status events are synthetic checkpoints. A newer checkpoint means
+  // the preceding status checkpoint is no longer the active one; preserve it
+  // in the log as completed instead of leaving several rows "in progress".
+  if (entry.kind === 'checkpoint') {
+    nextEntries = entries.map((item) => (
+      item.source === 'status' && item.kind === 'checkpoint' && item.status === 'running' &&
+      (existingIndex === -1 || !agentWorkLogEntryIdentityMatches(item, entry))
+        ? { ...item, status: 'completed' as const }
+        : item
+    ))
+  }
+
+  if (existingIndex !== -1) {
+    const existing = nextEntries[existingIndex]
+    if (!existing) return nextEntries
+    // Keep the original position while accepting the completion event's
+    // latest status, title and safe summary.
+    nextEntries = nextEntries.map((item, index) => (
+      index === existingIndex ? { ...existing, ...entry, order: existing.order } : item
+    ))
+  } else {
+    nextEntries = [...nextEntries, entry]
+  }
+  return agentWorkLogEntriesSorted(nextEntries).slice(-maxEntries)
+}
+
+type AgentWorkLogTerminalOutcome = 'completed' | 'failed' | 'cancelled' | 'warning'
+
+const settleAgentWorkLogEntries = (
+  entries: AgentWorkLogEntry[],
+  outcome: AgentWorkLogTerminalOutcome
+): AgentWorkLogEntry[] => {
+  const latestRunningIndex = entries.reduce<number>((latest, entry, index) => (
+    entry.status === 'running' ? index : latest
+  ), -1)
+  return entries.map((entry, index) => {
+    if (entry.status !== 'running') return entry
+    if (outcome === 'failed') {
+      return { ...entry, status: index === latestRunningIndex ? 'failed' : 'completed' }
+    }
+    if (outcome === 'cancelled' || outcome === 'warning') {
+      return { ...entry, status: index === latestRunningIndex ? 'warning' : 'completed' }
+    }
+    return { ...entry, status: 'completed' }
+  })
+}
+
+const executionLogDurationOf = (startedAt: string, completedAt: string): number => {
+  const startedMs = Date.parse(startedAt)
+  const completedMs = Date.parse(completedAt)
+  if (!Number.isFinite(startedMs) || !Number.isFinite(completedMs)) return 0
+  return Math.max(0, Math.min(24 * 60 * 60 * 1000, completedMs - startedMs))
+}
+
+const assistantExecutionLogForEntries = (
+  entries: AgentWorkLogEntry[],
+  startedAt: string,
+  completedAt: string
+): AssistantExecutionLog => {
+  const safeEntries = agentWorkLogEntriesSorted(entries)
+    .slice(-80)
+    .map<AssistantExecutionLogEntry | null>((entry) => {
+      const activityId = truncatedAgentActivityTextOf(entry.activityId, 120)
+      const stage = truncatedAgentActivityTextOf(entry.stage, 80)
+      const summary = truncatedAgentActivityTextOf(entry.summary)
+      if (!activityId || !stage || !summary || !Number.isSafeInteger(entry.sequence) || entry.sequence < 0) {
+        return null
+      }
+      const title = truncatedAgentActivityTextOf(entry.title, 120)
+      return {
+        activityId,
+        sequence: entry.sequence,
+        kind: entry.kind,
+        stage,
+        ...(title ? { title } : {}),
+        summary,
+        status: entry.status,
+        createdAt: typeof entry.createdAt === 'string' && !Number.isNaN(Date.parse(entry.createdAt))
+          ? entry.createdAt
+          : new Date(0).toISOString()
+      }
+    })
+    .filter((entry): entry is AssistantExecutionLogEntry => Boolean(entry))
+  return {
+    durationMs: executionLogDurationOf(startedAt, completedAt),
+    entries: safeEntries
+  }
+}
+
+const assistantExecutionLogOfMessage = (
+  message: ChatMessage
+): AssistantExecutionLog | undefined => {
+  const raw = message.executionLog
+  if (!isRecordObject(raw) || !Array.isArray(raw.entries)) return undefined
+  const durationMs = typeof raw.durationMs === 'number' && Number.isFinite(raw.durationMs)
+    ? Math.max(0, Math.min(24 * 60 * 60 * 1000, Math.trunc(raw.durationMs)))
+    : 0
+  const entries = raw.entries
+    .slice(-80)
+    .map<AssistantExecutionLogEntry | null>((value, index) => {
+      if (!isRecordObject(value)) return null
+      const activityId = truncatedAgentActivityTextOf(value.activityId, 120)
+      const stage = truncatedAgentActivityTextOf(value.stage, 80)
+      const summary = truncatedAgentActivityTextOf(value.summary)
+      const sequence = typeof value.sequence === 'number' && Number.isSafeInteger(value.sequence) && value.sequence >= 0
+        ? value.sequence
+        : index
+      const kind = value.kind
+      const status = value.status
+      if (!activityId || !stage || !summary ||
+        (kind !== 'narrative' && kind !== 'tool' && kind !== 'checkpoint') ||
+        (status !== 'running' && status !== 'completed' && status !== 'warning' && status !== 'failed')) {
+        return null
+      }
+      const title = truncatedAgentActivityTextOf(value.title, 120)
+      const createdAt = typeof value.createdAt === 'string' && !Number.isNaN(Date.parse(value.createdAt))
+        ? value.createdAt
+        : new Date(0).toISOString()
+      return {
+        activityId,
+        sequence,
+        kind,
+        stage,
+        ...(title ? { title } : {}),
+        summary,
+        status,
+        createdAt
+      }
+    })
+    .filter((entry): entry is AssistantExecutionLogEntry => Boolean(entry))
+  return { durationMs, entries }
+}
+
+type AgentWorkLogDisplayEntry = Pick<
+  AgentWorkLogEntry,
+  'activityId' | 'sequence' | 'kind' | 'stage' | 'title' | 'summary' | 'status' | 'createdAt'
+>
+
+const agentWorkLogStatusLabelOf = (status: AgentActivityStatus): string => (
+  status === 'running'
+    ? '进行中'
+    : status === 'completed'
+      ? '已完成'
+      : status === 'warning'
+        ? '需注意'
+        : '失败'
+)
+
+type AgentWorkLogDisclosureProps = {
+  id: string
+  entries: readonly AgentWorkLogDisplayEntry[]
+  durationMs: number
+  durationLabel?: string
+  open?: boolean
+  onOpenChange?: (open: boolean) => void
+  rationale?: AgentExecutionRationale | null
+}
+
+const AgentWorkLogDisclosure = ({
+  id,
+  entries,
+  durationMs,
+  durationLabel,
+  open,
+  onOpenChange,
+  rationale
+}: AgentWorkLogDisclosureProps): React.JSX.Element => {
+  const [internalOpen, setInternalOpen] = useState(false)
+  const isControlled = open !== undefined
+  const expanded = isControlled ? open : internalOpen
+  const sortedEntries = [...entries].sort((left, right) => left.sequence - right.sequence)
+  const toggle = (): void => {
+    const nextOpen = !expanded
+    if (!isControlled) setInternalOpen(nextOpen)
+    onOpenChange?.(nextOpen)
+  }
+  return (
+    <div className="agent-work-log-disclosure">
+      <button
+        type="button"
+        className="agent-work-log-toggle"
+        aria-expanded={expanded}
+        aria-controls={id}
+        onClick={toggle}
+      >
+        <span className="agent-work-log-duration">{durationLabel ?? formatAgentRunElapsed(durationMs)}</span>
+        <span className="agent-work-log-toggle-label">执行日志</span>
+        <span className="agent-work-log-count">{sortedEntries.length ? `${sortedEntries.length} 条` : '暂无事件'}</span>
+        <DownOutlined aria-hidden="true" />
+      </button>
+      {expanded && (
+        <div id={id} className="agent-work-log-content" aria-label="Agent 连续执行日志" aria-live="polite">
+          {rationale && (
+            <section className="agent-execution-rationale" aria-label="执行思路摘要">
+              <div className="agent-execution-rationale-heading">
+                <BulbOutlined aria-hidden="true" />
+                <strong>执行思路摘要</strong>
+                <small>仅展示可审计摘要，不是模型私有思维链</small>
+              </div>
+              <div className="agent-execution-rationale-grid">
+                {rationale.current && (
+                  <div><span>当前判断</span><p>{rationale.current}</p></div>
+                )}
+                {rationale.basis && (
+                  <div><span>依据 / 策略</span><p>{rationale.basis}</p></div>
+                )}
+                {rationale.next && (
+                  <div><span>下一步</span><p>{rationale.next}</p></div>
+                )}
+              </div>
+            </section>
+          )}
+          {sortedEntries.length ? (
+            <div className="agent-work-log-list" role="list">
+              {sortedEntries.map((entry) => {
+                const entryTitle = entry.title ?? agentStageLabelOf(entry.stage)
+                const entryIcon = entry.kind === 'tool'
+                  ? <ThunderboltOutlined aria-hidden="true" />
+                  : entry.kind === 'narrative'
+                    ? <BulbOutlined aria-hidden="true" />
+                    : <InfoCircleOutlined aria-hidden="true" />
+                return (
+                  <div
+                    className={`agent-work-log-entry ${entry.kind} status-${entry.status}`}
+                    key={`${entry.activityId}-${entry.sequence}`}
+                    role="listitem"
+                  >
+                    <span className="agent-work-log-entry-icon">{entryIcon}</span>
+                    <div className="agent-work-log-entry-copy">
+                      <div className="agent-work-log-entry-heading">
+                        <strong>{entryTitle}</strong>
+                        <span>{agentWorkLogStatusLabelOf(entry.status)}</span>
+                      </div>
+                      <p>{entry.summary}</p>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          ) : (
+            <span className="agent-work-log-empty">等待 Agent 发布可审计执行事件…</span>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
 
 const agentExecutionRationaleOf = (
   event: Extract<AgentEvent, { type: 'status' }>
@@ -3453,6 +3734,14 @@ const recordMaintenanceOperationLabels: Record<RecordMaintenanceOperation, strin
   rebuild_indexes: '仅重建索引'
 }
 
+const dataDeletePhaseLabels: Record<DataDeleteProgress['phase'], string> = {
+  preparing: '准备删除',
+  deleting_records: '删除记录',
+  rebuilding_index: '重建索引',
+  completed: '已完成',
+  failed: '删除失败'
+}
+
 const recordMaintenanceTaskStatusLabels: Record<RecordMaintenanceTaskStatus, string> = {
   queued: '排队中',
   scanning: '扫描中',
@@ -4297,6 +4586,9 @@ function DataPage({
   const [resumingImportRunId, setResumingImportRunId] = useState<string | null>(null)
   const [exporting, setExporting] = useState(false)
   const [deleting, setDeleting] = useState(false)
+  const [dataDeleteProgress, setDataDeleteProgress] = useState<DataDeleteProgress | null>(null)
+  const deletingRef = useRef(false)
+  const dataDeleteTaskIdRef = useRef<string | null>(null)
   const [review, setReview] = useState<{ batchId: string; items: DataReviewItem[] } | null>(null)
   const [maintenanceOpen, setMaintenanceOpen] = useState(false)
   const [maintenanceOpenFromDetail, setMaintenanceOpenFromDetail] = useState(false)
@@ -4495,6 +4787,22 @@ function DataPage({
       applyMaintenanceSnapshot(snapshot)
     })
   }, [applyMaintenanceSnapshot])
+
+  useEffect(() => {
+    if (typeof window.visslm.onDataDeleteProgress !== 'function') return undefined
+    return window.visslm.onDataDeleteProgress((snapshot) => {
+      if (!deletingRef.current) return
+      const activeTaskId = dataDeleteTaskIdRef.current
+      if (activeTaskId && activeTaskId !== snapshot.taskId) return
+      if (!activeTaskId) {
+        // A terminal event that was queued by an earlier flow must not claim
+        // this flow before its first running snapshot arrives.
+        if (snapshot.status !== 'running') return
+        dataDeleteTaskIdRef.current = snapshot.taskId
+      }
+      setDataDeleteProgress(snapshot)
+    })
+  }, [])
 
   const maintenanceTargetIds = useMemo(
     () => [...new Set(maintenanceTargetUids.map((uid) => uid.trim()).filter(Boolean))],
@@ -4727,7 +5035,54 @@ function DataPage({
     }
   }
 
+  const runDataDeletion = async (uids?: string[]): Promise<void> => {
+    if (deletingRef.current) return
+    const flowId = crypto.randomUUID()
+    deletingRef.current = true
+    dataDeleteTaskIdRef.current = null
+    setDataDeleteProgress(null)
+    setDeleting(true)
+    try {
+      const result = await window.visslm.deleteData(uids)
+      if (!result.ok) throw new Error(result.message || '数据删除失败')
+      message.success(result.message)
+      setDataDeleteProgress(null)
+      setSelectedRowKeys([])
+      setDetail(null)
+      setPage(1)
+      onDataChanged()
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error)
+      const failedTaskId = dataDeleteTaskIdRef.current ?? flowId
+      setDataDeleteProgress((current) => {
+        if (current?.status === 'failed') {
+          return {
+            ...current,
+            message: current.message || errorMessage,
+            detail: current.detail || errorMessage
+          }
+        }
+        return {
+          taskId: failedTaskId,
+          status: 'failed',
+          phase: 'failed',
+          current: current?.current ?? 0,
+          total: current?.total ?? 0,
+          percent: current?.percent ?? 0,
+          message: errorMessage,
+          detail: '删除流程未完成，请根据错误信息处理后重试'
+        }
+      })
+      message.error(errorMessage)
+    } finally {
+      deletingRef.current = false
+      dataDeleteTaskIdRef.current = null
+      setDeleting(false)
+    }
+  }
+
   const deleteData = (uids?: string[]): void => {
+    if (deletingRef.current || deleting) return
     const deletingAll = uids === undefined
     const count = deletingAll ? total : uids.length
     modal.confirm({
@@ -4738,21 +5093,8 @@ function DataPage({
       okText: deletingAll ? '全部删除' : '删除',
       okType: 'danger',
       cancelText: '取消',
-      onOk: async () => {
-        setDeleting(true)
-        try {
-          const result = await window.visslm.deleteData(uids)
-          message.success(result.message)
-          setSelectedRowKeys([])
-          setDetail(null)
-          setPage(1)
-          onDataChanged()
-        } catch (error) {
-          message.error(error instanceof Error ? error.message : String(error))
-          throw error
-        } finally {
-          setDeleting(false)
-        }
+      onOk: () => {
+        void runDataDeletion(uids)
       }
     })
   }
@@ -4794,6 +5136,32 @@ function DataPage({
     !maintenanceTaskIsActive
   )
   const detailMaintenance = detail?.maintenance ?? fallbackMaintenanceState()
+  const dataDeleteProgressVisible = Boolean(
+    dataDeleteProgress && ['running', 'failed'].includes(dataDeleteProgress.status)
+  )
+  const dataDeleteProgressFailed = dataDeleteProgress?.status === 'failed'
+  const dataDeleteProgressStage = dataDeleteProgress
+    ? dataDeletePhaseLabels[dataDeleteProgress.phase]
+    : ''
+  const dataDeleteProgressCurrent = dataDeleteProgress
+    ? Math.max(0, Math.trunc(Number.isFinite(dataDeleteProgress.current) ? dataDeleteProgress.current : 0))
+    : 0
+  const dataDeleteProgressTotal = dataDeleteProgress
+    ? Math.max(0, Math.trunc(Number.isFinite(dataDeleteProgress.total) ? dataDeleteProgress.total : 0))
+    : 0
+  const dataDeleteProgressPercent = dataDeleteProgress
+    ? Math.max(0, Math.min(100, Math.round(Number.isFinite(dataDeleteProgress.percent) ? dataDeleteProgress.percent : 0)))
+    : 0
+  const dataDeleteProgressMessage = dataDeleteProgress?.message
+    ?.trim()
+    .replace(/\s*[（(]\s*\d+\s*[\/／]\s*\d+\s*[）)]/gu, '')
+    .trim() || dataDeleteProgressStage
+  const dataDeleteProgressCount = dataDeleteProgressTotal > 0
+    ? `已处理 ${Math.min(dataDeleteProgressCurrent, dataDeleteProgressTotal)} / ${dataDeleteProgressTotal} 条`
+    : null
+  const dataDeleteProgressAccessibleLabel = dataDeleteProgress
+    ? `${dataDeleteProgressFailed ? '数据删除失败' : '正在删除数据'}，${dataDeleteProgressStage}，${dataDeleteProgressMessage}，进度 ${dataDeleteProgressPercent}%${dataDeleteProgressCount ? `，${dataDeleteProgressCount}` : ''}`
+    : ''
 
   return (
     <div className="page-stack">
@@ -4849,7 +5217,7 @@ function DataPage({
             danger
             icon={<DeleteOutlined />}
             loading={deleting}
-            disabled={!selectedRowKeys.length}
+            disabled={deleting || !selectedRowKeys.length}
             onClick={() => deleteData(selectedRowKeys)}
           >
             删除所选{selectedRowKeys.length ? `（${selectedRowKeys.length}）` : ''}
@@ -4859,13 +5227,57 @@ function DataPage({
             type="primary"
             icon={<DeleteOutlined />}
             loading={deleting}
-            disabled={!total}
+            disabled={deleting || !total}
             onClick={() => deleteData()}
           >
             全部删除
           </Button>
         </Space>
       </div>
+      {dataDeleteProgressVisible && dataDeleteProgress && (
+        <section
+          className={`asset-delete-progress-panel${dataDeleteProgressFailed ? ' is-failed' : ''}`}
+          role={dataDeleteProgressFailed ? 'alert' : 'status'}
+          aria-live={dataDeleteProgressFailed ? 'assertive' : 'polite'}
+          aria-label={dataDeleteProgressAccessibleLabel}
+        >
+          <div className="asset-delete-progress-heading">
+            <div className="asset-delete-progress-title">
+              <DeleteOutlined aria-hidden="true" />
+              <strong>{dataDeleteProgressFailed ? '数据删除失败' : '正在删除数据'}</strong>
+              <span className="asset-delete-progress-stage">{dataDeleteProgressStage}</span>
+            </div>
+            <div className="asset-delete-progress-meta">
+              {dataDeleteProgressCount && (
+                <span className="asset-delete-progress-count">{dataDeleteProgressCount}</span>
+              )}
+              {dataDeleteProgressFailed && (
+                <Button
+                  type="text"
+                  className="asset-delete-progress-dismiss"
+                  icon={<CloseOutlined aria-hidden="true" />}
+                  aria-label="关闭删除失败提示"
+                  title="关闭删除失败提示"
+                  onClick={() => setDataDeleteProgress(null)}
+                />
+              )}
+            </div>
+          </div>
+          <Tooltip title={dataDeleteProgressAccessibleLabel}>
+            <Progress
+              percent={dataDeleteProgressPercent}
+              status={dataDeleteProgressFailed ? 'exception' : 'active'}
+              showInfo={false}
+              strokeColor={dataDeleteProgressFailed ? 'var(--state-error)' : 'var(--accent)'}
+              aria-label={dataDeleteProgressAccessibleLabel}
+            />
+          </Tooltip>
+          <div className="asset-delete-progress-message">{dataDeleteProgressMessage}</div>
+          {dataDeleteProgress.detail && dataDeleteProgress.detail !== dataDeleteProgressMessage && (
+            <div className="asset-delete-progress-detail">{dataDeleteProgress.detail}</div>
+          )}
+        </section>
+      )}
       <Card className="data-workbench-card">
         <div className="filter-bar asset-center-filter-bar">
           <Input.Search
@@ -6656,6 +7068,7 @@ function ChatPage({
   const [agentExecutionRationale, setAgentExecutionRationale] = useState<AgentExecutionRationale | null>(null)
   const [agentWorkLogOpen, setAgentWorkLogOpen] = useState(false)
   const [agentRunElapsedMs, setAgentRunElapsedMs] = useState(0)
+  const agentWorkLogRef = useRef<AgentWorkLogEntry[]>([])
   const agentWorkLogOrderRef = useRef(0)
   const planAwaitingConfirmationPreviousRef = useRef(false)
   const [agentRunMetadata, setAgentRunMetadata] = useState<AgentRunMetadata>({})
@@ -7053,6 +7466,7 @@ function ChatPage({
 
   const resetAgentWorkLog = useCallback((): void => {
     agentWorkLogOrderRef.current = 0
+    agentWorkLogRef.current = []
     setAgentWorkLog([])
     setAgentExecutionRationale(null)
     setAgentWorkLogOpen(false)
@@ -7061,18 +7475,22 @@ function ChatPage({
 
   const appendAgentWorkLog = useCallback((entry: Omit<AgentWorkLogEntry, 'order'>): void => {
     const order = ++agentWorkLogOrderRef.current
-    setAgentWorkLog((current) => {
-      if (entry.source === 'activity' && current.some((item) => (
-        item.source === 'activity' && (
-          item.activityId === entry.activityId ||
-          (item.sequence !== undefined && item.sequence === entry.sequence)
-        )
-      ))) {
-        return current
-      }
-      return agentWorkLogEntriesSorted([...current, { ...entry, order }]).slice(-80)
-    })
+    const next = agentWorkLogEntriesWithEntry(
+      agentWorkLogRef.current,
+      { ...entry, order }
+    )
+    // Keep a synchronous snapshot because terminal handlers may run before
+    // React has committed the batched state update.
+    agentWorkLogRef.current = next
+    setAgentWorkLog(next)
   }, [])
+
+  const settleAgentWorkLog = (outcome: AgentWorkLogTerminalOutcome): AgentWorkLogEntry[] => {
+    const next = settleAgentWorkLogEntries(agentWorkLogRef.current, outcome)
+    agentWorkLogRef.current = next
+    setAgentWorkLog(next)
+    return next
+  }
 
   const clearActiveRun = (runId: string): boolean => {
     if (!isCurrentRun(runId)) return false
@@ -7120,6 +7538,11 @@ function ChatPage({
     executionSummaryRef.current = null
     setActiveExecutionSummary(null)
     const completedAt = new Date().toISOString()
+    const executionLog = assistantExecutionLogForEntries(
+      settleAgentWorkLog('cancelled'),
+      run.startedAt,
+      completedAt
+    )
     const cancellationMetadata = mergeAgentRunMetadata(run.initialMetadata, agentRunMetadata)
     const metadataTaskTrace = assistantTaskTraceViewFromObject({
       runId: run.runId,
@@ -7163,18 +7586,20 @@ function ChatPage({
     }
     const persistedTaskTrace = assistantTaskTracePayloadOf(cancelledTaskTrace, 'cancelled')
     const assistantMessageId = crypto.randomUUID()
+    const cancelledAssistantMessage: ChatMessage = {
+      id: assistantMessageId,
+      role: 'assistant',
+      content: '本次任务已停止，可修改问题后重试。',
+      retryQuestion: run.question,
+      ...(persistedTaskTrace ? { taskTrace: persistedTaskTrace } : {}),
+      executionLog,
+      createdAt: completedAt,
+      contextOutcome: 'undone'
+    }
     const cancelledMessages: ChatMessage[] = [
       ...run.baseMessages,
       { ...run.userMessage, contextOutcome: 'undone' },
-      {
-        id: assistantMessageId,
-        role: 'assistant',
-        content: '本次任务已停止，可修改问题后重试。',
-        retryQuestion: run.question,
-        ...(persistedTaskTrace ? { taskTrace: persistedTaskTrace } : {}),
-        createdAt: completedAt,
-        contextOutcome: 'undone'
-      }
+      cancelledAssistantMessage
     ]
 
     // Invalidate the awaiting askAgent continuation before any state update.
@@ -7753,6 +8178,18 @@ function ChatPage({
       })
       if (!isCurrentRun(runId)) return
       if (response.taskTrace?.runId && response.taskTrace.runId !== runId) return
+      // Some providers return the structured activity list only with the
+      // final response. Merge it before taking the terminal snapshot; live
+      // events are safely coalesced by activityId/sequence.
+      for (const event of response.events ?? []) {
+        const activityEvent = agentActivityEventOf(event)
+        if (activityEvent) {
+          appendAgentWorkLog(agentWorkLogEntryOfActivity(
+            activityEvent,
+            agentWorkLogOrderRef.current + 1
+          ))
+        }
+      }
       if (response.cancelled || response.taskTrace?.status === 'cancelled') {
         const currentRun = activeRunRef.current
         if (currentRun) finalizeCancelledRun(currentRun, response.taskTrace)
@@ -7811,32 +8248,40 @@ function ChatPage({
       const persistedTaskTrace = response.taskTrace ?? assistantTaskTracePayloadOf(responseTaskTrace, responseTaskStatus)
       if (response.artifactPreview) setArtifactPreview(response.artifactPreview)
       const assistantMessageId = crypto.randomUUID()
+      const completedAt = new Date().toISOString()
+      const executionLog = assistantExecutionLogForEntries(
+        settleAgentWorkLog(responseError ? 'failed' : response.needsClarification ? 'warning' : 'completed'),
+        startedAt,
+        completedAt
+      )
       const clarificationQuestion = response.clarificationQuestion?.trim() ||
         (response.needsClarification ? response.answer.trim() : '')
+      const completedAssistantMessage: ChatMessage = {
+        id: assistantMessageId,
+        role: 'assistant',
+        content: response.answer,
+        ...(responseError ? { retryQuestion: text } : {}),
+        sources: response.sources,
+        dataViews: response.dataViews,
+        dashboard: response.dashboard,
+        dashboardVersion,
+        expertId: response.expertId,
+        assistantIntent: response.assistantIntent,
+        executionSummary: response.executionSummary ?? executionSummaryRef.current ?? undefined,
+        executionLog,
+        recoverySuggestions: response.recoverySuggestions,
+        evidenceBlocks: response.evidenceBlocks,
+        ...(dataScope ? { dataScope, dataScopeSummary } : {}),
+        ...(persistedTaskTrace ? { taskTrace: persistedTaskTrace } : {}),
+        contextRefs: response.contextRefs,
+        contextStats: response.contextStats,
+        createdAt: completedAt,
+        contextOutcome: responseError ? 'failed' : 'success'
+      }
       const completedMessages: ChatMessage[] = [
         ...messages,
         { ...userMessage, contextOutcome: responseError ? 'failed' : 'success' },
-        {
-          id: assistantMessageId,
-          role: 'assistant',
-          content: response.answer,
-          ...(responseError ? { retryQuestion: text } : {}),
-          sources: response.sources,
-          dataViews: response.dataViews,
-          dashboard: response.dashboard,
-          dashboardVersion,
-          expertId: response.expertId,
-          assistantIntent: response.assistantIntent,
-          executionSummary: response.executionSummary ?? executionSummaryRef.current ?? undefined,
-          recoverySuggestions: response.recoverySuggestions,
-          evidenceBlocks: response.evidenceBlocks,
-          ...(dataScope ? { dataScope, dataScopeSummary } : {}),
-          ...(persistedTaskTrace ? { taskTrace: persistedTaskTrace } : {}),
-          contextRefs: response.contextRefs,
-          contextStats: response.contextStats,
-          createdAt: new Date().toISOString(),
-          contextOutcome: responseError ? 'failed' : 'success'
-        }
+        completedAssistantMessage
       ]
       setMessages(completedMessages)
       setMessageRunMetadata((current) => ({ ...current, [assistantMessageId]: responseMetadata }))
@@ -7861,17 +8306,25 @@ function ChatPage({
         ''
       )
       setQuestion(text)
+      const completedAt = new Date().toISOString()
+      const executionLog = assistantExecutionLogForEntries(
+        settleAgentWorkLog('failed'),
+        startedAt,
+        completedAt
+      )
+      const failedAssistantMessage: ChatMessage = {
+        id: crypto.randomUUID(),
+        role: 'assistant',
+        content: `请求失败：${errorMessage}`,
+        retryQuestion: text,
+        executionLog,
+        createdAt: completedAt,
+        contextOutcome: 'failed'
+      }
       const failedMessages: ChatMessage[] = [
         ...messages,
         { ...userMessage, contextOutcome: 'failed' },
-        {
-          id: crypto.randomUUID(),
-          role: 'assistant',
-          content: `请求失败：${errorMessage}`,
-          retryQuestion: text,
-          createdAt: new Date().toISOString(),
-          contextOutcome: 'failed'
-        }
+        failedAssistantMessage
       ]
       setMessages(failedMessages)
       setAgentRunStatus('failed')
@@ -8441,13 +8894,16 @@ function ChatPage({
             </div>
           ) : (
             messages.map((message, messageIndex) => {
-              const messageMetadata = mergeAgentRunMetadata(
-                agentRunMetadataOf(message),
-                messageRunMetadata[message.id] ?? {}
-              )
-              const messageTaskTrace = assistantTaskTraceForMessage(message, messageMetadata)
-              const clarificationQuestion = messageTaskTrace?.clarificationQuestion ||
-                clarificationByMessageId[message.id]
+               const messageMetadata = mergeAgentRunMetadata(
+                 agentRunMetadataOf(message),
+                 messageRunMetadata[message.id] ?? {}
+               )
+               const messageTaskTrace = assistantTaskTraceForMessage(message, messageMetadata)
+               const messageExecutionLog = message.role === 'assistant'
+                 ? assistantExecutionLogOfMessage(message)
+                 : undefined
+               const clarificationQuestion = messageTaskTrace?.clarificationQuestion ||
+                 clarificationByMessageId[message.id]
               const sourceGroups = chatSourceGroupsOf(message.sources)
               const sourceSummary = chatSourceSummaryOf(message.sources)
               return (
@@ -8487,6 +8943,13 @@ function ChatPage({
                     </div>
                     {message.role === 'assistant' && messageTaskTrace ? (
                       <AgentTaskSummary task={messageTaskTrace} className="chat-answer-task-summary" />
+                    ) : null}
+                    {message.role === 'assistant' && messageExecutionLog ? (
+                      <AgentWorkLogDisclosure
+                        id={`agent-work-log-content-message-${message.id}`}
+                        entries={messageExecutionLog.entries}
+                        durationMs={messageExecutionLog.durationMs}
+                      />
                     ) : null}
                     {message.role === 'assistant' && message.executionSummary ? (
                       <details className="agent-execution-summary is-persisted">
@@ -8627,40 +9090,79 @@ function ChatPage({
                               const view = block.dataViewId
                                 ? message.dataViews?.find((item) => item.id === block.dataViewId)
                                 : undefined
+                              const source = block.sourceIndexes
+                                ?.map((index) => message.sources?.[index])
+                                .find((item): item is ChatSource => Boolean(item))
+                              const sourceIsDocument = block.kind === 'document'
+                              const sourceDocumentId = sourceIsDocument
+                                ? normalizedChatSourceValueOf(source?.documentId)
+                                : ''
+                              const sourceRecordUid = !sourceIsDocument
+                                ? normalizedChatSourceValueOf(source?.uid)
+                                : ''
+                              const canOpen = Boolean(view || sourceDocumentId || sourceRecordUid)
+                              const evidenceCountUnit = block.kind === 'document'
+                                ? '份'
+                                : block.kind === 'aggregate'
+                                  ? '项'
+                                  : '条'
+                              const blockSummary = block.kind === 'record'
+                                ? '回答引用的数据记录，可打开原始记录核验'
+                                : block.kind === 'document'
+                                  ? '回答引用的知识文档，可打开原文核验'
+                                  : block.summary
                               const icon = block.kind === 'document'
                                 ? <FileTextOutlined aria-hidden="true" />
                                 : block.kind === 'record'
                                   ? <DatabaseOutlined aria-hidden="true" />
                                   : <EyeOutlined aria-hidden="true" />
+                              const countLabel = block.matchedCount === undefined
+                                ? `${block.count} ${evidenceCountUnit}`
+                                : `命中 ${block.matchedCount} ${evidenceCountUnit}${block.returnedCount === undefined ? '' : `，当前载入 ${block.returnedCount} ${evidenceCountUnit}`}`
                               const body = (
                                 <>
-                                  {icon}
-                                  <span>
-                                    <strong>{block.title}</strong>
-                                    <small>{block.summary}</small>
-                                    <em>
-                                      {block.matchedCount === undefined
-                                        ? `${block.count} 项`
-                                        : `命中 ${block.matchedCount} 项${block.returnedCount === undefined ? '' : `，当前载入 ${block.returnedCount} 项`}`}
-                                      {block.truncated ? ' · 可分页核验' : ''}
-                                    </em>
+                                  <span className="chat-evidence-block-icon">{icon}</span>
+                                  <span className="chat-evidence-block-copy">
+                                    <strong className="chat-evidence-block-title">{block.title}</strong>
+                                    <small>{blockSummary}</small>
+                                    <em className="chat-evidence-block-meta">{countLabel}{block.truncated ? ' · 可分页核验' : ''}</em>
                                   </span>
                                 </>
                               )
-                              return view ? (
-                                <Button
+                              const openEvidence = (): void => {
+                                if (view) {
+                                  openDataView(view)
+                                  return
+                                }
+                                if (sourceIsDocument && sourceDocumentId) {
+                                  void openKnowledgeDetail(sourceDocumentId, normalizedChatSourceValueOf(source?.chunkId) || undefined)
+                                  return
+                                }
+                                if (sourceRecordUid) {
+                                  void openRecordDetail({
+                                    uid: sourceRecordUid,
+                                    name: source?.name ?? '',
+                                    nodeType: source?.nodeType ?? '',
+                                    itemId: source?.itemId ?? '',
+                                    values: {}
+                                  }, true)
+                                }
+                              }
+                              return canOpen ? (
+                                <button
+                                  type="button"
                                   key={block.id}
-                                  type="text"
                                   className={`chat-evidence-block-item ${block.kind}`}
-                                  aria-label={`打开${block.title}：${block.summary}`}
-                                  onClick={() => openDataView(view)}
+                                  aria-label={`打开${block.title}：${blockSummary}，${countLabel}`}
+                                  title={`打开${block.title}`}
+                                  onClick={openEvidence}
                                 >
                                   {body}
-                                </Button>
+                                </button>
                               ) : (
-                                <div key={block.id} className={`chat-evidence-block-item ${block.kind}`}>
+                                <article key={block.id} className={`chat-evidence-block-item ${block.kind}`}>
                                   {body}
-                                </div>
+                                </article>
                               )
                             })}
                           </div>
@@ -8804,97 +9306,15 @@ function ChatPage({
                       <span>{latestStatusMessage}</span>
                       <Tag>{agentStageLabelOf(latestStatus?.stage)}</Tag>
                     </div>
-                    <div className="agent-work-log-disclosure">
-                      <button
-                        type="button"
-                        className="agent-work-log-toggle"
-                        aria-expanded={agentWorkLogOpen}
-                        aria-controls="agent-work-log-content"
-                        onClick={() => setAgentWorkLogOpen((open) => !open)}
-                      >
-                        <span className="agent-work-log-duration">{formatAgentRunElapsed(agentRunElapsedMs)}</span>
-                        <span className="agent-work-log-toggle-label">执行日志</span>
-                        <span className="agent-work-log-count">
-                          {visibleAgentWorkLog.length ? `${visibleAgentWorkLog.length} 条` : '等待事件'}
-                        </span>
-                        <DownOutlined aria-hidden="true" />
-                      </button>
-                      {agentWorkLogOpen && (
-                        <div
-                          id="agent-work-log-content"
-                          className="agent-work-log-content"
-                          aria-label="Agent 连续执行日志"
-                          aria-live="polite"
-                        >
-                          {agentExecutionRationale && (
-                            <section className="agent-execution-rationale" aria-label="执行思路摘要">
-                              <div className="agent-execution-rationale-heading">
-                                <BulbOutlined aria-hidden="true" />
-                                <strong>执行思路摘要</strong>
-                                <small>仅展示可审计摘要，不是模型私有思维链</small>
-                              </div>
-                              <div className="agent-execution-rationale-grid">
-                                {agentExecutionRationale.current && (
-                                  <div>
-                                    <span>当前判断</span>
-                                    <p>{agentExecutionRationale.current}</p>
-                                  </div>
-                                )}
-                                {agentExecutionRationale.basis && (
-                                  <div>
-                                    <span>依据 / 策略</span>
-                                    <p>{agentExecutionRationale.basis}</p>
-                                  </div>
-                                )}
-                                {agentExecutionRationale.next && (
-                                  <div>
-                                    <span>下一步</span>
-                                    <p>{agentExecutionRationale.next}</p>
-                                  </div>
-                                )}
-                              </div>
-                            </section>
-                          )}
-                          {visibleAgentWorkLog.length ? (
-                            <div className="agent-work-log-list" role="list">
-                              {visibleAgentWorkLog.map((entry) => {
-                                const entryTitle = entry.title ?? agentStageLabelOf(entry.stage)
-                                const entryIcon = entry.kind === 'tool'
-                                  ? <ThunderboltOutlined aria-hidden="true" />
-                                  : entry.kind === 'narrative'
-                                    ? <BulbOutlined aria-hidden="true" />
-                                    : <InfoCircleOutlined aria-hidden="true" />
-                                const entryStatusLabel = entry.status === 'running'
-                                  ? '进行中'
-                                  : entry.status === 'completed'
-                                    ? '已完成'
-                                    : entry.status === 'warning'
-                                      ? '需注意'
-                                      : '失败'
-                                return (
-                                  <div
-                                    className={`agent-work-log-entry ${entry.kind} status-${entry.status}`}
-                                    key={`${entry.source}-${entry.activityId}`}
-                                    role="listitem"
-                                  >
-                                    <span className="agent-work-log-entry-icon">{entryIcon}</span>
-                                    <div className="agent-work-log-entry-copy">
-                                      <div className="agent-work-log-entry-heading">
-                                        <strong>{entryTitle}</strong>
-                                        <span>{entryStatusLabel}</span>
-                                      </div>
-                                      <p>{entry.summary}</p>
-                                    </div>
-                                  </div>
-                                )
-                              })}
-                            </div>
-                          ) : (
-                            <span className="agent-work-log-empty">等待 Agent 发布可审计执行事件…</span>
-                          )}
-                        </div>
-                      )}
-                    </div>
+                    <AgentWorkLogDisclosure
+                      id={`agent-work-log-content-active-${activeRunId ?? 'current'}`}
+                      entries={visibleAgentWorkLog}
+                      durationMs={agentRunElapsedMs}
+                      durationLabel={formatAgentRunElapsed(agentRunElapsedMs)}
+                      open={agentWorkLogOpen}
+                      rationale={agentExecutionRationale}
+                      onOpenChange={setAgentWorkLogOpen}
+                    />
                     {activeExecutionSummary && (
                       <AssistantExecutionPlanCard
                         summary={activeExecutionSummary}
@@ -10500,7 +10920,7 @@ function PushPage({
 
   useEffect(() => {
     const draft: PushConfigDraft = {
-      version: 2,
+      version: 3,
       formValues,
       fieldMappings,
       mappingInitialized: mappingInitializedRef.current,
@@ -10571,8 +10991,7 @@ function PushPage({
     const initializingDefaults = !mappingInitializedRef.current
     const inspectingLegacyDefaults = !initializingDefaults &&
       mappingMigrationPendingRef.current &&
-      fieldMappings.length > 0 &&
-      fieldMappings.every((mapping) => mapping.sourceField === mapping.targetField)
+      fieldMappings.length > 0
     if ((!initializingDefaults && !inspectingLegacyDefaults) || !firstMappingRecordUid) return
     let canceled = false
     // The mapping needs only raw attributes; avoid loading the record's image

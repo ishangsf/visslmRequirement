@@ -15,14 +15,14 @@ export {
 export type PushFormValues = Omit<PushConfig, 'recordUids' | 'fieldMappings'>
 
 export type PushConfigDraft = {
-  version: 2
+  version: 3
   formValues: Partial<PushFormValues>
   fieldMappings: PushFieldMapping[]
   mappingInitialized: boolean
   /**
-   * v1 generated mappings used source names as their targets. Keep this bit
-   * until the first record is available so the renderer can verify and
-   * rebuild only an untouched generated mapping set.
+   * Legacy generated mappings need a first record before they can be rebuilt
+   * with the current default aliases. Keep this bit across navigation while
+   * the verification request is pending.
    */
   mappingMigrationPending?: boolean
   selectedRowKeys: string[]
@@ -32,8 +32,9 @@ export type PushConfigDraft = {
   pageSize: number
 }
 
-export const pushConfigDraftStorageKey = 'visslm:push-config-draft:v2'
-export const legacyPushConfigDraftStorageKey = 'visslm:push-config-draft:v1'
+export const pushConfigDraftStorageKey = 'visslm:push-config-draft:v3'
+export const legacyPushConfigDraftStorageKey = 'visslm:push-config-draft:v2'
+export const legacyV1PushConfigDraftStorageKey = 'visslm:push-config-draft:v1'
 
 const pushFormValueKeys = [
   'nodeType',
@@ -54,14 +55,15 @@ const isLegacyGeneratedDefaultMapping = (mapping: PushFieldMapping): boolean => 
   const match = mapping.id.match(legacyDefaultMappingIdPattern)
   return Boolean(match?.[1]) &&
     match?.[1] === mapping.sourceField &&
-    mapping.sourceField === mapping.targetField
+    (mapping.sourceField === mapping.targetField ||
+      defaultPushTargetField(mapping.sourceField) === mapping.targetField)
 }
 
 export const parsePushConfigDraft = (parsed: unknown): PushConfigDraft | null => {
-  if (!isRecordObject(parsed) || (parsed.version !== 1 && parsed.version !== 2)) return null
+  if (!isRecordObject(parsed) || (parsed.version !== 1 && parsed.version !== 2 && parsed.version !== 3)) return null
   // A version marker without any persisted draft state is not a recoverable
-  // draft. Keep malformed v2 values from masking a valid v1 fallback.
-  if (parsed.version === 2 && ![
+  // draft. Keep malformed v2/v3 values from masking an older fallback.
+  if ((parsed.version === 2 || parsed.version === 3) && ![
     'formValues',
     'fieldMappings',
     'mappingInitialized',
@@ -117,10 +119,10 @@ export const parsePushConfigDraft = (parsed: unknown): PushConfigDraft | null =>
     fieldMappings.every(isLegacyGeneratedDefaultMapping)
   const mappingMigrationPending = (
     hasLegacyDefaultMappingShape &&
-    (parsed.mappingMigrationPending === true || parsed.version === 1)
+    (parsed.mappingMigrationPending === true || parsed.version === 1 || parsed.version === 2)
   )
   return {
-    version: 2,
+    version: 3,
     formValues,
     fieldMappings,
     // Keep an explicit initialization marker even when every old mapping row
@@ -163,9 +165,9 @@ export const isLegacyDefaultPushFieldMappings = (
   mappings: PushFieldMapping[],
   _raw: Record<string, unknown>
 ): boolean => {
-  // Generated IDs contain the original source field. This identifies an
-  // untouched v1 default set even when the current first record has a
-  // different field shape, while rejecting user edits to either side.
+  // Generated IDs contain the original source field, so the old automatic
+  // set remains identifiable even when today's first record has a different
+  // shape. The rebuilt mappings themselves still come only from that record.
   return mappings.length > 0 && mappings.every(isLegacyGeneratedDefaultMapping)
 }
 
@@ -184,10 +186,11 @@ export const readPushConfigDraft = (): PushConfigDraft | null => {
   const currentDraft = readAt(pushConfigDraftStorageKey)
   if (currentDraft) return currentDraft
 
-  // Keep v1 untouched for rollback/recovery, but materialize the normalized
-  // v2 copy as soon as it can be read. The renderer will finish any
-  // first-record mapping migration after the record data is available.
-  const legacyDraft = readAt(legacyPushConfigDraftStorageKey)
+  // Keep both older keys untouched for rollback/recovery, but materialize the
+  // normalized v3 copy as soon as an older draft can be read. The renderer
+  // finishes any first-record mapping migration after record data is available.
+  const legacyDraft = readAt(legacyPushConfigDraftStorageKey) ??
+    readAt(legacyV1PushConfigDraftStorageKey)
   if (!legacyDraft) return null
   try {
     window.localStorage.setItem(pushConfigDraftStorageKey, JSON.stringify(legacyDraft))

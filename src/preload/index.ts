@@ -9,6 +9,7 @@ import type {
   ChatRequest,
   ChatSessionDeleteResult,
   ChatSessionSaveInput,
+  DataDeleteProgress,
   DataImportRunSnapshot,
   DataReviewApplyInput,
   KnowledgeDocumentDetail,
@@ -239,6 +240,12 @@ const api: AppApi = {
   resumeDataImportRun: (id: string) => ipcRenderer.invoke('data:import-resume', id),
   exportData: (query?: RecordExportQuery) => ipcRenderer.invoke('data:export', query),
   deleteData: (uids?: string[]) => ipcRenderer.invoke('data:delete', uids),
+  onDataDeleteProgress: (callback: (progress: DataDeleteProgress) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, progress: DataDeleteProgress): void =>
+      callback(progress)
+    ipcRenderer.on('data:delete-progress', listener)
+    return () => ipcRenderer.removeListener('data:delete-progress', listener)
+  },
   previewPush: (config: PushConfig) => ipcRenderer.invoke('push:preview', config),
   startPush: (config: PushConfig) => ipcRenderer.invoke('push:start', config),
   listPushLogs: (page?: number, pageSize?: number) =>

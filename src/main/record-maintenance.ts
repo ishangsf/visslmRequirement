@@ -26,6 +26,7 @@ const supportedScopes = new Set<RecordMaintenanceScope>(['all', 'selected'])
 const supportedOperations = new Set<RecordMaintenanceOperation>([
   'clean', 'rebuild_indexes', 'optimize'
 ])
+const RECORD_MAINTENANCE_VECTOR_BATCH_SIZE = 32
 
 const yieldToEventLoop = (): Promise<void> => new Promise((resolve) => {
   setImmediate(resolve)
@@ -121,11 +122,34 @@ export class RecordMaintenanceService {
         this.persist(snapshot)
         if (this.stopRequested) return
 
+        if (snapshot.operation === 'rebuild_indexes' || snapshot.operation === 'optimize') {
+          const assertEmbeddingReady = (this.knowledge as KnowledgeService & {
+            assertEmbeddingReady?: KnowledgeService['assertEmbeddingReady']
+          }).assertEmbeddingReady
+          if (typeof assertEmbeddingReady === 'function') {
+            snapshot = this.withUpdate(snapshot, {
+              status: 'scanning',
+              stage: 'scanning',
+              message: '正在检查本地向量运行时'
+            })
+            this.persist(snapshot)
+            await assertEmbeddingReady.call(this.knowledge)
+          }
+        }
+
         if (snapshot.operation === 'clean' || snapshot.operation === 'rebuild_indexes' || snapshot.operation === 'optimize') {
           this.db.invalidateRequirementMatchCacheForRecords(targets.map((target) => target.uid))
         }
         if (snapshot.operation === 'optimize') this.db.optimizeRecordMaintenance()
         let changed = false
+        const vectorBatch: RecordMaintenanceTarget[] = []
+        const flushVectorBatch = async (): Promise<void> => {
+          if (!vectorBatch.length) return
+          const batch = vectorBatch.splice(0, vectorBatch.length)
+          snapshot = await this.executeVectorBatch(snapshot, batch)
+          changed = true
+          await yieldToEventLoop()
+        }
         for (const target of targets) {
           if (this.stopRequested) break
           snapshot = this.withUpdate(snapshot, {
@@ -152,22 +176,39 @@ export class RecordMaintenanceService {
               },
               () => {
                 changed = true
-              }
+              },
+              snapshot.operation !== 'clean'
             )
-            this.db.saveRecordMaintenanceItem(snapshot.taskId, {
-              uid: target.uid,
-              name: target.name,
-              status: 'succeeded',
-              stage: itemStage
-            })
-            snapshot = this.withUpdate(snapshot, {
-              current: snapshot.current + 1,
-              succeeded: snapshot.succeeded + 1,
-              message: `已完成 ${target.name || target.uid}`,
-              stage: itemStage,
-              currentUid: target.uid,
-              currentName: target.name
-            })
+            if (itemStage === 'vector') {
+              this.db.saveRecordMaintenanceItem(snapshot.taskId, {
+                uid: target.uid,
+                name: target.name,
+                status: 'running',
+                stage: 'vector'
+              })
+              vectorBatch.push(target)
+              if (
+                vectorBatch.length >= RECORD_MAINTENANCE_VECTOR_BATCH_SIZE ||
+                this.stopRequested
+              ) {
+                await flushVectorBatch()
+              }
+            } else {
+              this.db.saveRecordMaintenanceItem(snapshot.taskId, {
+                uid: target.uid,
+                name: target.name,
+                status: 'succeeded',
+                stage: itemStage
+              })
+              snapshot = this.withUpdate(snapshot, {
+                current: snapshot.current + 1,
+                succeeded: snapshot.succeeded + 1,
+                message: `已完成 ${target.name || target.uid}`,
+                stage: itemStage,
+                currentUid: target.uid,
+                currentName: target.name
+              })
+            }
           } catch (error) {
             const message = maintenanceError(error)
             const failedItem: RecordMaintenanceFailedItem = {
@@ -203,6 +244,7 @@ export class RecordMaintenanceService {
           this.persist(snapshot)
           await yieldToEventLoop()
         }
+        await flushVectorBatch()
 
         snapshot = this.withUpdate(snapshot, {
           status: this.stopRequested
@@ -247,7 +289,8 @@ export class RecordMaintenanceService {
     snapshot: RecordMaintenanceTaskSnapshot,
     target: RecordMaintenanceTarget,
     onStage: (stage: RecordMaintenanceStage) => void,
-    onChanged: () => void
+    onChanged: () => void,
+    deferVector = false
   ): Promise<RecordMaintenanceStage> {
     const shouldClean = snapshot.operation === 'clean' || snapshot.operation === 'optimize'
     const shouldRebuildIndexes = snapshot.operation === 'rebuild_indexes' || snapshot.operation === 'optimize'
@@ -271,12 +314,123 @@ export class RecordMaintenanceService {
       }
       onChanged()
       onStage('vector')
+      if (deferVector) return 'vector'
       await this.updateStage(snapshot, target, 'vector', '正在生成记录向量')
       await this.knowledge.rebuildRecordIndexInLock(target.uid, snapshot.taskId, snapshot.operation)
       onChanged()
       return 'vector'
     }
     return shouldClean ? 'cleaning' : 'finalizing'
+  }
+
+  private async executeVectorBatch(
+    snapshot: RecordMaintenanceTaskSnapshot,
+    targets: RecordMaintenanceTarget[]
+  ): Promise<RecordMaintenanceTaskSnapshot> {
+    if (!targets.length) return snapshot
+    const byUid = new Map(targets.map((target) => [target.uid, target]))
+    const completed = new Set<string>()
+    let next = this.withUpdate(snapshot, {
+      status: 'running',
+      stage: 'vector',
+      message: `正在批量生成 ${targets.length} 条记录向量`,
+      currentUid: targets[0].uid,
+      currentName: targets[0].name
+    })
+    this.persist(next)
+
+    const complete = (uid: string, error?: string): void => {
+      if (completed.has(uid)) return
+      const target = byUid.get(uid)
+      if (!target) return
+      completed.add(uid)
+      if (error) {
+        const message = maintenanceError(error)
+        const failedItem: RecordMaintenanceFailedItem = {
+          uid: target.uid,
+          name: target.name,
+          stage: 'vector',
+          error: message
+        }
+        this.db.saveRecordMaintenanceItem(next.taskId, {
+          uid: target.uid,
+          name: target.name,
+          status: 'failed',
+          stage: 'vector',
+          error: message
+        })
+        this.db.markRecordMaintenanceStageFailed(
+          target.uid,
+          'vector',
+          message,
+          next.taskId,
+          next.operation
+        )
+        next = this.withUpdate(next, {
+          current: next.current + 1,
+          failed: next.failed + 1,
+          failedItems: [...next.failedItems, failedItem],
+          message: `处理 ${target.name || target.uid} 失败：${message}`,
+          stage: 'vector',
+          currentUid: target.uid,
+          currentName: target.name
+        })
+      } else {
+        this.db.saveRecordMaintenanceItem(next.taskId, {
+          uid: target.uid,
+          name: target.name,
+          status: 'succeeded',
+          stage: 'vector'
+        })
+        next = this.withUpdate(next, {
+          current: next.current + 1,
+          succeeded: next.succeeded + 1,
+          message: `已完成 ${target.name || target.uid}`,
+          stage: 'vector',
+          currentUid: target.uid,
+          currentName: target.name
+        })
+      }
+      this.persist(next)
+    }
+
+    const batchMethod = (this.knowledge as KnowledgeService & {
+      rebuildRecordIndexesInLock?: KnowledgeService['rebuildRecordIndexesInLock']
+    }).rebuildRecordIndexesInLock
+    try {
+      if (typeof batchMethod === 'function') {
+        const result = await batchMethod.call(
+          this.knowledge,
+          targets.map((target) => target.uid),
+          next.taskId,
+          next.operation,
+          {
+            onRecordComplete: (item) => complete(item.uid, item.error)
+          }
+        )
+        for (const item of result.results) complete(item.uid, item.error)
+      } else {
+        for (const target of targets) {
+          try {
+            await this.knowledge.rebuildRecordIndexInLock(
+              target.uid,
+              next.taskId,
+              next.operation
+            )
+            complete(target.uid)
+          } catch (error) {
+            complete(target.uid, maintenanceError(error))
+          }
+        }
+      }
+    } catch (error) {
+      const message = maintenanceError(error)
+      for (const target of targets) complete(target.uid, message)
+    }
+    for (const target of targets) {
+      complete(target.uid, '记录向量索引未返回处理结果')
+    }
+    return next
   }
 
   private async updateStage(

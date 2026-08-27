@@ -217,6 +217,10 @@ type SqlStatement = ReturnType<DatabaseSync['prepare']>
 const nowIso = (): string => new Date().toISOString()
 const KNOWLEDGE_VECTOR_COARSE_STEP = 8
 const TASK_RETENTION_DAYS = 30
+const KNOWLEDGE_RECORD_SNAPSHOT_PAGE_SIZE = 256
+const KNOWLEDGE_RECORD_REPLACEMENT_MAX = 64
+const KNOWLEDGE_RECORD_REPLACEMENT_MAX_CHUNKS = 4096
+const RECORD_MAINTENANCE_UID_BATCH_SIZE = 400
 
 const normalizeAssistantRunHistoryMetric = (value: unknown): number | undefined => (
   typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
@@ -456,6 +460,39 @@ export interface KnowledgeRecordIndexRow {
   contentHash: string
 }
 
+export interface KnowledgeRecordIndexSnapshotOptions {
+  /** Cursor for the candidate records branch; records are ordered by uid. */
+  recordCursor?: string
+  /** Cursor for the orphaned record-index rows branch; rows are ordered by uid. */
+  deletedCursor?: string
+  /** Maximum rows returned by each branch. */
+  limit?: number
+  /** Disable a branch after its cursor has reached the end. */
+  includeRecords?: boolean
+  includeDeleted?: boolean
+}
+
+export interface KnowledgeRecordIndexSnapshot {
+  rows: KnowledgeRecordIndexRow[]
+  deletedRecordUids: string[]
+  hasMoreRecords: boolean
+  hasMoreDeletedRecords: boolean
+  nextRecordCursor?: string
+  nextDeletedCursor?: string
+}
+
+export interface KnowledgeRecordChunkReplacement {
+  recordUid: string
+  chunks: readonly KnowledgeChunkInput[]
+  vectors: readonly KnowledgeVectorInput[]
+}
+
+export interface KnowledgeRecordChunkReplacementResult {
+  recordUid: string
+  chunkCount?: number
+  error?: string
+}
+
 export interface RequirementLexicalMatch {
   recordUid: string
   recordName: string
@@ -605,13 +642,14 @@ const mapRequirementMatchCacheRow = (row: SqlRow): RequirementMatchCache | null 
 const requirementSemanticContentSql = (alias: string): string => `${alias}.semantic_hash`
 
 const REQUIREMENT_BUSINESS_INDEX_MIGRATION_KEY = 'migration:requirement-business-index'
-const REQUIREMENT_BUSINESS_INDEX_VERSION = 'requirement-business-index-v2'
+const REQUIREMENT_BUSINESS_INDEX_VERSION = 'requirement-business-index-v3'
 
 const requirementSemanticSourceHash = (input: {
   name: string
   lastModifyTime: string
   rawJson: string
   normalizedText: string
+  fieldLabels?: Record<string, string>
 }): string => {
   let raw: Record<string, unknown> = {}
   try {
@@ -623,7 +661,11 @@ const requirementSemanticSourceHash = (input: {
     raw = {}
   }
   return createHash('sha256')
-    .update(`requirement-business-source-v2\n${buildRequirementBusinessText({ name: input.name, raw })}`)
+    .update(`requirement-business-source-v3\n${buildRequirementBusinessText({
+      name: input.name,
+      raw,
+      fieldLabels: input.fieldLabels
+    })}`)
     .digest('hex')
 }
 
@@ -1082,6 +1124,7 @@ export class AppDatabase {
     ensure: SqlStatement
     update: SqlStatement
   } | null = null
+  private readonly fieldDefinitionFingerprintCache = new Map<string, string>()
 
   constructor(databasePath: string, assetDir: string) {
     mkdirSync(assetDir, { recursive: true })
@@ -1460,6 +1503,8 @@ export class AppDatabase {
         ON knowledge_chunks(document_id, chunk_index);
       CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_record
         ON knowledge_chunks(record_uid, chunk_index);
+      CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_record_source
+        ON knowledge_chunks(record_uid, source_type, chunk_index);
 
       CREATE TABLE IF NOT EXISTS knowledge_vectors (
         chunk_id TEXT PRIMARY KEY,
@@ -2135,7 +2180,7 @@ export class AppDatabase {
       try {
         if (recomputeHashes) {
           const semanticHashRows = this.db.prepare(`
-            SELECT uid, name, last_modify_time, raw_json, normalized_text
+            SELECT uid, name, node_type, last_modify_time, raw_json, normalized_text
             FROM records
           `).all() as SqlRow[]
           const updateSemanticHash = this.db.prepare('UPDATE records SET semantic_hash = ? WHERE uid = ?')
@@ -2144,7 +2189,8 @@ export class AppDatabase {
               name: String(row.name ?? ''),
               lastModifyTime: String(row.last_modify_time ?? ''),
               rawJson: String(row.raw_json ?? '{}'),
-              normalizedText: String(row.normalized_text ?? '')
+              normalizedText: String(row.normalized_text ?? ''),
+              fieldLabels: this.getFieldDisplayNames(String(row.node_type ?? ''))
             }), String(row.uid))
           }
         }
@@ -2158,13 +2204,10 @@ export class AppDatabase {
     }
 
     if (migrationVersion !== REQUIREMENT_BUSINESS_INDEX_VERSION) {
-      if (completeBusinessIndex) {
-        // A previous launch may have completed the data work before the
-        // version marker was introduced or persisted.
-        this.setSetting(REQUIREMENT_BUSINESS_INDEX_MIGRATION_KEY, REQUIREMENT_BUSINESS_INDEX_VERSION)
-      } else {
-        runBusinessIndexMigration(true)
-      }
+      // Business extraction semantics changed. Recompute even when the old
+      // index was structurally complete so deployment-specific field labels
+      // participate in semantic hashes and invalidate stale vectors.
+      runBusinessIndexMigration(true)
     } else if (!completeBusinessIndex) {
       runBusinessIndexMigration(false)
     }
@@ -2208,31 +2251,45 @@ export class AppDatabase {
     recordUids: string[] | undefined,
     modelVersion: string
   ): RecordMaintenancePreview {
-    const targets = this.getRecordMaintenanceTargets(scope, recordUids)
     let cleanPendingCount = 0
     let lexicalPendingCount = 0
     let vectorPendingCount = 0
     let semanticInvalidationCount = 0
-    for (const target of targets) {
-      const state = this.getRecordMaintenanceState(target.uid, modelVersion)
+    let totalCount = 0
+    const countRow = (row: SqlRow): void => {
+      const state = this.mapRecordMaintenanceStateRow(row, modelVersion)
+      totalCount += 1
       if (state.clean.status !== 'ready') cleanPendingCount += 1
       if (state.lexical.status !== 'ready') lexicalPendingCount += 1
       if (state.vector.status !== 'ready') vectorPendingCount += 1
-      const semantic = this.db.prepare(`
-        SELECT r.semantic_hash, s.record_uid, s.content_hash, s.status
-        FROM records r
-        LEFT JOIN requirement_semantic_cards s ON s.record_uid = r.uid
-        WHERE r.uid = ?
-      `).get(target.uid) as SqlRow | undefined
-      if (semantic && semantic.record_uid &&
-        String(semantic.status ?? '') === 'ready' &&
-        String(semantic.content_hash ?? '') !== String(semantic.semantic_hash ?? '')) {
+      if (String(row.semantic_record_uid ?? '') &&
+        String(row.semantic_status ?? '') === 'ready' &&
+        String(row.semantic_content_hash ?? '') !== String(row.record_semantic_hash ?? '')) {
         semanticInvalidationCount += 1
+      }
+    }
+    if (scope === 'all') {
+      let cursor = ''
+      while (true) {
+        const rows = this.listRecordMaintenanceStateRows(undefined, modelVersion, cursor)
+        if (!rows.length) break
+        rows.forEach(countRow)
+        const lastUid = String(rows[rows.length - 1]?.record_uid_for_maintenance ?? '')
+        if (rows.length < KNOWLEDGE_RECORD_SNAPSHOT_PAGE_SIZE || !lastUid) break
+        cursor = lastUid
+      }
+    } else {
+      const selected = [...new Set((recordUids ?? [])
+        .map((uid) => String(uid).trim())
+        .filter(Boolean))]
+      for (let index = 0; index < selected.length; index += RECORD_MAINTENANCE_UID_BATCH_SIZE) {
+        const batch = selected.slice(index, index + RECORD_MAINTENANCE_UID_BATCH_SIZE)
+        this.listRecordMaintenanceStateRows(batch, modelVersion).forEach(countRow)
       }
     }
     return {
       scope,
-      totalCount: targets.length,
+      totalCount,
       cleanPendingCount,
       lexicalPendingCount,
       vectorPendingCount,
@@ -2244,12 +2301,105 @@ export class AppDatabase {
     }
   }
 
+  getRecordMaintenanceStates(
+    recordUids: readonly string[],
+    modelVersion = ''
+  ): Map<string, RecordMaintenanceState> {
+    const selected = [...new Set(recordUids.map((uid) => String(uid).trim()).filter(Boolean))]
+    const states = new Map<string, RecordMaintenanceState>()
+    for (let index = 0; index < selected.length; index += RECORD_MAINTENANCE_UID_BATCH_SIZE) {
+      const rows = this.listRecordMaintenanceStateRows(
+        selected.slice(index, index + RECORD_MAINTENANCE_UID_BATCH_SIZE),
+        modelVersion
+      )
+      for (const row of rows) {
+        const uid = String(row.record_uid_for_maintenance ?? '')
+        if (uid) states.set(uid, this.mapRecordMaintenanceStateRow(row, modelVersion))
+      }
+    }
+    return states
+  }
+
   getRecordMaintenanceState(uid: string, modelVersion = ''): RecordMaintenanceState {
     const recordUid = uid.trim()
-    const row = this.db.prepare(`
+    const rows = this.listRecordMaintenanceStateRows([recordUid], modelVersion)
+    if (rows.length) return this.mapRecordMaintenanceStateRow(rows[0], modelVersion)
+    const stateRow = this.db.prepare(`
       SELECT * FROM record_maintenance_states WHERE record_uid = ?
     `).get(recordUid) as SqlRow | undefined
-    const stateRow = row ?? {
+    return this.mapRecordMaintenanceStateRow({
+      ...(stateRow ?? {}),
+      record_uid_for_maintenance: '',
+      record_name_for_maintenance: '',
+      record_node_type_for_maintenance: '',
+      record_raw_json_for_maintenance: '',
+      record_semantic_hash: ''
+    }, modelVersion)
+  }
+
+  private listRecordMaintenanceStateRows(
+    recordUids: readonly string[] | undefined,
+    _modelVersion: string,
+    cursor = '',
+    limit = KNOWLEDGE_RECORD_SNAPSHOT_PAGE_SIZE
+  ): SqlRow[] {
+    const selected = recordUids
+      ? [...new Set(recordUids.map((uid) => String(uid).trim()).filter(Boolean))]
+      : []
+    if (recordUids && !selected.length) return []
+    const safeLimit = Math.min(
+      RECORD_MAINTENANCE_UID_BATCH_SIZE,
+      Math.max(1, Math.trunc(limit || KNOWLEDGE_RECORD_SNAPSHOT_PAGE_SIZE))
+    )
+    const targetWhere = recordUids
+      ? `WHERE r.uid IN (${selected.map(() => '?').join(', ')})`
+      : 'WHERE r.uid > ?'
+    const params = recordUids ? [...selected, safeLimit] : [cursor, safeLimit]
+    return this.db.prepare(`
+      WITH target_records AS (
+        SELECT r.uid, r.name, r.node_type, r.raw_json, r.semantic_hash
+        FROM records r
+        ${targetWhere}
+        ORDER BY r.uid
+        LIMIT ?
+      ),
+      vector_stats AS (
+        SELECT c.record_uid,
+               COUNT(*) AS actual_vector_chunk_count,
+               COUNT(DISTINCT v.model_version) AS actual_vector_model_count,
+               MAX(v.model_version) AS actual_vector_model_version,
+               COUNT(DISTINCT c.source_hash) AS actual_vector_source_hash_count,
+               MAX(c.source_hash) AS actual_vector_source_hash
+        FROM knowledge_chunks c
+        JOIN knowledge_vectors v ON v.chunk_id = c.id
+        JOIN target_records t ON t.uid = c.record_uid
+        WHERE c.source_type = 'record'
+        GROUP BY c.record_uid
+      )
+      SELECT t.uid AS record_uid_for_maintenance,
+             t.name AS record_name_for_maintenance,
+             t.node_type AS record_node_type_for_maintenance,
+             t.raw_json AS record_raw_json_for_maintenance,
+             t.semantic_hash AS record_semantic_hash,
+             s.*,
+             v.actual_vector_chunk_count,
+             v.actual_vector_model_count,
+             v.actual_vector_model_version,
+             v.actual_vector_source_hash_count,
+             v.actual_vector_source_hash,
+             semantic.record_uid AS semantic_record_uid,
+             semantic.content_hash AS semantic_content_hash,
+             semantic.status AS semantic_status
+      FROM target_records t
+      LEFT JOIN record_maintenance_states s ON s.record_uid = t.uid
+      LEFT JOIN vector_stats v ON v.record_uid = t.uid
+      LEFT JOIN requirement_semantic_cards semantic ON semantic.record_uid = t.uid
+      ORDER BY t.uid
+    `).all(...params) as SqlRow[]
+  }
+
+  private mapRecordMaintenanceStateRow(row: SqlRow, modelVersion: string): RecordMaintenanceState {
+    const stateRow = row.record_uid ? row : {
       clean_status: 'pending',
       clean_version: '',
       clean_updated_at: '',
@@ -2267,30 +2417,28 @@ export class AppDatabase {
       last_task_id: '',
       last_operation: ''
     } as SqlRow
-    const record = this.db.prepare(`
-      SELECT name, raw_json, semantic_hash FROM records WHERE uid = ?
-    `).get(recordUid) as SqlRow | undefined
-    const currentBusinessText = record ? this.requirementBusinessTextFromRow(record) : ''
-    const currentVectorSourceHash = record
+    const hasRecord = Boolean(String(row.record_uid_for_maintenance ?? ''))
+    const currentBusinessText = hasRecord
+      ? this.requirementBusinessTextFromRow({
+          name: row.record_name_for_maintenance,
+          node_type: row.record_node_type_for_maintenance,
+          raw_json: row.record_raw_json_for_maintenance
+        })
+      : ''
+    const currentVectorSourceHash = hasRecord
       ? createHash('sha256')
-        .update(`${String(record.semantic_hash ?? '')}\n${currentBusinessText}`)
+        .update(
+          `${String(row.record_semantic_hash ?? '')}\n` +
+          `${this.getFieldDefinitionFingerprint(String(row.record_node_type_for_maintenance ?? ''))}\n` +
+          currentBusinessText
+        )
         .digest('hex')
       : ''
-    const vector = this.db.prepare(`
-      SELECT COUNT(*) AS chunk_count,
-             COUNT(DISTINCT v.model_version) AS model_count,
-             MAX(v.model_version) AS model_version,
-             COUNT(DISTINCT c.source_hash) AS source_hash_count,
-             MAX(c.source_hash) AS source_hash
-      FROM knowledge_chunks c
-      JOIN knowledge_vectors v ON v.chunk_id = c.id
-      WHERE c.source_type = 'record' AND c.record_uid = ?
-    `).get(recordUid) as SqlRow
-    const vectorChunkCount = Number(vector.chunk_count ?? 0)
-    const actualVectorModel = String(vector.model_version ?? '')
-    const vectorModelCount = Number(vector.model_count ?? 0)
-    const vectorSourceHashCount = Number(vector.source_hash_count ?? 0)
-    const actualVectorSourceHash = String(vector.source_hash ?? '')
+    const vectorChunkCount = Number(row.actual_vector_chunk_count ?? 0)
+    const actualVectorModel = String(row.actual_vector_model_version ?? '')
+    const vectorModelCount = Number(row.actual_vector_model_count ?? 0)
+    const vectorSourceHashCount = Number(row.actual_vector_source_hash_count ?? 0)
+    const actualVectorSourceHash = String(row.actual_vector_source_hash ?? '')
     const effectiveModelVersion = actualVectorModel || String(stateRow.vector_model_version ?? '') || modelVersion.trim()
     const cleanStatus = this.maintenanceVersionedStatus(
       stateRow.clean_status,
@@ -2672,14 +2820,15 @@ export class AppDatabase {
     operation: RecordMaintenanceOperation | '' = 'clean'
   ): boolean {
     const row = this.db.prepare(`
-      SELECT name, last_modify_time, raw_json FROM records WHERE uid = ?
+      SELECT name, node_type, last_modify_time, raw_json FROM records WHERE uid = ?
     `).get(recordUid) as SqlRow | undefined
     if (!row) return false
     const semanticHash = requirementSemanticSourceHash({
       name: String(row.name ?? ''),
       lastModifyTime: String(row.last_modify_time ?? ''),
       rawJson: String(row.raw_json ?? '{}'),
-      normalizedText
+      normalizedText,
+      fieldLabels: this.getFieldDisplayNames(String(row.node_type ?? ''))
     })
     this.db.prepare(`
       UPDATE records SET normalized_text = ?, semantic_hash = ? WHERE uid = ?
@@ -2718,7 +2867,7 @@ export class AppDatabase {
     this.db.exec('BEGIN IMMEDIATE')
     try {
       const row = this.db.prepare(`
-        SELECT uid, name, raw_json FROM records WHERE uid = ?
+        SELECT uid, name, node_type, raw_json FROM records WHERE uid = ?
       `).get(recordUid) as SqlRow | undefined
       if (!row) {
         this.db.exec('ROLLBACK')
@@ -3169,8 +3318,8 @@ export class AppDatabase {
 
   replaceKnowledgeDocumentChunks(
     documentId: string,
-    chunks: KnowledgeChunkInput[],
-    vectors: KnowledgeVectorInput[]
+    chunks: readonly KnowledgeChunkInput[],
+    vectors: readonly KnowledgeVectorInput[]
   ): void {
     this.db.exec('BEGIN IMMEDIATE')
     try {
@@ -3190,31 +3339,110 @@ export class AppDatabase {
 
   replaceKnowledgeRecordChunks(
     recordUid: string,
-    chunks: KnowledgeChunkInput[],
-    vectors: KnowledgeVectorInput[],
+    chunks: readonly KnowledgeChunkInput[],
+    vectors: readonly KnowledgeVectorInput[],
     taskId = '',
     operation: RecordMaintenanceOperation | '' = ''
   ): void {
-    this.db.exec('BEGIN IMMEDIATE')
-    try {
-      this.db.prepare('DELETE FROM knowledge_chunks WHERE record_uid = ?').run(recordUid)
-      this.insertKnowledgeChunks(chunks)
-      this.insertKnowledgeVectors(vectors)
-      this.db.exec('COMMIT')
-      this.markRecordMaintenanceVectorReady(
-        recordUid,
-        vectors[0]?.modelVersion ?? '',
-        chunks.length,
-        taskId,
-        operation
-      )
-    } catch (error) {
-      this.db.exec('ROLLBACK')
-      throw error
+    const [result] = this.replaceKnowledgeRecordChunksBatch(
+      [{ recordUid, chunks, vectors }],
+      taskId,
+      operation
+    )
+    if (result?.error) throw new Error(result.error)
+  }
+
+  replaceKnowledgeRecordChunksBatch(
+    replacements: readonly KnowledgeRecordChunkReplacement[],
+    taskId = '',
+    operation: RecordMaintenanceOperation | '' = ''
+  ): KnowledgeRecordChunkReplacementResult[] {
+    if (!replacements.length) return []
+    if (replacements.length > KNOWLEDGE_RECORD_REPLACEMENT_MAX) {
+      throw new Error(`单次记录向量替换不得超过 ${KNOWLEDGE_RECORD_REPLACEMENT_MAX} 条`)
+    }
+    const results: KnowledgeRecordChunkReplacementResult[] = []
+    this.runInTransaction(() => {
+      for (let index = 0; index < replacements.length; index += 1) {
+        const replacement = replacements[index]
+        const recordUid = String(replacement.recordUid ?? '').trim()
+        const savepoint = `knowledge_record_replace_${index}`
+        let savepointActive = false
+        let recordExists = false
+        try {
+          this.db.exec(`SAVEPOINT ${savepoint}`)
+          savepointActive = true
+          recordExists = Boolean(this.db.prepare(
+            'SELECT 1 FROM records WHERE uid = ? LIMIT 1'
+          ).get(recordUid))
+          if (!recordUid || !recordExists) throw new Error('记录不存在或已被删除')
+          this.validateKnowledgeRecordReplacement(recordUid, replacement.chunks, replacement.vectors)
+          this.db.prepare('DELETE FROM knowledge_chunks WHERE record_uid = ?').run(recordUid)
+          this.insertKnowledgeChunks(replacement.chunks)
+          this.insertKnowledgeVectors(replacement.vectors)
+          this.markRecordMaintenanceVectorReady(
+            recordUid,
+            replacement.vectors[0]?.modelVersion ?? '',
+            replacement.chunks.length,
+            taskId,
+            operation
+          )
+          this.db.exec(`RELEASE SAVEPOINT ${savepoint}`)
+          savepointActive = false
+          results.push({ recordUid, chunkCount: replacement.chunks.length })
+        } catch (error) {
+          if (savepointActive) {
+            this.db.exec(`ROLLBACK TO SAVEPOINT ${savepoint}`)
+            this.db.exec(`RELEASE SAVEPOINT ${savepoint}`)
+            savepointActive = false
+          }
+          const message = error instanceof Error ? error.message : String(error)
+          if (recordExists) {
+            this.markRecordMaintenanceVectorFailed(recordUid, message, taskId, operation)
+          }
+          results.push({ recordUid, error: message.slice(0, 2000) })
+        }
+      }
+    })
+    return results
+  }
+
+  private validateKnowledgeRecordReplacement(
+    recordUid: string,
+    chunks: readonly KnowledgeChunkInput[],
+    vectors: readonly KnowledgeVectorInput[]
+  ): void {
+    if (chunks.length !== vectors.length) {
+      throw new Error('记录向量索引分块与向量数量不一致')
+    }
+    if (chunks.length > KNOWLEDGE_RECORD_REPLACEMENT_MAX_CHUNKS) {
+      throw new Error(`单条记录向量分块不得超过 ${KNOWLEDGE_RECORD_REPLACEMENT_MAX_CHUNKS} 个`)
+    }
+    const chunkIds = new Set<string>()
+    for (const chunk of chunks) {
+      if (chunk.recordUid !== recordUid || chunk.sourceType !== 'record') {
+        throw new Error('记录向量索引分块归属无效')
+      }
+      const chunkId = String(chunk.id ?? '').trim()
+      if (!chunkId || chunkIds.has(chunkId)) throw new Error('记录向量索引分块 ID 无效或重复')
+      chunkIds.add(chunkId)
+    }
+    const vectorIds = new Set<string>()
+    for (const item of vectors) {
+      const chunkId = String(item.chunkId ?? '').trim()
+      if (!chunkIds.has(chunkId) || vectorIds.has(chunkId)) {
+        throw new Error('记录向量索引向量与分块不匹配')
+      }
+      if (!(item.vector instanceof Float32Array) || !item.vector.length ||
+        item.vector.some((value) => !Number.isFinite(value))) {
+        throw new Error('记录向量索引包含无效向量')
+      }
+      if (!String(item.modelVersion ?? '').trim()) throw new Error('记录向量索引缺少模型版本')
+      vectorIds.add(chunkId)
     }
   }
 
-  private insertKnowledgeChunks(chunks: KnowledgeChunkInput[]): void {
+  private insertKnowledgeChunks(chunks: readonly KnowledgeChunkInput[]): void {
     const insert = this.db.prepare(`
       INSERT INTO knowledge_chunks(
         id, document_id, record_uid, source_type, source_name, source_hash,
@@ -3243,7 +3471,7 @@ export class AppDatabase {
     }
   }
 
-  private insertKnowledgeVectors(vectors: KnowledgeVectorInput[]): void {
+  private insertKnowledgeVectors(vectors: readonly KnowledgeVectorInput[]): void {
     const insert = this.db.prepare(`
       INSERT INTO knowledge_vectors(
         chunk_id, vector_blob, dimension, model_version, created_at,
@@ -3269,7 +3497,7 @@ export class AppDatabase {
     }
   }
 
-  saveKnowledgeVectors(vectors: KnowledgeVectorInput[]): void {
+  saveKnowledgeVectors(vectors: readonly KnowledgeVectorInput[]): void {
     this.insertKnowledgeVectors(vectors)
   }
 
@@ -3314,16 +3542,159 @@ export class AppDatabase {
     return (this.db.prepare(`
       SELECT uid, name, node_type, item_id, raw_json, semantic_hash
       FROM records ORDER BY uid
-    `).all() as SqlRow[]).map((row) => ({
+    `).all() as SqlRow[]).map((row) => this.mapKnowledgeRecordIndexRow(row))
+  }
+
+  listKnowledgeRecordIndexRowsByUids(recordUids: readonly string[]): KnowledgeRecordIndexRow[] {
+    const selected = [...new Set(recordUids.map((uid) => String(uid).trim()).filter(Boolean))]
+    if (!selected.length) return []
+    const rows: KnowledgeRecordIndexRow[] = []
+    for (let index = 0; index < selected.length; index += RECORD_MAINTENANCE_UID_BATCH_SIZE) {
+      const batch = selected.slice(index, index + RECORD_MAINTENANCE_UID_BATCH_SIZE)
+      const placeholders = batch.map(() => '?').join(', ')
+      const batchRows = this.db.prepare(`
+        SELECT uid, name, node_type, item_id, raw_json, semantic_hash
+        FROM records WHERE uid IN (${placeholders})
+        ORDER BY uid
+      `).all(...batch) as SqlRow[]
+      rows.push(...batchRows.map((row) => this.mapKnowledgeRecordIndexRow(row)))
+    }
+    return rows
+  }
+
+  getKnowledgeRecordIndexSnapshot(
+    modelVersion: string,
+    options: KnowledgeRecordIndexSnapshotOptions = {}
+  ): KnowledgeRecordIndexSnapshot {
+    const safeLimit = Math.min(
+      KNOWLEDGE_RECORD_SNAPSHOT_PAGE_SIZE,
+      Math.max(1, Math.trunc(options.limit || KNOWLEDGE_RECORD_SNAPSHOT_PAGE_SIZE))
+    )
+    const includeRecords = options.includeRecords !== false
+    const includeDeleted = options.includeDeleted !== false
+    const recordCursor = String(options.recordCursor ?? '')
+    const deletedCursor = String(options.deletedCursor ?? '')
+    // Keep candidate selection ahead of any chunk inspection.  The previous
+    // query grouped every record's chunks before applying the UID cursor and
+    // page limit, which made a multi-page sync repeat a full-table GROUP BY.
+    // Ready/current rows use indexed correlated checks for legacy or damaged
+    // state; only the bounded candidate set reaches the result projection.
+    const candidateSourceRows = includeRecords
+      ? this.db.prepare(`
+          WITH target_records AS MATERIALIZED (
+            SELECT r.uid, r.name, r.node_type, r.item_id, r.raw_json, r.semantic_hash
+            FROM records r
+            LEFT JOIN record_maintenance_states s ON s.record_uid = r.uid
+            WHERE r.uid > ?
+              AND (
+                s.record_uid IS NULL
+                OR COALESCE(s.vector_status, 'pending') <> 'ready'
+                OR COALESCE(s.vector_version, '') <> ?
+                OR COALESCE(s.vector_model_version, '') <> ?
+                OR (
+                  s.vector_status = 'ready'
+                  AND s.vector_version = ?
+                  AND s.vector_model_version = ?
+                  AND (
+                    NOT EXISTS (
+                      SELECT 1
+                      FROM knowledge_chunks c
+                      JOIN knowledge_vectors v ON v.chunk_id = c.id
+                      WHERE c.record_uid = r.uid AND c.source_type = 'record'
+                    )
+                    OR COALESCE(s.vector_chunk_count, 0) <> (
+                      SELECT COUNT(*)
+                      FROM knowledge_chunks c
+                      JOIN knowledge_vectors v ON v.chunk_id = c.id
+                      WHERE c.record_uid = r.uid AND c.source_type = 'record'
+                    )
+                    OR EXISTS (
+                      SELECT 1
+                      FROM knowledge_chunks c
+                      JOIN knowledge_vectors v ON v.chunk_id = c.id
+                      WHERE c.record_uid = r.uid
+                        AND c.source_type = 'record'
+                        AND v.model_version <> ?
+                    )
+                    OR (
+                      SELECT COUNT(DISTINCT c.source_hash)
+                      FROM knowledge_chunks c
+                      JOIN knowledge_vectors v ON v.chunk_id = c.id
+                      WHERE c.record_uid = r.uid AND c.source_type = 'record'
+                    ) <> 1
+                  )
+                )
+              )
+            ORDER BY r.uid
+            LIMIT ?
+          )
+          SELECT uid, name, node_type, item_id, raw_json, semantic_hash
+          FROM target_records
+          ORDER BY uid
+        `).all(
+          recordCursor,
+          RECORD_VECTOR_INDEX_VERSION,
+          modelVersion,
+          RECORD_VECTOR_INDEX_VERSION,
+          modelVersion,
+          modelVersion,
+          safeLimit + 1
+        ) as SqlRow[]
+      : []
+    const deletedSourceRows = includeDeleted
+      ? this.db.prepare(`
+          SELECT DISTINCT c.record_uid AS uid
+          FROM knowledge_chunks c
+          WHERE c.source_type = 'record'
+            AND c.record_uid IS NOT NULL
+            AND c.record_uid > ?
+            AND NOT EXISTS (
+              SELECT 1 FROM records r WHERE r.uid = c.record_uid
+            )
+          ORDER BY c.record_uid
+          LIMIT ?
+        `).all(deletedCursor, safeLimit + 1) as SqlRow[]
+      : []
+    const candidateRows = candidateSourceRows
+      .slice(0, safeLimit)
+      .map((row) => this.mapKnowledgeRecordIndexRow(row))
+    const deletedRows = deletedSourceRows.slice(0, safeLimit)
+    const hasMoreRecords = candidateSourceRows.length > safeLimit
+    const hasMoreDeletedRecords = deletedSourceRows.length > safeLimit
+    return {
+      rows: candidateRows,
+      deletedRecordUids: deletedRows.map((row) => String(row.uid)),
+      hasMoreRecords,
+      hasMoreDeletedRecords,
+      ...(hasMoreRecords && candidateRows.length
+        ? { nextRecordCursor: candidateRows[candidateRows.length - 1].uid }
+        : {}),
+      ...(hasMoreDeletedRecords && deletedRows.length
+        ? { nextDeletedCursor: String(deletedRows[deletedRows.length - 1].uid) }
+        : {})
+    }
+  }
+
+  countKnowledgeRecordIndexRecords(): number {
+    const row = this.db.prepare('SELECT COUNT(*) AS count FROM records').get() as SqlRow
+    return Math.max(0, Number(row.count ?? 0))
+  }
+
+  private mapKnowledgeRecordIndexRow(row: SqlRow): KnowledgeRecordIndexRow {
+    const content = this.requirementBusinessTextFromRow(row)
+    const fieldDefinitionFingerprint = this.getFieldDefinitionFingerprint(
+      String(row.node_type ?? '')
+    )
+    return {
       uid: String(row.uid),
-      name: String(row.name),
-      nodeType: String(row.node_type),
-      itemId: String(row.item_id),
-      content: this.requirementBusinessTextFromRow(row),
+      name: String(row.name ?? ''),
+      nodeType: String(row.node_type ?? ''),
+      itemId: String(row.item_id ?? ''),
+      content,
       contentHash: createHash('sha256')
-        .update(`${String(row.semantic_hash ?? '')}\n${this.requirementBusinessTextFromRow(row)}`)
+        .update(`${String(row.semantic_hash ?? '')}\n${fieldDefinitionFingerprint}\n${content}`)
         .digest('hex')
-    }))
+    }
   }
 
   getKnowledgeRecordIndexRow(recordUid: string): KnowledgeRecordIndexRow | null {
@@ -3332,21 +3703,23 @@ export class AppDatabase {
       FROM records WHERE uid = ? LIMIT 1
     `).get(recordUid) as SqlRow | undefined
     if (!row) return null
-    const content = this.requirementBusinessTextFromRow(row)
-    return {
-      uid: String(row.uid),
-      name: String(row.name),
-      nodeType: String(row.node_type),
-      itemId: String(row.item_id),
-      content,
-      contentHash: createHash('sha256')
-        .update(`${String(row.semantic_hash ?? '')}\n${content}`)
-        .digest('hex')
-    }
+    return this.mapKnowledgeRecordIndexRow(row)
   }
 
   deleteKnowledgeRecordIndex(recordUid: string): void {
     this.db.prepare('DELETE FROM knowledge_chunks WHERE record_uid = ?').run(recordUid)
+  }
+
+  deleteKnowledgeRecordIndexes(recordUids: readonly string[]): number {
+    const selected = [...new Set(recordUids.map((uid) => String(uid).trim()).filter(Boolean))]
+    if (!selected.length) return 0
+    const deleted = this.runInTransaction(() => {
+      const statement = this.db.prepare('DELETE FROM knowledge_chunks WHERE record_uid = ?')
+      let count = 0
+      for (const recordUid of selected) count += Number(statement.run(recordUid).changes)
+      return count
+    })
+    return deleted
   }
 
   listKnowledgeIndexedRecordUids(modelVersion?: string): string[] {
@@ -3382,6 +3755,10 @@ export class AppDatabase {
       )
       ORDER BY r.uid
     `).all(modelVersion) as SqlRow[]
+    const maintenanceStates = this.getRecordMaintenanceStates(
+      rows.map((row) => String(row.uid)),
+      modelVersion
+    )
     return rows.map((row): RecordDetail => {
       let raw: Record<string, unknown> = {}
       try {
@@ -3395,7 +3772,8 @@ export class AppDatabase {
         raw,
         images: [],
         matchingText: this.requirementBusinessTextFromRow(row),
-        maintenance: this.getRecordMaintenanceState(String(row.uid), modelVersion)
+        maintenance: maintenanceStates.get(String(row.uid)) ??
+          this.getRecordMaintenanceState(String(row.uid), modelVersion)
       }
     })
   }
@@ -6447,6 +6825,29 @@ export class AppDatabase {
           )
         }
       }
+      const nodeTypes = [...grouped.keys()]
+      for (const nodeType of nodeTypes) this.fieldDefinitionFingerprintCache.delete(nodeType)
+      const placeholders = nodeTypes.map(() => '?').join(', ')
+      const affectedRows = this.db.prepare(`
+        SELECT uid, name, node_type, last_modify_time, raw_json, normalized_text, semantic_hash
+        FROM records
+        WHERE node_type IN (${placeholders})
+      `).all(...nodeTypes) as SqlRow[]
+      const updateSemanticHash = this.db.prepare(
+        'UPDATE records SET semantic_hash = ? WHERE uid = ?'
+      )
+      for (const row of affectedRows) {
+        const semanticHash = requirementSemanticSourceHash({
+          name: String(row.name ?? ''),
+          lastModifyTime: String(row.last_modify_time ?? ''),
+          rawJson: String(row.raw_json ?? '{}'),
+          normalizedText: String(row.normalized_text ?? ''),
+          fieldLabels: this.getFieldDisplayNames(String(row.node_type ?? ''))
+        })
+        if (semanticHash === String(row.semantic_hash ?? '')) continue
+        updateSemanticHash.run(semanticHash, String(row.uid))
+        this.syncRequirementSearchIndex(String(row.uid))
+      }
       this.db.exec('COMMIT')
       return true
     } catch (error) {
@@ -6488,6 +6889,31 @@ export class AppDatabase {
       ORDER BY node_type ASC, field ASC
     `).all(...params) as SqlRow[]
     return rows.map(mapFieldDefinitionRow)
+  }
+
+  private getFieldDefinitionFingerprint(nodeType: string): string {
+    const normalizedNodeType = nodeType.trim()
+    if (!normalizedNodeType) return ''
+    const cached = this.fieldDefinitionFingerprintCache.get(normalizedNodeType)
+    if (cached !== undefined) return cached
+    const definitions = this.getFieldDefinitions(normalizedNodeType).map((definition) => ({
+      field: definition.field,
+      displayName: definition.displayName,
+      sourceType: definition.sourceType,
+      normalizedType: definition.normalizedType,
+      attrType: definition.attrType,
+      sourceUid: definition.sourceUid,
+      internalMember: definition.internalMember,
+      conditionUid: definition.conditionUid,
+      isSystem: definition.isSystem,
+      isEditable: definition.isEditable,
+      isRemovable: definition.isRemovable
+    }))
+    const fingerprint = definitions.length
+      ? createHash('sha256').update(JSON.stringify(definitions)).digest('hex')
+      : ''
+    this.fieldDefinitionFingerprintCache.set(normalizedNodeType, fingerprint)
+    return fingerprint
   }
 
   getFieldDisplayNames(
@@ -7095,7 +7521,11 @@ export class AppDatabase {
     } catch {
       raw = {}
     }
-    return buildRequirementBusinessText({ name: row.name, raw })
+    const nodeType = String(row.node_type ?? '').trim()
+    const fieldLabels = nodeType
+      ? this.getFieldDisplayNames(nodeType, Object.keys(raw))
+      : undefined
+    return buildRequirementBusinessText({ name: row.name, raw, fieldLabels })
   }
 
   private getRecordWriteStatements(): NonNullable<AppDatabase['recordWriteStatements']> {
@@ -7147,7 +7577,7 @@ export class AppDatabase {
     if (!this.requirementSearchStatements) {
       this.requirementSearchStatements = {
         delete: this.db.prepare('DELETE FROM requirement_records_fts WHERE record_uid = ?'),
-        select: this.db.prepare('SELECT uid, name, raw_json FROM records WHERE uid = ?'),
+        select: this.db.prepare('SELECT uid, name, node_type, raw_json FROM records WHERE uid = ?'),
         insert: this.db.prepare(
           'INSERT INTO requirement_records_fts(record_uid, business_text) VALUES (?, ?)'
         )
@@ -7189,7 +7619,7 @@ export class AppDatabase {
 
   private rebuildRequirementSearchIndex(): void {
     this.db.prepare('DELETE FROM requirement_records_fts').run()
-    const rows = this.db.prepare('SELECT uid, name, raw_json FROM records ORDER BY uid').all() as SqlRow[]
+    const rows = this.db.prepare('SELECT uid, name, node_type, raw_json FROM records ORDER BY uid').all() as SqlRow[]
     const insert = this.db.prepare(`
       INSERT INTO requirement_records_fts(record_uid, business_text) VALUES (?, ?)
     `)
@@ -7238,7 +7668,8 @@ export class AppDatabase {
       name: input.name,
       lastModifyTime: input.lastModifyTime,
       rawJson,
-      normalizedText: input.normalizedText
+      normalizedText: input.normalizedText,
+      fieldLabels: this.getFieldDisplayNames(input.nodeType, Object.keys(input.raw))
     })
     statements.upsert.run(
         input.uid,
@@ -7260,14 +7691,15 @@ export class AppDatabase {
 
   updateRecordNormalizedText(uid: string, normalizedText: string): void {
     const row = this.db.prepare(`
-      SELECT name, last_modify_time, raw_json FROM records WHERE uid = ?
+      SELECT name, node_type, last_modify_time, raw_json FROM records WHERE uid = ?
     `).get(uid) as SqlRow | undefined
     if (!row) return
     const semanticHash = requirementSemanticSourceHash({
       name: String(row.name ?? ''),
       lastModifyTime: String(row.last_modify_time ?? ''),
       rawJson: String(row.raw_json ?? '{}'),
-      normalizedText
+      normalizedText,
+      fieldLabels: this.getFieldDisplayNames(String(row.node_type ?? ''))
     })
     this.db.prepare(`
       UPDATE records
@@ -7291,13 +7723,16 @@ export class AppDatabase {
   ): void {
     const rawJson = JSON.stringify(raw)
     const contentHash = createHash('sha256').update(rawJson).digest('hex')
-    const row = this.db.prepare(`SELECT name, last_modify_time FROM records WHERE uid = ?`).get(uid) as SqlRow | undefined
+    const row = this.db.prepare(`
+      SELECT name, node_type, last_modify_time FROM records WHERE uid = ?
+    `).get(uid) as SqlRow | undefined
     if (!row) return
     const semanticHash = requirementSemanticSourceHash({
       name: String(row.name ?? ''),
       lastModifyTime: String(row.last_modify_time ?? ''),
       rawJson,
-      normalizedText
+      normalizedText,
+      fieldLabels: this.getFieldDisplayNames(String(row.node_type ?? ''), Object.keys(raw))
     })
     this.db.prepare(`
       UPDATE records
@@ -10101,6 +10536,25 @@ export class AppDatabase {
         `覆盖更新完成：${updatedCount} 条记录，${imageCount} 张图片` +
         (errors.length ? `，${errors.length} 条失败` : '')
     }
+  }
+
+  countDataDeleteImages(uids?: string[]): number {
+    const selected = [...new Set((uids ?? []).map((uid) => uid.trim()).filter(Boolean))]
+    if (uids !== undefined && !selected.length) return 0
+    const where = uids === undefined
+      ? ''
+      : 'WHERE record_uid IN (SELECT value FROM json_each(?))'
+    const params = uids === undefined ? [] : [JSON.stringify(selected)]
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS count
+         FROM (
+           SELECT DISTINCT sha256, binary_path, base64_path
+           FROM images ${where}
+         ) AS image_rows`
+      )
+      .get(...params) as SqlRow
+    return Number(row.count ?? 0)
   }
 
   deleteData(uids?: string[]): DataDeleteResult {

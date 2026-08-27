@@ -1,6 +1,6 @@
 {
   "name": "visslm-agent-desktop",
-  "version": "1.4.14",
+  "version": "1.4.15",
   "private": true,
   "author": "VISSLM Agent Team",
   "description": "VISSLM data collection, knowledge search and local AI agent desktop app",
@@ -14,9 +14,12 @@
     "typecheck": "tsc --noEmit",
     "smoke:updater": "node scripts/smoke-updater.mjs",
     "prepare:model": "node scripts/prepare-local-resources.mjs",
+    "prepare:runtime-dependencies": "node scripts/prepare-runtime-dependencies.mjs --download-if-missing && node scripts/verify-runtime-dependencies.mjs",
+    "verify:runtime-dependencies": "node scripts/verify-runtime-dependencies.mjs",
     "knowledge:smoke": "node scripts/smoke-knowledge.mjs",
     "test:platform-compat": "npx tsx ./tests/platform-compatibility.ts",
     "test:record-maintenance": "npx tsx ./tests/record-maintenance.ts",
+    "test:record-vector-scaling": "npx tsx ./tests/record-vector-scaling-regression.ts",
     "smoke:agent-similarity": "npx tsx ./scripts/smoke-agent-similarity.ts",
     "smoke:agent-requirement-analysis": "npx tsx ./scripts/smoke-agent-requirement-analysis.ts",
     "smoke:plain-chat": "npx tsx ./scripts/smoke-plain-chat.ts",
@@ -77,8 +80,8 @@
     "smoke:dashboard-pixel-diff": "npx tsx ./scripts/smoke-dashboard-pixel-diff.ts",
     "smoke:visualization-regression": "npx tsx ./scripts/smoke-visualization-regression.ts",
     "smoke:query-formulas": "npx tsx ./scripts/smoke-query-formulas.ts",
-    "package": "npm run prepare:model && npm run build && electron-builder --win",
-    "package:dir": "npm run prepare:model && npm run build && electron-builder --win --dir"
+    "package": "npm run prepare:model && npm run prepare:runtime-dependencies && npm run build && electron-builder --win",
+    "package:dir": "npm run prepare:model && npm run prepare:runtime-dependencies && npm run build && electron-builder --win --dir"
   },
   "dependencies": {
     "@ant-design/icons": "^6.1.0",
@@ -149,6 +152,10 @@
         "filter": [
           "**/*"
         ]
+      },
+      {
+        "from": "buildResources/installer/vc_redist.x64.exe",
+        "to": "installer/vc_redist.x64.exe"
       }
     ],
     "win": {
@@ -166,7 +173,8 @@
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
-      "createStartMenuShortcut": true
+      "createStartMenuShortcut": true,
+      "include": "build/installer.nsh"
     },
     "publish": {
       "provider": "github",

@@ -107,12 +107,15 @@ const testDefaultMappingsPreferBusinessAliases = (): void => {
     Source: 'source value',
     _valm_Description: 'description value',
     _valm_ItemID: 'ITEM-1',
+    RAO: 'development owner',
+    TSIS_ClarifyInfo: 'clarification text',
     Priority: 'P1',
     _valm_Uid: 'local-uid',
     _valm_NodeType: 'Task',
     RequireBy: 'legacy require-by value',
     UserStoryDescription: 'legacy description value',
-    AcceptCriteria: 'legacy acceptance value'
+    AcceptCriteria: 'legacy acceptance value',
+    Devs: 'legacy development owner value'
   })
 
   const sourceAndTargets = mappings.map(({ sourceField, targetField }) => ({ sourceField, targetField }))
@@ -120,13 +123,16 @@ const testDefaultMappingsPreferBusinessAliases = (): void => {
     { sourceField: 'Source', targetField: 'RequireBy' },
     { sourceField: '_valm_Description', targetField: 'UserStoryDescription' },
     { sourceField: '_valm_ItemID', targetField: 'AcceptCriteria' },
+    { sourceField: 'RAO', targetField: 'Devs' },
+    { sourceField: 'TSIS_ClarifyInfo', targetField: '_valm_Description' },
     { sourceField: 'Priority', targetField: 'Priority' }
   ], 'default mappings must preserve aliases and ordinary business fields')
   assert.ok(!mappings.some(({ sourceField }) => forbiddenSourceFields.includes(sourceField as typeof forbiddenSourceFields[number])))
   assert.ok(!mappings.some(({ sourceField }) => (
     sourceField === 'RequireBy' ||
     sourceField === 'UserStoryDescription' ||
-    sourceField === 'AcceptCriteria'
+    sourceField === 'AcceptCriteria' ||
+    sourceField === 'Devs'
   )), 'original fields that collide with alias targets must be excluded')
 
   const targetFields = mappings.map(({ targetField }) => targetField)
@@ -189,7 +195,7 @@ const testLegacyDefaultMappingsAreRecognizedPrecisely = (): void => {
   )
 }
 
-const testDraftVersionMigrationAndV2Persistence = (): void => {
+const testDraftVersionMigrationAndV3Persistence = (): void => {
   const legacyMappings = [
     { id: 'push-default-mapping-1-Source', sourceField: 'Source', targetField: 'Source' },
     { id: 'push-default-mapping-2-_valm_Description', sourceField: '_valm_Description', targetField: '_valm_Description' },
@@ -216,7 +222,7 @@ const testDraftVersionMigrationAndV2Persistence = (): void => {
 
   const migrated = parsePushConfigDraft(v1Draft)
   assert.ok(migrated, 'v1 drafts must remain readable')
-  assert.equal(migrated.version, 2, 'v1 drafts must migrate to the v2 draft version')
+  assert.equal(migrated.version, 3, 'v1 drafts must migrate to the v3 draft version')
   assert.deepEqual(migrated.formValues, v1Draft.formValues, 'v1 migration must preserve form values')
   assert.deepEqual(migrated.fieldMappings, legacyMappings, 'v1 migration must preserve legacy mappings for later default detection')
   assert.equal(migrated.mappingInitialized, true, 'v1 migration must preserve mappingInitialized')
@@ -237,7 +243,7 @@ const testDraftVersionMigrationAndV2Persistence = (): void => {
   }
   const parsedV2 = parsePushConfigDraft(v2Draft)
   assert.ok(parsedV2, 'v2 drafts must remain readable')
-  assert.equal(parsedV2.version, 2, 'v2 parsing must retain the v2 version')
+  assert.equal(parsedV2.version, 3, 'v2 drafts must migrate to the v3 draft version')
   assert.deepEqual(parsedV2.formValues, v2Draft.formValues, 'v2 parsing must preserve form values')
   assert.deepEqual(parsedV2.fieldMappings, v2Draft.fieldMappings, 'v2 parsing must preserve user mappings')
   assert.deepEqual(parsedV2.selectedRowKeys, v2Draft.selectedRowKeys, 'v2 parsing must preserve selection')
@@ -246,7 +252,7 @@ const testDraftVersionMigrationAndV2Persistence = (): void => {
   assert.equal(parsedV2.page, v2Draft.page, 'v2 parsing must preserve page')
   assert.equal(parsedV2.pageSize, v2Draft.pageSize, 'v2 parsing must preserve page size')
 
-  const storage = new Map<string, string>([[legacyPushConfigDraftStorageKey, JSON.stringify(v1Draft)]])
+  const storage = new Map<string, string>([[legacyPushConfigDraftStorageKey, JSON.stringify(v2Draft)]])
   let writtenKey = ''
   let writtenValue = ''
   const globalWithWindow = globalThis as unknown as {
@@ -270,21 +276,21 @@ const testDraftVersionMigrationAndV2Persistence = (): void => {
   }
   try {
     const recovered = readPushConfigDraft()
-    assert.ok(recovered, 'reader must recover a v1 draft when no v2 draft exists')
-    assert.equal(recovered.version, 2, 'reader must normalize the recovered draft to v2')
-    assert.deepEqual(recovered.formValues, v1Draft.formValues, 'reader must preserve recovered form state')
-    assert.ok(storage.has(legacyPushConfigDraftStorageKey), 'reader must keep the v1 key for rollback safety')
-    assert.ok(storage.has(pushConfigDraftStorageKey), 'reader must materialize the normalized v2 draft')
-    writePushConfigDraft(v2Draft as Parameters<typeof writePushConfigDraft>[0])
+    assert.ok(recovered, 'reader must recover a v2 draft when no v3 draft exists')
+    assert.equal(recovered.version, 3, 'reader must normalize the recovered draft to v3')
+    assert.deepEqual(recovered.formValues, v2Draft.formValues, 'reader must preserve recovered form state')
+    assert.ok(storage.has(legacyPushConfigDraftStorageKey), 'reader must keep the v2 key for rollback safety')
+    assert.ok(storage.has(pushConfigDraftStorageKey), 'reader must materialize the normalized v3 draft')
+    writePushConfigDraft(parsedV2 as Parameters<typeof writePushConfigDraft>[0])
   } finally {
     if (previousWindow === undefined) delete globalWithWindow.window
     else globalWithWindow.window = previousWindow
   }
-  assert.ok(writtenKey, 'v2 writer must write to localStorage')
-  assert.equal(writtenKey, pushConfigDraftStorageKey, 'writer must use the versioned v2 storage key')
+  assert.ok(writtenKey, 'v3 writer must write to localStorage')
+  assert.equal(writtenKey, pushConfigDraftStorageKey, 'writer must use the versioned v3 storage key')
   const persisted = JSON.parse(writtenValue) as { version?: unknown; fieldMappings?: unknown }
-  assert.equal(persisted.version, 2, 'writer must persist v2 drafts')
-  assert.deepEqual(persisted.fieldMappings, v2Draft.fieldMappings, 'writer must persist v2 mappings')
+  assert.equal(persisted.version, 3, 'writer must persist v3 drafts')
+  assert.deepEqual(persisted.fieldMappings, parsedV2.fieldMappings, 'writer must persist migrated mappings')
 }
 
 const testLegacyDetectionSurvivesRawShapeChanges = (): void => {
@@ -307,6 +313,54 @@ const testLegacyDetectionSurvivesRawShapeChanges = (): void => {
     true,
     'old automatic mappings must remain recognizable after raw fields are added or reordered'
   )
+  const mappingsFromPreviousFirstRecord = [
+    ...oldAutomaticMappings,
+    {
+      id: 'push-default-mapping-4-PreviousRecordOnly',
+      sourceField: 'PreviousRecordOnly',
+      targetField: 'PreviousRecordOnly'
+    }
+  ]
+  assert.equal(
+    isLegacyDefaultPushFieldMappings(mappingsFromPreviousFirstRecord, rawWithNewFieldsAndChangedOrder),
+    true,
+    'an old automatic set must remain recognizable when the current first record has a different shape'
+  )
+
+  const v2AutomaticMappings = [
+    { id: 'push-default-mapping-1-Source', sourceField: 'Source', targetField: 'RequireBy' },
+    {
+      id: 'push-default-mapping-2-_valm_Description',
+      sourceField: '_valm_Description',
+      targetField: 'UserStoryDescription'
+    },
+    { id: 'push-default-mapping-3-_valm_ItemID', sourceField: '_valm_ItemID', targetField: 'AcceptCriteria' },
+    { id: 'push-default-mapping-4-RAO', sourceField: 'RAO', targetField: 'RAO' },
+    {
+      id: 'push-default-mapping-5-TSIS_ClarifyInfo',
+      sourceField: 'TSIS_ClarifyInfo',
+      targetField: 'TSIS_ClarifyInfo'
+    },
+    { id: 'push-default-mapping-6-Priority', sourceField: 'Priority', targetField: 'Priority' }
+  ]
+  const v2AutomaticDraft = {
+    version: 2,
+    formValues: { nodeType: 'Task', projectId: 'project-v2' },
+    fieldMappings: v2AutomaticMappings,
+    mappingInitialized: true,
+    selectedRowKeys: ['v2-row-1'],
+    search: 'v2 筛选',
+    page: 2,
+    pageSize: 20
+  }
+  const upgradedAutomaticDraft = parsePushConfigDraft(v2AutomaticDraft)
+  assert.ok(upgradedAutomaticDraft, 'v2 automatic drafts must remain readable')
+  assert.equal(upgradedAutomaticDraft.version, 3, 'v2 automatic drafts must migrate to v3')
+  assert.equal(
+    upgradedAutomaticDraft.mappingMigrationPending,
+    true,
+    'v2 automatic defaults must remain eligible for alias upgrade'
+  )
 
   const editedTarget = oldAutomaticMappings.map((mapping, index) => (
     index === 0 ? { ...mapping, targetField: 'EditedRequireBy' } : mapping
@@ -325,6 +379,27 @@ const testLegacyDetectionSurvivesRawShapeChanges = (): void => {
     'a mapping with a user-owned ID must not be treated as an old automatic mapping'
   )
 
+  const editedTargetDraft = parsePushConfigDraft({
+    ...v2AutomaticDraft,
+    fieldMappings: editedTarget
+  })
+  assert.ok(editedTargetDraft, 'edited v2 drafts must remain readable')
+  assert.equal(
+    editedTargetDraft.mappingMigrationPending,
+    undefined,
+    'a changed v2 target must not be upgraded as an automatic default'
+  )
+  const userRenamedIdDraft = parsePushConfigDraft({
+    ...v2AutomaticDraft,
+    fieldMappings: userRenamedId
+  })
+  assert.ok(userRenamedIdDraft, 'v2 drafts with user IDs must remain readable')
+  assert.equal(
+    userRenamedIdDraft.mappingMigrationPending,
+    undefined,
+    'a user-owned v2 mapping ID must not be upgraded as an automatic default'
+  )
+
   const defaults = buildDefaultPushFieldMappings(rawWithNewFieldsAndChangedOrder)
   const targetBySource = new Map(defaults.map(({ sourceField, targetField }) => [sourceField, targetField]))
   assert.equal(targetBySource.get('Source'), 'RequireBy')
@@ -340,7 +415,7 @@ const main = (): void => {
   testCorruptedDraftsReturnNull()
   testDefaultMappingsPreferBusinessAliases()
   testLegacyDefaultMappingsAreRecognizedPrecisely()
-  testDraftVersionMigrationAndV2Persistence()
+  testDraftVersionMigrationAndV3Persistence()
   testLegacyDetectionSurvivesRawShapeChanges()
   console.log(JSON.stringify({
     ok: true,
@@ -350,9 +425,9 @@ const main = (): void => {
       'valid mappings and form/filter/selection/pagination state survive recovery',
       'mappingInitialized remains true after forbidden mappings are filtered',
       'corrupted drafts return null',
-      'default mappings prefer business aliases and avoid target collisions',
+      'default mappings prefer business aliases (including RAO/ClarifyInfo) and avoid target collisions',
       'legacy generated same-name defaults are recognized without overriding user edits',
-      'v1 drafts migrate to v2 while preserving state and v2 writes round-trip',
+      'v1/v2 drafts migrate to v3 while preserving state and v3 writes round-trip',
       'legacy detection tolerates raw field additions/reordering and preserves final aliases'
     ]
   }))
