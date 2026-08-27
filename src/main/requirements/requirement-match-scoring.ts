@@ -3,6 +3,12 @@ import {
   type RequirementMatchCard
 } from './requirement-match-card'
 import type { HybridRequirementCandidate } from './hybrid-retrieval'
+import {
+  hashRequirementBusiness,
+  normalizeRequirementBusinessText,
+  REQUIREMENT_NORMALIZATION_VERSION
+} from './requirement-business-normalization'
+import { evaluateRequirementMatchPolicy } from './requirement-match-policy'
 
 export const REQUIREMENT_MATCH_RELATIONS = [
   'duplicate',
@@ -456,12 +462,36 @@ const downgradeDecision = (
   }
 }
 
-/** No source-only fields are eligible for inferred action/object rules. */
 export const applyRequirementMatchHardRules = (
-  _base: RequirementMatchCard,
-  _candidate: RequirementMatchCard,
+  base: RequirementMatchCard,
+  candidate: RequirementMatchCard,
   decision: RequirementMatchDecision
-): RequirementMatchDecision => decision
+): RequirementMatchDecision => {
+  const policy = evaluateRequirementMatchPolicy(base, candidate, {
+    baseBusinessHash: hashRequirementBusiness(base),
+    candidateBusinessHash: hashRequirementBusiness(candidate),
+    normalizationVersionMatches: REQUIREMENT_NORMALIZATION_VERSION === 'requirement-business-v1',
+    candidateEligible: true,
+    normalizedTextMatches: normalizeRequirementBusinessText(base.matchingText) ===
+      normalizeRequirementBusinessText(candidate.matchingText)
+  })
+  if (policy.decisionStatus === 'rejected') {
+    return { relation: 'unrelated', finalScore: 0, downgradeReasons: [...decision.downgradeReasons, ...policy.reasonCodes] }
+  }
+  if (policy.decisionStatus === 'confirmed') {
+    return { relation: 'duplicate', finalScore: 100, downgradeReasons: decision.downgradeReasons }
+  }
+  const relation = decision.finalScore > policy.rankingCap && requirementMatchRelationRank(decision.relation) >
+    requirementMatchRelationRank('partial_overlap') ? 'partial_overlap' : decision.relation
+  return {
+    ...decision,
+    relation,
+    finalScore: clampRequirementScore(Math.min(decision.finalScore, policy.rankingCap)),
+    downgradeReasons: policy.reasonCodes.length
+      ? [...decision.downgradeReasons, ...policy.reasonCodes]
+      : decision.downgradeReasons
+  }
+}
 
 export const scoreRequirementMatch = (
   base: RequirementMatchCard,

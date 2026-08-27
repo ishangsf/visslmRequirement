@@ -347,7 +347,7 @@ const testSourceOnlyCleaningAndMetadataIsolation = async (): Promise<void> => {
     }
     assert.doesNotMatch(sourceOnly.evidence, /<[^>]+>/)
     assert.deepEqual(Object.keys(sourceOnly).sort(), [
-      'evidence', 'lexicalTerms', 'matchingText', 'module', 'productDomain',
+      'businessFacts', 'evidence', 'lexicalTerms', 'matchingText', 'module', 'productDomain',
       'requirementType', 'sourceDescription', 'sourceTitle'
     ].sort())
   })
