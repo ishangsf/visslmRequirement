@@ -1359,18 +1359,18 @@ function MatchDrawer({
           {showMatchingProgress && (
             <section className={`project-match-progress is-${matchingProgressStatus}`} aria-label="匹配执行进度" aria-live="polite">
               <div className="project-match-progress-heading">
-                <div>
-                  <Text strong>匹配执行进度</Text>
-                  <Text type="secondary">当前需求的重新匹配任务在此处实时更新</Text>
+                <div className="project-match-progress-heading-copy">
+                  <Text strong className="project-match-progress-title">匹配执行进度</Text>
+                  <Text type="secondary" className="project-match-progress-subtitle">当前需求的重新匹配任务在此处实时更新</Text>
                 </div>
-                <Tag color={matchingProgressStatus === 'success' ? 'success' : matchingProgressStatus === 'failed' ? 'error' : 'processing'}>{matchingProgressLabel}</Tag>
+                <Tag className="project-match-progress-status" color={matchingProgressStatus === 'success' ? 'success' : matchingProgressStatus === 'failed' ? 'error' : 'processing'}>{matchingProgressLabel}</Tag>
               </div>
               <div className="project-match-progress-main">
                 <Progress
                   className="project-match-progress-ring"
                   type="circle"
                   percent={matchingProgressPercent}
-                  size={56}
+                  size={64}
                   strokeWidth={9}
                   status={matchingProgressStatus === 'failed' ? 'exception' : matchingProgressStatus === 'success' ? 'success' : 'active'}
                   strokeColor={matchingProgressStatus === 'failed' ? 'var(--state-error)' : matchingProgressStatus === 'success' ? 'var(--state-success)' : 'var(--accent)'}
@@ -1379,9 +1379,14 @@ function MatchDrawer({
                   aria-label={`匹配执行进度 ${matchingProgressPercent}%`}
                 />
                 <div className="project-match-progress-copy">
-                  <Text strong>{matchingProgressMessage}</Text>
-                  {matchingProgress?.detail && <Text type="secondary">{matchingProgress.detail}</Text>}
-                  {matchingProgress && matchingProgress.total > 0 && <Text type="secondary" className="project-match-progress-count">已处理 {Math.min(matchingProgress.current, matchingProgress.total)} / {matchingProgress.total}</Text>}
+                  <Text strong className="project-match-progress-message">{matchingProgressMessage}</Text>
+                  {matchingProgress?.detail && <Text type="secondary" className="project-match-progress-detail">{matchingProgress.detail}</Text>}
+                  {matchingProgress && matchingProgress.total > 0 && (
+                    <div className="project-match-progress-meta" aria-label={`已处理 ${Math.min(matchingProgress.current, matchingProgress.total)} / ${matchingProgress.total}`}>
+                      <Text type="secondary">处理进度</Text>
+                      <Text strong className="project-match-progress-count">{Math.min(matchingProgress.current, matchingProgress.total)} / {matchingProgress.total}</Text>
+                    </div>
+                  )}
                 </div>
               </div>
             </section>

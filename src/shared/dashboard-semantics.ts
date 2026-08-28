@@ -50,13 +50,63 @@ const componentTitleSuffix: Partial<Record<DashboardComponentSpec['type'], strin
 const normalizeSemanticText = (value: string): string =>
   value.toLocaleLowerCase().replace(/[\s，。；：、·_\-—（）()\[\]【】]/g, '')
 
-const fieldLabel = (field: string): string => {
+const knownFieldLabels: Record<string, string> = {
+  uid: '数据 UID',
+  _valm_uid: '数据 UID',
+  lastmodifytime: '最后修改时间',
+  _valm_lastmodifytime: '最后修改时间',
+  itemid: '数据编号',
+  _valm_itemid: '数据编号',
+  nodetype: '数据类型',
+  _valm_nodetype: '数据类型',
+  projectid: '项目',
+  _valm_projectid: '项目',
+  name: '名称',
+  _valm_name: '名称',
+  createdat: '创建时间',
+  updatedat: '更新时间',
+  duedate: '截止日期',
+  effort: '投入工时',
+  score: '评分',
+  state: '状态',
+  _valm_state: '状态',
+  assignedto: '负责人',
+  _valm_assignedto: '负责人',
+  priority: '优先级',
+  _valm_priority: '优先级',
+  module: '模块',
+  _valm_module: '模块'
+}
+
+export const dashboardFieldLabel = (field: string): string => {
   const parts = field.split('.').filter(Boolean)
-  return parts[parts.length - 1] ?? field
+  const leaf = parts[parts.length - 1] ?? field
+  const known = knownFieldLabels[leaf.toLocaleLowerCase()]
+  if (known) return known
+  const withoutTransportPrefix = leaf.replace(/^_valm_/i, '')
+  const humanized = withoutTransportPrefix
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  return humanized || '字段'
+}
+
+export const dashboardFieldDisplayLabel = (
+  field: string,
+  displayName?: string
+): string => {
+  const fallback = dashboardFieldLabel(field)
+  const candidate = displayName?.trim()
+  if (!candidate) return fallback
+  const leaf = field.split('.').filter(Boolean).at(-1) ?? field
+  const rawEquivalent = normalizeSemanticText(candidate) === normalizeSemanticText(leaf)
+  const localizedFallback = normalizeSemanticText(fallback) !== normalizeSemanticText(leaf)
+  return rawEquivalent && localizedFallback ? fallback : candidate
 }
 
 export const metricDisplayLabel = (metric: DashboardMetricDefinition): string => {
-  const base = metric.label.trim() || (metric.field ? fieldLabel(metric.field) : metric.measureId)
+  const base = metric.label.trim() || (metric.field ? dashboardFieldLabel(metric.field) : metric.measureId)
   if (metric.calculation) return `${base}${calculationLabels[metric.calculation]}`
   if (metric.aggregation === 'count' && /数|量|count/i.test(base)) return base
   return `${base}${aggregationLabels[metric.aggregation]}`
@@ -73,7 +123,7 @@ export const automaticDashboardComponentTitle = (
     .filter((metric): metric is DashboardMetricDefinition => Boolean(metric))
   if (!metrics.length) return ''
   const metricLabel = metrics.map(metricDisplayLabel).join(' / ')
-  const dimensionLabel = binding.dimensionFields.map(fieldLabel).join(' / ')
+  const dimensionLabel = binding.dimensionFields.map(dashboardFieldLabel).join(' / ')
   const suffix = componentTitleSuffix[component.type]
   const base = [dimensionLabel, metricLabel].filter(Boolean).join(' · ')
   return suffix && !normalizeSemanticText(base).endsWith(normalizeSemanticText(suffix))
@@ -240,7 +290,7 @@ const bindingIssues = (
     const terms = binding.metricIds
       .map((metricId) => metricById.get(metricId))
       .filter((metric): metric is DashboardMetricDefinition => Boolean(metric))
-      .flatMap((metric) => [metric.label, metric.field ? fieldLabel(metric.field) : ''])
+      .flatMap((metric) => [metric.label, metric.field ? dashboardFieldLabel(metric.field) : ''])
       .filter(Boolean)
       .map(normalizeSemanticText)
     const normalizedTitle = normalizeSemanticText(component.title)

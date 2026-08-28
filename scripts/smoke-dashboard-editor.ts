@@ -177,6 +177,7 @@ const profiles: FieldProfile[] = [
   },
   {
     field: 'createdAt',
+    displayName: 'created At',
     inferredType: 'date',
     sensitivity: 'normal',
     nonNullRate: 1,
@@ -295,11 +296,18 @@ assertNoOverlaps([...base.components, manualBar], 'bar 手工新增布局')
 assert.equal(JSON.stringify(base), manualBarSource, 'bar 手工工厂不得修改源 Spec')
 
 const manualLineSource = JSON.stringify(base)
-const manualLine = requireManualComponent(base, 'line').component
+const manualLinePlan = requireManualComponent(base, 'line')
+const manualLine = manualLinePlan.component
 assert.equal(manualLine.type, 'line')
 assert.deepEqual(manualLine.query?.dimensions, [{ field: 'createdAt', timeGrain: 'month' }])
 assert.equal(manualLine.encoding?.label, 'createdAt')
 assert.equal(manualLine.encoding?.value, manualLine.query?.measures[0]?.id)
+assert.ok(manualLinePlan.analysisBlueprint?.questions.some((question) =>
+  question.dimensionFields.includes('createdAt') && question.question.includes('创建时间')
+), '手工新增的问题文案必须将 raw-equivalent displayName 本地化')
+assert.ok(!manualLinePlan.analysisBlueprint?.questions.some((question) =>
+  question.question.includes('created At')
+), '手工新增的问题文案不得泄露技术字段别名')
 assertNoOverlaps([...base.components, manualLine], 'line 手工新增布局')
 assert.equal(JSON.stringify(base), manualLineSource, 'line 手工工厂不得修改源 Spec')
 
@@ -467,7 +475,7 @@ const comboBlueprintPlan = requireManualComponent(comboBlueprintDashboard, 'comb
 assert.ok(comboBlueprintPlan.analysisBlueprint)
 assert.equal(comboBlueprintPlan.component.semanticBinding?.questionId, 'q-combo')
 assert.deepEqual(comboBlueprintPlan.component.semanticBinding?.metricIds, ['issueCount', 'effortTotal'])
-assert.equal(comboBlueprintPlan.component.title, 'createdAt · 缺陷数量 / 投入工时总量组合趋势')
+assert.equal(comboBlueprintPlan.component.title, '创建时间 · 缺陷数量 / 投入工时总量组合趋势')
 assert.equal(JSON.stringify(comboBlueprintDashboard), comboBlueprintSource, 'Combo Blueprint 手工工厂不得修改源 Spec')
 const comboBlueprintResult: DashboardSpec = {
   ...comboBlueprintDashboard,

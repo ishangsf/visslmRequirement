@@ -209,7 +209,7 @@ try {
     assert.equal(runs.length, 1)
     assert.equal(runs[0].status, 'success')
     assert.equal(runs[0].attemptCount, 2)
-    assert.equal(runs[0].toolCalls.filter((call) => call.tool === 'execute-query').length, 1)
+    assert.equal(runs[0].toolCalls.filter((call) => call.tool === 'execute-query').length, 0)
     assert.ok(runs[0].toolCalls.some((call) => call.tool === 'repair-attempt'))
 
     const path = provider === 'anthropic' ? `/${prefix}/messages` : `/${prefix}/chat/completions`
@@ -251,7 +251,7 @@ try {
     assert.deepEqual(retryPrompt.currentDashboard?.components.map((item) => item.id), ['kpi-total'])
     assert.ok(retryPrompt.previousValidationErrors?.includes('其他组件'))
     assert.ok(!JSON.stringify(retryPrompt.conversationContext).includes('Rejected old request'))
-    providerResults.push({ provider, attempts: requests.length, queryExecutions: 1 })
+    providerResults.push({ provider, attempts: requests.length, queryExecutions: 0 })
   }
 
   console.log(JSON.stringify({

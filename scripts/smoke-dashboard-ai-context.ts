@@ -15,6 +15,7 @@ import type {
   DashboardSpec,
   VisualizationRunInput
 } from '../src/shared/dashboard'
+import type { FieldProfile } from '../src/shared/query-spec'
 
 const records: AnalyticsRecord[] = [
   {
@@ -119,6 +120,29 @@ const semanticBlueprint: DashboardAnalysisBlueprint = {
   assumptions: [],
   unresolvedAmbiguities: [],
   generatedAt: '2026-08-27T00:00:00.000Z'
+}
+
+const runCanonicalMetadataLabelContract = (): void => {
+  const scope = { projectIds: ['p1'] }
+  const profiled = new QueryEngine(fakeDb).profile(scope)
+  const dateProfile = profiled.find((profile) => profile.field === 'lastModifyTime')
+  assert.ok(dateProfile, 'canonical metadata fixture must expose lastModifyTime')
+  const profiles: FieldProfile[] = [
+    { ...dateProfile, displayName: 'last Modify Time' },
+    { ...dateProfile, field: '_valm_LastModifyTime', displayName: undefined },
+    ...profiled.filter((profile) => profile.field !== 'lastModifyTime')
+  ]
+  const blueprint = planAnalysisBlueprint('按最后修改时间生成趋势', scope, profiles)
+  const trendQuestions = blueprint.questions.filter((question) =>
+    question.dimensionFields.includes('lastModifyTime')
+  )
+  assert.ok(trendQuestions.length, 'canonical lastModifyTime must produce a trend question')
+  for (const question of trendQuestions) {
+    assert.match(question.question, /最后修改时间/,
+      'canonical metadata trend question must use the localized label')
+    assert.doesNotMatch(question.question, /_valm_|lastModifyTime/i,
+      'canonical metadata trend question must not expose the raw field key')
+  }
 }
 
 const semanticDashboard: DashboardSpec = {
@@ -393,7 +417,7 @@ try {
 
   await applySuccessfulPatch('Rename only the selected component', {
     focusComponentId: 'kpi-total',
-    expectedQueries: 1
+    expectedQueries: 0
   })
   assert.equal(current.components.find((item) => item.id === 'kpi-total')?.title, 'Issue count')
   assert.deepEqual(current.components.find((item) => item.id === 'kpi-total')?.data, [
@@ -437,7 +461,7 @@ try {
 
   await applySuccessfulPatch('Add a subtitle to the selected line chart', {
     focusComponentId: 'kpi-total',
-    expectedQueries: 1
+    expectedQueries: 0
   })
   assert.equal(
     current.components.find((item) => item.id === 'kpi-total')?.subtitle,
@@ -471,10 +495,10 @@ try {
 
   assert.equal(fetchCount, 11)
   assert.deepEqual(versions, [1, 2, 3, 4, 5, 6, 7, 8, 9])
-  assert.deepEqual(runs.map(queryExecutions), [0, 0, 1, 1, 1, 1, 1, 0, 0, 0])
+  assert.deepEqual(runs.map(queryExecutions), [0, 0, 0, 1, 1, 1, 0, 0, 0, 0])
   const incrementalQueryExecutions = runs.reduce((total, run) => total + queryExecutions(run), 0)
   assert.equal(fullRefreshQueryBaseline, 35)
-  assert.equal(incrementalQueryExecutions, 5)
+  assert.equal(incrementalQueryExecutions, 3)
   assert.deepEqual(validateDashboardSpec(current, new QueryEngine(fakeDb)), [])
 
   globalThis.fetch = async () => new Response(JSON.stringify({
@@ -1012,6 +1036,7 @@ const runAiScatterContract = async (): Promise<void> => {
   }
 }
 
+runCanonicalMetadataLabelContract()
 await runBlueprintFirstContract()
 await runLegacyUpgradeContract()
 await runAiScatterContract()

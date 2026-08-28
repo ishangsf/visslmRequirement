@@ -8,7 +8,8 @@ import type {
   DashboardSpec
 } from '../../../shared/dashboard'
 import {
-  automaticDashboardComponentTitle
+  automaticDashboardComponentTitle,
+  dashboardFieldDisplayLabel
 } from '../../../shared/dashboard-semantics'
 import {
   findFirstAvailableDashboardLayout
@@ -64,7 +65,7 @@ export const planDashboardComponentRemoval = (
 }
 
 const fieldLabel = (profile?: FieldProfile, fallback = ''): string =>
-  profile?.displayName?.trim() || profile?.field.split('.').filter(Boolean).at(-1) || fallback
+  profile ? dashboardFieldDisplayLabel(profile.field, profile.displayName) : fallback
 
 const slug = (value: string): string =>
   value.toLocaleLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'component'
@@ -128,7 +129,9 @@ const deriveLegacySemanticBlueprint = (
         : undefined
       metrics.push({
         id: metricId,
-        label: profile?.displayName ?? (measure.id === 'record_count' ? '记录数' : measure.id),
+        label: profile
+          ? dashboardFieldDisplayLabel(profile.field, profile.displayName)
+          : measure.id === 'record_count' ? '记录数' : measure.id,
         description: '从历史组件 QuerySpec 推断的指标',
         measureId: measure.id,
         ...(measure.field ? { field: measure.field } : {}),

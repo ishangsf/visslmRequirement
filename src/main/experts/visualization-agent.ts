@@ -21,6 +21,7 @@ import {
 } from '../../shared/dashboard-layout'
 import {
   automaticDashboardComponentTitle,
+  dashboardFieldDisplayLabel,
   validateDashboardSemanticConsistency
 } from '../../shared/dashboard-semantics'
 import type {
@@ -348,6 +349,7 @@ type DashboardPatchOperation = {
 type AppliedDashboardPatch = {
   dashboard: DashboardSpec
   affectedComponentIds: Set<string>
+  queryAffectedComponentIds: Set<string>
   removedComponentIds: Set<string>
   typeChangedComponentIds: Set<string>
 }
@@ -1163,6 +1165,7 @@ const applyPatchOperations = (
   validateFocusedPatchOperations(input, operations, focusComponentId)
   const next = cloneDashboard(input)
   const affectedComponentIds = new Set<string>()
+  const queryAffectedComponentIds = new Set<string>()
   const removedComponentIds = new Set<string>()
   const typeChangedComponentIds = new Set<string>()
   let needsArrange = false
@@ -1192,6 +1195,7 @@ const applyPatchOperations = (
       next.components.push(addition.component)
       if (addition.blueprint) next.analysisBlueprint = addition.blueprint
       affectedComponentIds.add(addition.component.id)
+      queryAffectedComponentIds.add(addition.component.id)
       needsArrange = true
       continue
     }
@@ -1201,6 +1205,7 @@ const applyPatchOperations = (
     if (operation.op === 'remove-component') {
       if (next.components.length <= 1) throw new Error('大屏至少需要保留一个组件')
       affectedComponentIds.delete(component.id)
+      queryAffectedComponentIds.delete(component.id)
       typeChangedComponentIds.delete(component.id)
       removedComponentIds.add(component.id)
       next.components.splice(index, 1)
@@ -1208,7 +1213,14 @@ const applyPatchOperations = (
     }
     affectedComponentIds.add(component.id)
     if (operation.op === 'set-component-title') {
-      component.title = requireTextValue(operation, '组件标题')
+      const previousTitle = component.title
+      const nextTitle = requireTextValue(operation, '组件标题')
+      component.title = nextTitle
+      if (!component.encoding?.label && Array.isArray(component.data)) {
+        component.data = component.data.map((point) => point.name === previousTitle
+          ? { ...point, name: nextTitle }
+          : point)
+      }
       if (component.semanticBinding) {
         component.semanticBinding = {
           ...component.semanticBinding,
@@ -1230,6 +1242,7 @@ const applyPatchOperations = (
       component.type = type as DashboardComponentType
       component.slotRole = dashboardSlotRoleForType(component.type, component.query?.dimensions ?? [])
       typeChangedComponentIds.add(component.id)
+      queryAffectedComponentIds.add(component.id)
       if (queryEngine) {
         next.components[index] = adaptDashboardComponentQuery(next, component.id, queryEngine).component
       }
@@ -1243,6 +1256,7 @@ const applyPatchOperations = (
         throw new Error(`组件 ${component.title} 的 Top N 必须是 1 到 500 的整数`)
       }
       component.query = { ...component.query, limit }
+      queryAffectedComponentIds.add(component.id)
       continue
     }
     if (operation.op === 'set-component-sort') {
@@ -1254,6 +1268,7 @@ const applyPatchOperations = (
         ...component.query,
         sort: [{ field, direction: operation.sortDirection }]
       }
+      queryAffectedComponentIds.add(component.id)
       continue
     }
     if (operation.op === 'set-component-time-grain') {
@@ -1275,6 +1290,7 @@ const applyPatchOperations = (
             : dimension
         )
       }
+      queryAffectedComponentIds.add(component.id)
     }
   }
   const arrangedComponents = needsArrange
@@ -1287,6 +1303,7 @@ const applyPatchOperations = (
   return {
     dashboard: rebound,
     affectedComponentIds,
+    queryAffectedComponentIds,
     removedComponentIds,
     typeChangedComponentIds
   }
@@ -1318,7 +1335,7 @@ const toDataPoints = (
 }
 
 const catalogForPrompt = (profiles: FieldProfile[]): object[] =>
-  profiles.slice(0, 100).map((profile) => ({
+  planSafeProfiles(profiles).slice(0, 100).map((profile) => ({
     field: profile.field,
     displayName: profile.displayName ?? profile.field,
     role: profile.role,
@@ -1375,9 +1392,10 @@ const dashboardSlotRoleForType = (
 }
 
 const profileLabel = (profile: FieldProfile | undefined, field: string | undefined): string => {
-  if (profile?.displayName?.trim()) return profile.displayName.trim()
-  const value = field?.split('.').filter(Boolean).pop()?.trim()
-  return value || '记录'
+  const resolvedField = field?.trim() || profile?.field.trim()
+  return resolvedField
+    ? dashboardFieldDisplayLabel(resolvedField, profile?.displayName)
+    : '记录'
 }
 
 const profileForField = (
@@ -1446,9 +1464,23 @@ const analysisProfileRelevance = (request: string, profile: FieldProfile): numbe
   }, 0)
 }
 
-const planSafeProfiles = (profiles: FieldProfile[]): FieldProfile[] => profiles.filter((profile) =>
-  profile.sensitivity !== 'sensitive' && profile.role !== 'identifier'
-)
+const canonicalMetadataForTransportAlias: Record<string, string> = {
+  '_valm_uid': 'uid',
+  '_valm_nodetype': 'nodeType',
+  '_valm_name': 'name',
+  '_valm_itemid': 'itemId',
+  '_valm_projectid': 'projectId',
+  '_valm_lastmodifytime': 'lastModifyTime'
+}
+
+const planSafeProfiles = (profiles: FieldProfile[]): FieldProfile[] => {
+  const availableFields = new Set(profiles.map((profile) => profile.field.toLocaleLowerCase()))
+  return profiles.filter((profile) => {
+    if (profile.sensitivity === 'sensitive' || profile.role === 'identifier') return false
+    const canonicalField = canonicalMetadataForTransportAlias[profile.field.toLocaleLowerCase()]
+    return !canonicalField || !availableFields.has(canonicalField.toLocaleLowerCase())
+  })
+}
 
 const profileIsCategory = (profile: FieldProfile): boolean =>
   profile.role === 'dimension' || ['string', 'enum', 'boolean'].includes(profile.inferredType)
@@ -2762,7 +2794,7 @@ export class VisualizationAgent {
             affectedComponentCount: result.affectedComponentIds.size,
             removedComponentCount: result.removedComponentIds.size,
             queryExecutionCount: result.dashboard.components.filter((component) =>
-              result.affectedComponentIds.has(component.id) && Boolean(component.query)
+              result.queryAffectedComponentIds.has(component.id) && Boolean(component.query)
             ).length
           })
         )
@@ -2801,7 +2833,7 @@ export class VisualizationAgent {
           id: baseDashboard.id,
           updatedAt: new Date().toISOString(),
           components: patched.components.map((component) => {
-            if (!component.query || !appliedPatch.affectedComponentIds.has(component.id)) {
+            if (!component.query || !appliedPatch.queryAffectedComponentIds.has(component.id)) {
               return component
             }
             const dataset = audit.run(

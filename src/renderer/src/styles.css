@@ -9271,9 +9271,9 @@ body,
 
 .project-match-progress {
   min-width: 0;
-  padding: 14px 16px;
+  padding: 16px;
   border: 1px solid color-mix(in srgb, var(--accent) 36%, var(--stroke));
-  border-radius: 10px;
+  border-radius: 12px;
   background: color-mix(in srgb, var(--accent) 8%, var(--surface-soft));
   box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text-main) 4%, transparent);
 }
@@ -9288,41 +9288,57 @@ body,
   background: color-mix(in srgb, var(--state-error) 7%, var(--surface-soft));
 }
 
-.project-match-progress-heading,
-.project-match-progress-main {
-  display: flex;
+.project-match-progress-heading {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   min-width: 0;
   align-items: center;
-}
-
-.project-match-progress-heading {
-  justify-content: space-between;
   gap: 12px;
 }
 
-.project-match-progress-heading > div:first-child,
+.project-match-progress-heading-copy,
 .project-match-progress-copy {
   display: flex;
   min-width: 0;
   flex-direction: column;
+}
+
+.project-match-progress-heading-copy {
   gap: 4px;
 }
 
-.project-match-progress-heading > div:first-child {
-  gap: 2px;
+.project-match-progress-title {
+  color: var(--text-main) !important;
+  font-size: 14px;
+  line-height: 1.4;
 }
 
-.project-match-progress-heading .ant-typography-secondary {
+.project-match-progress-subtitle {
   font-size: 11px;
+  line-height: 1.5;
+}
+
+.project-match-progress-status.ant-tag {
+  min-height: 24px;
+  margin-inline-end: 0;
+  padding-inline: 8px;
+  border-radius: 999px;
+  line-height: 22px;
+  white-space: nowrap;
 }
 
 .project-match-progress-main {
-  gap: 12px;
-  margin-top: 12px;
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr);
+  min-width: 0;
+  align-items: center;
+  gap: 16px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid color-mix(in srgb, var(--accent) 20%, var(--stroke));
 }
 
 .project-match-progress-ring.ant-progress {
-  flex: 0 0 auto;
   margin: 0;
 }
 
@@ -9334,6 +9350,7 @@ body,
 }
 
 .project-match-progress-copy {
+  gap: 4px;
   overflow: hidden;
 }
 
@@ -9343,21 +9360,60 @@ body,
   text-overflow: ellipsis;
 }
 
-.project-match-progress-copy > .ant-typography:first-child {
+.project-match-progress-message {
   color: var(--text-main) !important;
+  font-size: 13px;
+  line-height: 1.5;
   white-space: nowrap;
 }
 
-.project-match-progress-copy > .ant-typography:nth-child(2) {
+.project-match-progress-detail {
   display: -webkit-box;
   overflow-wrap: anywhere;
+  line-height: 1.5;
   white-space: normal;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
 }
 
+.project-match-progress-meta {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.project-match-progress-meta > .ant-typography {
+  font-size: inherit;
+}
+
 .project-match-progress-count {
+  color: var(--text-main) !important;
+  font-variant-numeric: tabular-nums;
   white-space: nowrap;
+}
+
+@media (max-width: 680px) {
+  .project-match-progress {
+    padding: 16px;
+  }
+
+  .project-match-progress-heading {
+    align-items: start;
+  }
+
+  .project-match-progress-main {
+    grid-template-columns: 1fr;
+    justify-items: start;
+    gap: 12px;
+  }
+
+  .project-match-progress-copy {
+    width: 100%;
+  }
 }
 
 .project-score-button.ant-btn {
