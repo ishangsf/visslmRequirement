@@ -11,6 +11,7 @@ import { expertRegistry } from '../experts/router'
 import { ModelClient } from '../model-client'
 import type { ModelChatInput, ModelResponse } from '../model-client'
 import { sanitizeContextText, selectHistoryMessages } from '../context-budget'
+import { resolveNaturalLanguageDeliveryIntent } from '../../shared/assistant-natural-language'
 
 /** Narrow adapter used by tests and by alternative model transports. */
 export interface AssistantIntentModelClient {
@@ -406,11 +407,20 @@ export class AssistantIntentRouter {
   ): Promise<AssistantIntentDecision> {
     const question = String(request.question ?? '').trim()
     const cleanedQuestion = stripMentions(question)
+    // A natural-language delivery phrase is only a hint for routing.  It does
+    // not authorize artifact generation; it removes the delivery clause so
+    // the data/knowledge planner receives the user's actual target.
+    const naturalDelivery = resolveNaturalLanguageDeliveryIntent(cleanedQuestion)
+    const deliveryQuery = naturalDelivery?.queryText.trim() ?? ''
+    const routingQuestion = deliveryQuery || cleanedQuestion
     const history = userHistory(request.history)
-    const sourceText = groundingText(question, request.history)
-    const groupedFollowUp = groupedResultPattern.test(cleanedQuestion)
+    // Keep format words and "上一轮结果" out of entity grounding.  Otherwise
+    // a classifier can echo Excel/文件 as a group entity and turn delivery
+    // instructions into a record search term.
+    const sourceText = groundingText(routingQuestion, request.history)
+    const groupedFollowUp = groupedResultPattern.test(routingQuestion)
     const recoveredGroupEntities = groupedFollowUp
-      ? recoverGroupedEntities(cleanedQuestion, history)
+      ? recoverGroupedEntities(routingQuestion, history)
       : []
     const explicitArtifactMention = mentionPatterns.artifact.test(question)
     if (!cleanedQuestion) {
@@ -481,15 +491,33 @@ export class AssistantIntentRouter {
         reason: 'explicit-artifact-skill'
       }
     }
+    if (naturalDelivery && !deliveryQuery) {
+      const clarificationQuestion = naturalDelivery.referencesPriorResult
+        ? '当前会话中没有可直接复用的已核验证据，请先完成一轮查询或知识库问答。'
+        : '请说明要查询或整理哪些数据；获得可核验证据后，我会打开交付物预览供你确认。'
+      return {
+        taskType: 'conversation',
+        skillId: 'general',
+        sourceMode: 'conversation',
+        resolvedQuestion: routingQuestion,
+        resultMode: 'answer',
+        groupEntities: [],
+        needsClarification: true,
+        clarificationQuestion,
+        reason: naturalDelivery.referencesPriorResult
+          ? 'natural-delivery-prior-result-missing'
+          : 'natural-delivery-query-target-missing'
+      }
+    }
 
     const forcedSkill = mentionPatterns.general.test(question) ? 'general' : undefined
-    const exactIds = forcedSkill ? [] : extractExplicitRequirementIds(cleanedQuestion)
+    const exactIds = forcedSkill ? [] : extractExplicitRequirementIds(routingQuestion)
     if (exactIds.length) {
       return {
         taskType: 'requirement_matching',
         skillId: 'requirement-analysis',
         sourceMode: 'records',
-        resolvedQuestion: cleanedQuestion,
+        resolvedQuestion: routingQuestion,
         resultMode: 'answer',
         groupEntities: [],
         needsClarification: false,
@@ -522,7 +550,7 @@ export class AssistantIntentRouter {
       {
         role: 'user',
         content: JSON.stringify({
-          currentQuestion: question,
+          currentQuestion: routingQuestion,
           conversationHistory: history.map((message) => ({
             role: message.role,
             content: message.content
@@ -586,15 +614,30 @@ export class AssistantIntentRouter {
     const modelResolvedQuestion = typeof raw.resolvedQuestion === 'string'
       ? sanitizeContextText(raw.resolvedQuestion, 2_000).trim()
       : ''
-    const inferredTask = normalizedTaskForQuestion(taskType, cleanedQuestion, exactIds)
+    const inferredTask = normalizedTaskForQuestion(taskType, routingQuestion, exactIds)
+    const naturalDeliveryTask = deliveryQuery
+      ? (() => {
+          const hasKnowledgeSource = knowledgeSourcePattern.test(routingQuestion)
+          const hasRecordSource = explicitRecordSourcePattern.test(routingQuestion) ||
+            recordDomainPattern.test(routingQuestion)
+          if (hasKnowledgeSource && hasRecordSource) return 'mixed_analysis' as const
+          if (hasKnowledgeSource) return 'knowledge_qa' as const
+          // A non-empty target extracted from a delivery request is an
+          // explicit request to retrieve source material, even when the
+          // target is just a name (for example "生成周顺峰的 Excel").
+          return 'record_query' as const
+        })()
+      : inferredTask
     const artifactWithoutExplicitMention = inferredTask === 'artifact_generation' && !explicitArtifactMention
     const contextualGroupedRecordQuery = groupedFollowUp && entities.length >= 2
     // A forced general mention stays inside the general assistant, while
     // automatic specialists require user-visible evidence in the question.
     const normalizedTask = contextualGroupedRecordQuery
       ? 'record_query'
+      : naturalDeliveryTask !== inferredTask && deliveryQuery
+      ? naturalDeliveryTask
       : artifactWithoutExplicitMention
-      ? inferredTaskForQuestion(cleanedQuestion, exactIds)
+      ? inferredTaskForQuestion(routingQuestion, exactIds)
       : forcedSkill === 'general' && (
           inferredTask === 'visualization' ||
           inferredTask === 'requirement_matching' ||
@@ -604,16 +647,22 @@ export class AssistantIntentRouter {
         : inferredTask
     const normalizedSource = canonicalSourceForTask(normalizedTask)
     const normalizedSkill = forcedSkill ?? canonicalSkillForTask(normalizedTask)
-    const normalizedResult = normalizedResultForQuestion(
-      normalizedTask,
-      rawResultMode,
-      cleanedQuestion,
-      entities
-    )
+    const normalizedResult = deliveryQuery && naturalDeliveryTask === 'record_query'
+      ? entities.length && groupedResultPattern.test(routingQuestion)
+        ? 'grouped_list'
+        : 'list'
+      : normalizedResultForQuestion(
+          normalizedTask,
+          rawResultMode,
+          routingQuestion,
+          entities
+        )
     const taskWasNormalized = taskType !== undefined && taskType !== normalizedTask
-    const safeResolvedQuestion = hasUngroundedGroupEntity || invalidDecisionShape || taskWasNormalized
-      ? cleanedQuestion
-      : modelResolvedQuestion
+    const safeResolvedQuestion = deliveryQuery
+      ? deliveryQuery
+      : hasUngroundedGroupEntity || invalidDecisionShape || taskWasNormalized
+        ? cleanedQuestion
+        : modelResolvedQuestion
     const resolvedQuestion = [
       safeResolvedQuestion || cleanedQuestion,
       entities.length && entities.some((entity) => !normalizedGrounding(safeResolvedQuestion).includes(
@@ -629,7 +678,7 @@ export class AssistantIntentRouter {
       !request.artifactSource?.evidenceBlocks.length
     const sourceMismatch = rawSourceMode !== undefined && rawSourceMode !== normalizedSource
     const taskSkillMismatch = modelSkill !== undefined && modelSkill !== normalizedSkill
-    const actionableGoal = questionHasActionableGoal(cleanedQuestion)
+    const actionableGoal = questionHasActionableGoal(routingQuestion)
     // Classifier transport/schema errors and redundant route-field mismatches
     // are internal recovery events. They must never be presented as missing
     // user information. Clarification is reserved for a missing user goal or
@@ -648,6 +697,9 @@ export class AssistantIntentRouter {
       taskWasNormalized ? `task normalized from ${taskType} to ${normalizedTask}` : '',
       sourceMismatch ? `source normalized to ${normalizedSource}` : '',
       taskSkillMismatch ? `skill normalized to ${normalizedSkill}` : '',
+      naturalDelivery
+        ? `natural delivery intent recognized as ${naturalDelivery.format}`
+        : '',
       modelNeedsClarification && actionableGoal ? 'non-actionable classifier clarification suppressed' : ''
     ].filter(Boolean)
 

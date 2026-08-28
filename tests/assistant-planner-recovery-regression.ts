@@ -25,6 +25,27 @@ const planQuestionOf = (agent: OllamaAgent): PlanQuestion => (
   (agent as unknown as { planQuestion: PlanQuestion }).planQuestion.bind(agent)
 )
 
+const installPlan = (agent: OllamaAgent, plan: DataCenterQueryPlan): void => {
+  Object.defineProperty(agent, 'planQuestion', {
+    configurable: true,
+    value: async (): Promise<DataCenterQueryPlan> => plan
+  })
+}
+
+const spyDataCenterExecutions = (agent: OllamaAgent): { count: () => number } => {
+  const internal = (agent as unknown as { dataCenterAgent: DataCenterAgent }).dataCenterAgent
+  const execute = internal.executePlan.bind(internal)
+  let calls = 0
+  Object.defineProperty(internal, 'executePlan', {
+    configurable: true,
+    value: (...args: Parameters<DataCenterAgent['executePlan']>) => {
+      calls += 1
+      return execute(...args)
+    }
+  })
+  return { count: () => calls }
+}
+
 const installModel = (
   agent: OllamaAgent,
   handler: (input: ModelChatInput) => Promise<ModelResponse> | ModelResponse
@@ -179,6 +200,73 @@ const main = async (): Promise<void> => {
     assert.deepEqual(ownerListPlan.searchTerms, ['周顺峰'])
     assert.equal(ownerListPlan.needsClarification, false)
 
+    const compoundDeliveryQuestion = '整理周顺峰相关的数据，生成一份excel文件给我。'
+    const compoundDeliveryAgent = new OllamaAgent(db, settings)
+    installModel(compoundDeliveryAgent, async () => {
+      throw new Error('planner transport unavailable')
+    })
+    const compoundDeliveryPlan = await planQuestionOf(compoundDeliveryAgent)({
+      question: compoundDeliveryQuestion,
+      projectId: 'planner-recovery-project',
+      assistantIntent: {
+        ...recordIntent(compoundDeliveryQuestion),
+        resultMode: 'list'
+      }
+    } as ChatRequest)
+    assert.equal(compoundDeliveryPlan.intent, 'filter_records')
+    assert.equal(compoundDeliveryPlan.resultMode, 'list')
+    assert.deepEqual(
+      compoundDeliveryPlan.searchTerms,
+      ['周顺峰'],
+      'the natural-language delivery suffix must not become a record search term'
+    )
+    assert.equal(
+      compoundDeliveryPlan.searchTerms.some((term) => /整理|excel|生成|文件/iu.test(term)),
+      false,
+      'search terms must not contain delivery/action words'
+    )
+    const compoundDeliveryExecution = dataCenter.executePlan(
+      'planner-recovery-project',
+      compoundDeliveryPlan
+    )
+    const compoundDeliveryResult = compoundDeliveryExecution.result as {
+      matchedCount: number
+      returnedCount: number
+      records: unknown[]
+    }
+    assert.equal(compoundDeliveryResult.matchedCount, truth.ownerCount)
+    assert.equal(compoundDeliveryResult.returnedCount, truth.ownerCount)
+    assert.equal(compoundDeliveryResult.records.length, truth.ownerCount)
+
+    const zeroHitRecoveryPlan: DataCenterQueryPlan = {
+      sourceMode: 'records',
+      needsClarification: false,
+      resultMode: 'list',
+      groupEntities: [],
+      intent: 'filter_records',
+      explanation: 'contaminated planner term fixture',
+      searchTerms: ['整理周顺峰'],
+      searchMode: 'any',
+      filters: [],
+      fields: [],
+      limit: 50
+    }
+    const zeroHitRecoveryAgent = new OllamaAgent(db, settings)
+    installPlan(zeroHitRecoveryAgent, zeroHitRecoveryPlan)
+    const zeroHitRecoveryExecutions = spyDataCenterExecutions(zeroHitRecoveryAgent)
+    const zeroHitRecoveryAnswer = await zeroHitRecoveryAgent.ask({
+      question: '整理周顺峰相关的数据',
+      projectId: 'planner-recovery-project',
+      assistantIntent: {
+        ...recordIntent('整理周顺峰相关的数据'),
+        resultMode: 'list'
+      }
+    } as ChatRequest)
+    assert.equal(zeroHitRecoveryExecutions.count(), 2, 'one zero-hit query may perform only one bounded retry')
+    assert.deepEqual(zeroHitRecoveryPlan.searchTerms, ['周顺峰'])
+    assert.deepEqual(zeroHitRecoveryAnswer.executionSummary?.searchTerms, ['周顺峰'])
+    assert.equal(zeroHitRecoveryAnswer.sources.length, truth.ownerCount)
+
     const explicitCodeQuestion = '查询需求代号 ZX-不存在-2026 的记录'
     const explicitCodeAgent = new OllamaAgent(db, settings)
     installModel(explicitCodeAgent, async () => {
@@ -195,6 +283,33 @@ const main = async (): Promise<void> => {
     assert.equal(explicitCodePlan.resultMode, 'list')
     assert.deepEqual(explicitCodePlan.searchTerms, ['ZX-不存在-2026'])
     assert.equal(explicitCodePlan.needsClarification, false, 'an explicit requirement code must remain a grounded zero-result lookup')
+    const explicitCodeExecution = dataCenter.executePlan(undefined, explicitCodePlan)
+    const explicitCodeResult = explicitCodeExecution.result as {
+      matchedCount: number
+      returnedCount: number
+      records: unknown[]
+    }
+    assert.deepEqual(explicitCodeExecution.args.search_terms, ['ZX-不存在-2026'])
+    assert.equal(explicitCodeResult.matchedCount, 0, 'an explicit missing code must remain a zero-result lookup')
+    assert.equal(explicitCodeResult.returnedCount, 0)
+    assert.deepEqual(explicitCodeResult.records, [])
+
+    const exactZeroPlan: DataCenterQueryPlan = {
+      ...explicitCodePlan,
+      searchTerms: ['ZX-不存在-2026']
+    }
+    const exactZeroAgent = new OllamaAgent(db, settings)
+    installPlan(exactZeroAgent, exactZeroPlan)
+    const exactZeroExecutions = spyDataCenterExecutions(exactZeroAgent)
+    const exactZeroAnswer = await exactZeroAgent.ask({
+      question: explicitCodeQuestion,
+      assistantIntent: {
+        ...recordIntent(explicitCodeQuestion),
+        resultMode: 'list'
+      }
+    } as ChatRequest)
+    assert.equal(exactZeroExecutions.count(), 1, 'a structured business identifier must never be broadened or retried')
+    assert.deepEqual(exactZeroAnswer.executionSummary?.searchTerms, ['ZX-不存在-2026'])
 
     const groupedCountQuestion = '分别统计周顺峰和负责人乙各自负责的需求数量'
     const groupedCountAgent = new OllamaAgent(db, settings)
@@ -685,6 +800,9 @@ const main = async (): Promise<void> => {
         'qualified count questions recover grounded terms when planning fails',
         'unqualified total counts recover deterministically',
         'follow-up counts recover their grounded user-history object',
+        'compound natural-language delivery requests keep a clean owner term and list the same grounded records',
+        'zero-hit action-word contamination receives one bounded correction and records the executed term',
+        'explicit missing business codes remain exact zero-result lookups without retry or broadening',
         'owner and 64+ result counts preserve full matched truth beyond the return limit',
         'owner-count planner drift restores grounded terms and drops unmentioned catalog constraints',
         'explicit owner predicates remain available when the user names the owner field',

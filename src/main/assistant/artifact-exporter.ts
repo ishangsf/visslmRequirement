@@ -775,14 +775,6 @@ const docxTable = (headers: string[], rows: string[][]): Table => new Table({
   }
 })
 
-const rowColumns = (view: NormalizedView): Array<{ key: string; label: string }> => [
-  { key: '__uid', label: '记录 UID' },
-  { key: '__name', label: '名称' },
-  { key: '__nodeType', label: '节点类型' },
-  { key: '__itemId', label: '项目编号' },
-  ...view.fields.map((field) => ({ key: field, label: view.fieldLabels[field] ?? field }))
-]
-
 const rowValue = (row: ChatDataRow, key: string): string => {
   if (key === '__uid') return row.uid
   if (key === '__name') return row.name
@@ -790,6 +782,92 @@ const rowValue = (row: ChatDataRow, key: string): string => {
   if (key === '__itemId') return row.itemId
   const value = row.values[key]
   return Array.isArray(value) ? value.join('、') : toText(value, key)
+}
+
+interface RowColumnCandidate {
+  key: string
+  label: string
+  kind: 'system' | 'property'
+}
+
+const normalizedColumnLabel = (value: string): string => value
+  .normalize('NFKC')
+  .trim()
+  .toLocaleLowerCase()
+
+/**
+ * Build the columns shared by DOCX/XLSX/PPTX exports.
+ *
+ * DataView rows always carry a fixed system name column.  A source field can
+ * also be labelled "名称" (or another system label), which used to produce
+ * two indistinguishable columns.  We only discard a dynamic collision when
+ * every loaded row proves that it is the same value as the system column;
+ * otherwise both values remain visible with stable 系统/属性 labels.
+ */
+const rowColumns = (view: NormalizedView): Array<{ key: string; label: string }> => {
+  const systemColumns: RowColumnCandidate[] = [
+    { key: '__uid', label: '记录 UID', kind: 'system' },
+    { key: '__name', label: '名称', kind: 'system' },
+    { key: '__nodeType', label: '节点类型', kind: 'system' },
+    { key: '__itemId', label: '项目编号', kind: 'system' }
+  ]
+  const dynamicColumns: RowColumnCandidate[] = view.fields.map((field) => ({
+    key: field,
+    label: view.fieldLabels[field] ?? field,
+    kind: 'property' as const
+  }))
+
+  const retainedDynamicColumns = dynamicColumns.filter((column) => {
+    const systemColumn = systemColumns.find((candidate) => (
+      normalizedColumnLabel(candidate.label) === normalizedColumnLabel(column.label)
+    ))
+    if (!systemColumn) return true
+    // With no loaded rows there is no evidence that the two columns are
+    // duplicates.  Keep both columns and disambiguate their labels.
+    if (!view.rows.length) return true
+    return !view.rows.every(({ row }) => (
+      rowValue(row, column.key) === rowValue(row, systemColumn.key)
+    ))
+  })
+
+  const candidates = [...systemColumns, ...retainedDynamicColumns]
+  const byBaseLabel = new Map<string, RowColumnCandidate[]>()
+  for (const column of candidates) {
+    const base = normalizedColumnLabel(column.label)
+    const group = byBaseLabel.get(base) ?? []
+    group.push(column)
+    byBaseLabel.set(base, group)
+  }
+
+  const usedLabels = new Set<string>()
+  const labels = new Map<string, string>()
+  for (const column of candidates) {
+    const base = column.label.trim() || column.key
+    const group = byBaseLabel.get(normalizedColumnLabel(column.label)) ?? [column]
+    const hasCollision = group.length > 1
+    let requested = base
+    if (hasCollision) {
+      const sameKindBefore = group.filter((candidate) => candidate.kind === column.kind)
+        .findIndex((candidate) => candidate.key === column.key)
+      const suffix = column.kind === 'system'
+        ? '（系统）'
+        : `（属性${sameKindBefore > 0 ? ` ${sameKindBefore + 1}` : ''}）`
+      requested = `${base}${suffix}`
+    }
+    let unique = requested
+    let duplicateIndex = 2
+    while (usedLabels.has(normalizedColumnLabel(unique))) {
+      unique = `${requested} ${duplicateIndex}`
+      duplicateIndex += 1
+    }
+    usedLabels.add(normalizedColumnLabel(unique))
+    labels.set(column.key, unique)
+  }
+
+  return candidates.map((column) => ({
+    key: column.key,
+    label: labels.get(column.key) ?? column.label
+  }))
 }
 
 const buildReport = async (snapshot: NormalizedArtifact): Promise<Uint8Array> => {

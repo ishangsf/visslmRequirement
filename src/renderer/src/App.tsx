@@ -123,6 +123,7 @@ import {
 import type {
   AppSettings,
   AssistantArtifact,
+  AssistantArtifactInput,
   AssistantArtifactOutputFormat,
   AssistantArtifactPreview,
   AssistantExecutionLog,
@@ -192,6 +193,7 @@ import type {
   SyncScopeConfig,
   UpdateStatus
 } from '../../shared/types'
+import { resolveNaturalLanguageDeliveryIntent } from '../../shared/assistant-natural-language'
 
 const { Content, Sider } = Layout
 const { Title, Text, Paragraph } = Typography
@@ -1661,6 +1663,52 @@ const explicitAgentSkillOf = (question: string): string | undefined => {
 const followUpQuestionOf = (question: string): boolean => (
   /(?:刚才|上一轮|前面|上述|以上|前述|继续(?:查|分析|看|说)?|这些(?:记录|数据|文档|结果)?|它们|这个结果|那个结果)/.test(question)
 )
+
+/**
+ * Natural-language delivery requests may refer to the answer immediately
+ * before them instead of naming a new query target.  Such a request can be
+ * fulfilled from the local evidence ledger without sending a meaningless
+ * "上一轮" query back through the data agents.
+ */
+const isNaturalLanguageDeliveryReference = (queryText: string): boolean => {
+  const normalized = queryText
+    .trim()
+    .replace(/[\s，。！？；：,.!?;:、]+$/gu, '')
+    .replace(/[\s]+/gu, '')
+  if (!normalized || normalized.length > 32) return false
+  return /^(?:(?:请|麻烦|帮我|把|将|对|基于|依据|根据)*(?:(?:上一轮|上轮|上一条|最近一条|前一条)(?:的)?(?:回答|结果|数据|记录|内容|查询结果)?|(?:刚才|刚刚|前面|上述|以上|前述)(?:的)?(?:回答|结果|数据|记录|内容|查询结果)?|这些(?:回答|结果|数据|记录|内容)?|这个(?:回答|结果|数据|记录|内容)|那个(?:回答|结果|数据|记录|内容))(?:进行)?(?:整理|汇总|梳理|导出|生成)?)$/u.test(normalized)
+}
+
+const assistantArtifactInputFromMessage = ({
+  conversationId,
+  messageId,
+  title,
+  question,
+  source,
+  outputFormat,
+  instructions
+}: {
+  conversationId: string
+  messageId: string
+  title: string
+  question: string
+  source: Pick<ChatMessage, 'content' | 'executionSummary' | 'evidenceBlocks' | 'dataViews' | 'sources'>
+  outputFormat: AssistantArtifactOutputFormat
+  instructions?: string
+}): AssistantArtifactInput => ({
+  type: 'delivery_draft',
+  conversationId,
+  messageId,
+  title: title.slice(0, 120),
+  question,
+  answer: source.content,
+  ...(source.executionSummary ? { executionSummary: source.executionSummary } : {}),
+  evidenceBlocks: source.evidenceBlocks ?? [],
+  dataViews: source.dataViews ?? [],
+  sources: source.sources ?? [],
+  outputFormat,
+  ...(instructions?.trim() ? { instructions: instructions.trim() } : {})
+})
 
 const assistantExecutionAgentLabels: Record<AssistantExecutionAgentId, string> = {
   conversation: 'Conversation Agent',
@@ -6052,6 +6100,12 @@ function ChatPage({
       message.warning('模型未连接，请先完成系统配置')
       return
     }
+    // Resolve the delivery part locally so a natural-language request can
+    // remain a normal read-only query while the renderer prepares a
+    // confirmation preview after evidence is returned.  Explicit specialist
+    // mentions retain their existing route and are intentionally excluded
+    // from this opt-in path below.
+    const naturalLanguageDeliveryIntent = resolveNaturalLanguageDeliveryIntent(text)
     const sessionId = conversationId
     const runId = crypto.randomUUID()
     const startedAt = new Date().toISOString()
@@ -6095,6 +6149,7 @@ function ChatPage({
       const hasExplicitExpertMention = /@(?:数据可视化专家|通用数据助手|需求分析专家|知识库专家|交付物专家)(?:\s|$)/.test(text)
       const requestsVisualization = /@数据可视化专家(?:\s|$)/.test(text)
       const requestsArtifactExport = /@交付物专家(?:\s|$)/.test(text)
+      const requestsNaturalLanguageArtifact = Boolean(naturalLanguageDeliveryIntent) && !requestsArtifactExport
       const requestArtifact = requestsVisualization && artifactAttached ? activeArtifact : null
       const artifactSourceMessage = requestsArtifactExport
         ? [...messages].reverse().find((item) => (
@@ -6108,13 +6163,86 @@ function ChatPage({
       const artifactSourceQuestion = artifactSourceIndex > 0
         ? [...messages.slice(0, artifactSourceIndex)].reverse().find((item) => item.role === 'user')?.content
         : undefined
-      const requestedArtifactFormat: AssistantArtifactOutputFormat = /(?:xlsx|excel|表格)/i.test(text)
-        ? 'xlsx'
-        : /(?:pptx|ppt|演示|汇报)/i.test(text)
-          ? 'pptx'
-          : /(?:zip|导出包|打包)/i.test(text)
-            ? 'zip'
-            : 'docx'
+      const requestedArtifactFormat: AssistantArtifactOutputFormat = requestsNaturalLanguageArtifact && naturalLanguageDeliveryIntent
+        ? naturalLanguageDeliveryIntent.format
+        : /(?:xlsx|excel|表格)/i.test(text)
+          ? 'xlsx'
+          : /(?:pptx|ppt|演示|汇报)/i.test(text)
+            ? 'pptx'
+            : /(?:zip|导出包|打包)/i.test(text)
+              ? 'zip'
+              : 'docx'
+      const queryQuestion = requestsNaturalLanguageArtifact
+        ? naturalLanguageDeliveryIntent?.queryText?.trim() || text
+        : text
+      const naturalLanguageDeliveryReference = naturalLanguageDeliveryIntent && (
+        naturalLanguageDeliveryIntent.referencesPriorResult === true ||
+        isNaturalLanguageDeliveryReference(naturalLanguageDeliveryIntent.queryText)
+      )
+
+      // A reference-only request such as “把上一轮整理成 Excel” already
+      // has a verified source in the current conversation.  Reuse it locally
+      // instead of asking a data agent to search for the literal reference.
+      const naturalArtifactSourceMessage = requestsNaturalLanguageArtifact &&
+        naturalLanguageDeliveryReference
+        ? [...messages].reverse().find((item) => (
+            item.role === 'assistant' && item.contextOutcome !== 'failed' &&
+            item.contextOutcome !== 'undone' && item.evidenceBlocks?.length
+          ))
+        : undefined
+      if (naturalArtifactSourceMessage && naturalLanguageDeliveryIntent) {
+        const sourceIndex = messages.findIndex((item) => item.id === naturalArtifactSourceMessage.id)
+        const sourceQuestion = sourceIndex > 0
+          ? [...messages.slice(0, sourceIndex)].reverse().find((item) => item.role === 'user')?.content
+          : undefined
+        const assistantMessageId = crypto.randomUUID()
+        const completedAt = new Date().toISOString()
+        const directAssistantMessage: ChatMessage = {
+          id: assistantMessageId,
+          role: 'assistant',
+          content: '已基于当前会话中最近一条有核验证据的回答准备交付物预览，请确认后生成文件。',
+          ...(dataScope ? { dataScope, dataScopeSummary } : {}),
+          executionLog: assistantExecutionLogForEntries(
+            settleAgentWorkLog('completed'),
+            startedAt,
+            completedAt
+          ),
+          createdAt: completedAt,
+          contextOutcome: 'success'
+        }
+        const directMessages: ChatMessage[] = [
+          ...messages,
+          { ...userMessage, contextOutcome: 'success' },
+          directAssistantMessage
+        ]
+        const directArtifactInput = assistantArtifactInputFromMessage({
+          conversationId: sessionId,
+          // The evidence belongs to the previous assistant turn.  Keep that
+          // source id in the artifact payload; the newly created message is
+          // only the visible delivery status in the current conversation.
+          messageId: naturalArtifactSourceMessage.id,
+          title: `交付物 · ${text}`,
+          question: sourceQuestion ?? text,
+          source: naturalArtifactSourceMessage,
+          outputFormat: requestedArtifactFormat,
+          instructions: naturalLanguageDeliveryIntent.instructions
+        })
+        setMessages(directMessages)
+        setMessageRunMetadata((current) => ({ ...current, [assistantMessageId]: initialRunMetadata }))
+        setAgentRunStatus('idle')
+        void persistSession(sessionId, directMessages)
+        try {
+          const preview = await window.visslm.previewAssistantArtifact(directArtifactInput)
+          if (!isCurrentRun(runId)) return
+          setArtifactExportFormat(preview.input.outputFormat ?? requestedArtifactFormat)
+          setArtifactGenerationStatus('idle')
+          setArtifactGenerationMessage('')
+          setArtifactPreview(preview)
+        } catch (error) {
+          message.warning(`交付物预览创建失败，查询结果已保留：${error instanceof Error ? error.message : String(error)}`)
+        }
+        return
+      }
       const contextMessages = messages
         .filter((message) => message.contextOutcome !== 'failed' && message.contextOutcome !== 'undone')
         .map(({ role, content, contextOutcome, contextRefs }) => ({
@@ -6125,7 +6253,7 @@ function ChatPage({
         }))
       const response = await window.visslm.askAgent({
         runId,
-        question: text,
+        question: queryQuestion,
         conversationId: sessionId,
         entrypoint: 'chat',
         expertId: 'general',
@@ -6185,7 +6313,11 @@ function ChatPage({
       // flashes through an empty state and no partial is saved to history.
       clearAnswerStream(runId)
       const responseError = response.events?.find((event) => event.type === 'error')
-      if (response.artifactPreview) {
+      const responseArtifactPreviewAllowed = Boolean(response.artifactPreview) && (
+        !requestsNaturalLanguageArtifact ||
+        (!responseError && !response.needsClarification && Boolean(response.evidenceBlocks?.length))
+      )
+      if (responseArtifactPreviewAllowed && response.artifactPreview) {
         setArtifactExportFormat(response.artifactPreview.input.outputFormat ?? requestedArtifactFormat)
         setArtifactGenerationStatus('idle')
         setArtifactGenerationMessage('')
@@ -6231,7 +6363,7 @@ function ChatPage({
           }
         : undefined
       const persistedTaskTrace = response.taskTrace ?? assistantTaskTracePayloadOf(responseTaskTrace, responseTaskStatus)
-      if (response.artifactPreview) setArtifactPreview(response.artifactPreview)
+      if (responseArtifactPreviewAllowed && response.artifactPreview) setArtifactPreview(response.artifactPreview)
       const assistantMessageId = crypto.randomUUID()
       const completedAt = new Date().toISOString()
       const executionLog = assistantExecutionLogForEntries(
@@ -6278,6 +6410,39 @@ function ChatPage({
       setAgentTaskTrace(responseTaskTrace ?? null)
       setAgentRunStatus(response.needsClarification ? 'clarification' : responseError ? 'failed' : 'idle')
       void persistSession(sessionId, completedMessages)
+
+      // Natural-language delivery is a two-phase operation: the query above
+      // remains read-only, then the verified answer is shown in the existing
+      // confirmation panel.  Keep preview errors outside the query failure
+      // path so a usable answer is never relabeled as failed.
+      if (
+        requestsNaturalLanguageArtifact &&
+        naturalLanguageDeliveryIntent &&
+        !response.artifactPreview &&
+        !responseError &&
+        !response.needsClarification &&
+        response.evidenceBlocks?.length
+      ) {
+        const naturalArtifactInput = assistantArtifactInputFromMessage({
+          conversationId: sessionId,
+          messageId: assistantMessageId,
+          title: `交付物 · ${text}`,
+          question: text,
+          source: completedAssistantMessage,
+          outputFormat: naturalLanguageDeliveryIntent.format,
+          instructions: naturalLanguageDeliveryIntent.instructions
+        })
+        try {
+          const preview = await window.visslm.previewAssistantArtifact(naturalArtifactInput)
+          if (!isCurrentRun(runId)) return
+          setArtifactExportFormat(preview.input.outputFormat ?? naturalLanguageDeliveryIntent.format)
+          setArtifactGenerationStatus('idle')
+          setArtifactGenerationMessage('')
+          setArtifactPreview(preview)
+        } catch (error) {
+          message.warning(`交付物预览创建失败，查询结果已保留：${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
     } catch (error) {
       if (!isCurrentRun(runId)) return
       const currentRun = activeRunRef.current

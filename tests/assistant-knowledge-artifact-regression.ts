@@ -563,6 +563,200 @@ const testArtifactFormatsAndEvidenceBoundary = async (): Promise<void> => {
   }
 }
 
+const dataRowsFromXlsx = (bytes: Buffer, viewTitle: string): unknown[][] => {
+  const workbook = XLSX.read(bytes, { type: 'buffer' })
+  const sheetName = workbook.SheetNames.find((name) => name.startsWith(`查询-${viewTitle}`))
+  assert.ok(sheetName, `XLSX must include the DataView sheet for ${viewTitle}`)
+  const sheet = workbook.Sheets[sheetName!]
+  assert.ok(sheet)
+  return XLSX.utils.sheet_to_json(sheet, {
+    header: 1,
+    raw: true,
+    defval: ''
+  }) as unknown[][]
+}
+
+const artifactForColumnDedup = (
+  view: AssistantArtifactInput['dataViews'][number]
+): AssistantArtifact => validArtifact({
+  ...validInput,
+  evidenceBlocks: [{
+    ...validInput.evidenceBlocks[0]!,
+    dataViewId: view.id
+  }],
+  dataViews: [view]
+})
+
+const renderXlsxForColumnDedup = async (
+  renderer: ReturnType<typeof exportFunctionOf>,
+  artifact: AssistantArtifact,
+  directory: string
+): Promise<unknown[][]> => {
+  const { bytes } = await materializeRendered(
+    await renderer.invoke(artifact, 'xlsx'),
+    directory
+  )
+  return dataRowsFromXlsx(bytes, artifact.payload.dataViews[0]?.title ?? '')
+}
+
+const testArtifactXlsxColumnDeduplication = async (): Promise<void> => {
+  const exporter = await loadExportModule()
+  const renderer = exportFunctionOf(exporter)
+  const directory = await mkdtemp(join(tmpdir(), 'knowledge-artifact-column-dedup-'))
+  try {
+    const identicalView: AssistantArtifactInput['dataViews'][number] = {
+      id: 'view:column-dedup-identical',
+      title: '名称列去重-相同值',
+      description: '固定名称与动态名称字段内容完全相同',
+      total: 2,
+      loadedRows: 2,
+      isPreview: false,
+      fields: ['Summary'],
+      fieldLabels: { Summary: '名称' },
+      groups: [{
+        name: '全部',
+        count: 2,
+        rows: [
+          {
+            uid: 'record:column-dedup-001',
+            name: '需求一',
+            nodeType: 'Requirement',
+            itemId: 'REQ-COLUMN-001',
+            values: { Summary: '需求一' }
+          },
+          {
+            uid: 'record:column-dedup-002',
+            name: '需求二',
+            nodeType: 'Requirement',
+            itemId: 'REQ-COLUMN-002',
+            values: { Summary: '需求二' }
+          }
+        ]
+      }],
+      recordUids: ['record:column-dedup-001', 'record:column-dedup-002']
+    }
+    const identicalRows = await renderXlsxForColumnDedup(
+      renderer,
+      artifactForColumnDedup(identicalView),
+      directory
+    )
+    const identicalHeaders = (identicalRows[0] ?? []).map(String)
+    assert.equal(
+      identicalHeaders.filter((header) => header === '名称').length,
+      1,
+      'identical fixed and dynamic name columns must collapse to one 名称 header'
+    )
+    assert.equal(new Set(identicalHeaders).size, identicalHeaders.length)
+    checks.push('固定 row.name 与 Summary(label=名称) 值相同时，XLSX 只保留一个名称列')
+
+    const distinctView: AssistantArtifactInput['dataViews'][number] = {
+      id: 'view:column-dedup-distinct',
+      title: '名称列去重-不同值',
+      description: '动态名称字段与固定名称内容不同',
+      total: 2,
+      loadedRows: 2,
+      isPreview: false,
+      fields: ['Summary'],
+      fieldLabels: { Summary: '名称' },
+      groups: [{
+        name: '全部',
+        count: 2,
+        rows: [
+          {
+            uid: 'record:column-distinct-001',
+            name: '需求一',
+            nodeType: 'Requirement',
+            itemId: 'REQ-DISTINCT-001',
+            values: { Summary: '摘要一' }
+          },
+          {
+            uid: 'record:column-distinct-002',
+            name: '需求二',
+            nodeType: 'Requirement',
+            itemId: 'REQ-DISTINCT-002',
+            values: { Summary: '摘要二' }
+          }
+        ]
+      }],
+      recordUids: ['record:column-distinct-001', 'record:column-distinct-002']
+    }
+    const distinctRows = await renderXlsxForColumnDedup(
+      renderer,
+      artifactForColumnDedup(distinctView),
+      directory
+    )
+    const distinctHeaders = (distinctRows[0] ?? []).map(String)
+    const distinctNameIndexes = distinctHeaders
+      .map((header, index) => ({ header, index }))
+      .filter(({ header }) => header === '名称' || header.startsWith('名称'))
+    assert.equal(distinctNameIndexes.length, 2, 'different same-label values must retain two name columns')
+    assert.equal(new Set(distinctNameIndexes.map(({ header }) => header)).size, 2, 'name headers must be unique')
+    const distinctValues = distinctRows.slice(1).map((row) => (
+      distinctNameIndexes.map(({ index }) => String(row[index] ?? ''))
+    ))
+    assert.deepEqual(distinctValues, [
+      ['需求一', '摘要一'],
+      ['需求二', '摘要二']
+    ], 'fixed and dynamic name values must both survive XLSX export')
+    assert.equal(new Set(distinctHeaders).size, distinctHeaders.length)
+    checks.push('同名但内容不同的动态字段保留两个唯一名称表头及两份值')
+
+    const multipleDynamicView: AssistantArtifactInput['dataViews'][number] = {
+      id: 'view:column-dedup-multiple',
+      title: '名称列去重-多个属性',
+      description: '多个动态属性使用相同显示名称',
+      total: 2,
+      loadedRows: 2,
+      isPreview: false,
+      fields: ['Summary', 'Title'],
+      fieldLabels: { Summary: '名称', Title: '名称' },
+      groups: [{
+        name: '全部',
+        count: 2,
+        rows: [
+          {
+            uid: 'record:column-multiple-001',
+            name: '需求一',
+            nodeType: 'Requirement',
+            itemId: 'REQ-MULTIPLE-001',
+            values: { Summary: '摘要一', Title: '标题一' }
+          },
+          {
+            uid: 'record:column-multiple-002',
+            name: '需求二',
+            nodeType: 'Requirement',
+            itemId: 'REQ-MULTIPLE-002',
+            values: { Summary: '摘要二', Title: '标题二' }
+          }
+        ]
+      }],
+      recordUids: ['record:column-multiple-001', 'record:column-multiple-002']
+    }
+    const multipleDynamicRows = await renderXlsxForColumnDedup(
+      renderer,
+      artifactForColumnDedup(multipleDynamicView),
+      directory
+    )
+    const multipleDynamicHeaders = (multipleDynamicRows[0] ?? []).map(String)
+    const multipleNameIndexes = multipleDynamicHeaders
+      .map((header, index) => ({ header, index }))
+      .filter(({ header }) => header === '名称' || header.startsWith('名称'))
+    assert.equal(multipleNameIndexes.length, 3, 'multiple same-label properties must remain three name columns')
+    assert.equal(new Set(multipleNameIndexes.map(({ header }) => header)).size, 3)
+    assert.deepEqual(
+      multipleDynamicRows.slice(1).map((row) => multipleNameIndexes.map(({ index }) => String(row[index] ?? ''))),
+      [
+        ['需求一', '摘要一', '标题一'],
+        ['需求二', '摘要二', '标题二']
+      ],
+      'multiple same-label property values must remain aligned with their unique headers'
+    )
+    checks.push('多个同名动态属性列也会生成唯一名称表头并保持列值对齐')
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+}
+
 const testArtifactGenerationRejectsUnsafeInputs = async (): Promise<void> => {
   const exporter = await loadExportModule()
   const renderer = exportFunctionOf(exporter)
@@ -602,6 +796,7 @@ const main = async (): Promise<void> => {
   await testKnowledgeSourceIsolationAndPermissions()
   await testArtifactRouteAndFailClosedPlanning()
   await testArtifactFormatsAndEvidenceBoundary()
+  await testArtifactXlsxColumnDeduplication()
   await testArtifactGenerationRejectsUnsafeInputs()
   console.log(JSON.stringify({ ok: true, checks }, null, 2))
 }

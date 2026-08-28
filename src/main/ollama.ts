@@ -46,6 +46,7 @@ import {
   selectHistoryMessages,
   selectHistoryWithSummary
 } from './context-budget'
+import { resolveNaturalLanguageDeliveryIntent } from '../shared/assistant-natural-language'
 
 type AgentStatusEvent = Extract<AgentEvent, { type: 'status' }>
 
@@ -111,16 +112,37 @@ const isUnconstrainedRecordCountQuestion = (question: string): boolean => {
 }
 
 const normalizeSearchCandidate = (value: string): string | undefined => {
-  const candidate = sanitizeContextText(value, 120)
-    .replace(/^(?:请问|请|麻烦|帮我|帮忙|查询|查找|统计|看看|看一下)\s*/u, '')
-    .replace(/^(?:当前)?数据中心(?:里|中)?\s*(?:和|与)?/u, '')
-    .replace(/^(?:想知道|数一下|统计一下|算一下|找出|列出|查找|查询|搜索|筛选)\s*(?:和|与)?/u, '')
-    .replace(/^(?:和|与)\s*/u, '')
+  let candidate = sanitizeContextText(value, 120)
+    .replace(/[\r\n]+/gu, ' ')
+    .replace(/[\s，,。！？!?：:；;]+$/gu, '')
+    .trim()
+  // Planner output is untrusted text.  Strip only well-known query/delivery
+  // scaffolding in a bounded loop; never expand a term or invent synonyms.
+  for (let pass = 0; pass < 4; pass += 1) {
+    const previous = candidate
+    candidate = candidate
+      .replace(/^(?:请问|请|麻烦|帮我|帮忙|想知道|想查|需要|查询|查找|统计|看看|看一下|数一下|统计一下|算一下|找出|列出|搜索|筛选)\s*/u, '')
+      .replace(/^(?:当前|本地)?数据中心(?:里|中|内)?\s*(?:和|与|及|以及)?/u, '')
+      .replace(/^(?:(?:整理|汇总|梳理|收集|归纳)(?:成|为)?|导出|生成|制作|做成|转(?:成|为)|转换(?:成|为)|保存(?:为|成)|给我(?:一份|一个|一张)?|提供(?:一份|一个|一张)?)\s*/u, '')
+      .replace(/^(?:和|与|及|以及)\s*/u, '')
+      .replace(/^[“"']|[”"']$/gu, '')
+      .trim()
+    if (candidate === previous) break
+  }
+  candidate = candidate
+    .replace(/的(?:需求记录|需求|记录|项目|数据|事项)$/u, '')
+    .replace(/(?:相关|有关)(?:的)?(?:需求|记录|项目|数据|事项)$/u, '')
     .replace(/(?:相关|有关)$/u, '')
+    .replace(/(?:文件|表格)给我$/u, '')
+    .replace(/(?:的)?(?:一共|总共|共有)?(?:有多少|多少|几(?:条|个|项)?|数量|总数)$/u, '')
     .replace(/[\s，,。！？!?：:；;]+$/gu, '')
     .trim()
   if (!candidate || candidate.length > 80) return undefined
-  if (/^(?:当前|本地)?(?:数据中心)?(?:全部|所有)?(?:需求|记录|数据)?$/u.test(candidate)) return undefined
+  if (
+    /^(?:当前|本地)?(?:数据中心)?(?:全部|所有)?(?:需求|记录|数据)?$/u.test(candidate) ||
+    isGenericRecordTypeTerm(candidate) ||
+    isRecordCountScaffoldingTerm(candidate)
+  ) return undefined
   return candidate
 }
 
@@ -141,10 +163,25 @@ const groundedSearchTermsFromQuestion = (question: string): string[] => {
     /(?:负责人|责任人|承办人|经办人)\s*(?:为|是|[:：])\s*([^，。！？!?]{1,80}?)(?:的)?(?:需求|记录|项目|数据)/u,
     /([^，。！？!?]{1,80}?)(?:的)?(?:需求|记录)(?:一共)?(?:有)?(?:多少|几条)/u,
     /关于\s*([^，。！？!?]{1,80}?)(?:的)?(?:需求|记录|数据)/u,
-    /(?:包含|含有|涉及|围绕)\s*([^，。！？!?]{1,80}?)(?:关键词)?(?:的)?(?:需求|记录|数据)/u
+    /(?:包含|含有|涉及|围绕)\s*([^，。！？!?]{1,80}?)(?:关键词)?(?:的)?(?:需求|记录|数据)/u,
+    /(?:关于|针对|围绕|面向)\s*([^，。！？!?]{1,80}?)(?:的)?$/u,
+    /(?:负责人|责任人|承办人|经办人)\s*(?:为|是|[:：])\s*([^，。！？!?]{1,80}?)(?:的)?$/u
   ]) {
     const match = text.match(pattern)?.[1]
     if (match) candidates.push(match)
+  }
+  // Delivery requests can contain a bare, but explicit, target such as
+  // "生成周顺峰的 Excel".  Once the delivery clause has been removed, the
+  // remaining short phrase is safe to ground as a term; scaffolding and broad
+  // record nouns are rejected by normalizeSearchCandidate below.
+  if (
+    !candidates.length &&
+    !/(?:数据中心|需求|记录|项目|数据|事项|查询|查找|统计|筛选|搜索|列出|查看|负责人|责任人|承办人|经办人|知识库|文档|资料)/u.test(text)
+  ) {
+    const fallback = normalizeSearchCandidate(text)
+    if (fallback && !isGenericRecordTypeTerm(fallback) && !isRecordCountScaffoldingTerm(fallback)) {
+      candidates.push(fallback)
+    }
   }
   return candidates
     .map(normalizeSearchCandidate)
@@ -244,6 +281,55 @@ type QuestionPlanSourceMode = DataCenterQueryPlan['sourceMode']
 type QuestionPlan = DataCenterQueryPlan
 type RecordPlanExecution = DataCenterExecution
 type KnowledgePlanExecution = Awaited<ReturnType<KnowledgeBaseAgent['search']>>
+
+const compactGroundingForSearch = (value: string): string => value
+  .normalize('NFKC')
+  .toLocaleLowerCase()
+  .replace(/[^\p{L}\p{N}]+/gu, '')
+
+const explicitBusinessIdentifierPattern = /^[A-Za-z][A-Za-z0-9]*(?:[-_.][A-Za-z0-9]+)+$/u
+
+/**
+ * Return one bounded term-only correction for a zero-hit record query.
+ *
+ * The candidate must be produced by removing known planner/query scaffolding
+ * from an existing term, remain visibly present in user-authored text, and
+ * not be a structured business identifier.  Scope, filters, fields, project
+ * and permissions are intentionally outside this helper and therefore remain
+ * untouched by the retry.
+ */
+const zeroHitSearchCorrectionFor = (
+  request: ChatRequest,
+  plan: QuestionPlan
+): string[] | undefined => {
+  if (plan.sourceMode !== 'records' || !plan.searchTerms.length) return undefined
+  const userText = [
+    request.question,
+    ...(request.history ?? [])
+      .filter((message) => message.role === 'user')
+      .map((message) => message.content)
+  ].join('\n')
+  const compactUserText = compactGroundingForSearch(userText)
+  const corrected: string[] = []
+  let changed = false
+  for (const value of plan.searchTerms) {
+    const original = String(value ?? '').trim()
+    if (!original || explicitBusinessIdentifierPattern.test(original)) return undefined
+    const candidate = normalizeSearchCandidate(original)
+    if (!candidate) return undefined
+    if (candidate !== original) changed = true
+    if (candidate !== original) {
+      if (explicitBusinessIdentifierPattern.test(candidate)) return undefined
+      const compactCandidate = compactGroundingForSearch(candidate)
+      if (!compactCandidate || !compactUserText.includes(compactCandidate)) return undefined
+      if (isGenericRecordTypeTerm(candidate) || isRecordCountScaffoldingTerm(candidate)) return undefined
+    }
+    if (!corrected.some((term) => compactGroundingForSearch(term) === compactGroundingForSearch(candidate))) {
+      corrected.push(candidate)
+    }
+  }
+  return changed && corrected.length ? corrected : undefined
+}
 
 interface PlanAnswerExecution {
   response: ChatResponse
@@ -496,16 +582,29 @@ export class OllamaAgent {
         })
       }
     }
-    let effectiveRequest = request.assistantIntent?.resolvedQuestion
-      ? { ...request, question: request.assistantIntent.resolvedQuestion }
-      : request
+    const naturalDelivery = resolveNaturalLanguageDeliveryIntent(request.question)
+    const naturalDeliveryQuery = naturalDelivery?.queryText.trim() ?? ''
+    const suppliedResolvedQuestion = request.assistantIntent?.resolvedQuestion?.trim() ?? ''
+    // Prefer the deterministic delivery boundary over a model-provided
+    // resolvedQuestion.  This prevents a planner/classifier from re-inserting
+    // "Excel 文件给我" as a record term while keeping explicit artifact
+    // routing (which never reaches this path) unchanged.
+    const effectiveQuestion = naturalDeliveryQuery || suppliedResolvedQuestion || request.question
+    let effectiveRequest = effectiveQuestion === request.question
+      ? request
+      : { ...request, question: effectiveQuestion }
     this.progress('route', '正在理解问题并准备执行')
     let plan: QuestionPlan | undefined
     let planningError: unknown
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       try {
         this.progress('plan', '正在读取可用数据并准备查询')
-        plan = await this.planQuestion(effectiveRequest, request.question)
+        // Only a detected delivery clause may replace the grounding text.
+        // For ordinary requests, keep the user's original wording as the
+        // evidence boundary even when the intent router supplied a rewritten
+        // resolvedQuestion; otherwise grounded entities can disappear.
+        const planningGroundingQuestion = naturalDeliveryQuery || request.question
+        plan = await this.planQuestion(effectiveRequest, planningGroundingQuestion)
         break
       } catch (error) {
         planningError = error
@@ -550,13 +649,16 @@ export class OllamaAgent {
         })
       }
     }
-    const executionSummary = this.executionSummaryFor(effectiveRequest, plan)
     if (process.env.VISSLM_AGENT_DEBUG === '1') {
       console.info('[Agent] 结构化查询条件：', JSON.stringify(plan))
     }
     try {
       this.progress('query', '正在执行本地查询并获取证据')
       const execution = await this.executePlanAndAnswer(effectiveRequest, plan)
+      // executePlanAndAnswer may perform one bounded, term-only recovery.  It
+      // updates the plan before returning so this summary records the exact
+      // searchTerms that reached the data-center tool.
+      const executionSummary = this.executionSummaryFor(effectiveRequest, plan)
       const context = this.traceContextForPlan(plan)
       return attachAssistantTaskTrace({ ...execution.response, executionSummary }, context, {
         startedAt,
@@ -649,8 +751,13 @@ export class OllamaAgent {
 
   private async planQuestion(
     request: ChatRequest,
-    groundingQuestion = request.question
+    groundingQuestionInput?: string
   ): Promise<QuestionPlan> {
+    const rawGroundingQuestion = String(groundingQuestionInput ?? request.question).trim()
+    const parsedDelivery = resolveNaturalLanguageDeliveryIntent(rawGroundingQuestion)
+    const groundingQuestion = parsedDelivery?.queryText.trim() || rawGroundingQuestion
+    const naturalDeliveryQuery = parsedDelivery?.queryText.trim() ?? ''
+    const naturalDeliveryRecordRequest = Boolean(naturalDeliveryQuery)
     const conversationContext = selectHistoryMessages(request.history, 6, 1_200)
     const plannerGroundingText = [
       groundingQuestion,
@@ -717,7 +824,7 @@ export class OllamaAgent {
             {
               role: 'user',
               content: JSON.stringify({
-                currentQuestion: request.question,
+                currentQuestion: groundingQuestion,
                 conversationContext,
                 availableNodeTypes: [],
                 fieldCatalog: []
@@ -840,7 +947,7 @@ export class OllamaAgent {
               {
                 role: 'user',
                 content: JSON.stringify({
-                  currentQuestion: request.question,
+                  currentQuestion: groundingQuestion,
                   groundingQuestion,
                   conversationContext,
                   availableNodeTypes: nodeTypes,
@@ -1011,8 +1118,10 @@ export class OllamaAgent {
           .slice(0, 20)
       : []
     const groundedTerm = (value: unknown): string | undefined => {
-      const term = String(value ?? '').trim()
-      return term && normalizedGrounding.includes(term.toLocaleLowerCase()) ? term : undefined
+      const term = normalizeSearchCandidate(String(value ?? ''))
+      if (!term) return undefined
+      const normalizedTerm = term.normalize('NFKC').toLocaleLowerCase()
+      return normalizedGrounding.includes(normalizedTerm) ? term : undefined
     }
     const countQuestion = assistantCountQuestionPattern.test(groundingQuestion)
     const groundedQuestionTerms = groundedSearchTermsFromQuestion(plannerGroundingText)
@@ -1106,6 +1215,22 @@ export class OllamaAgent {
         ? { field: sortField, direction: sortInput?.direction === 'asc' ? 'asc' : 'desc' }
         : undefined,
       limit: effectiveLimit
+    }
+    if (
+      naturalDeliveryRecordRequest &&
+      (plan.sourceMode === 'records' || plan.sourceMode === 'mixed') &&
+      plan.intent !== 'conversation'
+    ) {
+      // A composite request such as "整理周顺峰的数据，生成 Excel" first
+      // needs a concrete record retrieval.  Do not let a planner fallback to
+      // search_content merely because the cleaned query no longer contains a
+      // list verb from the delivery clause.
+      plan.intent = 'filter_records'
+      if (plan.resultMode !== 'grouped_list' && plan.resultMode !== 'table') {
+        plan.resultMode = 'list'
+      }
+      plan.needsClarification = false
+      plan.clarificationQuestion = undefined
     }
     const comparativeRecordRequest = (plan.sourceMode === 'records' || plan.sourceMode === 'mixed') &&
       plan.groupEntities.length >= 2 &&
@@ -1290,6 +1415,29 @@ export class OllamaAgent {
     if (plan.sourceMode !== 'knowledge') {
       invokedAgents.push('data-center')
       recordExecution = this.dataCenterAgent.executePlan(selectedProjectId, plan)
+      if (
+        plan.sourceMode === 'records' &&
+        recordExecution.toolName === 'query_records_by_fields' &&
+        matchedRecordCount(recordExecution.result) === 0
+      ) {
+        const correctedSearchTerms = zeroHitSearchCorrectionFor(request, plan)
+        if (correctedSearchTerms) {
+          const originalSearchTerms = [...plan.searchTerms]
+          const retryPlan: QuestionPlan = {
+            ...plan,
+            searchTerms: correctedSearchTerms
+          }
+          recordExecution = this.dataCenterAgent.executePlan(selectedProjectId, retryPlan)
+          // Keep the in-memory plan authoritative for rendering, the data
+          // view, and the execution summary.  No scope/filters/fields are
+          // changed by this one bounded retry.
+          plan.searchTerms = correctedSearchTerms
+          plan.explanation = [
+            plan.explanation,
+            `首次查询零命中，已将检索词从“${originalSearchTerms.join('、')}”安全清理为“${correctedSearchTerms.join('、')}”后重试`
+          ].filter(Boolean).join('; ')
+        }
+      }
     }
     let knowledgeExecution: KnowledgePlanExecution | undefined
     if (plan.sourceMode !== 'records') {
