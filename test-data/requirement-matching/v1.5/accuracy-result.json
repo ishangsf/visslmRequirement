@@ -19,10 +19,10 @@
     "configHash": "c8fc7bf0d939cd8cffc14865028e0fc1bbe7457c457b453fbe669f1ea12134b0",
     "repeat": 2,
     "indexedRecordCount": 624,
-    "startedAt": "2026-08-28T00:53:47.949Z",
-    "durationMs": 49137
+    "startedAt": "2026-08-28T00:59:40.243Z",
+    "durationMs": 49190
   },
-  "codeCommit": "c6da7ab81c76db246fd8e40cc75d1e0647943f9d",
+  "codeCommit": "58f679d130332f5b5b49ceca6b182e420c497ae1",
   "metrics": {
     "exactRecallAt1": 0.5,
     "exactRecallAt5": 1,
