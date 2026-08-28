@@ -20,6 +20,15 @@ const analysisLogAlwaysVisibleContract = !projectPageSource.includes('analysisLo
   && projectPageSource.includes('progress={projectProgress}')
   && !projectStylesSource.includes('.project-analysis-log-panel.is-collapsed')
   && projectStylesSource.includes('.project-match-progress')
+const analysisProgressLayoutContract = projectPageSource.includes('className="project-analysis-header"')
+  && projectPageSource.includes('className="project-analysis-body"')
+  && projectPageSource.includes('className="project-analysis-step-marker"')
+  && projectPageSource.includes('任务正在后台持续执行，请勿重复上传协议文件。')
+  && !projectPageSource.includes('后台处理中 · 请勿重复上传')
+  && !projectPageSource.includes('className="project-analysis-eta"')
+  && projectStylesSource.includes('grid-template-columns: minmax(240px, 0.8fr) minmax(520px, 2fr)')
+  && projectStylesSource.includes('.project-analysis-step-marker::before')
+  && projectStylesSource.includes('.project-analysis-footer')
 const projectMatchingSettingsContract = appSource.includes("key: 'general'")
   && appSource.includes('saveProjectMatchingSettings')
   && appSource.includes('name="minScore"')
@@ -85,13 +94,14 @@ const relationshipGraphContract = projectPageSource.includes("import { ProjectRe
 
 if (process.env.VISSLM_UI_STATIC_ONLY === '1') {
   assert.equal(analysisLogAlwaysVisibleContract, true)
+  assert.equal(analysisProgressLayoutContract, true)
   assert.equal(projectMatchingSettingsContract, true)
   assert.equal(requirementStatusFilterContract, true)
   assert.equal(linkedAssetListContract, true)
   assert.equal(taskRequirementContract, true)
   assert.equal(themedAppIconContract, true)
   assert.equal(relationshipGraphContract, true)
-  console.log(JSON.stringify({ ok: true, mode: 'static', checks: ['project requirement status provenance'] }))
+  console.log(JSON.stringify({ ok: true, mode: 'static', checks: ['project requirement status provenance', 'responsive analysis progress layout'] }))
   process.exit(0)
 }
 

@@ -708,7 +708,7 @@ function ProjectStatus({ project }: { project: ManagedProject }): React.JSX.Elem
 type MatchTableColumnKey = 'rank' | 'record' | 'score' | 'relation' | 'evidence' | 'asset'
 type MatchTableColumnWidths = Record<MatchTableColumnKey, number>
 
-const matchTableColumnStorageKey = 'project-requirement-match-runs:v1'
+const matchTableColumnStorageKey = 'project-requirement-match-runs:v2'
 const projectAppTableScrollY = 'min(560px, max(260px, calc(100vh - 300px)))'
 const projectCompactTableScrollY = 'min(360px, max(180px, calc(100vh - 420px)))'
 const projectDetailTableScrollY = 'min(440px, max(220px, calc(100vh - 500px)))'
@@ -717,16 +717,16 @@ const matchTableColumnDefaults: MatchTableColumnWidths = {
   rank: 72,
   record: 224,
   score: 112,
-  relation: 150,
-  evidence: 300,
+  relation: 184,
+  evidence: 320,
   asset: 180
 }
 const matchTableColumnMinWidths: MatchTableColumnWidths = {
   rank: 64,
   record: 180,
   score: 96,
-  relation: 130,
-  evidence: 220,
+  relation: 160,
+  evidence: 260,
   asset: 144
 }
 const matchTableColumnMaxWidths: MatchTableColumnWidths = {
@@ -741,10 +741,60 @@ const matchTableColumnLabels: Record<MatchTableColumnKey, string> = {
   rank: '排名',
   record: '数据中心数据',
   score: '综合匹配分',
-  relation: '关系与决策',
-  evidence: '匹配证据',
+  relation: '匹配判断',
+  evidence: '判断依据',
   asset: '项目资产'
 }
+
+const matchDecisionMeta: Record<ProjectRequirementMatch['decisionStatus'], { label: string; color: string; hint: string }> = {
+  confirmed: { label: '可以确认', color: 'success', hint: '证据充分，可优先关联' },
+  suggested: { label: '建议匹配', color: 'purple', hint: '建议结合业务上下文确认' },
+  ambiguous: { label: '需人工确认', color: 'warning', hint: '当前证据不足，请核对后再关联' },
+  rejected: { label: '不建议匹配', color: 'default', hint: '存在明显冲突或相关性不足' }
+}
+
+const matchRelationMeta: Record<NonNullable<ProjectRequirementMatch['relation']>, string> = {
+  duplicate: '内容基本一致',
+  highly_similar: '业务内容高度相似',
+  partial_overlap: '部分内容重合',
+  same_pattern: '业务模式相似',
+  topic_only: '仅主题相关',
+  unrelated: '业务内容不相关'
+}
+
+const matchEvidenceLevelMeta: Record<ProjectRequirementMatch['evidenceLevel'], { label: string; color: string }> = {
+  exact_business_hash: { label: '业务内容完全一致', color: 'success' },
+  exact_normalized_text: { label: '规范化文本一致', color: 'success' },
+  deterministic_rule: { label: '规则判断', color: 'blue' },
+  model_supported: { label: '模型辅助判断', color: 'purple' },
+  retrieval_only: { label: '仅初步召回', color: 'default' }
+}
+
+const matchReasonLabels: Record<string, string> = {
+  EXACT_BUSINESS_HASH: '业务内容完全一致',
+  EXACT_NORMALIZED_TEXT: '去除格式差异后内容一致',
+  MISSING_REQUIRED_FIELD: '关键信息不完整，暂无法确认',
+  CANDIDATE_INELIGIBLE: '该数据不在当前可关联范围内',
+  NORMALIZATION_VERSION_MISMATCH: '数据处理版本不一致，需要重新匹配',
+  ACTION_CONFLICT: '执行动作不一致',
+  OBJECT_CONFLICT: '业务对象不一致',
+  NEGATION_CONFLICT: '需求肯定与否定关系冲突',
+  CONSTRAINT_CONFLICT: '约束条件存在冲突',
+  BUSINESS_OVERLAP: '业务目标和内容存在重合'
+}
+
+const matchDegradationLabels: Record<string, string> = {
+  RERANKER_UNAVAILABLE: '精排模型暂不可用，当前结果仅供初步筛选',
+  EXPLAINER_UNAVAILABLE: '匹配说明暂不可用，请结合原始内容判断',
+  EXPLANATION_PROTOCOL_ERROR: '匹配说明生成异常，请结合原始内容判断'
+}
+
+const readableMatchReasons = (codes: string[]): string => codes.length
+  ? codes.map((code) => matchReasonLabels[code] ?? '系统规则给出了限制条件').join('；')
+  : '系统根据业务内容相似度给出候选'
+
+const readableMatchDegradations = (codes: string[]): string[] =>
+  codes.map((code) => matchDegradationLabels[code] ?? '部分辅助能力暂不可用，结果需要人工复核')
 
 const clampMatchTableColumnWidth = (key: MatchTableColumnKey, value: number): number =>
   Math.min(matchTableColumnMaxWidths[key], Math.max(matchTableColumnMinWidths[key], Math.round(value)))
@@ -1189,18 +1239,45 @@ function MatchDrawer({
       render: (value: number, row) => <Tooltip title={`当前算法版本内的相对匹配程度，不代表统计概率。排序版本：${row.rankingVersion}`}><strong>{value.toFixed(1)}</strong></Tooltip>
     },
     {
-      title: '关系与决策', key: 'relation', width: columnWidths.relation,
+      title: '匹配判断', key: 'relation', width: columnWidths.relation,
       onHeaderCell: () => ({
         width: columnWidths.relation, columnKey: 'relation', minWidth: matchTableColumnMinWidths.relation,
         maxWidth: matchTableColumnMaxWidths.relation, onResize: (width: number) => resizeColumn('relation', width),
         onResizeEnd: (width: number) => commitColumnResize('relation', width)
       } as ResizableHeaderCellProps),
-      render: (_value, row) => <Space direction="vertical" size={4}><Tag color={row.decisionStatus === 'confirmed' ? 'success' : row.decisionStatus === 'ambiguous' ? 'warning' : 'purple'}>{row.decisionStatus}</Tag><Text type="secondary">{row.relation ?? '待判定'}</Text></Space>
+      render: (_value, row) => {
+        const decision = matchDecisionMeta[row.decisionStatus]
+        const relation = row.relation ? matchRelationMeta[row.relation] : '关系暂未确定'
+        return (
+          <Tooltip title={`技术信息：${row.decisionStatus} · ${row.relation ?? 'null'}`}>
+            <div className="project-match-decision">
+              <Tag color={decision.color}>{decision.label}</Tag>
+              <Text strong>{relation}</Text>
+              <Text type="secondary">{decision.hint}</Text>
+            </div>
+          </Tooltip>
+        )
+      }
     },
     {
-      title: '匹配证据', key: 'evidence', width: columnWidths.evidence,
+      title: '判断依据', key: 'evidence', width: columnWidths.evidence,
       onHeaderCell: () => ({ width: columnWidths.evidence, columnKey: 'evidence', minWidth: matchTableColumnMinWidths.evidence, maxWidth: matchTableColumnMaxWidths.evidence, onResize: (width: number) => resizeColumn('evidence', width), onResizeEnd: (width: number) => commitColumnResize('evidence', width) } as ResizableHeaderCellProps),
-      render: (_value, row) => <div className="project-match-evidence"><span>{row.explanation || row.reasonCodes.join('、') || '确定性排序候选'}</span>{row.degradationCodes.length > 0 && <Tag color="warning">{row.degradationCodes.join('、')}</Tag>}</div>
+      render: (_value, row) => {
+        const evidence = matchEvidenceLevelMeta[row.evidenceLevel]
+        const reason = readableMatchReasons(row.reasonCodes)
+        const degradations = readableMatchDegradations(row.degradationCodes)
+        const technicalCodes = [...row.reasonCodes, ...row.degradationCodes].join('、') || '无'
+        return (
+          <div className="project-match-evidence">
+            <Tooltip title={`技术代码：${technicalCodes}`}>
+              <div className="project-match-evidence-summary"><SafetyCertificateOutlined /><Text>{reason}</Text></div>
+            </Tooltip>
+            {row.explanation && row.explanation !== reason && <Text type="secondary" className="project-match-reason">{row.explanation}</Text>}
+            <Tag color={evidence.color}>{evidence.label}</Tag>
+            {degradations.map((message) => <Text type="warning" className="project-match-evidence-warning" key={message}>{message}</Text>)}
+          </div>
+        )
+      }
     },
     {
       title: '项目资产',
@@ -1255,7 +1332,7 @@ function MatchDrawer({
           {matchRun ? (
             <section className="project-match-run-banner" aria-label="匹配运行信息">
               <div><Text strong>排序版本 {matchRun.rankingVersion}</Text><Text type="secondary">完成于 {matchRun.completedAt || '—'} · 当前算法版本内的相对匹配程度，不代表统计概率</Text></div>
-              {matchRun.degradationCodes.length > 0 && <Tag color="warning">降级：{matchRun.degradationCodes.join('、')}</Tag>}
+              {matchRun.degradationCodes.length > 0 && <Tooltip title={`技术代码：${matchRun.degradationCodes.join('、')}`}><Tag color="warning">部分辅助能力不可用，结果需要复核</Tag></Tooltip>}
             </section>
           ) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无与当前需求版本兼容的匹配运行" />}
           <Card
@@ -1359,18 +1436,18 @@ function MatchDrawer({
           {showMatchingProgress && (
             <section className={`project-match-progress is-${matchingProgressStatus}`} aria-label="匹配执行进度" aria-live="polite">
               <div className="project-match-progress-heading">
-                <div className="project-match-progress-heading-copy">
-                  <Text strong className="project-match-progress-title">匹配执行进度</Text>
-                  <Text type="secondary" className="project-match-progress-subtitle">当前需求的重新匹配任务在此处实时更新</Text>
+                <div>
+                  <Text strong>匹配执行进度</Text>
+                  <Text type="secondary">当前需求的重新匹配任务在此处实时更新</Text>
                 </div>
-                <Tag className="project-match-progress-status" color={matchingProgressStatus === 'success' ? 'success' : matchingProgressStatus === 'failed' ? 'error' : 'processing'}>{matchingProgressLabel}</Tag>
+                <Tag color={matchingProgressStatus === 'success' ? 'success' : matchingProgressStatus === 'failed' ? 'error' : 'processing'}>{matchingProgressLabel}</Tag>
               </div>
               <div className="project-match-progress-main">
                 <Progress
                   className="project-match-progress-ring"
                   type="circle"
                   percent={matchingProgressPercent}
-                  size={64}
+                  size={56}
                   strokeWidth={9}
                   status={matchingProgressStatus === 'failed' ? 'exception' : matchingProgressStatus === 'success' ? 'success' : 'active'}
                   strokeColor={matchingProgressStatus === 'failed' ? 'var(--state-error)' : matchingProgressStatus === 'success' ? 'var(--state-success)' : 'var(--accent)'}
@@ -1379,14 +1456,9 @@ function MatchDrawer({
                   aria-label={`匹配执行进度 ${matchingProgressPercent}%`}
                 />
                 <div className="project-match-progress-copy">
-                  <Text strong className="project-match-progress-message">{matchingProgressMessage}</Text>
-                  {matchingProgress?.detail && <Text type="secondary" className="project-match-progress-detail">{matchingProgress.detail}</Text>}
-                  {matchingProgress && matchingProgress.total > 0 && (
-                    <div className="project-match-progress-meta" aria-label={`已处理 ${Math.min(matchingProgress.current, matchingProgress.total)} / ${matchingProgress.total}`}>
-                      <Text type="secondary">处理进度</Text>
-                      <Text strong className="project-match-progress-count">{Math.min(matchingProgress.current, matchingProgress.total)} / {matchingProgress.total}</Text>
-                    </div>
-                  )}
+                  <Text strong>{matchingProgressMessage}</Text>
+                  {matchingProgress?.detail && <Text type="secondary">{matchingProgress.detail}</Text>}
+                  {matchingProgress && matchingProgress.total > 0 && <Text type="secondary" className="project-match-progress-count">已处理 {Math.min(matchingProgress.current, matchingProgress.total)} / {matchingProgress.total}</Text>}
                 </div>
               </div>
             </section>
@@ -3227,21 +3299,26 @@ function ProjectDetail({
 
       {isProcessing && (
         <section className="project-analysis-panel" aria-live="polite">
-          <div className="project-analysis-strip">
+          <div className="project-analysis-header">
             <div className="project-analysis-file">
               <div className="project-analysis-file-icon"><FileSearchOutlined /></div>
               <div className="project-analysis-file-copy">
                 <Text strong>{current.currentDocumentName || '技术协议处理中'}</Text>
                 <Text type="secondary">{documentStatus}</Text>
-                <Text className="project-analysis-live-badge"><SyncOutlined spin /> 后台处理中 · 请勿重复上传</Text>
               </div>
             </div>
+            <div className="project-analysis-summary">
+              <Text className="project-analysis-live-badge"><SyncOutlined spin /> 后台处理中</Text>
+              <Text strong>已完成 {Math.min(activeStageIndex, analysisStageMeta.length - 1)} / {analysisStageMeta.length - 1} 个阶段</Text>
+            </div>
+          </div>
+          <div className="project-analysis-body">
             <div className="project-analysis-progress-main">
               <Progress
                 className="project-analysis-progress-ring"
                 type="circle"
                 percent={progressPercent}
-                size={76}
+                size={72}
                 strokeWidth={8}
                 strokeColor="var(--accent)"
                 trailColor="var(--stroke-strong)"
@@ -3249,23 +3326,26 @@ function ProjectDetail({
                 aria-label={`协议处理进度 ${progressPercent}%`}
               />
               <div className="project-analysis-progress-copy">
-                <Text type="secondary">{projectProgress ? projectProgress.message : '正在执行协议分析'}</Text>
+                <Text type="secondary" className="project-analysis-current-label">当前执行</Text>
+                <Text strong className="project-analysis-current-stage">{analysisStageMeta[activeStageIndex]?.label || '处理中'}</Text>
+                <Text type="secondary" className="project-analysis-progress-message">{projectProgress ? projectProgress.message : '正在执行协议分析'}</Text>
                 {projectProgress?.detail && <Text type="secondary" className="project-analysis-progress-detail">{projectProgress.detail}</Text>}
-                <div className="project-analysis-current-step"><Text type="secondary">当前执行</Text><Text strong>{analysisStageMeta[activeStageIndex]?.label || '处理中'}</Text></div>
               </div>
             </div>
-            <div className="project-analysis-step-list">
+            <ol className="project-analysis-step-list" aria-label="协议处理阶段">
               {analysisStageMeta.map((stage, index) => {
                 const complete = index < activeStageIndex
                 const active = index === activeStageIndex
-                return <div key={stage.phase} className={`project-analysis-step ${complete ? 'is-complete' : active ? 'is-active' : ''}`}>
-                  <span className="project-analysis-step-dot">{complete ? <CheckCircleFilled /> : active ? <SyncOutlined spin /> : index + 1}</span>
-                  <Text>{stage.label}</Text>
-                </div>
+                return <li key={stage.phase} className={`project-analysis-step ${complete ? 'is-complete' : active ? 'is-active' : ''}`}>
+                  <span className="project-analysis-step-marker" aria-hidden="true">
+                    <span className="project-analysis-step-dot">{complete ? <CheckCircleFilled /> : active ? <SyncOutlined spin /> : index + 1}</span>
+                  </span>
+                  <Text strong={active}>{stage.label}</Text>
+                </li>
               })}
-            </div>
-            <div className="project-analysis-eta"><Text strong>已完成 {Math.min(activeStageIndex, analysisStageMeta.length - 1)} / {analysisStageMeta.length - 1} 个阶段</Text><Text type="secondary">请勿重复上传</Text></div>
+            </ol>
           </div>
+          <div className="project-analysis-footer"><InfoCircleOutlined /><Text>任务正在后台持续执行，请勿重复上传协议文件。</Text></div>
           {current.analysisMessage?.includes('重复') && <div className="project-analysis-detail"><InfoCircleOutlined /><Text>检测到重复文件，将复用现有知识库索引并继续后续分析。</Text></div>}
         </section>
       )}

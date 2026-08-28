@@ -9103,6 +9103,7 @@ body,
 }
 
 .project-match-run-banner > div,
+.project-match-decision,
 .project-match-evidence {
   display: flex;
   min-width: 0;
@@ -9110,12 +9111,52 @@ body,
   gap: 4px;
 }
 
+.project-match-decision > .ant-tag,
+.project-match-evidence > .ant-tag {
+  width: fit-content;
+  margin: 0;
+}
+
+.project-match-decision > .ant-typography {
+  min-width: 0;
+  line-height: 1.45;
+}
+
+.project-match-decision > .ant-typography:last-child {
+  display: -webkit-box;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
 .project-match-rank {
   color: var(--accent);
 }
 
-.project-match-evidence > span {
-  color: var(--text-main);
+.project-match-evidence-summary {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.project-match-evidence-summary > .anticon {
+  flex: 0 0 auto;
+  margin-top: 3px;
+  color: var(--accent);
+}
+
+.project-match-evidence-summary > .ant-typography {
+  color: var(--text-main) !important;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.project-match-evidence-warning {
+  color: var(--state-warning) !important;
+  font-size: 11px;
+  line-height: 1.5;
   overflow-wrap: anywhere;
 }
 
@@ -9271,9 +9312,9 @@ body,
 
 .project-match-progress {
   min-width: 0;
-  padding: 16px;
+  padding: 14px 16px;
   border: 1px solid color-mix(in srgb, var(--accent) 36%, var(--stroke));
-  border-radius: 12px;
+  border-radius: 10px;
   background: color-mix(in srgb, var(--accent) 8%, var(--surface-soft));
   box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text-main) 4%, transparent);
 }
@@ -9288,57 +9329,41 @@ body,
   background: color-mix(in srgb, var(--state-error) 7%, var(--surface-soft));
 }
 
-.project-match-progress-heading {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+.project-match-progress-heading,
+.project-match-progress-main {
+  display: flex;
   min-width: 0;
   align-items: center;
+}
+
+.project-match-progress-heading {
+  justify-content: space-between;
   gap: 12px;
 }
 
-.project-match-progress-heading-copy,
+.project-match-progress-heading > div:first-child,
 .project-match-progress-copy {
   display: flex;
   min-width: 0;
   flex-direction: column;
-}
-
-.project-match-progress-heading-copy {
   gap: 4px;
 }
 
-.project-match-progress-title {
-  color: var(--text-main) !important;
-  font-size: 14px;
-  line-height: 1.4;
+.project-match-progress-heading > div:first-child {
+  gap: 2px;
 }
 
-.project-match-progress-subtitle {
+.project-match-progress-heading .ant-typography-secondary {
   font-size: 11px;
-  line-height: 1.5;
-}
-
-.project-match-progress-status.ant-tag {
-  min-height: 24px;
-  margin-inline-end: 0;
-  padding-inline: 8px;
-  border-radius: 999px;
-  line-height: 22px;
-  white-space: nowrap;
 }
 
 .project-match-progress-main {
-  display: grid;
-  grid-template-columns: 64px minmax(0, 1fr);
-  min-width: 0;
-  align-items: center;
-  gap: 16px;
-  margin-top: 16px;
-  padding-top: 16px;
-  border-top: 1px solid color-mix(in srgb, var(--accent) 20%, var(--stroke));
+  gap: 12px;
+  margin-top: 12px;
 }
 
 .project-match-progress-ring.ant-progress {
+  flex: 0 0 auto;
   margin: 0;
 }
 
@@ -9350,7 +9375,6 @@ body,
 }
 
 .project-match-progress-copy {
-  gap: 4px;
   overflow: hidden;
 }
 
@@ -9360,60 +9384,21 @@ body,
   text-overflow: ellipsis;
 }
 
-.project-match-progress-message {
+.project-match-progress-copy > .ant-typography:first-child {
   color: var(--text-main) !important;
-  font-size: 13px;
-  line-height: 1.5;
   white-space: nowrap;
 }
 
-.project-match-progress-detail {
+.project-match-progress-copy > .ant-typography:nth-child(2) {
   display: -webkit-box;
   overflow-wrap: anywhere;
-  line-height: 1.5;
   white-space: normal;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
 }
 
-.project-match-progress-meta {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  gap: 8px;
-  margin-top: 4px;
-  font-size: 11px;
-  line-height: 1.5;
-}
-
-.project-match-progress-meta > .ant-typography {
-  font-size: inherit;
-}
-
 .project-match-progress-count {
-  color: var(--text-main) !important;
-  font-variant-numeric: tabular-nums;
   white-space: nowrap;
-}
-
-@media (max-width: 680px) {
-  .project-match-progress {
-    padding: 16px;
-  }
-
-  .project-match-progress-heading {
-    align-items: start;
-  }
-
-  .project-match-progress-main {
-    grid-template-columns: 1fr;
-    justify-items: start;
-    gap: 12px;
-  }
-
-  .project-match-progress-copy {
-    width: 100%;
-  }
 }
 
 .project-score-button.ant-btn {
@@ -10418,17 +10403,19 @@ body,
 .project-analysis-panel {
   overflow: hidden;
   border-color: color-mix(in srgb, var(--accent) 45%, var(--stroke));
+  border-radius: 12px;
   background: var(--surface-elevated);
   box-shadow: var(--shadow-panel);
 }
 
-.project-analysis-strip {
-  display: grid;
-  grid-template-columns: minmax(220px, 1.1fr) minmax(150px, 0.65fr) minmax(380px, 2fr) auto;
+.project-analysis-header {
+  display: flex;
   align-items: center;
-  gap: 18px;
-  min-height: 108px;
-  padding: 18px 20px;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--stroke);
+  background: color-mix(in srgb, var(--accent) 4%, var(--surface-raised));
 }
 
 .project-analysis-file,
@@ -10441,12 +10428,12 @@ body,
 
 .project-analysis-file-icon {
   display: grid;
-  width: 44px;
-  height: 50px;
+  width: 48px;
+  height: 48px;
   flex: 0 0 auto;
   place-items: center;
   border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--stroke));
-  border-radius: 7px;
+  border-radius: 10px;
   color: var(--accent);
   background: var(--accent-soft);
   font-size: 19px;
@@ -10468,6 +10455,21 @@ body,
   font-size: 11px;
 }
 
+.project-analysis-summary {
+  display: flex;
+  align-items: flex-end;
+  flex: 0 0 auto;
+  flex-direction: column;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.project-analysis-summary > .ant-typography:last-child {
+  color: var(--text-main) !important;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
 .project-analysis-file-copy .ant-typography:first-child,
 .project-inline-notice-main .ant-typography:first-child {
   overflow: hidden;
@@ -10477,9 +10479,10 @@ body,
 }
 
 .project-analysis-progress-main {
-  display: flex;
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
   align-items: center;
-  gap: 14px;
+  gap: 16px;
   min-width: 0;
 }
 
@@ -10499,95 +10502,106 @@ body,
   display: flex;
   min-width: 0;
   flex-direction: column;
-  gap: 8px;
+  gap: 3px;
 }
 
 .project-analysis-progress-copy > .ant-typography {
-  max-width: 190px;
-  overflow: hidden;
+  min-width: 0;
   color: var(--text-muted) !important;
-  font-size: 11px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  font-size: 12px;
+  line-height: 1.5;
 }
 
-.project-analysis-progress-copy > .project-analysis-progress-detail {
+.project-analysis-current-label {
+  font-size: 11px !important;
+}
+
+.project-analysis-current-stage {
+  color: var(--accent) !important;
+  font-size: 14px !important;
+}
+
+.project-analysis-progress-message {
+  margin-top: 4px;
+  color: var(--text-main) !important;
+  overflow-wrap: anywhere;
+}
+
+.project-analysis-progress-detail {
   display: -webkit-box;
-  max-width: 260px;
   overflow: hidden;
+  overflow-wrap: anywhere;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
   white-space: normal;
 }
 
-.project-analysis-progress-row {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 8px;
-}
-
-.project-analysis-progress-row > .ant-typography:first-child {
-  color: var(--text-main) !important;
-  font-size: 22px;
-  font-variant-numeric: tabular-nums;
-  line-height: 1;
-}
-
-.project-analysis-progress-row > .ant-typography:last-child {
-  max-width: 190px;
-  overflow: hidden;
-  color: var(--text-muted) !important;
-  font-size: 11px;
-  text-align: right;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.project-analysis-current-step {
-  display: flex;
+.project-analysis-body {
+  display: grid;
+  grid-template-columns: minmax(240px, 0.8fr) minmax(520px, 2fr);
   align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  margin-top: 0;
-}
-
-.project-analysis-current-step .ant-typography:first-child,
-.project-analysis-current-step .ant-typography:last-child {
-  font-size: 11px;
-}
-
-.project-analysis-current-step .ant-typography:last-child {
-  color: var(--accent) !important;
+  gap: 32px;
+  min-width: 0;
+  padding: 20px;
 }
 
 .project-analysis-step-list {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
-  gap: 8px;
   min-width: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.project-analysis-step-marker {
+  position: relative;
+  display: grid;
+  width: 100%;
+  place-items: center;
+}
+
+.project-analysis-step:not(:first-child) .project-analysis-step-marker::before {
+  position: absolute;
+  z-index: 0;
+  top: 50%;
+  right: 50%;
+  left: -50%;
+  height: 2px;
+  background: var(--stroke-strong);
+  content: '';
+  transform: translateY(-50%);
+}
+
+.project-analysis-step.is-complete .project-analysis-step-marker::before,
+.project-analysis-step.is-active .project-analysis-step-marker::before {
+  background: color-mix(in srgb, var(--state-success) 65%, var(--stroke));
 }
 
 .project-analysis-step {
   display: flex;
   align-items: center;
   min-width: 0;
-  gap: 7px;
+  flex-direction: column;
+  gap: 8px;
   color: var(--text-muted);
   font-size: 12px;
+  text-align: center;
 }
 
 .project-analysis-step > .ant-typography {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  color: currentColor;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .project-analysis-step-dot {
+  position: relative;
+  z-index: 1;
   display: grid;
-  width: 23px;
-  height: 23px;
+  width: 28px;
+  height: 28px;
   flex: 0 0 auto;
   place-items: center;
   border: 1px solid var(--stroke-strong);
@@ -10617,22 +10631,18 @@ body,
   background: color-mix(in srgb, var(--state-success) 12%, var(--surface-soft));
 }
 
-.project-analysis-eta {
+.project-analysis-footer {
   display: flex;
-  align-items: flex-end;
-  flex-direction: column;
-  gap: 4px;
-  white-space: nowrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 20px;
+  border-top: 1px solid var(--stroke);
+  color: var(--accent);
+  background: var(--surface-soft);
 }
 
-.project-analysis-eta > .ant-typography:first-child {
-  color: var(--text-main) !important;
-  font-size: 12px;
-  font-variant-numeric: tabular-nums;
-}
-
-.project-analysis-eta > .ant-typography:last-child {
-  color: var(--accent) !important;
+.project-analysis-footer > .ant-typography {
+  color: var(--text-muted) !important;
   font-size: 11px;
 }
 
@@ -12344,12 +12354,13 @@ body,
 }
 
 @media (max-width: 1240px) {
-  .project-analysis-strip {
-    grid-template-columns: minmax(200px, 1fr) minmax(150px, 0.7fr) minmax(300px, 1.5fr);
+  .project-analysis-body {
+    grid-template-columns: 1fr;
+    gap: 20px;
   }
 
-  .project-analysis-eta {
-    display: none;
+  .project-analysis-progress-main {
+    max-width: 560px;
   }
 
   .project-health-metrics {
@@ -12396,14 +12407,68 @@ body,
     flex-direction: column;
   }
 
-  .project-analysis-strip,
   .project-coverage-panel,
   .project-command-side {
     grid-template-columns: 1fr;
   }
 
+  .project-analysis-header {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 12px;
+    padding: 16px;
+  }
+
+  .project-analysis-summary {
+    align-items: flex-start;
+  }
+
+  .project-analysis-body {
+    gap: 16px;
+    padding: 16px;
+  }
+
+  .project-analysis-progress-main {
+    grid-template-columns: 64px minmax(0, 1fr);
+    gap: 12px;
+  }
+
+  .project-analysis-progress-ring.ant-progress {
+    width: 64px !important;
+    height: 64px !important;
+    font-size: 64px !important;
+  }
+
   .project-analysis-step-list {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: 1fr;
+  }
+
+  .project-analysis-step {
+    display: grid;
+    grid-template-columns: 32px minmax(0, 1fr);
+    gap: 8px;
+    min-height: 40px;
+    text-align: left;
+  }
+
+  .project-analysis-step-marker {
+    width: 32px;
+    height: 40px;
+  }
+
+  .project-analysis-step:not(:first-child) .project-analysis-step-marker::before {
+    top: -20px;
+    right: auto;
+    bottom: 20px;
+    left: 50%;
+    width: 2px;
+    height: auto;
+    transform: translateX(-50%);
+  }
+
+  .project-analysis-footer {
+    align-items: flex-start;
+    padding-inline: 16px;
   }
 
   .project-analysis-log-heading {
