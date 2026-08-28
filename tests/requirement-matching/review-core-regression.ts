@@ -92,9 +92,9 @@ const testIneligibleCandidatesAreExcludedBeforeRerank = async (): Promise<void> 
   assert.ok(eligibilityChecks.every((item) => item.includeCurrentProjectRecords === false))
 }
 
-// Mutation caught: prepending an exact-hash candidate and renumbering every retrieved candidate's true RRF fusedRank.
-// Mutation caught: allowing exact-hash injection to evict one of the original RRF Top20 reranker inputs.
-const testExactInjectionPreservesRrfRanksAndTop20 = async (): Promise<void> => {
+// Exact-hash injection keeps retrieved RRF ranks for audit while every displayed
+// candidate, including the injected exact result, passes through the reranker.
+const testExactInjectionPreservesRrfRanksAndReranksDisplaySet = async (): Promise<void> => {
   const base = card('查询订单详情')
   const retrieved = Array.from({ length: 20 }, (_, index) => candidate(
     `retrieved-${String(index).padStart(2, '0')}`,
@@ -118,7 +118,7 @@ const testExactInjectionPreservesRrfRanksAndTop20 = async (): Promise<void> => {
 
   assert.equal(firstRetrieved?.stageScores.fusedRank, 1)
   assert.equal(lastRetrieved?.stageScores.fusedRank, 20)
-  assert.deepEqual(rerankerCalls, [retrieved.map((item) => item.record.uid)])
+  assert.deepEqual(rerankerCalls, [[exact.record.uid, ...retrieved.map((item) => item.record.uid)]])
   assert.equal(exactResult?.decisionStatus, 'confirmed')
   assert.equal(exactResult?.rankingScore, 100)
 }
@@ -263,7 +263,7 @@ const testRequirementAgentUsesInjectedSharedCore = async (): Promise<void> => {
 
 const tests: Array<{ name: string; run: () => Promise<void> }> = [
   { name: 'ineligible candidates are excluded before rerank', run: testIneligibleCandidatesAreExcludedBeforeRerank },
-  { name: 'exact injection preserves RRF ranks and original Top20', run: testExactInjectionPreservesRrfRanksAndTop20 },
+  { name: 'exact injection preserves RRF ranks and reranks the display set', run: testExactInjectionPreservesRrfRanksAndReranksDisplaySet },
   { name: 'result uses pinned reranker identity', run: testResultUsesPinnedRerankerIdentity },
   { name: 'config hash uses pinned reranker identity', run: testConfigHashUsesPinnedRerankerIdentity },
   { name: 'RequirementAnalysisAgent uses injected shared core', run: testRequirementAgentUsesInjectedSharedCore }

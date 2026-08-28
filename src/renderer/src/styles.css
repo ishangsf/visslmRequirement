@@ -768,17 +768,36 @@ body {
   flex-direction: column;
   gap: 7px;
   padding: 8px;
-  border: 1px solid #e7eaf0;
+  overflow: hidden;
+  border: 1px solid var(--stroke);
   border-radius: 8px;
+  background: var(--surface-raised);
 }
 
-.image-tile .ant-image,
-.image-tile img {
+.image-tile .ant-image {
+  display: block;
   width: 100%;
   height: 120px;
-  object-fit: contain;
-  background: #f6f7f9;
+  flex: 0 0 120px;
+  overflow: hidden;
+  background: var(--surface-soft);
   border-radius: 5px;
+}
+
+.image-tile .ant-image .ant-image-img {
+  display: block;
+  width: 100%;
+  height: 100% !important;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+.image-tile > .ant-typography,
+.image-tile > div:not(.ant-image) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .text-preview,
@@ -2282,6 +2301,65 @@ body {
   min-width: 0;
 }
 
+.sync-progress-counts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--ds-space-2);
+  margin-top: var(--ds-space-3);
+}
+
+.sync-progress-stat {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: var(--ds-space-1);
+  padding: var(--ds-space-2) var(--ds-space-3);
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  color: var(--text-main);
+  background: var(--surface-soft);
+  line-height: 1.35;
+  white-space: nowrap;
+}
+
+.sync-progress-stat > .anticon {
+  flex: 0 0 auto;
+  align-self: center;
+  font-size: 14px;
+}
+
+.sync-progress-stat-label,
+.sync-progress-stat-unit {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.sync-progress-stat-value {
+  min-width: 0;
+  color: var(--text-main);
+  font-size: 18px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.sync-progress-stat--success {
+  border-color: color-mix(in srgb, var(--state-success) 42%, var(--stroke));
+  background: color-mix(in srgb, var(--state-success) 8%, var(--surface-soft));
+}
+
+.sync-progress-stat--success > .anticon {
+  color: var(--state-success);
+}
+
+.sync-progress-stat--error {
+  border-color: color-mix(in srgb, var(--state-error) 42%, var(--stroke));
+  background: color-mix(in srgb, var(--state-error) 8%, var(--surface-soft));
+}
+
+.sync-progress-stat--error > .anticon {
+  color: var(--state-error);
+}
+
 .sync-progress-message {
   display: flex;
   min-width: 0;
@@ -2350,6 +2428,12 @@ body {
 
 .sync-progress-card .sync-progress {
   border-radius: 10px;
+}
+
+@media (max-width: 560px) {
+  .sync-progress-counts {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 .settings-width {
@@ -2740,6 +2824,12 @@ body {
 
   .return-property-config {
     gap: 10px;
+  }
+}
+
+@media (max-width: 680px) {
+  .image-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 
@@ -9102,6 +9192,26 @@ body,
   background: var(--surface-soft);
 }
 
+.project-match-run-banner > .anticon {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  cursor: help;
+}
+
+.project-match-explanation-alert.ant-alert {
+  border-color: color-mix(in srgb, var(--state-warning) 42%, var(--stroke));
+  background: color-mix(in srgb, var(--state-warning) 8%, var(--surface-soft));
+}
+
+.project-match-explanation-alert .ant-alert-message,
+.project-match-explanation-alert .ant-alert-description {
+  color: var(--text-main);
+}
+
+.project-match-explanation-alert .ant-alert-description {
+  line-height: 1.6;
+}
+
 .project-match-run-banner > div,
 .project-match-decision,
 .project-match-evidence {
@@ -9155,6 +9265,86 @@ body,
 
 .project-match-evidence-warning {
   color: var(--state-warning) !important;
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.project-match-common-guidance.ant-alert {
+  border-color: color-mix(in srgb, var(--accent) 32%, var(--stroke));
+  background: color-mix(in srgb, var(--accent) 7%, var(--surface-soft));
+}
+
+.project-match-common-guidance-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.project-match-common-guidance-copy > .ant-typography {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.project-match-ranking-score {
+  display: inline-flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+  border-radius: 6px;
+  outline: none;
+}
+
+.project-match-ranking-score:focus-visible {
+  box-shadow: var(--focus-ring);
+}
+
+.project-match-ranking-score strong {
+  color: var(--text-main);
+  font-variant-numeric: tabular-nums;
+}
+
+.project-match-score-tooltip {
+  display: flex;
+  max-width: 320px;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.project-match-analysis {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.project-match-analysis > .ant-tooltip-open,
+.project-match-analysis > .ant-typography {
+  display: block;
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  font-size: 11px;
+  line-height: 1.55;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-match-analysis strong {
+  color: var(--text-main);
+}
+
+.project-match-explanation-summary {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.project-match-explanation-summary > .ant-typography {
+  margin: 0;
   font-size: 11px;
   line-height: 1.5;
   overflow-wrap: anywhere;
@@ -9464,12 +9654,62 @@ body,
   box-shadow: var(--focus-ring);
 }
 
-.project-match-table .project-match-record .project-table-link,
-.project-match-table .project-match-record > .ant-typography {
+.project-match-table .project-match-record .project-table-link {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  overflow: hidden;
+  text-align: left;
+}
+
+.project-match-table .project-match-record .project-table-link > .ant-btn-icon,
+.project-match-table .project-match-record .project-table-link > .anticon {
+  flex: 0 0 auto;
+}
+
+.project-match-record-name {
+  display: block;
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-match-record-meta {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.45;
+  white-space: nowrap;
+}
+
+.project-match-record-type,
+.project-match-record-separator {
+  flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.project-match-record-item-id {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-match-table .project-match-record .project-table-link:focus-visible:not(:disabled) {
+  box-shadow: var(--focus-ring) !important;
 }
 
 .project-match-table .project-match-reason {

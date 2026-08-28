@@ -145,8 +145,8 @@ const requirementRows = (requirements: ProjectRequirement[]): ExcelCell[][] => r
   requirement.status,
   requirement.statusSource,
   requirement.statusReason,
-  requirement.highestMatchScore,
-  requirement.matchCount,
+  requirement.highestSimilarityScore,
+  requirement.similarCandidateCount,
   requirement.documentId,
   requirement.setId,
   requirement.version,
@@ -216,7 +216,7 @@ export const createProjectWorkbook = (snapshot: ProjectDataSnapshot): XLSX.WorkB
   ].map(cell)), [38, 14, 32, 60, 38, 16, 16, 38, 18, 48, 16, 14, 10, 10, 12, 24, 24])
   appendSheet(workbook, '功能需求', [
     '需求 ID', '需求编号', '类别', '模块', '标题', '内容', '关键信息词', '信息词来源', '来源位置', '来源分块 ID',
-    '证据摘录', '置信度', '审核状态', '审核备注', '实现状态', '状态来源', '状态原因', '最高匹配分', '匹配数',
+    '证据摘录', '置信度', '审核状态', '审核备注', '实现状态', '状态来源', '状态原因', '最高相似度评分', '相似候选数',
     '文档 ID', '审核集 ID', '版本', '项目 ID', '创建时间', '更新时间'
   ], requirementRows(snapshot.requirements), [38, 12, 14, 20, 32, 70, 30, 14, 22, 38, 60, 12, 14, 36, 14, 14, 36, 14, 10, 38, 38, 10, 38, 24, 24])
   appendSheet(workbook, '需求匹配', [

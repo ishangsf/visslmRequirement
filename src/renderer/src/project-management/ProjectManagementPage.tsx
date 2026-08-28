@@ -50,6 +50,7 @@ import {
   Input,
   InputNumber,
   Modal,
+  Popover,
   Popconfirm,
   Progress,
   Select,
@@ -705,76 +706,50 @@ function ProjectStatus({ project }: { project: ManagedProject }): React.JSX.Elem
   )
 }
 
-type MatchTableColumnKey = 'rank' | 'record' | 'score' | 'relation' | 'evidence' | 'asset'
+type MatchTableColumnKey = 'rank' | 'record' | 'score' | 'analysis' | 'asset'
 type MatchTableColumnWidths = Record<MatchTableColumnKey, number>
 
-const matchTableColumnStorageKey = 'project-requirement-match-runs:v2'
+const matchTableColumnStorageKey = 'project-requirement-match-runs:v3'
 const projectAppTableScrollY = 'min(560px, max(260px, calc(100vh - 300px)))'
 const projectCompactTableScrollY = 'min(360px, max(180px, calc(100vh - 420px)))'
 const projectDetailTableScrollY = 'min(440px, max(220px, calc(100vh - 500px)))'
 const projectMatchTableScrollY = 'clamp(280px, calc(100vh - 360px), 620px)'
 const matchTableColumnDefaults: MatchTableColumnWidths = {
-  rank: 72,
-  record: 224,
-  score: 112,
-  relation: 184,
-  evidence: 320,
-  asset: 180
+  rank: 64,
+  record: 210,
+  score: 104,
+  analysis: 300,
+  asset: 150
 }
 const matchTableColumnMinWidths: MatchTableColumnWidths = {
-  rank: 64,
-  record: 180,
-  score: 96,
-  relation: 160,
-  evidence: 260,
-  asset: 144
+  rank: 56,
+  record: 176,
+  score: 92,
+  analysis: 240,
+  asset: 132
 }
 const matchTableColumnMaxWidths: MatchTableColumnWidths = {
-  rank: 100,
-  record: 420,
-  score: 180,
-  relation: 260,
-  evidence: 520,
-  asset: 300
+  rank: 88,
+  record: 360,
+  score: 152,
+  analysis: 520,
+  asset: 240
 }
 const matchTableColumnLabels: Record<MatchTableColumnKey, string> = {
   rank: '排名',
-  record: '数据中心数据',
-  score: '综合匹配分',
-  relation: '匹配判断',
-  evidence: '判断依据',
-  asset: '项目资产'
-}
-
-const matchDecisionMeta: Record<ProjectRequirementMatch['decisionStatus'], { label: string; color: string; hint: string }> = {
-  confirmed: { label: '可以确认', color: 'success', hint: '证据充分，可优先关联' },
-  suggested: { label: '建议匹配', color: 'purple', hint: '建议结合业务上下文确认' },
-  ambiguous: { label: '需人工确认', color: 'warning', hint: '当前证据不足，请核对后再关联' },
-  rejected: { label: '不建议匹配', color: 'default', hint: '存在明显冲突或相关性不足' }
-}
-
-const matchRelationMeta: Record<NonNullable<ProjectRequirementMatch['relation']>, string> = {
-  duplicate: '内容基本一致',
-  highly_similar: '业务内容高度相似',
-  partial_overlap: '部分内容重合',
-  same_pattern: '业务模式相似',
-  topic_only: '仅主题相关',
-  unrelated: '业务内容不相关'
-}
-
-const matchEvidenceLevelMeta: Record<ProjectRequirementMatch['evidenceLevel'], { label: string; color: string }> = {
-  exact_business_hash: { label: '业务内容完全一致', color: 'success' },
-  exact_normalized_text: { label: '规范化文本一致', color: 'success' },
-  deterministic_rule: { label: '规则判断', color: 'blue' },
-  model_supported: { label: '模型辅助判断', color: 'purple' },
-  retrieval_only: { label: '仅初步召回', color: 'default' }
+  record: '候选数据',
+  score: '相似度评分',
+  analysis: '匹配分析',
+  asset: '关联操作'
 }
 
 const matchReasonLabels: Record<string, string> = {
   EXACT_BUSINESS_HASH: '业务内容完全一致',
   EXACT_NORMALIZED_TEXT: '去除格式差异后内容一致',
   MISSING_REQUIRED_FIELD: '关键信息不完整，暂无法确认',
+  MISSING_CATEGORY_FIELD: '当前类别所需的关键信息不完整',
   CANDIDATE_INELIGIBLE: '该数据不在当前可关联范围内',
+  SOURCE_TYPE_MISMATCH: '候选数据类型与项目需求不一致',
   NORMALIZATION_VERSION_MISMATCH: '数据处理版本不一致，需要重新匹配',
   ACTION_CONFLICT: '执行动作不一致',
   OBJECT_CONFLICT: '业务对象不一致',
@@ -783,18 +758,108 @@ const matchReasonLabels: Record<string, string> = {
   BUSINESS_OVERLAP: '业务目标和内容存在重合'
 }
 
-const matchDegradationLabels: Record<string, string> = {
-  RERANKER_UNAVAILABLE: '精排模型暂不可用，当前结果仅供初步筛选',
-  EXPLAINER_UNAVAILABLE: '匹配说明暂不可用，请结合原始内容判断',
-  EXPLANATION_PROTOCOL_ERROR: '匹配说明生成异常，请结合原始内容判断'
-}
-
 const readableMatchReasons = (codes: string[]): string => codes.length
   ? codes.map((code) => matchReasonLabels[code] ?? '系统规则给出了限制条件').join('；')
   : '系统根据业务内容相似度给出候选'
 
-const readableMatchDegradations = (codes: string[]): string[] =>
-  codes.map((code) => matchDegradationLabels[code] ?? '部分辅助能力暂不可用，结果需要人工复核')
+interface MatchOptimizationGuidance {
+  issue: string
+  action: string
+  actionKind: 'review_source' | 'improve_recall' | 'link' | 'rerun'
+}
+
+const matchOptimizationGuidance = (row: ProjectRequirementMatch): MatchOptimizationGuidance => {
+  const codes = new Set(row.reasonCodes)
+  if (codes.has('MISSING_REQUIRED_FIELD')) {
+    return {
+      issue: '项目需求或候选数据没有同时写清“做什么”和“作用对象”，系统不能据此确认匹配。',
+      action: '查看双方原文：缺哪一方就补全该方的动作、对象及约束后重新匹配。关键功能信息词只能改善召回，不能替代缺失字段。',
+      actionKind: 'review_source'
+    }
+  }
+  if (codes.has('MISSING_CATEGORY_FIELD')) {
+    return {
+      issue: '当前需求类别缺少用于判断的专用信息，例如性能指标与阈值、接口方向与数据对象，或验收标准与证据。',
+      action: '根据当前需求类别补充可核验字段后重新匹配；不要只追加宽泛关键词。',
+      actionKind: 'review_source'
+    }
+  }
+  if (codes.has('SOURCE_TYPE_MISMATCH')) {
+    return {
+      issue: '该数据属于缺陷等其他业务类型，不应作为历史需求自动关联。',
+      action: '无需修改项目需求；请在相关问题或缺陷参考通道查看该数据。',
+      actionKind: 'review_source'
+    }
+  }
+  if (codes.has('ACTION_CONFLICT')) {
+    return {
+      issue: '双方描述的操作不同，例如“查询”和“修改”不能视为同一能力。',
+      action: '核对候选原文；如果动作确实不同，请跳过该候选；如果原文用词不准确，修正动作描述后重新匹配。',
+      actionKind: 'review_source'
+    }
+  }
+  if (codes.has('OBJECT_CONFLICT')) {
+    return {
+      issue: '双方操作的业务对象不同，不能仅凭主题相近确认关联。',
+      action: '核对操作对象、数据范围和所属模块；对象不同则跳过，对象表述不完整则补全原文后重新匹配。',
+      actionKind: 'review_source'
+    }
+  }
+  if (codes.has('CONSTRAINT_CONFLICT') || codes.has('NEGATION_CONFLICT')) {
+    return {
+      issue: codes.has('NEGATION_CONFLICT') ? '双方存在“支持/不支持”等方向冲突。' : '双方的范围、标准、版本或性能约束存在冲突。',
+      action: '查看原文并逐项核对约束；冲突真实存在时不要关联，原文有误时修正后重新匹配。',
+      actionKind: 'review_source'
+    }
+  }
+  if (codes.has('NORMALIZATION_VERSION_MISMATCH')) {
+    return {
+      issue: '该结果使用了不兼容的数据处理版本。',
+      action: '无需修改需求内容，直接重新执行匹配即可。',
+      actionKind: 'rerun'
+    }
+  }
+  if (codes.has('CANDIDATE_INELIGIBLE')) {
+    return {
+      issue: '该候选不在当前项目允许关联的数据范围内。',
+      action: '无需调整需求，请选择其他候选。',
+      actionKind: 'review_source'
+    }
+  }
+  if (codes.has('EXACT_BUSINESS_HASH') || codes.has('EXACT_NORMALIZED_TEXT') || row.decisionStatus === 'confirmed') {
+    return {
+      issue: '双方核心业务内容一致，当前证据已足以确认。',
+      action: '建议查看原文确认无项目范围差异后，直接关联当前需求。',
+      actionKind: 'link'
+    }
+  }
+  if (row.relation === 'topic_only' || row.relation === 'same_pattern') {
+    return {
+      issue: '当前只确认主题或实现模式相近，尚未找到足够的业务内容重合。',
+      action: '补充产品名、模块、核心动作、业务对象和关键约束等召回词，再保存并重新匹配。',
+      actionKind: 'improve_recall'
+    }
+  }
+  return {
+    issue: readableMatchReasons(row.reasonCodes),
+    action: row.decisionStatus === 'suggested'
+      ? '先查看候选原文，确认动作、对象和约束一致后再关联。'
+      : '查看双方原文核对差异；信息不足时完善原始描述后重新匹配。',
+    actionKind: 'review_source'
+  }
+}
+
+const parseMatchExplanation = (value: string | null): { similarities: string[]; differences: string[] } | null => {
+  if (!value) return null
+  try {
+    const parsed = JSON.parse(value) as { similarities?: unknown; differences?: unknown }
+    const similarities = Array.isArray(parsed.similarities) ? parsed.similarities.filter((item): item is string => typeof item === 'string' && Boolean(item.trim())) : []
+    const differences = Array.isArray(parsed.differences) ? parsed.differences.filter((item): item is string => typeof item === 'string' && Boolean(item.trim())) : []
+    return similarities.length || differences.length ? { similarities, differences } : null
+  } catch {
+    return null
+  }
+}
 
 const clampMatchTableColumnWidth = (key: MatchTableColumnKey, value: number): number =>
   Math.min(matchTableColumnMaxWidths[key], Math.max(matchTableColumnMinWidths[key], Math.round(value)))
@@ -1090,6 +1155,13 @@ function MatchDrawer({
     void load()
   }, [load, matchingProgress?.status, matchingProgress?.taskId])
 
+  const explanationPending = matches.some((row) => row.explanationStatus === 'pending')
+  useEffect(() => {
+    if (!open || !explanationPending) return
+    const timer = window.setTimeout(() => void load(), 1_500)
+    return () => window.clearTimeout(timer)
+  }, [explanationPending, load, open])
+
   const saveKeyInfoTerms = async (): Promise<void> => {
     if (!requirement) return
     setMatchingTaskId(null)
@@ -1099,6 +1171,19 @@ function MatchDrawer({
       const result = await onSaveKeyInfoTerms(requirement.id, keyInfoTermsDraft)
       if (result.ok && result.taskId) setMatchingTaskId(result.taskId)
       setEditingKeyInfoTerms(false)
+    } finally {
+      setSavingKeyInfoTerms(false)
+    }
+  }
+
+  const restartMatching = async (): Promise<void> => {
+    if (!requirement) return
+    setMatchingTaskId(null)
+    setMatchingProgress(null)
+    setSavingKeyInfoTerms(true)
+    try {
+      const result = await onSaveKeyInfoTerms(requirement.id, requirement.keyInfoTerms)
+      if (result.ok && result.taskId) setMatchingTaskId(result.taskId)
     } finally {
       setSavingKeyInfoTerms(false)
     }
@@ -1116,9 +1201,13 @@ function MatchDrawer({
     ? '匹配完成'
     : matchingProgressStatus === 'failed'
       ? '匹配失败'
+      : matchingProgressStatus === 'cancelled'
+        ? '已停止'
       : '匹配中'
   const matchingProgressMessage = matchingProgress?.message ?? '正在保存信息词并启动匹配'
   const showMatchingProgress = savingKeyInfoTerms || Boolean(matchingTaskId) || Boolean(matchingProgress)
+  const explanationUnavailable = Boolean(matchRun?.degradationCodes.some((code) => code === 'EXPLAINER_UNAVAILABLE' || code === 'EXPLANATION_PROTOCOL_ERROR' || code === 'EXPLANATION_PARTIAL'))
+  const rerankerUnavailable = Boolean(matchRun?.degradationCodes.includes('RERANKER_UNAVAILABLE'))
 
   const resizeColumn = useCallback((key: MatchTableColumnKey, value: number): void => {
     const nextWidths = {
@@ -1196,6 +1285,21 @@ function MatchDrawer({
     }
   }, [onUnlinkAssetRequirement, requirement])
 
+  const sharedGuidance = useMemo(() => {
+    if (matches.length < 2) return null
+    const groups = new Map<string, { guidance: MatchOptimizationGuidance; count: number }>()
+    for (const row of matches) {
+      const guidance = matchOptimizationGuidance(row)
+      const key = `${guidance.issue}\n${guidance.action}`
+      const group = groups.get(key)
+      groups.set(key, { guidance, count: (group?.count ?? 0) + 1 })
+    }
+    const dominant = [...groups.values()].sort((left, right) => right.count - left.count)[0]
+    return dominant && dominant.guidance.actionKind !== 'link' && dominant.count >= 2 && dominant.count / matches.length >= 0.6
+      ? dominant
+      : null
+  }, [matches])
+
   const matchColumns = useMemo<TableColumnsType<ProjectRequirementMatch>>(() => [
     {
       title: '排名', key: 'rank', dataIndex: 'finalRank', width: columnWidths.rank,
@@ -1203,7 +1307,7 @@ function MatchDrawer({
       render: (value: number) => <strong className="project-match-rank">#{value}</strong>
     },
     {
-      title: '数据中心数据',
+      title: '候选数据',
       key: 'record',
       width: columnWidths.record,
       onHeaderCell: () => ({
@@ -1214,18 +1318,35 @@ function MatchDrawer({
         onResize: (width: number) => resizeColumn('record', width),
         onResizeEnd: (width: number) => commitColumnResize('record', width)
       } as ResizableHeaderCellProps),
-      render: (_value, row) => (
-        <div className="project-match-record">
-          <Button type="link" className="project-table-link" onClick={() => onOpenRecord(row.recordUid)}>
-            <EyeOutlined /> {row.recordName || row.recordUid}
-          </Button>
-          <Text type="secondary">{row.nodeType} · {row.itemId}</Text>
-        </div>
-      )
+      render: (_value, row) => {
+        const recordName = row.recordName || row.recordUid
+        return (
+          <div className="project-match-record">
+            <Button
+              type="link"
+              className="project-table-link"
+              icon={<EyeOutlined />}
+              aria-label={`打开数据中心记录：${recordName}`}
+              onClick={() => onOpenRecord(row.recordUid)}
+            >
+              <Tooltip title={recordName} placement="topLeft">
+                <span className="project-match-record-name">{recordName}</span>
+              </Tooltip>
+            </Button>
+            <Text type="secondary" className="project-match-record-meta">
+              <span className="project-match-record-type">{row.nodeType}</span>
+              <span className="project-match-record-separator" aria-hidden="true"> · </span>
+              <Tooltip title={row.itemId} placement="topLeft">
+                <span className="project-match-record-item-id">{row.itemId}</span>
+              </Tooltip>
+            </Text>
+          </div>
+        )
+      }
     },
     {
-      title: '综合匹配分',
-      dataIndex: 'rankingScore',
+      title: '相似度评分',
+      dataIndex: 'similarityScore',
       width: columnWidths.score,
       sorter: false,
       onHeaderCell: () => ({
@@ -1236,51 +1357,57 @@ function MatchDrawer({
         onResize: (width: number) => resizeColumn('score', width),
         onResizeEnd: (width: number) => commitColumnResize('score', width)
       } as ResizableHeaderCellProps),
-      render: (value: number, row) => <Tooltip title={`当前算法版本内的相对匹配程度，不代表统计概率。排序版本：${row.rankingVersion}`}><strong>{value.toFixed(1)}</strong></Tooltip>
-    },
-    {
-      title: '匹配判断', key: 'relation', width: columnWidths.relation,
-      onHeaderCell: () => ({
-        width: columnWidths.relation, columnKey: 'relation', minWidth: matchTableColumnMinWidths.relation,
-        maxWidth: matchTableColumnMaxWidths.relation, onResize: (width: number) => resizeColumn('relation', width),
-        onResizeEnd: (width: number) => commitColumnResize('relation', width)
-      } as ResizableHeaderCellProps),
-      render: (_value, row) => {
-        const decision = matchDecisionMeta[row.decisionStatus]
-        const relation = row.relation ? matchRelationMeta[row.relation] : '关系暂未确定'
+      render: (value: number, row) => {
+        const breakdown = row.scoreBreakdown
+        const scoreBreakdown = (
+          <div className="project-match-score-tooltip">
+            <strong>相似度评分明细</strong>
+            <span>向量语义：{breakdown.dense.normalizedScore.toFixed(2)} × {(breakdown.dense.weight * 100).toFixed(0)}% = {breakdown.dense.contribution.toFixed(2)}</span>
+            <span>关键词：{breakdown.lexical.normalizedScore.toFixed(2)} × {(breakdown.lexical.weight * 100).toFixed(0)}% = {breakdown.lexical.contribution.toFixed(2)}</span>
+            <span>Cross-Encoder：{breakdown.reranker.available ? breakdown.reranker.normalizedScore.toFixed(2) : '未参与'} × {(breakdown.reranker.weight * 100).toFixed(0)}% = {breakdown.reranker.contribution.toFixed(2)}</span>
+            <span>业务结构：{breakdown.businessAlignment.normalizedScore.toFixed(2)} × {(breakdown.businessAlignment.weight * 100).toFixed(0)}% = {breakdown.businessAlignment.contribution.toFixed(2)}</span>
+            <span>合计：{breakdown.total.toFixed(2)} · 公式版本：{breakdown.formulaVersion}</span>
+            <span>评分表示综合相似程度，不代表匹配正确概率。</span>
+          </div>
+        )
         return (
-          <Tooltip title={`技术信息：${row.decisionStatus} · ${row.relation ?? 'null'}`}>
-            <div className="project-match-decision">
-              <Tag color={decision.color}>{decision.label}</Tag>
-              <Text strong>{relation}</Text>
-              <Text type="secondary">{decision.hint}</Text>
-            </div>
+          <Tooltip title={scoreBreakdown} placement="topLeft">
+            <span
+              className="project-match-ranking-score"
+              tabIndex={0}
+              aria-label={`相似度评分 ${value.toFixed(2)}，悬停查看评分明细`}
+            >
+              <strong>{value.toFixed(2)}</strong>
+            </span>
           </Tooltip>
         )
       }
     },
     {
-      title: '判断依据', key: 'evidence', width: columnWidths.evidence,
-      onHeaderCell: () => ({ width: columnWidths.evidence, columnKey: 'evidence', minWidth: matchTableColumnMinWidths.evidence, maxWidth: matchTableColumnMaxWidths.evidence, onResize: (width: number) => resizeColumn('evidence', width), onResizeEnd: (width: number) => commitColumnResize('evidence', width) } as ResizableHeaderCellProps),
+      title: '匹配分析', key: 'analysis', width: columnWidths.analysis,
+      onHeaderCell: () => ({
+        width: columnWidths.analysis, columnKey: 'analysis', minWidth: matchTableColumnMinWidths.analysis,
+        maxWidth: matchTableColumnMaxWidths.analysis, onResize: (width: number) => resizeColumn('analysis', width),
+        onResizeEnd: (width: number) => commitColumnResize('analysis', width)
+      } as ResizableHeaderCellProps),
       render: (_value, row) => {
-        const evidence = matchEvidenceLevelMeta[row.evidenceLevel]
-        const reason = readableMatchReasons(row.reasonCodes)
-        const degradations = readableMatchDegradations(row.degradationCodes)
-        const technicalCodes = [...row.reasonCodes, ...row.degradationCodes].join('、') || '无'
+        const explanation = parseMatchExplanation(row.explanation)
+        const similarity = explanation?.similarities[0] ?? row.deterministicAnalysis.similarities[0]
+        const difference = explanation?.differences[0] ?? row.deterministicAnalysis.differences[0]
         return (
-          <div className="project-match-evidence">
-            <Tooltip title={`技术代码：${technicalCodes}`}>
-              <div className="project-match-evidence-summary"><SafetyCertificateOutlined /><Text>{reason}</Text></div>
+          <div className="project-match-analysis">
+            <Tooltip title={similarity} placement="topLeft">
+              <Text><strong>相似：</strong>{similarity}</Text>
             </Tooltip>
-            {row.explanation && row.explanation !== reason && <Text type="secondary" className="project-match-reason">{row.explanation}</Text>}
-            <Tag color={evidence.color}>{evidence.label}</Tag>
-            {degradations.map((message) => <Text type="warning" className="project-match-evidence-warning" key={message}>{message}</Text>)}
+            <Tooltip title={difference} placement="topLeft">
+              <Text type="secondary"><strong>差异：</strong>{difference}</Text>
+            </Tooltip>
           </div>
         )
       }
     },
     {
-      title: '项目资产',
+      title: '关联操作',
       key: 'asset',
       width: columnWidths.asset,
       onHeaderCell: () => ({
@@ -1331,10 +1458,38 @@ function MatchDrawer({
           </Card>
           {matchRun ? (
             <section className="project-match-run-banner" aria-label="匹配运行信息">
-              <div><Text strong>排序版本 {matchRun.rankingVersion}</Text><Text type="secondary">完成于 {matchRun.completedAt || '—'} · 当前算法版本内的相对匹配程度，不代表统计概率</Text></div>
-              {matchRun.degradationCodes.length > 0 && <Tooltip title={`技术代码：${matchRun.degradationCodes.join('、')}`}><Tag color="warning">部分辅助能力不可用，结果需要复核</Tag></Tooltip>}
+              <div><Text strong>已按相似度评分从高到低排序</Text><Text type="secondary">评分由向量语义、关键词、Cross-Encoder和业务结构共同构成；是否关联请结合问题与优化建议判断</Text></div>
+              <Tooltip title={`完成于 ${matchRun.completedAt || '—'} · 评分版本 ${matchRun.rankingVersion}`}><InfoCircleOutlined aria-label="查看本次相似度运行信息" /></Tooltip>
             </section>
           ) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无与当前需求版本兼容的匹配运行" />}
+          {explanationPending && (
+            <Alert
+              className="project-match-explanation-alert"
+              type="info"
+              showIcon
+              message="排序已经完成，正在后台补充逐项说明"
+              description="现在即可查看和关联候选；说明生成不会阻塞匹配任务，完成后本页会自动刷新。"
+            />
+          )}
+          {explanationUnavailable && (
+            <Alert
+              className="project-match-explanation-alert"
+              type="warning"
+              showIcon
+              message="本次没有生成逐项相似点和差异点"
+              description="解释模型的整批请求未完成，所以同一需求下的候选都会显示这一状态；候选排序仍可查看。这不是每条数据分别失败，也不表示必须修改需求。可先按下方建议核对原文；如需自动说明，请确认系统配置中的模型可用后重新匹配。"
+              action={<Button size="small" icon={<ReloadOutlined />} loading={savingKeyInfoTerms} onClick={() => void restartMatching()}>重新匹配</Button>}
+            />
+          )}
+          {rerankerUnavailable && (
+            <Alert
+              className="project-match-explanation-alert"
+              type="warning"
+              showIcon
+              message="本次未完成精细排序"
+              description="当前顺序仅来自初步召回，建议先检查本地重排模型资源，再重新匹配。"
+            />
+          )}
           <Card
             size="small"
             className="project-key-info-terms-card"
@@ -1360,7 +1515,7 @@ function MatchDrawer({
             ) : (
               <div className="project-key-info-terms-display">
                 {requirement.keyInfoTerms.length ? <Space wrap size={[6, 6]}>{requirement.keyInfoTerms.map((term) => <Tag color="purple" key={term}>{term}</Tag>)}</Space> : <Text type="secondary">暂无补充信息词，系统仍会使用完整需求进行语义匹配</Text>}
-                <Text type="secondary" className="project-key-info-terms-source">{requirement.keyInfoTermsSource === 'manual' ? '人工修改' : 'AI 提取'} · 作为语义匹配的补充信息，不作为硬约束</Text>
+                <Text type="secondary" className="project-key-info-terms-source">{requirement.keyInfoTermsSource === 'manual' ? '人工修改' : 'AI 提取'} · 只能改善候选召回和排序，不能替代原文中缺失的动作、对象或约束</Text>
               </div>
             )}
           </Card>
@@ -1440,7 +1595,7 @@ function MatchDrawer({
                   <Text strong>匹配执行进度</Text>
                   <Text type="secondary">当前需求的重新匹配任务在此处实时更新</Text>
                 </div>
-                <Tag color={matchingProgressStatus === 'success' ? 'success' : matchingProgressStatus === 'failed' ? 'error' : 'processing'}>{matchingProgressLabel}</Tag>
+                <Tag color={matchingProgressStatus === 'success' ? 'success' : matchingProgressStatus === 'failed' ? 'error' : matchingProgressStatus === 'cancelled' ? 'warning' : 'processing'}>{matchingProgressLabel}</Tag>
               </div>
               <div className="project-match-progress-main">
                 <Progress
@@ -1450,7 +1605,7 @@ function MatchDrawer({
                   size={56}
                   strokeWidth={9}
                   status={matchingProgressStatus === 'failed' ? 'exception' : matchingProgressStatus === 'success' ? 'success' : 'active'}
-                  strokeColor={matchingProgressStatus === 'failed' ? 'var(--state-error)' : matchingProgressStatus === 'success' ? 'var(--state-success)' : 'var(--accent)'}
+                  strokeColor={matchingProgressStatus === 'failed' ? 'var(--state-error)' : matchingProgressStatus === 'success' ? 'var(--state-success)' : matchingProgressStatus === 'cancelled' ? 'var(--state-warning)' : 'var(--accent)'}
                   trailColor="var(--stroke-strong)"
                   format={(percent) => `${percent ?? 0}%`}
                   aria-label={`匹配执行进度 ${matchingProgressPercent}%`}
@@ -1462,6 +1617,25 @@ function MatchDrawer({
                 </div>
               </div>
             </section>
+          )}
+          {sharedGuidance && (
+            <Alert
+              className="project-match-common-guidance"
+              type="info"
+              showIcon
+              message={`当前页 ${sharedGuidance.count} 条候选存在同一判断条件`}
+              description={(
+                <div className="project-match-common-guidance-copy">
+                  <Text>{sharedGuidance.guidance.issue}</Text>
+                  <Text type="secondary">建议：{sharedGuidance.guidance.action}</Text>
+                </div>
+              )}
+              action={sharedGuidance.guidance.actionKind === 'improve_recall'
+                ? <Button size="small" icon={<EditOutlined />} onClick={() => { setKeyInfoTermsDraft(requirement.keyInfoTerms); setEditingKeyInfoTerms(true) }}>编辑信息词</Button>
+                : sharedGuidance.guidance.actionKind === 'rerun'
+                  ? <Button size="small" icon={<ReloadOutlined />} loading={savingKeyInfoTerms} onClick={() => void restartMatching()}>重新匹配</Button>
+                  : undefined}
+            />
           )}
           <Table<ProjectRequirementMatch>
             className="project-match-table"
@@ -2481,6 +2655,7 @@ function ProjectDetail({
   const [recordTotal, setRecordTotal] = useState(0)
   const [recordSearch, setRecordSearch] = useState('')
   const [loading, setLoading] = useState(false)
+  const [stoppingMatching, setStoppingMatching] = useState(false)
   const [assetModalOpen, setAssetModalOpen] = useState(false)
   const [costModalOpen, setCostModalOpen] = useState(false)
   const [editingCost, setEditingCost] = useState<ProjectCostEntry | null>(null)
@@ -2562,8 +2737,9 @@ function ProjectDetail({
 
   useEffect(() => {
     if (!progress || progress.projectId !== current.id) return
-    const terminal = progress.status === 'success' || progress.status === 'failed'
+    const terminal = progress.status === 'success' || progress.status === 'failed' || progress.status === 'cancelled'
     if (terminal) {
+      setStoppingMatching(false)
       const reloadKey = `${progress.taskId}:${progress.status}`
       if (terminalProgressReloadKeyRef.current === reloadKey) return
       terminalProgressReloadKeyRef.current = reloadKey
@@ -2594,6 +2770,32 @@ function ProjectDetail({
       analysisLogRefreshTimerRef.current = null
     }
   }, [])
+
+  useEffect(() => {
+    if (current.analysisStatus !== 'processing' && current.matchStatus !== 'processing') return
+    let disposed = false
+    let polling = false
+    const pollProjectStatus = async (): Promise<void> => {
+      if (disposed || polling) return
+      polling = true
+      try {
+        const nextProject = await window.visslm.getManagedProject(current.id)
+        if (disposed || !nextProject) return
+        setCurrent(nextProject)
+        const terminal = nextProject.analysisStatus !== 'processing' && nextProject.matchStatus !== 'processing'
+        if (terminal) await reload()
+      } catch {
+        // A transient IPC/read failure should not stop the next polling attempt.
+      } finally {
+        polling = false
+      }
+    }
+    const timer = window.setInterval(() => void pollProjectStatus(), 1_500)
+    return () => {
+      disposed = true
+      window.clearInterval(timer)
+    }
+  }, [current.analysisStatus, current.id, current.matchStatus, reload])
 
   useEffect(() => {
     if (!participantModalOpen && !editModalOpen && activeTab !== 'plan') return
@@ -2735,9 +2937,51 @@ function ProjectDetail({
   }
 
   const startMatching = async (): Promise<void> => {
+    setStoppingMatching(false)
     const result = await window.visslm.startProjectMatching(current.id)
     if (!result.ok) message.error(result.message)
-    else message.success(result.message)
+    else {
+      setCurrent((projectSnapshot) => ({
+        ...projectSnapshot,
+        matchStatus: 'processing',
+        matchMessage: result.message
+      }))
+      onChanged()
+      message.success(result.message)
+    }
+  }
+
+  const stopMatching = (): void => {
+    modal.confirm({
+      title: '停止当前匹配任务？',
+      icon: <WarningOutlined />,
+      content: '停止将在当前需求处理完成后的安全点生效；已完成结果会保留，未完成需求可稍后重新匹配。',
+      okText: '停止匹配',
+      cancelText: '继续执行',
+      okButtonProps: { danger: true },
+      onOk: async () => {
+        setStoppingMatching(true)
+        try {
+          const result = await window.visslm.stopProjectMatching(current.id)
+          if (!result.ok) {
+            setStoppingMatching(false)
+            message.error(result.message)
+            await reload()
+            return
+          }
+          setCurrent((projectSnapshot) => ({
+            ...projectSnapshot,
+            matchStatus: 'processing',
+            matchMessage: result.message
+          }))
+          message.success(result.message)
+          onChanged()
+        } catch (error) {
+          setStoppingMatching(false)
+          message.error(error instanceof Error ? error.message : '停止匹配失败')
+        }
+      }
+    })
   }
 
   const saveRequirementKeyInfoTerms = async (id: string, terms: string[]): Promise<ProjectAnalysisStartResult> => {
@@ -3148,8 +3392,26 @@ function ProjectDetail({
 
   const projectProgress = progress?.projectId === current.id ? progress : null
   const availableAssetRecords = records.filter((row) => !assets.some((asset) => asset.recordUid === row.uid))
+  // Persisted project state is authoritative. Progress events enrich the live
+  // detail panel, but a stale/missed terminal event must not keep the header
+  // status stuck in "执行中" after polling has observed completion.
   const isProcessing = current.analysisStatus === 'processing' || current.matchStatus === 'processing'
+  const isMatchingProcessing = current.matchStatus === 'processing'
   const isFailed = current.analysisStatus === 'failed' || current.matchStatus === 'failed'
+  const projectLifecycleLabel = current.lifecycle === 'draft'
+    ? '待确认'
+    : isProcessing
+      ? '执行中'
+      : isFailed
+        ? '执行失败'
+        : '项目已确认'
+  const projectLifecycleColor = current.lifecycle === 'draft'
+    ? 'purple'
+    : isProcessing
+      ? 'processing'
+      : isFailed
+        ? 'error'
+        : 'success'
   const analysisPhase = projectProgress?.phase
     ?? (current.matchStatus === 'processing' ? 'matching' : current.analysisStatus === 'processing' ? 'embedding' : current.analysisStatus === 'ready' && current.matchStatus === 'ready' ? 'done' : 'queued')
   const activeStageIndex = analysisPhaseIndex[analysisPhase]
@@ -3207,7 +3469,9 @@ function ProjectDetail({
         </div>
         <Space wrap className="project-detail-actions">
           {current.lifecycle === 'draft' && <Button type="primary" icon={<CheckCircleOutlined />} disabled={isProcessing} onClick={() => void confirmProject()}>确认创建并匹配</Button>}
-          {current.lifecycle === 'active' && <Button type="primary" icon={<SyncOutlined />} disabled={isProcessing} onClick={() => void startMatching()}>重新匹配</Button>}
+          {current.lifecycle === 'active' && (isMatchingProcessing
+            ? <Button danger icon={<CloseOutlined />} loading={stoppingMatching} disabled={stoppingMatching} onClick={stopMatching}>{stoppingMatching ? '正在停止' : '停止匹配'}</Button>
+            : <Button type="primary" icon={<SyncOutlined />} disabled={isProcessing} onClick={() => void startMatching()}>重新匹配</Button>)}
           <Button icon={<UploadOutlined />} disabled={isProcessing} onClick={() => void uploadAgreement()}>{isProcessing ? '正在处理协议' : '上传协议附件'}</Button>
           {current.analysisStatus === 'failed' && <Button icon={<ReloadOutlined />} onClick={retryOrUploadAnalysis}>{current.currentDocumentId ? '重试分析' : '重新上传并执行'}</Button>}
           <Button icon={<EditOutlined />} disabled={isProcessing} onClick={() => setEditModalOpen(true)}>编辑项目</Button>
@@ -3259,7 +3523,7 @@ function ProjectDetail({
                 <span>匹配已完成</span>
               </div>
             )}
-            <Tag className="project-status-capsule" color={current.lifecycle === 'active' ? 'processing' : 'purple'}>{current.lifecycle === 'active' ? '执行中' : '待确认'}</Tag>
+            <Tag className="project-status-capsule" color={projectLifecycleColor}>{projectLifecycleLabel}</Tag>
           </div>
           <div className="project-heading-meta">
             <Text>客户：{current.customerName || '未填写'}</Text>
@@ -3308,7 +3572,7 @@ function ProjectDetail({
               </div>
             </div>
             <div className="project-analysis-summary">
-              <Text className="project-analysis-live-badge"><SyncOutlined spin /> 后台处理中</Text>
+              <Text className="project-analysis-live-badge"><SyncOutlined spin /> {stoppingMatching ? '正在安全停止' : '后台处理中'}</Text>
               <Text strong>已完成 {Math.min(activeStageIndex, analysisStageMeta.length - 1)} / {analysisStageMeta.length - 1} 个阶段</Text>
             </div>
           </div>
@@ -3401,7 +3665,7 @@ function ProjectDetail({
                     <div className="project-command-empty"><Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={current.currentDocumentName ? '技术协议尚未识别出功能需求' : '请先上传技术协议'} /></div>
                   ) : (
                     <div className="project-command-requirement-preview">
-                      <div className="project-command-section-head project-preview-head"><div><Text strong>需求预览</Text><Text type="secondary">显示前 5 条需求，点击匹配度查看数据中心结果</Text></div><Text type="secondary">共 {current.requirementCount} 条</Text></div>
+                      <div className="project-command-section-head project-preview-head"><div><Text strong>需求预览</Text><Text type="secondary">显示前 5 条需求，点击相似度评分查看数据中心结果</Text></div><Text type="secondary">共 {current.requirementCount} 条</Text></div>
                       <ResizableTable<ProjectRequirement>
                         tableKey="project-overview-requirements-v2"
                         rowKey="id"
@@ -3415,18 +3679,20 @@ function ProjectDetail({
                           { title: '模块', dataIndex: 'module', width: 150, ellipsis: true, render: (value: string) => value || <Text type="secondary">未分类</Text> },
                           { title: '需求描述', key: 'content', width: 300, render: (_value, row) => <div className="project-command-requirement-cell"><Text strong>{row.title}</Text><Text type="secondary">{row.content}</Text></div> },
                           {
-                            title: '最高匹配度', dataIndex: 'highestMatchScore', width: 150,
-                            render: (value: number, row) => {
-                              const scoreLabel = value ? formatPercent(value) : '暂无匹配结果'
+                            title: '最高相似度评分', dataIndex: 'highestSimilarityScore', width: 168,
+                            render: (value: number | null, row) => {
+                              const hasScore = Number.isFinite(value)
+                              const score = hasScore ? Number(value) : 0
+                              const scoreLabel = hasScore ? `${score.toFixed(2)} / 100` : '待重新匹配'
                               return (
-                                <Tooltip title={`最高匹配度：${scoreLabel}`}>
+                                <Tooltip title={`最高相似度评分：${scoreLabel}`}>
                                   <Button
                                     type="link"
                                     className="project-command-score"
-                                    aria-label={`最高匹配度：${scoreLabel}`}
+                                    aria-label={`最高相似度评分：${scoreLabel}`}
                                     onClick={() => setMatchRequirement(row)}
                                   >
-                                    <Progress percent={value || 0} showInfo={false} size="small" />
+                                    <Progress percent={score} showInfo={false} size="small" />
                                   </Button>
                                 </Tooltip>
                               )
@@ -3619,12 +3885,12 @@ function ProjectDetail({
                           render: (_value, row) => <div className="project-key-info-terms-cell">{row.keyInfoTerms.length ? <Space wrap size={[4, 4]}>{row.keyInfoTerms.slice(0, 6).map((term) => <Tag color="blue" key={term}>{term}</Tag>)}{row.keyInfoTerms.length > 6 && <Tag>+{row.keyInfoTerms.length - 6}</Tag>}</Space> : <Text type="secondary">待提取</Text>}<Text type="secondary">{row.keyInfoTermsSource === 'manual' ? '人工修改' : 'AI 提取'}</Text></div>
                         },
                         ...(!requirementSet ? [{
-                          title: '最高匹配度', dataIndex: 'highestMatchScore', width: 150,
-                          render: (value: number, row: ProjectRequirement) => <Button type="link" className="project-score-button" onClick={() => setMatchRequirement(row)}>{value ? `${value.toFixed(1)}%` : '暂无结果'} <EyeOutlined /></Button>
+                          title: '最高相似度评分', dataIndex: 'highestSimilarityScore', width: 168,
+                          render: (value: number | null, row: ProjectRequirement) => <Button type="link" className="project-score-button" onClick={() => setMatchRequirement(row)}>{Number.isFinite(value) ? `${Number(value).toFixed(2)} / 100` : '待重新匹配'} <EyeOutlined /></Button>
                         }, {
                           title: '状态', dataIndex: 'status', width: 150,
                           render: (value: ProjectRequirementStatus, row: ProjectRequirement) => <Space direction="vertical" size={2}><Select size="small" value={value} options={Object.entries(requirementStatusMeta).map(([key, item]) => ({ value: key, label: item.label }))} onChange={(next) => void updateRequirementStatus(row.id, next as ProjectRequirementStatus)} /><Text type="secondary" className={row.statusSource === 'legacy_unverified' ? 'project-requirement-status-source is-legacy' : 'project-requirement-status-source'}>{requirementStatusSourceLabel[row.statusSource]}</Text></Space>
-                        }, { title: '匹配数据', dataIndex: 'matchCount', width: 100, render: (value: number) => `${value} 条` }] : []),
+                        }, { title: '相似候选', dataIndex: 'similarCandidateCount', width: 100, render: (value: number) => `${value} 条` }] : []),
                         {
                           title: '操作', key: 'action', fixed: 'right', width: requirementSet ? 250 : 150,
                           render: (_value, row) => requirementSet ? <Space size={0}>
@@ -3822,7 +4088,7 @@ function ProjectDetail({
               <Text type="secondary">按时间倒序展示协议上传、解析、索引、抽取和失败重试记录</Text>
             </div>
             <Space size={8}>
-              {latestAnalysisLog && <Tag color={latestAnalysisLog.status === 'failed' ? 'error' : latestAnalysisLog.status === 'success' ? 'success' : 'processing'}>{analysisLogPhaseMeta[latestAnalysisLog.phase]}</Tag>}
+              {latestAnalysisLog && <Tag color={latestAnalysisLog.status === 'failed' ? 'error' : latestAnalysisLog.status === 'success' ? 'success' : latestAnalysisLog.status === 'cancelled' ? 'warning' : 'processing'}>{analysisLogPhaseMeta[latestAnalysisLog.phase]}</Tag>}
               <Text type="secondary">{agreementAnalysisLogs.length} 条记录</Text>
             </Space>
           </div>
@@ -4268,17 +4534,6 @@ export function ProjectManagementPage({
           <Button type="primary" icon={<PlusOutlined />} onClick={() => setCreateModalOpen(true)}>手动创建项目</Button>
         </Space>
         </div>
-        {progress && progress.status === 'running' && (
-        <Alert
-          showIcon
-          icon={<SyncOutlined spin />}
-          title={progress.message}
-          description={progress.detail
-            ? `${progress.detail}${progress.total > 0 ? ` · 已处理 ${Math.min(progress.current, progress.total)} / ${progress.total}` : ''}`
-            : progress.total > 0 ? `已处理 ${Math.min(progress.current, progress.total)} / ${progress.total}` : '任务正在后台执行'}
-          type="info"
-        />
-        )}
         <Card className="project-list-card">
         <div className="project-list-filter"><Input.Search allowClear prefix={<SearchOutlined />} placeholder="搜索项目名称或客户名称" value={search} onChange={(event) => { setSearch(event.target.value); setPage(1) }} onSearch={() => void loadProjects()} style={{ width: 320 }} /><Text type="secondary">共 {total} 个项目</Text></div>
         <ResizableTable<ManagedProject>

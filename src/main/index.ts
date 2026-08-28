@@ -85,6 +85,7 @@ import { startDatabaseBootstrap } from './database-bootstrap'
 import type { DatabaseMigrationProgress } from './database-bootstrap-protocol'
 import { validateDashboardSpec } from './dashboards/validator'
 import { diagnoseDashboard } from './dashboards/diagnostics'
+import { evaluateDashboardDomainSaveGate } from './dashboards/dashboard-domain-save-gate'
 import { repairDashboardComponent } from './dashboards/component-repair'
 import { dashboardSpecHash } from './dashboards/spec-hash'
 import { ExpertRouter } from './experts/router'
@@ -124,6 +125,7 @@ import {
 import { renderAssistantArtifact } from './assistant/artifact-exporter'
 import { RequirementAnalysisAgent } from './experts/requirement-analysis-agent'
 import { VisualizationAgent } from './experts/visualization-agent'
+import { runDashboardDomainChatRequest } from './experts/dashboard-domain-chat'
 import { resolveVisualizationRequestMode } from './experts/visualization-intent'
 import { OllamaAgent } from './ollama'
 import { PlainChatAgent } from './plain-chat'
@@ -1620,6 +1622,79 @@ const registerIpc = (): void => {
       )
       const isPatchRequest = requestMode === 'patch'
       emitActivity(workLogForStatus('execute'))
+      if (!isPatchRequest) {
+        const domainChatResult = await runDashboardDomainChatRequest({
+          question: route.question,
+          scope,
+          generatedAt: new Date().toISOString()
+        }, queryEngine)
+        if (!domainChatResult.recognized) {
+          // Keep non-domain requests on the existing model-assisted path.
+        } else if (domainChatResult.status === 'ready') {
+          if (!domainChatResult.dashboard) {
+            throw new Error('领域大屏生成成功但未返回 DashboardSpec')
+          }
+          emitActivity(workLogForVerification())
+          emitActivity(workLogForDelivery())
+          return attachAssistantIntent({
+            answer: domainChatResult.answer ?? '领域大屏已生成，等待预览。',
+            sources: [],
+            dataViews: [],
+            expertId: route.expert.id,
+            dashboard: domainChatResult.dashboard,
+            events: [
+              {
+                type: 'status' as const,
+                stage: 'validate',
+                message: '领域 Blueprint、QuerySpec、过程绑定与查询结果校验通过'
+              },
+              {
+                type: 'artifact' as const,
+                artifactId: domainChatResult.dashboard.id,
+                version: 1,
+                dashboard: domainChatResult.dashboard
+              }
+            ]
+          }, {
+            invokedAgents: ['visualization']
+          })
+        } else if (domainChatResult.status === 'clarification') {
+          return attachAssistantIntent({
+            answer: domainChatResult.answer ?? '生成领域大屏前还需要确认业务上下文。',
+            sources: [],
+            dataViews: [],
+            expertId: route.expert.id,
+            needsClarification: true,
+            clarificationQuestion: domainChatResult.answer ?? '请选择适用的业务选项。',
+            clarificationOptions: domainChatResult.clarificationOptions
+              ? [...domainChatResult.clarificationOptions]
+              : undefined
+          }, {
+            status: 'clarification',
+            invokedAgents: ['visualization']
+          })
+        } else if (domainChatResult.status === 'rejected') {
+          const message = domainChatResult.answer ?? domainChatResult.reason ?? '领域大屏生成被质量门禁阻断'
+          return attachAssistantIntent({
+            answer: message,
+            sources: [],
+            dataViews: [],
+            expertId: route.expert.id,
+            dashboard: undefined,
+            events: [{
+              type: 'error' as const,
+              code: 'DASHBOARD_DOMAIN_REJECTED',
+              message,
+              recoverable: true,
+              stage: 'validate'
+            }]
+          }, {
+            status: 'failed',
+            invokedAgents: ['visualization'],
+            error: { code: 'DASHBOARD_DOMAIN_REJECTED', message }
+          })
+        }
+      }
       let latestVisualizationRun: VisualizationRunInput | undefined
       const agent = new VisualizationAgent(
         queryEngine,
@@ -1954,6 +2029,12 @@ const registerIpc = (): void => {
     try {
       const errors = validateDashboardSpec(input.spec, new QueryEngine(db))
       if (errors.length) throw new Error(`大屏校验失败：${errors.join('；')}`)
+      const domainSaveGate = evaluateDashboardDomainSaveGate(input.spec, new QueryEngine(db))
+      if (!domainSaveGate.allowed) {
+        throw new Error(
+          `领域大屏保存门禁未通过（${domainSaveGate.score} 分，${domainSaveGate.status}）：${domainSaveGate.reasons.join('；')}`
+        )
+      }
       const saved = db.saveDashboard(input)
       recordDashboardAudit({
         dashboardId: saved.dashboardId,
@@ -2722,6 +2803,7 @@ const registerIpc = (): void => {
   })
   ipcMain.handle('projects:retry-analysis', (_event, id: string) => projectManagementService.retryAnalysis(id))
   ipcMain.handle('projects:start-matching', (_event, id: string) => projectManagementService.startMatching(id))
+  ipcMain.handle('projects:stop-matching', (_event, id: string) => projectManagementService.stopMatching(id))
   ipcMain.handle('projects:requirements', (_event, query: ProjectRequirementQuery) =>
     projectManagementService.listRequirements(query)
   )

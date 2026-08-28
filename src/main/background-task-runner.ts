@@ -58,7 +58,7 @@ export class BackgroundTaskRunner {
   cancel(taskId: string): boolean {
     const controller = this.controllers.get(taskId.trim())
     if (!controller) return false
-    controller.abort()
+    controller.abort(new TaskCancelledError())
     return true
   }
 

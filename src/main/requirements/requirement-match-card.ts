@@ -1,5 +1,4 @@
 import type { ProjectRequirement } from '../../shared/project-types'
-import type { RecordDetail } from '../../shared/types'
 import type { RequirementBusinessFacts } from './requirement-match-domain'
 import { extractRequirementBusinessFacts } from './requirement-business-normalization'
 
@@ -11,6 +10,10 @@ import { extractRequirementBusinessFacts } from './requirement-business-normaliz
  * business rules, and it is never persisted as a generated asset.
  */
 export interface RequirementMatchCard {
+  /** Business artifact lane. Legacy callers may omit it and rely on requirementType inference. */
+  artifactType?: 'requirement' | 'defect' | 'unknown'
+  /** Project requirement category such as functional, interface, or performance. */
+  requirementCategory?: string
   requirementType: string
   productDomain: string
   module: string
@@ -218,8 +221,15 @@ export const requirementLexicalTermsOf = (values: string[]): string[] => {
   return [...new Set(terms)].slice(0, 80)
 }
 
+const artifactTypeOf = (value: string): RequirementMatchCard['artifactType'] => {
+  const normalized = value.normalize('NFKC').toLocaleLowerCase().replace(/[\s_\-]+/g, '')
+  if (/(?:defect|bug|缺陷|故障|错误)/iu.test(normalized)) return 'defect'
+  if (/(?:requirement|enhancement|feature|story|需求|功能)/iu.test(normalized)) return 'requirement'
+  return 'unknown'
+}
+
 /** Build a read-only source view for every matching request. */
-export const buildRequirementSourceView = (record: RecordDetail): RequirementMatchCard => {
+export const buildRequirementSourceView = (record: RequirementBusinessSource): RequirementMatchCard => {
   const source: RequirementBusinessSource = record
   const requirementType = requirementField(source, [
     'IssueType', 'issueType', '_valm_IssueType', 'requirementType', '需求类型', '问题类型'
@@ -242,6 +252,7 @@ export const buildRequirementSourceView = (record: RecordDetail): RequirementMat
   const sourceDescription = requirementDescriptionOf(source)
   const evidence = buildRequirementBusinessText(source)
   return {
+    artifactType: artifactTypeOf(requirementType),
     requirementType,
     productDomain,
     module,
@@ -271,6 +282,8 @@ export const buildProjectRequirementMatchCard = (
     sourceDescription ? `描述：${sourceDescription}` : ''
   ].filter(Boolean).join('\n')
   return {
+    artifactType: 'requirement',
+    requirementCategory: requirementType,
     requirementType,
     productDomain: '',
     module,

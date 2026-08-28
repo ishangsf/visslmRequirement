@@ -144,6 +144,67 @@ const visualizationToolLabels: Record<VisualizationRun['toolCalls'][number]['too
   'repair-attempt': '自动修复'
 }
 
+const dashboardDomainRoleLabels: Record<string, string> = {
+  'project-owner': '项目负责人',
+  'qa-epg': '质量与过程负责人',
+  'rd-lead': '研发负责人',
+  'model-org-manager': '型号/组织管理负责人'
+}
+
+const dashboardDomainScenarioLabels: Record<string, string> = {
+  'project-overview': '项目综合态势',
+  'requirements-delivery': '需求到交付全链路',
+  'plan-milestone': '计划与里程碑执行',
+  'software-quality': '软件质量与缺陷闭环',
+  'test-validation': '测试与验证充分性',
+  'configuration-change': '配置管理与变更控制',
+  'gjb5000b-compliance': '过程证据审计',
+  'organization-improvement': '组织改进'
+}
+
+const dashboardDomainArtifactStatusLabels: Record<string, string> = {
+  preview: '预览',
+  formal: '正式'
+}
+
+const dashboardDomainContextValue = (
+  label: string,
+  value: string,
+  labels?: Record<string, string>
+): React.JSX.Element => {
+  const displayValue = labels?.[value] ?? value
+  const tooltipValue = displayValue === value ? value : `${displayValue}（${value}）`
+  return (
+    <Tooltip title={tooltipValue}>
+      <Text ellipsis aria-label={`${label}：${tooltipValue}`} title={tooltipValue}>
+        {displayValue}
+      </Text>
+    </Tooltip>
+  )
+}
+
+const dashboardSemanticConfidenceLabel = (value: unknown): string | null => {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1) return null
+  return `${Math.round(value * 100)}%`
+}
+
+const dashboardDomainReceiptItemsOf = (items?: readonly unknown[]): string[] =>
+  (items ?? []).filter((item): item is string =>
+    typeof item === 'string' && item.trim().length > 0
+  )
+
+const dashboardDomainReceiptList = (label: string, items: string[]): React.JSX.Element => (
+  <List
+    size="small"
+    dataSource={items}
+    renderItem={(item, index) => (
+      <List.Item key={`${label}-${index}`}>
+        {dashboardDomainContextValue(label, item)}
+      </List.Item>
+    )}
+  />
+)
+
 const visualizationToolMetadataLabels: Record<string, string> = {
   fieldCount: '字段',
   errorCount: '错误',
@@ -2397,6 +2458,13 @@ export function DashboardStudio({
     </div>
   )
 
+  const domainReceipt = dashboard?.domainReceipt
+  const domainReceiptWarnings = dashboardDomainReceiptItemsOf(domainReceipt?.warnings)
+  const domainReceiptConfirmations = dashboardDomainReceiptItemsOf(domainReceipt?.confirmations)
+  const domainReceiptVetoCodes = dashboardDomainReceiptItemsOf(domainReceipt?.vetoCodes)
+  const domainReceiptEvidenceMissing = dashboardDomainReceiptItemsOf(domainReceipt?.evidenceMissing)
+  const domainReceiptEvidenceInsufficient = dashboardDomainReceiptItemsOf(domainReceipt?.evidenceInsufficient)
+
   return (
     <div className={[
       'dashboard-studio',
@@ -2836,7 +2904,107 @@ export function DashboardStudio({
                       </span>
                     ),
                     children: renderGlobalFilterEditor()
-                  }
+                  },
+                  ...(dashboard.domainContext ? [{
+                    key: 'domain-context',
+                    label: (
+                      <span className="dashboard-inspector-group-label">
+                        <strong>领域上下文</strong>
+                        <small>角色、场景与基线</small>
+                      </span>
+                    ),
+                    children: (
+                      <section className="dashboard-domain-context" aria-label="领域上下文详情">
+                        <Descriptions bordered size="small" column={1}>
+                          <Descriptions.Item label="角色">
+                            {dashboardDomainContextValue('角色', dashboard.domainContext.role, dashboardDomainRoleLabels)}
+                          </Descriptions.Item>
+                          <Descriptions.Item label="场景">
+                            {dashboardDomainContextValue('场景', dashboard.domainContext.scenario, dashboardDomainScenarioLabels)}
+                          </Descriptions.Item>
+                          <Descriptions.Item label="产物状态">
+                            {dashboardDomainContextValue('产物状态', dashboard.domainContext.artifactStatus, dashboardDomainArtifactStatusLabels)}
+                          </Descriptions.Item>
+                          <Descriptions.Item label="目录版本">
+                            {dashboardDomainContextValue('目录版本', dashboard.domainContext.catalogVersion)}
+                          </Descriptions.Item>
+                          <Descriptions.Item label="裁剪基线">
+                            {dashboardDomainContextValue('裁剪基线', dashboard.domainContext.tailoringBaselineId)}
+                          </Descriptions.Item>
+                        </Descriptions>
+                        {domainReceipt && (
+                          <section className="dashboard-domain-receipt" aria-label="领域生成回执">
+                            <div className="dashboard-inspector-field-header">
+                              <strong>生成回执</strong>
+                              <Space size={4} wrap aria-label="生成回执摘要">
+                                {dashboardSemanticConfidenceLabel(domainReceipt.confidence) && (
+                                  <Tooltip
+                                    title={`生成回执可信度：${dashboardSemanticConfidenceLabel(domainReceipt.confidence)}`}
+                                  >
+                                    <Tag
+                                      aria-label={`生成回执可信度 ${dashboardSemanticConfidenceLabel(domainReceipt.confidence)}`}
+                                    >
+                                      可信度 {dashboardSemanticConfidenceLabel(domainReceipt.confidence)}
+                                    </Tag>
+                                  </Tooltip>
+                                )}
+                                {domainReceiptEvidenceMissing.length > 0 && (
+                                  <Tooltip title={`证据缺失：${domainReceiptEvidenceMissing.join('、')}`}>
+                                    <Tag aria-label={`证据缺失 ${domainReceiptEvidenceMissing.length} 项`}>
+                                      证据缺失 {domainReceiptEvidenceMissing.length}
+                                    </Tag>
+                                  </Tooltip>
+                                )}
+                                {domainReceiptEvidenceInsufficient.length > 0 && (
+                                  <Tooltip title={`证据不足：${domainReceiptEvidenceInsufficient.join('、')}`}>
+                                    <Tag aria-label={`证据不足 ${domainReceiptEvidenceInsufficient.length} 项`}>
+                                      证据不足 {domainReceiptEvidenceInsufficient.length}
+                                    </Tag>
+                                  </Tooltip>
+                                )}
+                              </Space>
+                            </div>
+                            {domainReceiptVetoCodes.length > 0 && (
+                              <div aria-label="领域生成回执阻断项">
+                                <Alert
+                                  type="error"
+                                  showIcon
+                                  message={`存在 ${domainReceiptVetoCodes.length} 个阻断项，当前结果不可作为正式交付`}
+                                  description={(
+                                    <Space size={4} wrap aria-label={`阻断代码：${domainReceiptVetoCodes.join('、')}`}>
+                                      {domainReceiptVetoCodes.map((code) => (
+                                        <Tooltip title={code} key={code}>
+                                          <Tag aria-label={`阻断代码 ${code}`}>{code}</Tag>
+                                        </Tooltip>
+                                      ))}
+                                    </Space>
+                                  )}
+                                />
+                              </div>
+                            )}
+                            {(domainReceiptWarnings.length > 0 || domainReceiptConfirmations.length > 0) && (
+                              <Collapse
+                                size="small"
+                                defaultActiveKey={[]}
+                                items={[
+                                  ...(domainReceiptWarnings.length > 0 ? [{
+                                    key: 'warnings',
+                                    label: `警告 ${domainReceiptWarnings.length}`,
+                                    children: dashboardDomainReceiptList('警告', domainReceiptWarnings)
+                                  }] : []),
+                                  ...(domainReceiptConfirmations.length > 0 ? [{
+                                    key: 'confirmations',
+                                    label: `确认 ${domainReceiptConfirmations.length}`,
+                                    children: dashboardDomainReceiptList('确认', domainReceiptConfirmations)
+                                  }] : [])
+                                ]}
+                              />
+                            )}
+                          </section>
+                        )}
+                      </section>
+                    )
+                  }] : [])
                 ]}
               />
             )}
@@ -2898,6 +3066,29 @@ export function DashboardStudio({
                                 dashboard?.analysisBlueprint?.metrics.find((metric) => metric.id === metricId)?.label ?? metricId
                               ).join('、') || '未指定'}
                             </small>
+                            {dashboardSemanticConfidenceLabel(selectedComponent.semanticBinding.confidence) && (
+                              <Tooltip
+                                title={`语义绑定可信度：${dashboardSemanticConfidenceLabel(selectedComponent.semanticBinding.confidence)}`}
+                              >
+                                <Tag
+                                  aria-label={`语义绑定可信度 ${dashboardSemanticConfidenceLabel(selectedComponent.semanticBinding.confidence)}`}
+                                >
+                                  可信度 {dashboardSemanticConfidenceLabel(selectedComponent.semanticBinding.confidence)}
+                                </Tag>
+                              </Tooltip>
+                            )}
+                            {selectedComponent.semanticBinding.processBindingIds?.length ? (
+                              <div aria-label="过程绑定">
+                                <small>过程绑定：</small>
+                                <Space size={4} wrap>
+                                  {selectedComponent.semanticBinding.processBindingIds.map((bindingId) => (
+                                    <Tooltip title={bindingId} key={bindingId}>
+                                      <Tag aria-label={`过程绑定 ${bindingId}`}>{bindingId}</Tag>
+                                    </Tooltip>
+                                  ))}
+                                </Space>
+                              </div>
+                            ) : null}
                             {selectedComponent.semanticBinding.titleMode === 'custom' && (
                               <small className="dashboard-semantic-binding-hint">
                                 自定义标题不会随指标变化自动更新；编辑查询字段或聚合方式时，绑定定义会同步校正。

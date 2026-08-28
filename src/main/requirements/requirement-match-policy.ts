@@ -11,7 +11,9 @@ export const REQUIREMENT_MATCH_REASON_CODES = [
   'EXACT_BUSINESS_HASH',
   'EXACT_NORMALIZED_TEXT',
   'MISSING_REQUIRED_FIELD',
+  'MISSING_CATEGORY_FIELD',
   'CANDIDATE_INELIGIBLE',
+  'SOURCE_TYPE_MISMATCH',
   'NORMALIZATION_VERSION_MISMATCH',
   'ACTION_CONFLICT',
   'OBJECT_CONFLICT',
@@ -33,7 +35,6 @@ export interface RequirementMatchPolicyDecision {
   relation: MatchRelation
   decisionStatus: MatchDecisionStatus
   evidenceLevel: MatchEvidenceLevel
-  rankingCap: number
   mayConfirm: boolean
   reasonCodes: RequirementMatchReasonCode[]
 }
@@ -71,14 +72,71 @@ const rejected = (reason: RequirementMatchReasonCode): RequirementMatchPolicyDec
   relation: 'unrelated',
   decisionStatus: 'rejected',
   evidenceLevel: 'deterministic_rule',
-  rankingCap: 0,
   mayConfirm: false,
   reasonCodes: [reason]
 })
 
-const hasRequiredFacts = (facts: RequirementBusinessFacts): boolean => (
-  facts.source !== 'missing' && Boolean(normalizedFact(facts.action)) && Boolean(normalizedFact(facts.object))
-)
+const REQUIREMENT_CATEGORY_ALIASES: Readonly<Record<string, string>> = Object.freeze({
+  functional: 'functional', 功能: 'functional', 功能需求: 'functional',
+  interface: 'interface', 接口: 'interface', 接口需求: 'interface',
+  data: 'data', 数据: 'data', 数据需求: 'data',
+  performance: 'performance', 性能: 'performance', 性能需求: 'performance',
+  security: 'security', 安全: 'security', 安全需求: 'security',
+  deployment: 'deployment', 部署: 'deployment', 环境: 'deployment',
+  operations: 'operations', 运维: 'operations', 运营: 'operations',
+  acceptance: 'acceptance', 验收: 'acceptance',
+  business: 'business', 业务: 'business'
+})
+
+const categoryOf = (card: RequirementMatchCard): string => {
+  const raw = normalizedFact(card.requirementCategory || card.requirementType)
+  return REQUIREMENT_CATEGORY_ALIASES[raw] ?? raw
+}
+
+export const requirementArtifactTypeOf = (card: RequirementMatchCard): 'requirement' | 'defect' | 'unknown' => {
+  if (card.artifactType) return card.artifactType
+  const type = normalizedFact(card.requirementType)
+  if (/(?:defect|bug|缺陷|故障|错误)/iu.test(type)) return 'defect'
+  if (/(?:requirement|enhancement|feature|story|需求|功能)/iu.test(type) || REQUIREMENT_CATEGORY_ALIASES[type]) {
+    return 'requirement'
+  }
+  return 'unknown'
+}
+
+export const requirementArtifactTypesCompatible = (
+  base: RequirementMatchCard,
+  candidate: RequirementMatchCard
+): boolean => {
+  const baseType = requirementArtifactTypeOf(base)
+  const candidateType = requirementArtifactTypeOf(candidate)
+  return baseType === 'unknown' || candidateType === 'unknown' || baseType === candidateType
+}
+
+const categoryFactsComplete = (card: RequirementMatchCard, category: string): boolean => {
+  const facts = card.businessFacts
+  const action = Boolean(normalizedFact(facts.action))
+  const object = Boolean(normalizedFact(facts.object))
+  const text = `${card.sourceTitle}\n${card.sourceDescription}`
+  if (category === 'performance') {
+    return facts.constraints.length > 0 && (action || object || /(?:响应|吞吐|并发|时延|准确率|容量|可用率|性能)/u.test(text))
+  }
+  if (category === 'interface') {
+    return (action && object) || /(?:接口|协议|调用|接收|发送|输入|输出|来源|目标|请求|响应)/u.test(text)
+  }
+  if (category === 'deployment') {
+    return (action || object) && /(?:部署|安装|环境|操作系统|数据库|服务器|国产化|版本|架构)/u.test(text)
+  }
+  if (category === 'acceptance') {
+    return /(?:验收|通过|满足|符合|交付|验证|测试)/u.test(text) && (object || facts.constraints.length > 0)
+  }
+  if (category === 'operations') {
+    return (action && object) || /(?:运维|维护|服务|支持|保障|SLA|响应时间|驻场)/iu.test(text)
+  }
+  if (category === 'business') {
+    return (action && object) || /(?:负责|提供|承担|完成|交付|配合)/u.test(text)
+  }
+  return facts.source !== 'missing' && action && object
+}
 
 /** Deterministic policy. Later model output may explain this decision but cannot upgrade it. */
 export const evaluateRequirementMatchPolicy = (
@@ -87,12 +145,12 @@ export const evaluateRequirementMatchPolicy = (
   context: RequirementMatchPolicyContext
 ): RequirementMatchPolicyDecision => {
   if (!context.candidateEligible) return rejected('CANDIDATE_INELIGIBLE')
+  if (!requirementArtifactTypesCompatible(base, candidate)) return rejected('SOURCE_TYPE_MISMATCH')
   if (!context.normalizationVersionMatches) {
     return {
       relation: null,
       decisionStatus: 'ambiguous',
       evidenceLevel: 'retrieval_only',
-      rankingCap: 69.99,
       mayConfirm: false,
       reasonCodes: ['NORMALIZATION_VERSION_MISMATCH']
     }
@@ -112,14 +170,14 @@ export const evaluateRequirementMatchPolicy = (
       constraintsConflict(candidateFacts.constraints, baseFacts.constraints)) {
     return rejected('CONSTRAINT_CONFLICT')
   }
-  if (!hasRequiredFacts(baseFacts) || !hasRequiredFacts(candidateFacts)) {
+  const category = categoryOf(base)
+  if (!categoryFactsComplete(base, category) || !categoryFactsComplete(candidate, category)) {
     return {
       relation: null,
       decisionStatus: 'ambiguous',
       evidenceLevel: 'retrieval_only',
-      rankingCap: 69.99,
       mayConfirm: false,
-      reasonCodes: ['MISSING_REQUIRED_FIELD']
+      reasonCodes: [category && category !== 'functional' ? 'MISSING_CATEGORY_FIELD' : 'MISSING_REQUIRED_FIELD']
     }
   }
   if (context.baseBusinessHash && context.baseBusinessHash === context.candidateBusinessHash) {
@@ -127,7 +185,6 @@ export const evaluateRequirementMatchPolicy = (
       relation: 'duplicate',
       decisionStatus: 'confirmed',
       evidenceLevel: 'exact_business_hash',
-      rankingCap: 100,
       mayConfirm: true,
       reasonCodes: ['EXACT_BUSINESS_HASH']
     }
@@ -137,7 +194,6 @@ export const evaluateRequirementMatchPolicy = (
       relation: 'duplicate',
       decisionStatus: 'suggested',
       evidenceLevel: 'exact_normalized_text',
-      rankingCap: 99,
       mayConfirm: false,
       reasonCodes: ['EXACT_NORMALIZED_TEXT']
     }
@@ -146,7 +202,6 @@ export const evaluateRequirementMatchPolicy = (
     relation: null,
     decisionStatus: 'suggested',
     evidenceLevel: 'deterministic_rule',
-    rankingCap: 99,
     mayConfirm: false,
     reasonCodes: []
   }

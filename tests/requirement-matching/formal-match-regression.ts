@@ -243,16 +243,16 @@ const testRerankerSortAndRawDuplicateDecision = async (): Promise<void> => {
       prompt.candidates?.map((candidate) => candidate.recordUid).sort(),
       [fixture.nearDuplicate.uid, fixture.boundary.uid].sort()
     )
-    const formal = formalRowsOf(response)
-    assert.deepEqual(formal.map((row) => row.uid), [fixture.boundary.uid])
-    const scoreDetails = JSON.parse(String(formal[0]?.values.scoreDetails)) as {
+    const ranked = rowsOf(response)
+    assert.deepEqual(ranked.map((row) => row.uid), [fixture.boundary.uid, fixture.nearDuplicate.uid])
+    assert.ok(ranked.every((row) => row.values.relation !== 'duplicate' && row.values.relation !== 'highly_similar'))
+    const scoreDetails = JSON.parse(String(ranked[0]?.values.scoreDetails)) as {
       decisionPath?: string
       confidenceBasis?: unknown
     }
     assert.equal(scoreDetails.decisionPath, 'deterministic_score')
     assert.ok(Array.isArray(scoreDetails.confidenceBasis))
-    assert.equal(formal[0]?.values.rerankerScore, '99.0%')
-    assert.ok(!formal.some((row) => row.uid === fixture.nearDuplicate.uid))
+    assert.equal(ranked[0]?.values.rerankerScore, '99.0%')
     assert.ok(rowsOf(response).every((row) => !/<(?:p|strong|br)\b/i.test(String(row.values.description))))
     assert.doesNotMatch(response.answer, /<\/?(?:p|strong|br)\b/i)
   })
@@ -274,13 +274,14 @@ const testRawDuplicateSurvivesUnavailableReview = async (): Promise<void> => {
     ).ask({ question: 'Analyze requirement GENERIC-NEAR-BASE' })
 
     assert.equal(model.calls, 1)
-    assert.deepEqual(formalRowsOf(response).map((row) => row.uid), [fixture.boundary.uid])
-    assert.equal(formalRowsOf(response)[0]?.values.relation, 'duplicate')
-    const scoreDetails = JSON.parse(String(formalRowsOf(response)[0]?.values.scoreDetails)) as {
+    const ranked = rowsOf(response)
+    assert.deepEqual(ranked.map((row) => row.uid), [fixture.boundary.uid, fixture.nearDuplicate.uid])
+    assert.notEqual(ranked[0]?.values.relation, 'duplicate')
+    assert.notEqual(ranked[0]?.values.relation, 'highly_similar')
+    const scoreDetails = JSON.parse(String(ranked[0]?.values.scoreDetails)) as {
       decisionPath?: string
     }
     assert.equal(scoreDetails.decisionPath, 'deterministic_score')
-    assert.ok(!formalRowsOf(response).some((row) => row.uid === fixture.nearDuplicate.uid))
   })
 }
 
@@ -302,8 +303,9 @@ const testInvalidReviewFailsClosed = async (): Promise<void> => {
       ).ask({ question: 'Analyze requirement GENERIC-NEAR-BASE' })
 
       assert.equal(model.calls, 1, `${mode} must not trigger a repair pass`)
-      assert.deepEqual(formalRowsOf(response).map((row) => row.uid), [fixture.nearDuplicate.uid])
-      assert.ok(!formalRowsOf(response).some((row) => row.uid === fixture.boundary.uid))
+      const ranked = rowsOf(response)
+      assert.deepEqual(ranked.map((row) => row.uid), [fixture.nearDuplicate.uid, fixture.boundary.uid])
+      assert.ok(ranked.every((row) => row.values.relation !== 'duplicate' && row.values.relation !== 'highly_similar'))
     })
   }
 }
@@ -347,7 +349,7 @@ const testSourceOnlyCleaningAndMetadataIsolation = async (): Promise<void> => {
     }
     assert.doesNotMatch(sourceOnly.evidence, /<[^>]+>/)
     assert.deepEqual(Object.keys(sourceOnly).sort(), [
-      'businessFacts', 'evidence', 'lexicalTerms', 'matchingText', 'module', 'productDomain',
+      'artifactType', 'businessFacts', 'evidence', 'lexicalTerms', 'matchingText', 'module', 'productDomain',
       'requirementType', 'sourceDescription', 'sourceTitle'
     ].sort())
   })

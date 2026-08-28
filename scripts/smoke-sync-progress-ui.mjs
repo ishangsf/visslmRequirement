@@ -14,6 +14,54 @@ const cssRule = (selector) => {
   return match?.[1] ?? ''
 }
 
+const cssRulesForClass = (className) => {
+  const escapedClassName = className.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const rulePattern = new RegExp(
+    `\\.${escapedClassName}(?=[\\s,.:>+~{])[^{}]*\\{([^{}]*)\\}`,
+    'gm'
+  )
+  return [...stylesSource.matchAll(rulePattern)].map((match) => match[1]).join('\n')
+}
+
+const syncPageStart = appSource.indexOf('function SyncPage(')
+const pushPageStart = syncPageStart >= 0 ? appSource.indexOf('\nfunction PushPage(', syncPageStart) : -1
+const syncPageSource = syncPageStart >= 0
+  ? appSource.slice(syncPageStart, pushPageStart >= 0 ? pushPageStart : undefined)
+  : ''
+const syncProgressCardStart = syncPageSource.indexOf('className="sync-progress-card"')
+const syncProgressCardEnd = syncProgressCardStart >= 0
+  ? syncPageSource.indexOf('</Card>', syncProgressCardStart)
+  : -1
+const syncProgressCardSource = syncProgressCardStart >= 0
+  ? syncPageSource.slice(
+    syncProgressCardStart,
+    syncProgressCardEnd >= 0 ? syncProgressCardEnd + '</Card>'.length : undefined
+  )
+  : ''
+
+const hasProgressField = (field) => new RegExp(`progress(?:\\?\\.|\\.)${field}`).test(syncPageSource)
+const hasCountIdentifier = (field) => new RegExp(`\\b${field}\\b`).test(syncProgressCardSource)
+const progressClassNames = [...syncProgressCardSource.matchAll(/className="([^"]*sync-progress[^\"]*)"/g)]
+  .flatMap((match) => match[1].split(/\s+/))
+const progressStatsClassNames = [...new Set(progressClassNames)].filter((className) =>
+  /(?:^|[-_])(?:stats?|counts?|summary|metrics|outcome|results?)(?:[-_]|$)/i.test(className)
+)
+const progressStatsRules = progressStatsClassNames
+  .map((className) => cssRulesForClass(className))
+  .filter(Boolean)
+  .join('\n')
+const ariaLabelAttributes = [...syncProgressCardSource.matchAll(
+  /aria-label\s*=\s*(?:\{`[\s\S]*?`\}|\{[^{}]*\}|["'][^"']*["'])/g
+)].map((match) => match[0])
+const hasAccessibleCount = (field) => ariaLabelAttributes.some((attribute) =>
+  new RegExp(`(?:progress(?:\\?\\.|\\.)|\\b)${field}`).test(attribute)
+)
+const syncPageToolbarStart = syncPageSource.indexOf('<div className="page-toolbar">')
+const syncPageToolbarEnd = syncPageToolbarStart >= 0
+  ? syncPageSource.indexOf('</div>', syncPageToolbarStart)
+  : -1
+const syncPageTabsStart = syncPageSource.search(/<Tabs\b/)
+
 const syncProgressRule = cssRule('.sync-progress')
 const messageRule = cssRule('.sync-progress-message')
 const messageTextRule = cssRule('.sync-progress-message-text')
@@ -36,6 +84,16 @@ const checks = {
   messageTextDoesNotForceNoWrap: !messageTextRule.includes('white-space: nowrap'),
   themeSurfaceTokens: messageRule.includes('var(--surface-soft)') && messageRule.includes('var(--stroke)') && messageRule.includes('var(--text-main)'),
   semanticStateTokens: stylesSource.includes('.sync-progress--error') && stylesSource.includes('var(--state-error)') && stylesSource.includes('var(--state-success)'),
+  progressCardAfterToolbarBeforeTabs: syncPageToolbarEnd >= 0 && syncProgressCardStart > syncPageToolbarEnd && syncPageTabsStart >= 0 && syncProgressCardStart < syncPageTabsStart,
+  progressStatsContainer: progressStatsClassNames.length > 0,
+  successfulCountReference: hasProgressField('successfulCount'),
+  failedCountReference: hasProgressField('failedCount'),
+  progressStatsHaveVisibleLabelsAndUnit: /成功/.test(syncProgressCardSource) && /失败/.test(syncProgressCardSource) && /条/.test(syncProgressCardSource) && hasCountIdentifier('successfulCount') && hasCountIdentifier('failedCount'),
+  successfulCountHasAccessibleName: hasAccessibleCount('successfulCount'),
+  failedCountHasAccessibleName: hasAccessibleCount('failedCount'),
+  progressStatsUseThemeTokens: /var\(--(?:surface-soft|surface-raised|stroke|text-main|text-muted)\)/.test(progressStatsRules),
+  progressStatsUseSemanticStateTokens: /var\(--state-(?:success|error)\)/.test(progressStatsRules),
+  progressStatsKeepCountAndUnitTogether: progressStatsRules.includes('white-space: nowrap'),
   noLocalLightBackground: !/\.sync-progress(?:-[^{\s]+)?(?:[^{}]*)\{[^{}]*background:\s*(?:#|rgb\(|white)/i.test(stylesSource),
   cspHasImgSrcDirective: imgSrcDirective.length > 0,
   cspAllowsVisslmAssetScheme: imgSrcDirective.split(/\s+/).includes('visslm-asset:'),

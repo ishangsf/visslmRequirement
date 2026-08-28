@@ -31,7 +31,6 @@ assert.deepEqual(decide(card('查询订单详情'), card('查询订单详情')),
   relation: 'duplicate',
   decisionStatus: 'confirmed',
   evidenceLevel: 'exact_business_hash',
-  rankingCap: 100,
   mayConfirm: true,
   reasonCodes: ['EXACT_BUSINESS_HASH']
 })
@@ -39,7 +38,6 @@ assert.deepEqual(decide(card('查询订单详情'), card('查询订单详情')),
 const actionConflict = decide(card('查询订单'), card('删除订单'))
 assert.equal(actionConflict.relation, 'unrelated')
 assert.equal(actionConflict.decisionStatus, 'rejected')
-assert.equal(actionConflict.rankingCap, 0)
 assert.ok(actionConflict.reasonCodes.includes('ACTION_CONFLICT'))
 
 const objectConflict = decide(card('查询订单'), card('查询员工'))
@@ -66,11 +64,9 @@ const normalizedTextOnly = decide(card('查询订单'), card('查询订单'), {
 })
 assert.equal(normalizedTextOnly.relation, 'duplicate')
 assert.equal(normalizedTextOnly.decisionStatus, 'suggested')
-assert.equal(normalizedTextOnly.rankingCap, 99)
 assert.equal(normalizedTextOnly.mayConfirm, false)
 
 const ineligible = decide(card('查询订单'), card('查询订单'), { candidateEligible: false })
 assert.equal(ineligible.decisionStatus, 'rejected')
-assert.equal(ineligible.rankingCap, 0)
 
 console.log(JSON.stringify({ ok: true, checks: ['exact confirmation', 'hard conflicts', 'missing facts', 'normalized-only suggestion', 'eligibility'] }))

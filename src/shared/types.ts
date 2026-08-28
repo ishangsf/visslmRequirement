@@ -732,6 +732,10 @@ export interface SyncProgress {
   message: string
   current: number
   total: number
+  /** Number of valid records accepted or processed by the current run. */
+  successfulCount?: number
+  /** Number of records that could not be accepted or processed by the current run. */
+  failedCount?: number
 }
 
 export interface SyncResult {
@@ -1128,6 +1132,8 @@ export interface AssistantClarificationOption {
   id: string
   label: string
   description?: string
+  /** Marks the single safest default when a planner can recommend one. */
+  recommended?: boolean
   /** Text to submit immediately or place in the composer, depending on action. */
   prompt: string
   action: AssistantClarificationOptionAction
@@ -1514,6 +1520,7 @@ export interface AppApi {
   confirmManagedProject(id: string): Promise<ManagedProject | null>
   retryProjectAnalysis(id: string): Promise<ProjectAnalysisStartResult>
   startProjectMatching(id: string): Promise<ProjectAnalysisStartResult>
+  stopProjectMatching(id: string): Promise<ProjectAnalysisStartResult>
   listProjectRequirements(query: ProjectRequirementQuery): Promise<ProjectRequirementPage>
   listAllProjectRequirements(projectId: string): Promise<ProjectRequirement[]>
   getProjectRequirement(id: string): Promise<ProjectRequirement | null>

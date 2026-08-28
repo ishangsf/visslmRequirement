@@ -53,7 +53,7 @@ const request = {
 
 const result = await core.match(request)
 assert.equal(result.candidates.length, 50)
-assert.equal(rerankedUids.length, 20)
+assert.equal(rerankedUids.length, 50)
 assert.equal(explainedUids.length, 10)
 assert.equal(result.candidates[0]?.finalRank, 1)
 assert.equal(result.candidates[0]?.explanation?.startsWith('解释'), true)
@@ -69,7 +69,27 @@ const exactCore = new RequirementMatchingCore({
 const degraded = await exactCore.match({ ...request, explanationPolicy: { mode: 'disabled', allowExternalProcessing: false } })
 assert.ok(degraded.candidates.some((item) => item.recordUid === exact.record.uid && item.decisionStatus === 'confirmed'))
 assert.ok(degraded.degradationCodes.includes('RERANKER_UNAVAILABLE'))
-assert.equal(degraded.rankingVersion, 'requirement-ranking-v1-rrf-fallback')
+assert.equal(degraded.rankingVersion, 'requirement-similarity-v3-retrieval-fallback')
+
+const defect = {
+  ...candidate('defect-candidate', '查询订单详情缺陷', 99),
+  card: { ...card('查询订单详情缺陷'), artifactType: 'defect' as const, requirementType: 'Defect' }
+}
+const requirementCandidate = candidate('requirement-candidate', '查询订单详情并展示状态', 90)
+const typedCore = new RequirementMatchingCore({
+  retriever: { async retrieve() { return [defect, requirementCandidate] } },
+  reranker: {
+    modelId: 'typed-reranker',
+    async rerank(_base, candidates) {
+      return candidates.map((item, index) => ({ recordUid: item.record.uid, score: 95 - index }))
+    }
+  },
+  async exactBusinessHashCandidates() { return [] },
+  candidateEligible() { return true }
+})
+const typed = await typedCore.match({ ...request, explanationPolicy: { mode: 'disabled', allowExternalProcessing: false } })
+assert.equal(typed.candidates.some((item) => item.recordUid === defect.record.uid), false)
+assert.equal(typed.candidates[0]?.relation, null)
 
 const ineligible = candidate('ineligible', '查询订单详情', 0)
 const ineligibleCore = new RequirementMatchingCore({
@@ -92,4 +112,4 @@ const onlineCore = new RequirementMatchingCore({
 await onlineCore.match({ ...request, explanationPolicy: { mode: 'online', allowExternalProcessing: false } })
 assert.equal(onlineCalls, 0)
 
-console.log(JSON.stringify({ ok: true, checks: ['50/20/10 pipeline', 'exact injection', 'reranker degradation', 'eligibility', 'online consent'] }))
+console.log(JSON.stringify({ ok: true, checks: ['50/50/10 pipeline', 'all displayed candidates use one scoring formula', 'exact injection', 'reranker degradation', 'eligibility', 'source type lane', 'unknown relation stays unknown', 'online consent'] }))

@@ -317,7 +317,11 @@ export interface ProjectRequirement {
   status: ProjectRequirementStatus
   statusSource: ProjectRequirementStatusSource
   statusReason: string
+  /** Legacy score retained for import/export compatibility. */
   highestMatchScore: number
+  highestSimilarityScore: number | null
+  latestSimilarityRunId: string | null
+  similarCandidateCount: number
   matchCount: number
   createdAt: string
   updatedAt: string
@@ -433,15 +437,33 @@ export interface ProjectRequirementMatchCandidate {
   itemId: string
   description: string
   finalRank: number
+  similarityScore: number
+  /** Compatibility alias for older integrations. */
   rankingScore: number
   rankingVersion: string
+  scoreBreakdown: {
+    formulaVersion: string
+    dense: { rawScore: number | null; normalizedScore: number; weight: number; contribution: number; available: boolean }
+    lexical: { rawScore: number | null; normalizedScore: number; weight: number; contribution: number; available: boolean }
+    reranker: { rawScore: number | null; normalizedScore: number; weight: number; contribution: number; available: boolean }
+    businessAlignment: { rawScore: number | null; normalizedScore: number; weight: number; contribution: number; available: boolean }
+    total: number
+  }
   relation: 'duplicate' | 'highly_similar' | 'partial_overlap' | 'same_pattern' | 'topic_only' | 'unrelated' | null
   decisionStatus: 'confirmed' | 'suggested' | 'ambiguous' | 'rejected'
+  confidenceStatus: 'high' | 'medium' | 'low' | 'abstain'
+  confidenceReasons: string[]
   evidenceLevel: 'exact_business_hash' | 'exact_normalized_text' | 'deterministic_rule' | 'model_supported' | 'retrieval_only'
   reasonCodes: string[]
   degradationCodes: string[]
   evidenceJson?: unknown
+  explanationStatus: 'not_requested' | 'pending' | 'available' | 'unavailable'
   explanation: string | null
+  deterministicAnalysis: {
+    similarities: string[]
+    differences: string[]
+    basis: 'business_facts_and_terms'
+  }
   denseScore: number | null
   lexicalScore: number | null
   fusedScore: number
@@ -483,7 +505,7 @@ export interface ProjectAnalysisProgress extends ProjectAnalysisLogMetrics {
   fileName?: string
   current: number
   total: number
-  status: 'running' | 'success' | 'failed'
+  status: 'running' | 'success' | 'failed' | 'cancelled'
 }
 
 export interface ProjectAnalysisLogEntry extends ProjectAnalysisLogMetrics {
@@ -498,7 +520,7 @@ export interface ProjectAnalysisLogEntry extends ProjectAnalysisLogMetrics {
   fileName?: string
   current: number
   total: number
-  status: 'running' | 'success' | 'failed'
+  status: 'running' | 'success' | 'failed' | 'cancelled'
   createdAt: string
 }
 

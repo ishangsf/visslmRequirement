@@ -481,12 +481,8 @@ export const applyRequirementMatchHardRules = (
   if (policy.decisionStatus === 'confirmed') {
     return { relation: 'duplicate', finalScore: 100, downgradeReasons: decision.downgradeReasons }
   }
-  const relation = decision.finalScore > policy.rankingCap && requirementMatchRelationRank(decision.relation) >
-    requirementMatchRelationRank('partial_overlap') ? 'partial_overlap' : decision.relation
   return {
     ...decision,
-    relation,
-    finalScore: clampRequirementScore(Math.min(decision.finalScore, policy.rankingCap)),
     downgradeReasons: policy.reasonCodes.length
       ? [...decision.downgradeReasons, ...policy.reasonCodes]
       : decision.downgradeReasons

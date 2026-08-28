@@ -629,6 +629,110 @@ try {
   const automaticMatches = db.listRequirementMatchCandidates({ runId: latestRun.id, page: 1, pageSize: 20 })
   assert.equal(automaticMatches.total, 1, 'hard-conflict candidates must be excluded from the default suggestion list')
   assert.equal(automaticMatches.rows[0]?.recordUid, 'smoke-record-1')
+
+  const cancellationProject = db.createManagedProject(randomUUID(), {
+    projectName: '匹配停止 Smoke'
+  })
+  db.replaceProjectRequirements(cancellationProject.id, document.id, [
+    {
+      id: 'cancellation-requirement-1',
+      requirementNo: 1,
+      module: '停止验证',
+      title: '长耗时匹配',
+      content: '验证匹配任务可以在安全点停止',
+      sourceLocation: 'Smoke',
+      sourceChunkId: 'cancellation-chunk-1'
+    },
+    {
+      id: 'cancellation-requirement-2',
+      requirementNo: 2,
+      module: '停止验证',
+      title: '正在停止的需求',
+      content: '停止请求在本条需求的安全点生效',
+      sourceLocation: 'Smoke',
+      sourceChunkId: 'cancellation-chunk-2'
+    },
+    {
+      id: 'cancellation-requirement-3',
+      requirementNo: 3,
+      module: '停止验证',
+      title: '不应继续执行',
+      content: '停止后不应执行第三条需求',
+      sourceLocation: 'Smoke',
+      sourceChunkId: 'cancellation-chunk-3'
+    }
+  ])
+  let releaseCancellationMatch: (() => void) | undefined
+  let markCancellationMatchStarted: (() => void) | undefined
+  const cancellationMatchStarted = new Promise<void>((resolve) => { markCancellationMatchStarted = resolve })
+  const cancellationMatchRelease = new Promise<void>((resolve) => { releaseCancellationMatch = resolve })
+  let cancellationRetrieveCount = 0
+  const cancellationProgress: ProjectAnalysisProgress[] = []
+  let cancellationFailureCode = ''
+  const originalFailRequirementMatchRun = db.failRequirementMatchRun.bind(db)
+  db.failRequirementMatchRun = (runId: string, failureCode: string): void => {
+    cancellationFailureCode = failureCode
+    originalFailRequirementMatchRun(runId, failureCode)
+  }
+  const cancellationCore = new RequirementMatchingCore({
+    retriever: {
+      async retrieve() {
+        cancellationRetrieveCount += 1
+        if (cancellationRetrieveCount === 1) return []
+        markCancellationMatchStarted?.()
+        await cancellationMatchRelease
+        return []
+      }
+    },
+    reranker: {
+      modelId: 'project-cancellation-smoke-reranker',
+      async rerank() { return [] }
+    },
+    async exactBusinessHashCandidates() { return [] },
+    candidateEligible() { return true }
+  })
+  const cancellationService = new ProjectManagementService(
+    db,
+    fakeKnowledge,
+    () => ({
+      source: 'local',
+      provider: 'ollama',
+      baseUrl: 'http://127.0.0.1:1',
+      model: 'smoke',
+      thinking: false
+    }),
+    (progress) => cancellationProgress.push(progress),
+    undefined,
+    cancellationCore
+  )
+  const cancellationStart = cancellationService.startMatching(cancellationProject.id)
+  assert.equal(cancellationStart.ok, true)
+  await cancellationMatchStarted
+  const cancellationStop = cancellationService.stopMatching(cancellationProject.id)
+  assert.equal(cancellationStop.ok, true)
+  assert.match(cancellationStop.message, /停止请求已提交/)
+  releaseCancellationMatch?.()
+  for (let attempt = 0; attempt < 50 && db.getManagedProject(cancellationProject.id)?.matchStatus === 'processing'; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  const cancelledProject = db.getManagedProject(cancellationProject.id)
+  assert(cancelledProject)
+  assert.equal(cancelledProject.matchStatus, 'stale')
+  assert.match(cancelledProject.matchMessage, /已完成 1\/3 条需求/)
+  assert.equal(cancellationRetrieveCount, 2, 'stop must prevent the requirement after the active one from starting')
+  assert(cancellationProgress.some((entry) => entry.status === 'cancelled'))
+  const preservedRun = db.getLatestCompatibleRequirementMatchRun({
+    requirementId: 'cancellation-requirement-1',
+    requirementSnapshotHash: hashProjectRequirementSnapshot(db.getProjectRequirement('cancellation-requirement-1')!)
+  })
+  assert.equal(preservedRun?.status, 'succeeded', 'completed requirement results must remain available after stopping')
+  assert.equal(db.getLatestCompatibleRequirementMatchRun({
+    requirementId: 'cancellation-requirement-3',
+    requirementSnapshotHash: hashProjectRequirementSnapshot(db.getProjectRequirement('cancellation-requirement-3')!)
+  }), null, 'requirements after the stop boundary must not start')
+  assert.equal(cancellationFailureCode, 'MATCH_CANCELLED')
+  db.failRequirementMatchRun = originalFailRequirementMatchRun
+  assert.equal(cancellationService.stopMatching(cancellationProject.id).ok, false)
   db.replaceRequirementMatches('smoke-requirement-1', [
     {
       recordUid: 'smoke-record-1',

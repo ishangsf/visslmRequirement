@@ -2723,10 +2723,17 @@ export class SyncService {
     const retainedUids: string[] = []
     let skippedCount = 0
     let invalidItemIdCount = 0
+    let successfulCount = 0
+    let failedCount = 0
     try {
       const client = this.clientFactory()
       const pendingRecords: RecordInput[] = []
       const pendingItemIds = new Set<string>()
+      const emitProgress = (
+        progress: Omit<SyncProgress, 'successfulCount' | 'failedCount'>
+      ): void => {
+        this.progress({ ...progress, successfulCount, failedCount })
+      }
       const flushPendingRecords = async (): Promise<void> => {
         if (!pendingRecords.length) return
         const batch = pendingRecords.splice(0, pendingRecords.length)
@@ -2761,9 +2768,10 @@ export class SyncService {
               normalizeText(imageSync.raw, refreshedLabels)
             )
           }
+          successfulCount += 1
         }
       }
-      this.progress({ phase: 'connect', message: '正在验证平台连接', current: 0, total: 1 })
+      emitProgress({ phase: 'connect', message: '正在验证平台连接', current: 0, total: 1 })
       const connection = await client.test()
       if (!connection.ok) throw new Error(connection.message)
       if (!config?.selectedTypes.length) {
@@ -2775,7 +2783,7 @@ export class SyncService {
         const configuredType = config.selectedTypes[typeIndex]
         const rule = rules.get(configuredType)
         const filters = rule?.filters ?? []
-        this.progress({
+        emitProgress({
           phase: 'projects',
           message: `正在通过 items 接口查询 ${configuredType}`,
           current: typeIndex,
@@ -2786,7 +2794,7 @@ export class SyncService {
             const definitions = await client.getFieldDefinitions(configuredType)
             this.db.replaceFieldDefinitions(definitions)
           } catch (error) {
-            this.progress({
+            emitProgress({
               phase: 'projects',
               message: `field definitions unavailable for ${configuredType}; continue collection (${error instanceof Error ? error.message : String(error)})`,
               current: typeIndex,
@@ -2838,10 +2846,14 @@ export class SyncService {
           const itemId = value(raw, '_valm_ItemID').trim()
           if (!itemId) {
             invalidItemIdCount += 1
+            failedCount += 1
             continue
           }
           const uid = value(raw, '_valm_Uid').trim()
-          if (!uid) continue
+          if (!uid) {
+            failedCount += 1
+            continue
+          }
           const nodeType = value(raw, '_valm_NodeType') || configuredType
           const projectId =
             nodeType === 'Project'
@@ -2866,7 +2878,7 @@ export class SyncService {
             raw: normalizedRaw,
             normalizedText: normalizeText(normalizedRaw, fieldLabels)
           }
-          this.progress({
+          emitProgress({
             phase: 'records',
             message: `校验 ${nodeType}：${name}`,
             current: index + 1,
@@ -2976,7 +2988,8 @@ export class SyncService {
               })
             }
             if (recordChanged || imageRawChanged) updatedCount += 1
-            this.progress({
+            successfulCount += 1
+            emitProgress({
               phase: 'records',
               message: `已自动更新 _valm_ItemID：${itemId}`,
               current: index + 1,
@@ -2997,7 +3010,7 @@ export class SyncService {
 
         await flushPendingRecords()
 
-        this.progress({
+        emitProgress({
           phase: 'projects',
           message: `类型 ${configuredType} 同步完成`,
           current: typeIndex + 1,
@@ -3007,7 +3020,7 @@ export class SyncService {
 
       this.db.retainRecords(retainedUids)
       this.db.finishSync(runId, 'success', counts)
-      this.progress({
+      emitProgress({
         phase: 'done',
         message:
           `同步完成：新增 ${counts.records} 条，自动更新 ${updatedCount} 条` +
@@ -3032,8 +3045,16 @@ export class SyncService {
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
+      failedCount += 1
       this.db.finishSync(runId, 'failed', counts, message)
-      this.progress({ phase: 'error', message, current: 0, total: 0 })
+      this.progress({
+        phase: 'error',
+        message,
+        current: 0,
+        total: 0,
+        successfulCount,
+        failedCount
+      })
       return {
         ok: false,
         projectCount: counts.projects,

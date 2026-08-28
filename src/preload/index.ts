@@ -274,6 +274,7 @@ const api: AppApi = {
   confirmManagedProject: (id: string) => ipcRenderer.invoke('projects:confirm', id),
   retryProjectAnalysis: (id: string) => ipcRenderer.invoke('projects:retry-analysis', id),
   startProjectMatching: (id: string) => ipcRenderer.invoke('projects:start-matching', id),
+  stopProjectMatching: (id: string) => ipcRenderer.invoke('projects:stop-matching', id),
   listProjectRequirements: (query: ProjectRequirementQuery) =>
     ipcRenderer.invoke('projects:requirements', query),
   listAllProjectRequirements: (projectId: string) =>

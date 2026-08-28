@@ -45,6 +45,14 @@ try {
         return candidates.map((candidate) => ({ recordUid: candidate.record.uid, score: 95 }))
       }
     },
+    explainer: {
+      mode: 'local',
+      timeoutMs: 1_000,
+      async explain(_base, candidates) {
+        await new Promise((resolve) => setTimeout(resolve, 50))
+        return new Map(candidates.map((candidate) => [candidate.record.uid, `说明 ${candidate.record.uid}`]))
+      }
+    },
     async exactBusinessHashCandidates() { return [] },
     candidateEligible() { return true }
   })
@@ -58,6 +66,22 @@ try {
   assert.equal(db.listRequirementMatchCandidates({ runId: first.runId, page: 1, pageSize: 20 }).total, 1)
   assert.equal(db.listLegacyProjectRequirementMatches({ requirementId: 'requirement-service', page: 1, pageSize: 20 }).total, 0)
   assert.equal(db.listProjectAssets(project.id).length, 0)
+  const firstSummary = db.getProjectRequirement('requirement-service')!
+  assert.equal(firstSummary.highestSimilarityScore, 93.25)
+  assert.equal(firstSummary.latestSimilarityRunId, first.runId)
+  assert.equal(firstSummary.similarCandidateCount, 1)
+
+  const deferred = await service.start({
+    requirementId: 'requirement-service', explainTopN: 1,
+    explanationPolicy: { mode: 'local', allowExternalProcessing: false }
+  })
+  await service.execute(deferred.runId)
+  const pendingExplanation = db.listRequirementMatchCandidates({ runId: deferred.runId, page: 1, pageSize: 20 }).rows[0]
+  assert.equal(pendingExplanation?.explanationStatus, 'pending')
+  await new Promise((resolve) => setTimeout(resolve, 100))
+  const enrichedExplanation = db.listRequirementMatchCandidates({ runId: deferred.runId, page: 1, pageSize: 20 }).rows[0]
+  assert.equal(enrichedExplanation?.explanationStatus, 'available')
+  assert.match(enrichedExplanation?.explanation ?? '', /说明 candidate-service/)
 
   mutateDuringRun = true
   const second = await service.start({
@@ -69,7 +93,7 @@ try {
   assert.equal(db.getRequirementMatchRun(second.runId)?.failureCode, 'REQUIREMENT_SNAPSHOT_CHANGED')
   assert.equal(db.listRequirementMatchCandidates({ runId: second.runId, page: 1, pageSize: 20 }).total, 0)
 
-  console.log(JSON.stringify({ ok: true, checks: ['run success', 'no legacy/formal writes', 'snapshot race failure'] }))
+  console.log(JSON.stringify({ ok: true, checks: ['run success', 'similarity summary writeback', 'deferred explanation enrichment', 'no legacy/formal writes', 'snapshot race failure'] }))
 } finally {
   db.close()
   await rm(directory, { recursive: true, force: true })

@@ -302,8 +302,8 @@ const buildRelationshipGraph = (
       metadata: [
         { label: '模块', value: requirement.module || '未分类' },
         { label: '状态', value: requirementStatusLabels[requirement.status] },
-        { label: '匹配数据', value: `${requirement.matchCount} 条` },
-        { label: '最高匹配度', value: requirement.highestMatchScore ? `${requirement.highestMatchScore.toFixed(1)}%` : '暂无' },
+        { label: '相似候选', value: `${requirement.similarCandidateCount} 条` },
+        { label: '最高相似度评分', value: requirement.highestSimilarityScore !== null ? `${requirement.highestSimilarityScore.toFixed(2)} / 100` : '待重新匹配' },
         { label: '下游数据', value: `${assets.filter((asset) => asset.requirements.some((item) => item.requirementId === requirement.id)).length} 条` }
       ],
       symbolSize: requirement.status === 'satisfied' ? 34 : 30

@@ -7,8 +7,36 @@ const projectPageSource = readFileSync(join(process.cwd(), 'src/renderer/src/pro
 const relationshipGraphSource = readFileSync(join(process.cwd(), 'src/renderer/src/project-management/ProjectRelationshipGraph.tsx'), 'utf8')
 const projectStylesSource = readFileSync(join(process.cwd(), 'src/renderer/src/styles.css'), 'utf8')
 const appSource = readFileSync(join(process.cwd(), 'src/renderer/src/App.tsx'), 'utf8')
+const matchRecordColumnStart = projectPageSource.indexOf("title: '数据中心数据'")
+const matchRecordColumnEnd = projectPageSource.indexOf("title: '综合匹配分'", matchRecordColumnStart)
+const matchRecordColumnSource = matchRecordColumnStart >= 0 && matchRecordColumnEnd > matchRecordColumnStart
+  ? projectPageSource.slice(matchRecordColumnStart, matchRecordColumnEnd)
+  : ''
+const compactProjectStylesSource = projectStylesSource.replace(/\s+/g, ' ')
+const matchRecordNameStyle = compactProjectStylesSource.match(/\.project-match-record-name\b[^{}]*\{([^}]*)\}/)
+const matchRecordMetaStyle = compactProjectStylesSource.match(/(?:\.project-match-record-meta\b|\.project-match-record\s*>\s*\.ant-typography\b)[^{}]*\{([^}]*)\}/)
+const matchRecordItemIdStyle = compactProjectStylesSource.match(/\.project-match-record-item-id\b[^{}]*\{([^}]*)\}/)
+const matchRecordIconStyle = compactProjectStylesSource.match(/\.project-match-record(?:-link)?\b[^{}]*\.anticon\b[^{}]*\{([^}]*)\}/)
+const hasEllipsisStyle = (styleBlock) => Boolean(styleBlock
+  && /min-width:\s*0/.test(styleBlock[1])
+  && /overflow:\s*hidden/.test(styleBlock[1])
+  && /text-overflow:\s*ellipsis/.test(styleBlock[1])
+  && /white-space:\s*nowrap/.test(styleBlock[1]))
 assert.match(projectPageSource, /legacy_unverified[\s\S]*历史 AI 结果待复核/)
 assert.match(projectPageSource, /system_rule[\s\S]*系统规则/)
+const matchRecordDisplayContract = matchRecordColumnSource.includes('icon={<EyeOutlined />}')
+  && !/<Button\b[^>]*>\s*<EyeOutlined\b[^>]*\/>/.test(matchRecordColumnSource)
+  && matchRecordColumnSource.includes('const recordName = row.recordName || row.recordUid')
+  && /<Tooltip\b[^>]*title=\{recordName\}[^>]*>\s*<span className="project-match-record-name">\{recordName\}<\/span>\s*<\/Tooltip>/.test(matchRecordColumnSource)
+  && matchRecordColumnSource.includes('aria-label={`打开数据中心记录：${recordName}`}')
+  && matchRecordColumnSource.includes('className="project-match-record-name"')
+  && hasEllipsisStyle(matchRecordNameStyle)
+  && Boolean(matchRecordMetaStyle
+    && /min-width:\s*0/.test(matchRecordMetaStyle[1])
+    && /overflow:\s*hidden/.test(matchRecordMetaStyle[1])
+    && /white-space:\s*nowrap/.test(matchRecordMetaStyle[1]))
+  && hasEllipsisStyle(matchRecordItemIdStyle)
+  && Boolean(matchRecordIconStyle && /flex:\s*0 0 auto/.test(matchRecordIconStyle[1]))
 const detailTabsSource = projectPageSource.slice(projectPageSource.indexOf('project-detail-tabs'))
 const relationshipTabOrderContract = detailTabsSource.lastIndexOf("key: 'relationships'") > detailTabsSource.lastIndexOf("key: 'knowledge'")
 const analysisLogAlwaysVisibleContract = !projectPageSource.includes('analysisLogsExpanded')
@@ -29,6 +57,16 @@ const analysisProgressLayoutContract = projectPageSource.includes('className="pr
   && projectStylesSource.includes('grid-template-columns: minmax(240px, 0.8fr) minmax(520px, 2fr)')
   && projectStylesSource.includes('.project-analysis-step-marker::before')
   && projectStylesSource.includes('.project-analysis-footer')
+const projectScopedProgressContract = projectPageSource.includes("const projectProgress = progress?.projectId === current.id ? progress : null")
+  && projectPageSource.includes("const isProcessing = projectProgress?.status === 'running' || current.analysisStatus === 'processing' || current.matchStatus === 'processing'")
+  && projectPageSource.includes("matchStatus: 'processing'")
+  && projectPageSource.includes('matchMessage: result.message')
+  && !projectPageSource.includes("progress && progress.status === 'running'")
+const matchingCancellationContract = projectPageSource.includes('window.visslm.stopProjectMatching(current.id)')
+  && projectPageSource.includes("title: '停止当前匹配任务？'")
+  && projectPageSource.includes("progress.status === 'cancelled'")
+  && projectPageSource.includes("stoppingMatching ? '正在停止' : '停止匹配'")
+  && projectPageSource.includes("matchStatus: 'processing'")
 const projectMatchingSettingsContract = appSource.includes("key: 'general'")
   && appSource.includes('saveProjectMatchingSettings')
   && appSource.includes('name="minScore"')
@@ -93,15 +131,18 @@ const relationshipGraphContract = projectPageSource.includes("import { ProjectRe
   && projectStylesSource.includes('.project-relationship-page.is-canvas-fullscreen')
 
 if (process.env.VISSLM_UI_STATIC_ONLY === '1') {
+  assert.equal(matchRecordDisplayContract, true)
   assert.equal(analysisLogAlwaysVisibleContract, true)
   assert.equal(analysisProgressLayoutContract, true)
+  assert.equal(projectScopedProgressContract, true)
+  assert.equal(matchingCancellationContract, true)
   assert.equal(projectMatchingSettingsContract, true)
   assert.equal(requirementStatusFilterContract, true)
   assert.equal(linkedAssetListContract, true)
   assert.equal(taskRequirementContract, true)
   assert.equal(themedAppIconContract, true)
   assert.equal(relationshipGraphContract, true)
-  console.log(JSON.stringify({ ok: true, mode: 'static', checks: ['project requirement status provenance', 'responsive analysis progress layout'] }))
+  console.log(JSON.stringify({ ok: true, mode: 'static', checks: ['stable data-center match-record display', 'project requirement status provenance', 'responsive analysis progress layout', 'project-scoped live matching progress', 'controlled matching cancellation'] }))
   process.exit(0)
 }
 
@@ -223,6 +264,7 @@ const checks = await evaluate(`(async () => {
   document.querySelector('.ant-modal-close')?.click()
   await new Promise((resolve) => setTimeout(resolve, 200))
   let taskListFeatures = {
+    matchRecordDisplay: ${matchRecordDisplayContract},
     taskPlanReady: true,
     taskGanttReady: true,
     resourceGanttReady: true,
@@ -363,6 +405,7 @@ const checks = await evaluate(`(async () => {
       .some((header) => header.textContent?.includes('需求清单'))
     taskListFeatures = {
       taskPlanReady: detailReady && planReady,
+      matchRecordDisplay: ${matchRecordDisplayContract},
       taskGanttReady: taskGanttReady && Boolean(document.querySelector('.project-task-gantt')?.textContent?.includes('任务甘特图')),
       resourceGanttReady: resourceGanttReady && Boolean(document.querySelector('.project-resource-gantt')?.textContent?.includes('人力资源甘特图')),
       inlineEdit: !taskRow || taskButtons.some((button) => button.textContent?.trim() === '编辑' || button.getAttribute('aria-label')?.startsWith('编辑任务：')),
@@ -443,7 +486,7 @@ const checks = await evaluate(`(async () => {
   }
 })()`)
 
-  if (!checks.pageReady || !checks.themedAppIcon || !checks.listTable || !checks.organizationPeoplePage || !checks.createButton || !checks.importProjectButton || !checks.formReady || !checks.projectNameField || !checks.contractAmountField || !checks.projectOwnerSelects || !checks.taskPlanReady || !checks.taskGanttReady || !checks.resourceGanttReady || !checks.inlineEdit || !checks.subtaskEntry || !checks.inlineCreate || !checks.parentColumnRemoved || !checks.dragReady || !checks.costResponsibleField || !checks.requirementReviewPolicy || !checks.requirementModuleColumn || !checks.technicalIndicatorMatch || !checks.agreementStatus || !checks.matchStatus || !checks.analysisLogAlwaysVisible || !checks.projectMatchingSettings || !checks.requirementStatusFilter || !checks.linkedAssetList || !checks.taskRequirement || !checks.relationshipGraph || !checks.projectExport || !checks.projectDelete) {
+  if (!checks.pageReady || !checks.themedAppIcon || !checks.listTable || !checks.organizationPeoplePage || !checks.createButton || !checks.importProjectButton || !checks.formReady || !checks.projectNameField || !checks.contractAmountField || !checks.projectOwnerSelects || !checks.matchRecordDisplay || !checks.taskPlanReady || !checks.taskGanttReady || !checks.resourceGanttReady || !checks.inlineEdit || !checks.subtaskEntry || !checks.inlineCreate || !checks.parentColumnRemoved || !checks.dragReady || !checks.costResponsibleField || !checks.requirementReviewPolicy || !checks.requirementModuleColumn || !checks.technicalIndicatorMatch || !checks.agreementStatus || !checks.matchStatus || !checks.analysisLogAlwaysVisible || !checks.projectMatchingSettings || !checks.requirementStatusFilter || !checks.linkedAssetList || !checks.taskRequirement || !checks.relationshipGraph || !checks.projectExport || !checks.projectDelete) {
   throw new Error(`Project management UI smoke failed: ${JSON.stringify(checks)}`)
 }
 

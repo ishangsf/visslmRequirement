@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { AppDatabase } from '../src/main/database'
 import { SyncService, VisslmClient } from '../src/main/visslm'
-import type { SyncScopeConfig } from '../src/shared/types'
+import type { SyncProgress, SyncScopeConfig } from '../src/shared/types'
 
 const root = mkdtempSync(join(tmpdir(), 'visslm-itemid-dedup-'))
 const db = new AppDatabase(join(root, 'dedup.db'), join(root, 'assets'))
@@ -34,17 +34,22 @@ let remoteRows = [
     KeepField: 'old value'
   }
 ]
+let queryError: Error | null = null
+const progressEvents: SyncProgress[] = []
 
 const fakeClient = {
   test: async () => ({ ok: true, message: 'ok' }),
   queryItemsTrace: () => ({ endpoint: 'http://example.test/rest/items', params: {} }),
-  queryItems: async () => remoteRows,
+  queryItems: async () => {
+    if (queryError) throw queryError
+    return remoteRows
+  },
   getAttachments: async () => [],
   download: async () => ({ bytes: Buffer.alloc(0), mimeType: 'image/png', sourceUrl: '' })
 } as unknown as VisslmClient
 
 try {
-  const service = new SyncService(db, () => fakeClient, () => undefined)
+  const service = new SyncService(db, () => fakeClient, (progress) => progressEvents.push(progress))
   const first = await service.run(config)
   assert.equal(first.ok, true)
   assert.equal(first.recordCount, 2)
@@ -70,6 +75,16 @@ try {
       _valm_NodeType: 'Task',
       _valm_ItemID: 'ITEM-3',
       _valm_Name: 'New task'
+    },
+    {
+      _valm_Uid: 'missing-item-id',
+      _valm_NodeType: 'Task',
+      _valm_Name: 'Missing item ID'
+    },
+    {
+      _valm_NodeType: 'Task',
+      _valm_ItemID: 'ITEM-MISSING-UID',
+      _valm_Name: 'Missing UID'
     }
   ]
   const second = await service.run(config)
@@ -77,7 +92,12 @@ try {
   assert.equal(second.recordCount, 1)
   assert.equal(second.updatedCount, 2)
   assert.equal(second.skippedCount, 0)
+  assert.equal(second.invalidItemIdCount, 1)
   assert.equal(second.duplicates.length, 0)
+  const secondDoneProgress = progressEvents.findLast((progress) => progress.phase === 'done')
+  assert(secondDoneProgress)
+  assert.equal(secondDoneProgress.successfulCount, 3)
+  assert.equal(secondDoneProgress.failedCount, 2)
   assert.equal(db.listRecords({ page: 1, pageSize: 20 }).total, 3)
   assert.equal(db.getRecord('remote-1')?.name, 'Updated task')
   assert.equal(db.findRecordByItemId('ITEM-1')?.uid, 'remote-1')
@@ -128,12 +148,25 @@ try {
   assert.equal(missingItemId.recordCount, 0)
   assert(missingItemId.errors.some((error) => error.includes('_valm_ItemID')))
 
+  queryError = new Error('simulated collection failure')
+  const failed = await service.run(config)
+  assert.equal(failed.ok, false)
+  const errorProgress = progressEvents.findLast((progress) => progress.phase === 'error')
+  assert(errorProgress)
+  assert.equal(errorProgress.successfulCount, 0)
+  assert.equal(errorProgress.failedCount, 1)
+
   console.log(JSON.stringify({
     firstRun: first.recordCount,
     skippedOnSecondRun: second.skippedCount,
     syncUpdated: second.updatedCount,
     importUpdated: importOverwrite.updatedCount,
-    missingItemIdRejected: missingItemId.recordCount === 0
+    missingItemIdRejected: missingItemId.recordCount === 0,
+    syncProgressCounts: {
+      successful: secondDoneProgress.successfulCount,
+      failed: secondDoneProgress.failedCount
+    },
+    failedRunCount: errorProgress.failedCount
   }, null, 2))
 } finally {
   db.close()

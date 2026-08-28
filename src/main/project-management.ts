@@ -1,5 +1,10 @@
 import { randomUUID } from 'node:crypto'
 import { basename, extname } from 'node:path'
+import {
+  BackgroundTaskRunner,
+  TaskCancelledError,
+  type BackgroundTaskHandle
+} from './background-task-runner'
 import type {
   ManagedProject,
   ManagedProjectInput,
@@ -104,14 +109,31 @@ const mapLegacyMatchesToCandidatePage = (
       itemId: match.itemId,
       description: match.description,
       finalRank: (normalizedPage - 1) * normalizedPageSize + index + 1,
+      similarityScore: match.finalScore,
       rankingScore: match.finalScore,
       rankingVersion: LEGACY_SAFE_RANKING_VERSION,
+      scoreBreakdown: {
+        formulaVersion: LEGACY_SAFE_RANKING_VERSION,
+        dense: { rawScore: match.vectorScore, normalizedScore: match.vectorScore, weight: 1, contribution: match.vectorScore, available: true },
+        lexical: { rawScore: null, normalizedScore: 0, weight: 0, contribution: 0, available: false },
+        reranker: { rawScore: null, normalizedScore: 0, weight: 0, contribution: 0, available: false },
+        businessAlignment: { rawScore: null, normalizedScore: 0, weight: 0, contribution: 0, available: false },
+        total: match.finalScore
+      },
       relation: null,
       decisionStatus: 'ambiguous',
+      confidenceStatus: 'abstain',
+      confidenceReasons: ['LEGACY_UNVERIFIED'],
       evidenceLevel: 'retrieval_only',
       reasonCodes: [...LEGACY_SAFE_REASON_CODES],
       degradationCodes: [...LEGACY_SAFE_DEGRADATION_CODES],
+      explanationStatus: match.reason.trim() ? 'available' : 'not_requested',
       explanation: match.reason.trim() || null,
+      deterministicAnalysis: {
+        similarities: ['历史结果未保存动作、对象和约束，无法核验共同业务要素'],
+        differences: ['请重新执行匹配以生成候选级相似点和关键差异'],
+        basis: 'business_facts_and_terms'
+      },
       denseScore: match.vectorScore,
       lexicalScore: null,
       fusedScore: match.finalScore,
@@ -413,6 +435,8 @@ interface MatchReview {
 
 export class ProjectManagementService {
   private readonly runningProjectIds = new Set<string>()
+  private readonly matchingTaskRunner = new BackgroundTaskRunner()
+  private readonly matchingTaskIdsByProject = new Map<string, string>()
   private readonly matchingCore: RequirementMatchingCore
   private readonly requirementMatchRuns: RequirementMatchRunService
 
@@ -591,13 +615,41 @@ export class ProjectManagementService {
     }
     if (this.runningProjectIds.has(id)) return { ok: false, projectId: id, message: '该项目已有任务正在运行' }
     const taskId = randomUUID()
+    const taskHandle = this.matchingTaskRunner.begin(taskId)
     this.runningProjectIds.add(id)
+    this.matchingTaskIdsByProject.set(id, taskId)
     this.db.updateManagedProjectState(id, {
       matchStatus: 'processing',
       matchMessage: '正在准备数据中心匹配'
     })
-    void this.runMatching(taskId, id)
+    void this.runMatching(taskId, id, taskHandle)
     return { ok: true, projectId: id, taskId, message: '匹配任务已启动' }
+  }
+
+  stopMatching(id: string): ProjectAnalysisStartResult {
+    const project = this.db.getManagedProject(id)
+    if (!project) return { ok: false, message: '项目不存在' }
+    const taskId = this.matchingTaskIdsByProject.get(id)
+    if (!taskId || project.matchStatus !== 'processing') {
+      return { ok: false, projectId: id, message: '当前项目没有正在运行的匹配任务' }
+    }
+    if (!this.matchingTaskRunner.cancel(taskId)) {
+      return { ok: false, projectId: id, taskId, message: '匹配任务已结束，请刷新项目状态' }
+    }
+    const latestProgress = this.db.listProjectAnalysisLogs(id, 50).find((entry) => entry.taskId === taskId)
+    const message = '正在停止匹配，将在当前需求处理完成后停止'
+    this.db.updateManagedProjectState(id, { matchStatus: 'processing', matchMessage: message })
+    this.emit({
+      taskId,
+      projectId: id,
+      phase: 'matching',
+      message: '正在安全停止匹配',
+      detail: '停止将在当前需求处理到安全边界后生效，已完成的匹配结果会保留',
+      current: latestProgress?.current ?? 0,
+      total: latestProgress?.total ?? project.requirementCount,
+      status: 'running'
+    })
+    return { ok: true, projectId: id, taskId, message: '停止请求已提交，将在当前需求处理完成后停止' }
   }
 
   listRequirements(query: ProjectRequirementQuery): ProjectRequirementPage {
@@ -702,12 +754,14 @@ export class ProjectManagementService {
     }
     if (this.runningProjectIds.has(requirement.projectId)) return { ok: false, message: '该项目已有任务正在运行' }
     const taskId = randomUUID()
+    const taskHandle = this.matchingTaskRunner.begin(taskId)
     this.runningProjectIds.add(requirement.projectId)
+    this.matchingTaskIdsByProject.set(requirement.projectId, taskId)
     this.db.updateManagedProjectState(requirement.projectId, {
       matchStatus: 'processing',
       matchMessage: `正在重新匹配：${requirement.title}`
     })
-    void this.runSingleRequirementMatching(taskId, requirement.projectId, requirement.id)
+    void this.runSingleRequirementMatching(taskId, requirement.projectId, requirement.id, taskHandle)
     return { ok: true, projectId: requirement.projectId, taskId, message: '该需求的匹配任务已启动' }
   }
 
@@ -1785,10 +1839,14 @@ export class ProjectManagementService {
     return null
   }
 
-  private async runMatching(taskId: string, projectId: string): Promise<void> {
+  private async runMatching(taskId: string, projectId: string, taskHandle: BackgroundTaskHandle): Promise<void> {
+    let completedCount = 0
+    let total = 0
     try {
       const requirements = this.db.listAllProjectRequirements(projectId)
+      total = requirements.length
       for (let index = 0; index < requirements.length; index += 1) {
+        await taskHandle.checkpoint()
         const requirement = requirements[index]
         this.emit({
           taskId,
@@ -1805,26 +1863,56 @@ export class ProjectManagementService {
           total: requirements.length,
           status: 'running'
         })
-        await this.matchSingleRequirement(requirement, taskId)
+        await this.matchSingleRequirement(requirement, taskId, taskHandle.signal)
+        completedCount = index + 1
+        await taskHandle.checkpoint()
       }
+      await taskHandle.checkpoint()
       this.db.updateManagedProjectState(projectId, {
         matchStatus: 'ready',
         matchMessage: `已完成 ${requirements.length} 条需求匹配`
       })
       this.emit({ taskId, projectId, phase: 'done', message: '技术协议需求匹配完成', current: requirements.length, total: requirements.length, status: 'success' })
     } catch (error) {
+      if (error instanceof TaskCancelledError) {
+        const message = `匹配任务已停止，已完成 ${completedCount}/${total} 条需求，可重新执行`
+        this.db.updateManagedProjectState(projectId, {
+          matchStatus: 'stale',
+          matchMessage: message
+        })
+        this.emit({
+          taskId,
+          projectId,
+          phase: 'matching',
+          message: '匹配任务已停止',
+          detail: `已完成的 ${completedCount} 条结果已保留，未完成需求可通过“重新匹配”继续处理`,
+          current: completedCount,
+          total,
+          status: 'cancelled'
+        })
+        return
+      }
       this.db.updateManagedProjectState(projectId, {
         matchStatus: 'failed',
         matchMessage: error instanceof Error ? error.message : String(error)
       })
       this.emit({ taskId, projectId, phase: 'error', message: error instanceof Error ? error.message : String(error), current: 0, total: 0, status: 'failed' })
     } finally {
+      taskHandle.dispose()
+      if (this.matchingTaskIdsByProject.get(projectId) === taskId) this.matchingTaskIdsByProject.delete(projectId)
       this.runningProjectIds.delete(projectId)
     }
   }
 
-  private async runSingleRequirementMatching(taskId: string, projectId: string, requirementId: string): Promise<void> {
+  private async runSingleRequirementMatching(
+    taskId: string,
+    projectId: string,
+    requirementId: string,
+    taskHandle: BackgroundTaskHandle
+  ): Promise<void> {
+    let completedCount = 0
     try {
+      await taskHandle.checkpoint()
       const requirement = this.db.getProjectRequirement(requirementId)
       if (!requirement || requirement.projectId !== projectId) throw new Error('功能需求不存在')
       this.emit({
@@ -1841,7 +1929,9 @@ export class ProjectManagementService {
         total: 1,
         status: 'running'
       })
-      await this.matchSingleRequirement(requirement, taskId)
+      await this.matchSingleRequirement(requirement, taskId, taskHandle.signal)
+      completedCount = 1
+      await taskHandle.checkpoint()
       this.db.updateManagedProjectState(projectId, {
         matchStatus: 'ready',
         matchMessage: `已完成「${requirement.title}」的匹配`
@@ -1857,6 +1947,26 @@ export class ProjectManagementService {
         status: 'success'
       })
     } catch (error) {
+      if (error instanceof TaskCancelledError) {
+        const message = completedCount
+          ? '该需求匹配已完成，停止请求已在结果保存后生效'
+          : '该需求匹配已停止，可重新执行'
+        this.db.updateManagedProjectState(projectId, {
+          matchStatus: 'stale',
+          matchMessage: message
+        })
+        this.emit({
+          taskId,
+          projectId,
+          phase: 'matching',
+          message: '匹配任务已停止',
+          detail: completedCount ? '本条需求结果已安全保存' : '本次未完成的匹配结果未写入',
+          current: completedCount,
+          total: 1,
+          status: 'cancelled'
+        })
+        return
+      }
       const message = error instanceof Error ? error.message : String(error)
       this.db.updateManagedProjectState(projectId, {
         matchStatus: 'failed',
@@ -1864,11 +1974,13 @@ export class ProjectManagementService {
       })
       this.emit({ taskId, projectId, phase: 'error', message, current: 0, total: 1, status: 'failed' })
     } finally {
+      taskHandle.dispose()
+      if (this.matchingTaskIdsByProject.get(projectId) === taskId) this.matchingTaskIdsByProject.delete(projectId)
       this.runningProjectIds.delete(projectId)
     }
   }
 
-  private async matchSingleRequirement(requirement: ProjectRequirement, taskId: string): Promise<void> {
+  private async matchSingleRequirement(requirement: ProjectRequirement, taskId: string, signal?: AbortSignal): Promise<void> {
     const rollout = resolveRequirementMatchingRollout(this.projectMatchingSettings().rolloutMode)
     if (!rollout.newPipelinePersisted) return
     const { runId } = await this.requirementMatchRuns.start({
@@ -1879,7 +1991,7 @@ export class ProjectManagementService {
       },
       explainTopN: 10
     })
-    await this.requirementMatchRuns.execute(runId)
+    await this.requirementMatchRuns.execute(runId, signal)
     const completedRun = this.db.getRequirementMatchRun(runId)
     if (!completedRun || completedRun.status !== 'succeeded') {
       throw new Error(`需求匹配运行未成功完成：${completedRun?.failureCode || completedRun?.status || 'RUN_NOT_FOUND'}`)

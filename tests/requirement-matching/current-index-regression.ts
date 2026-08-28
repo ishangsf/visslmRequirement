@@ -159,7 +159,7 @@ const assertSourceOnlyCard = (
 ): void => {
   assert.deepEqual(candidate.card, buildRequirementSourceView(record))
   assert.deepEqual(Object.keys(candidate.card).sort(), [
-    'businessFacts', 'evidence', 'lexicalTerms', 'matchingText', 'module', 'productDomain',
+    'artifactType', 'businessFacts', 'evidence', 'lexicalTerms', 'matchingText', 'module', 'productDomain',
     'requirementType', 'sourceDescription', 'sourceTitle'
   ].sort())
   assert.ok(candidate.card.evidence.includes(record.name))

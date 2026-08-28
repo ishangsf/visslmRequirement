@@ -26,6 +26,7 @@ export const createRequirementMatchingCore = (
     reranker,
     explainer: {
       mode: () => settings().source === 'local' ? 'local' : 'online',
+      timeoutMs: 30_000,
       async explain(base, candidates) {
         const current = settings()
         const result = await explainRequirementMatches(
@@ -37,7 +38,7 @@ export const createRequirementMatchingCore = (
             temperature: 0,
             numPredict: current.source === 'local' && current.thinking ? -1 : Math.max(2_400, candidates.length * 260),
             numCtx: 32_768,
-            timeoutMs: 120_000
+            timeoutMs: 30_000
           }
         )
         return new Map(result.items.map((item) => [item.recordUid, JSON.stringify(item)]))

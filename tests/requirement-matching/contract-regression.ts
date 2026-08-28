@@ -126,7 +126,7 @@ const testSourceCardContract = async (): Promise<void> => {
     assert.equal(card.matchingText, card.evidence)
     assert.ok(card.lexicalTerms.length > 0)
     assert.deepEqual(Object.keys(card).sort(), [
-      'businessFacts', 'evidence', 'lexicalTerms', 'matchingText', 'module', 'productDomain',
+      'artifactType', 'businessFacts', 'evidence', 'lexicalTerms', 'matchingText', 'module', 'productDomain',
       'requirementType', 'sourceDescription', 'sourceTitle'
     ].sort())
   })

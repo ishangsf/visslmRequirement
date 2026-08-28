@@ -13,7 +13,6 @@ const policy = (overrides: Partial<RequirementMatchPolicyDecision> = {}): Requir
   relation: 'partial_overlap',
   decisionStatus: 'suggested',
   evidenceLevel: 'deterministic_rule',
-  rankingCap: 99,
   mayConfirm: false,
   reasonCodes: [],
   ...overrides
@@ -31,22 +30,23 @@ const input = (
   },
   deterministicAgreement: 0.8,
   degradationCodes: [],
+  explanationStatus: 'not_requested',
   explanation: null,
   ...overrides
 })
 
 const exact = rankRequirementCandidates([
-  input('exact', { policy: policy({ relation: 'duplicate', decisionStatus: 'confirmed', evidenceLevel: 'exact_business_hash', rankingCap: 100, mayConfirm: true }) })
+  input('exact', { policy: policy({ relation: 'duplicate', decisionStatus: 'confirmed', evidenceLevel: 'exact_business_hash', mayConfirm: true }) })
 ], FULL_REQUIREMENT_RANKING_MANIFEST)[0]!
 assert.equal(exact.rankingScore, 100)
 
 const rejected = rankRequirementCandidates([
-  input('rejected', { policy: policy({ relation: 'unrelated', decisionStatus: 'rejected', rankingCap: 0 }) })
+  input('rejected', { policy: policy({ relation: 'unrelated', decisionStatus: 'rejected' }) })
 ], FULL_REQUIREMENT_RANKING_MANIFEST)[0]!
 assert.equal(rejected.rankingScore, 0)
 
 const normalizedOnly = rankRequirementCandidates([
-  input('normalized', { policy: policy({ relation: 'duplicate', evidenceLevel: 'exact_normalized_text', rankingCap: 99 }) })
+  input('normalized', { policy: policy({ relation: 'duplicate', evidenceLevel: 'exact_normalized_text' }) })
 ], FULL_REQUIREMENT_RANKING_MANIFEST)[0]!
 assert.ok(normalizedOnly.rankingScore <= 99)
 
@@ -60,6 +60,24 @@ const tied = rankRequirementCandidates([input('b'), input('a')], FULL_REQUIREMEN
 assert.deepEqual(tied.map((item) => item.recordUid), ['a', 'b'])
 assert.deepEqual(tied.map((item) => item.finalRank), [1, 2])
 
+const rrfAuditOnlyA = rankRequirementCandidates([
+  input('audit', { stageScores: { ...input('audit').stageScores, fusedScore: 1 } })
+], FULL_REQUIREMENT_RANKING_MANIFEST)[0]!
+const rrfAuditOnlyB = rankRequirementCandidates([
+  input('audit', { stageScores: { ...input('audit').stageScores, fusedScore: 99 } })
+], FULL_REQUIREMENT_RANKING_MANIFEST)[0]!
+assert.equal(rrfAuditOnlyA.similarityScore, rrfAuditOnlyB.similarityScore, 'RRF fusion is retrieval audit data, not an absolute similarity component')
+assert.equal(
+  normalizedOnly.scoreBreakdown.total,
+  Number((
+    normalizedOnly.scoreBreakdown.dense.contribution +
+    normalizedOnly.scoreBreakdown.lexical.contribution +
+    normalizedOnly.scoreBreakdown.reranker.contribution +
+    normalizedOnly.scoreBreakdown.businessAlignment.contribution
+  ).toFixed(2)),
+  'the displayed score must equal the visible component contributions'
+)
+
 assert.notEqual(FULL_RERANK_RANKING_VERSION, FALLBACK_RANKING_VERSION)
 assert.notEqual(
   hashRequirementRankingManifest(FULL_REQUIREMENT_RANKING_MANIFEST),
@@ -67,8 +85,8 @@ assert.notEqual(
 )
 assert.equal(
   hashRequirementRankingManifest(FULL_REQUIREMENT_RANKING_MANIFEST),
-  '9c5ed8aa71146a86ce9f38892a4dce5fdcdf1ac34c209823719621cafd373285',
+  '16d71695db0c0cbda87d615e25248ea173fa81d72f5921e7963700ac85f58112',
   'ranking weights, transforms, caps, or tie-breaks require an explicit versioned contract update'
 )
 
-console.log(JSON.stringify({ ok: true, checks: ['fixed score boundaries', 'reranker monotonicity', 'stable tie break', 'degraded version'] }))
+console.log(JSON.stringify({ ok: true, checks: ['fixed score boundaries', 'component sum', 'RRF audit only', 'reranker monotonicity', 'stable tie break', 'degraded version'] }))

@@ -77,13 +77,15 @@ import {
   sanitizeContextText
 } from './context-budget'
 import { sanitizeChatMessageContent } from '../shared/chat-message-format'
-import { buildProjectRequirementMatchCard, buildRequirementBusinessText } from './requirements/requirement-match-card'
+import { buildProjectRequirementMatchCard, buildRequirementBusinessText, buildRequirementSourceView } from './requirements/requirement-match-card'
+import { buildDeterministicRequirementMatchAnalysis } from './requirements/requirement-match-analysis'
 import { hashRequirementBusiness, hashRequirementBusinessText } from './requirements/requirement-business-normalization'
 import type {
   PersistedRequirementMatchCandidate,
   RequirementMatchCandidatePage,
   RequirementMatchCandidateResult,
   RequirementMatchDegradationCode,
+  RequirementSimilarityScoreBreakdown,
   RequirementMatchRun,
   RequirementMatchRunCompatibilityQuery,
   RequirementMatchRunCreateInput
@@ -376,6 +378,30 @@ const parseJsonValue = (input: unknown, fallback: unknown): unknown => {
   } catch {
     return fallback
   }
+}
+
+const legacySimilarityBreakdown = (
+  score: number,
+  formulaVersion: string
+): RequirementSimilarityScoreBreakdown => ({
+  formulaVersion,
+  dense: { rawScore: null, normalizedScore: 0, weight: 0, contribution: 0, available: false },
+  lexical: { rawScore: null, normalizedScore: 0, weight: 0, contribution: 0, available: false },
+  reranker: { rawScore: null, normalizedScore: 0, weight: 0, contribution: 0, available: false },
+  businessAlignment: { rawScore: null, normalizedScore: score, weight: 1, contribution: score, available: false },
+  total: score
+})
+
+const parseSimilarityBreakdown = (
+  value: unknown,
+  score: number,
+  formulaVersion: string
+): RequirementSimilarityScoreBreakdown => {
+  const parsed = parseJsonValue(value, null)
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return legacySimilarityBreakdown(score, formulaVersion)
+  }
+  return parsed as RequirementSimilarityScoreBreakdown
 }
 
 const visualizationToolNames = new Set<VisualizationToolName>([
@@ -1671,6 +1697,9 @@ export class AppDatabase {
         status_source TEXT NOT NULL DEFAULT 'ai',
         status_reason TEXT NOT NULL DEFAULT '',
         highest_match_score REAL NOT NULL DEFAULT 0,
+        highest_similarity_score REAL,
+        latest_similarity_run_id TEXT,
+        similar_candidate_count INTEGER NOT NULL DEFAULT 0,
         match_count INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
@@ -1726,14 +1755,19 @@ export class AppDatabase {
         record_uid TEXT NOT NULL,
         final_rank INTEGER NOT NULL,
         ranking_score REAL NOT NULL,
+        similarity_score REAL,
         ranking_version TEXT NOT NULL,
         relation TEXT,
           decision_status TEXT NOT NULL,
+          confidence_status TEXT NOT NULL DEFAULT 'low',
+          confidence_reasons_json TEXT NOT NULL DEFAULT '[]',
           evidence_level TEXT NOT NULL,
           reason_codes_json TEXT NOT NULL DEFAULT '[]',
           degradation_codes_json TEXT NOT NULL DEFAULT '[]',
           stage_scores_json TEXT NOT NULL,
+          score_breakdown_json TEXT NOT NULL DEFAULT '{}',
           evidence_json TEXT NOT NULL DEFAULT '{}',
+          explanation_status TEXT NOT NULL DEFAULT 'not_requested',
           explanation TEXT,
         record_snapshot_hash TEXT NOT NULL,
         PRIMARY KEY(run_id, record_uid),
@@ -1952,10 +1986,18 @@ export class AppDatabase {
       "ALTER TABLE pm_requirements ADD COLUMN confidence REAL NOT NULL DEFAULT 1",
       "ALTER TABLE pm_requirements ADD COLUMN review_status TEXT NOT NULL DEFAULT 'approved'",
       "ALTER TABLE pm_requirements ADD COLUMN review_note TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE pm_requirements ADD COLUMN highest_similarity_score REAL",
+      "ALTER TABLE pm_requirements ADD COLUMN latest_similarity_run_id TEXT",
+      "ALTER TABLE pm_requirements ADD COLUMN similar_candidate_count INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE pm_requirement_match_runs ADD COLUMN requirement_business_hash TEXT NOT NULL DEFAULT ''",
       "ALTER TABLE pm_requirement_match_runs ADD COLUMN index_version TEXT NOT NULL DEFAULT 'legacy_unknown'",
       "ALTER TABLE pm_requirement_match_runs ADD COLUMN started_at TEXT NOT NULL DEFAULT ''",
       "ALTER TABLE pm_requirement_match_candidates ADD COLUMN evidence_json TEXT NOT NULL DEFAULT '{}'",
+      "ALTER TABLE pm_requirement_match_candidates ADD COLUMN confidence_status TEXT NOT NULL DEFAULT 'low'",
+      "ALTER TABLE pm_requirement_match_candidates ADD COLUMN confidence_reasons_json TEXT NOT NULL DEFAULT '[]'",
+      "ALTER TABLE pm_requirement_match_candidates ADD COLUMN explanation_status TEXT NOT NULL DEFAULT 'not_requested'",
+      "ALTER TABLE pm_requirement_match_candidates ADD COLUMN similarity_score REAL",
+      "ALTER TABLE pm_requirement_match_candidates ADD COLUMN score_breakdown_json TEXT NOT NULL DEFAULT '{}'",
       "UPDATE pm_requirements SET status = 'unmarked', status_reason = '待人工标记' WHERE status_source = 'ai' AND status <> 'satisfied'",
       "ALTER TABLE pm_cost_entries ADD COLUMN responsible_participant_id TEXT",
       "ALTER TABLE pm_cost_entries ADD COLUMN responsible_person_name TEXT NOT NULL DEFAULT ''",
@@ -5496,6 +5538,13 @@ export class AppDatabase {
       statusSource: String(row.status_source ?? 'ai') as ProjectRequirementStatusSource,
       statusReason: String(row.status_reason ?? ''),
       highestMatchScore: Number(row.highest_match_score ?? 0),
+      highestSimilarityScore: row.highest_similarity_score === null || row.highest_similarity_score === undefined
+        ? null
+        : Number(row.highest_similarity_score),
+      latestSimilarityRunId: row.latest_similarity_run_id === null || row.latest_similarity_run_id === undefined
+        ? null
+        : String(row.latest_similarity_run_id),
+      similarCandidateCount: Number(row.similar_candidate_count ?? 0),
       matchCount: Number(row.match_count ?? 0),
       createdAt: String(row.created_at ?? ''),
       updatedAt: String(row.updated_at ?? '')
@@ -5548,7 +5597,9 @@ export class AppDatabase {
       this.db.prepare(`
         UPDATE pm_requirements
         SET key_info_terms_json = ?, key_info_terms_source = 'manual',
-            highest_match_score = 0, match_count = 0, updated_at = ?
+            highest_match_score = 0, match_count = 0,
+            highest_similarity_score = NULL, latest_similarity_run_id = NULL,
+            similar_candidate_count = 0, updated_at = ?
         WHERE id = ?
       `).run(JSON.stringify(terms), timestamp, id)
       this.db.prepare(`
@@ -5638,22 +5689,28 @@ export class AppDatabase {
   ): void {
     this.db.exec('BEGIN IMMEDIATE')
     try {
-      const run = this.db.prepare('SELECT status FROM pm_requirement_match_runs WHERE id = ?').get(runId) as SqlRow | undefined
+      const run = this.db.prepare('SELECT status, requirement_id FROM pm_requirement_match_runs WHERE id = ?').get(runId) as SqlRow | undefined
       if (!run || String(run.status) !== 'running') throw new Error('匹配运行不存在或已结束')
       const insert = this.db.prepare(`
         INSERT INTO pm_requirement_match_candidates(
-        run_id, record_uid, final_rank, ranking_score, ranking_version, relation,
-          decision_status, evidence_level, reason_codes_json, degradation_codes_json,
-          stage_scores_json, evidence_json, explanation, record_snapshot_hash
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        run_id, record_uid, final_rank, ranking_score, similarity_score, ranking_version, relation,
+          decision_status, confidence_status, confidence_reasons_json, evidence_level,
+          reason_codes_json, degradation_codes_json, stage_scores_json, score_breakdown_json, evidence_json,
+          explanation_status, explanation, record_snapshot_hash
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
       for (const candidate of candidates) {
+        const explanationStatus = candidate.explanationStatus ??
+          (candidate.explanation ? 'available' : 'not_requested')
         insert.run(
           runId, candidate.recordUid, candidate.finalRank, candidate.rankingScore,
-          candidate.rankingVersion, candidate.relation, candidate.decisionStatus,
-          candidate.evidenceLevel, JSON.stringify(candidate.reasonCodes),
+          candidate.similarityScore ?? candidate.rankingScore, candidate.rankingVersion, candidate.relation, candidate.decisionStatus,
+          candidate.confidenceStatus ?? 'abstain', JSON.stringify(candidate.confidenceReasons ?? []), candidate.evidenceLevel,
+          JSON.stringify(candidate.reasonCodes),
           JSON.stringify(candidate.degradationCodes), JSON.stringify(candidate.stageScores),
-          JSON.stringify(candidate.evidenceJson ?? {}), candidate.explanation, candidate.recordSnapshotHash
+          JSON.stringify(candidate.scoreBreakdown ?? legacySimilarityBreakdown(candidate.rankingScore, candidate.rankingVersion)),
+          JSON.stringify(candidate.evidenceJson ?? {}), explanationStatus,
+          candidate.explanation, candidate.recordSnapshotHash
         )
       }
       this.db.prepare(`
@@ -5670,6 +5727,58 @@ export class AppDatabase {
         metadata?.pipelineVersion ?? null, metadata?.rankingVersion ?? null,
         metadata?.configHash ?? null, metadata?.modelVersion ?? null, runId
       )
+      const eligible = candidates.filter((candidate) => candidate.decisionStatus !== 'rejected')
+      const highestSimilarityScore = eligible.length
+        ? Math.max(...eligible.map((candidate) => candidate.similarityScore ?? candidate.rankingScore))
+        : null
+      this.db.prepare(`
+        UPDATE pm_requirements
+        SET highest_similarity_score = ?, latest_similarity_run_id = ?,
+            similar_candidate_count = ?
+        WHERE id = ?
+      `).run(highestSimilarityScore, runId, eligible.length, String(run.requirement_id))
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  updateRequirementMatchExplanations(
+    runId: string,
+    candidates: Array<Pick<RequirementMatchCandidateResult,
+      'recordUid' | 'explanation' | 'explanationStatus' | 'degradationCodes'>>,
+    degradationCodes: RequirementMatchDegradationCode[]
+  ): void {
+    if (!candidates.length) return
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const update = this.db.prepare(`
+        UPDATE pm_requirement_match_candidates
+        SET explanation = ?, explanation_status = ?, degradation_codes_json = ?
+        WHERE run_id = ? AND record_uid = ?
+      `)
+      for (const candidate of candidates) {
+        update.run(
+          candidate.explanation,
+          candidate.explanationStatus,
+          JSON.stringify(candidate.degradationCodes),
+          runId,
+          candidate.recordUid
+        )
+      }
+      const run = this.db.prepare(
+        'SELECT degradation_codes_json FROM pm_requirement_match_runs WHERE id = ?'
+      ).get(runId) as SqlRow | undefined
+      if (run) {
+        const merged = [...new Set([
+          ...parseJsonArray(run.degradation_codes_json),
+          ...degradationCodes
+        ])]
+        this.db.prepare(
+          'UPDATE pm_requirement_match_runs SET degradation_codes_json = ? WHERE id = ?'
+        ).run(JSON.stringify(merged), runId)
+      }
       this.db.exec('COMMIT')
     } catch (error) {
       this.db.exec('ROLLBACK')
@@ -5690,6 +5799,12 @@ export class AppDatabase {
     this.db.prepare(`
       UPDATE pm_requirement_match_runs SET status = 'stale'
       WHERE status = 'succeeded'${where}
+    `).run(...(requirementId ? [requirementId] : []))
+    this.db.prepare(`
+      UPDATE pm_requirements
+      SET highest_similarity_score = NULL, latest_similarity_run_id = NULL,
+          similar_candidate_count = 0
+      ${requirementId ? 'WHERE id = ?' : ''}
     `).run(...(requirementId ? [requirementId] : []))
   }
 
@@ -5734,15 +5849,24 @@ export class AppDatabase {
         runId: String(row.run_id),
         recordUid: String(row.record_uid),
         finalRank: Number(row.final_rank),
+        similarityScore: Number(row.similarity_score ?? row.ranking_score),
         rankingScore: Number(row.ranking_score),
         rankingVersion: String(row.ranking_version),
+        scoreBreakdown: parseSimilarityBreakdown(
+          row.score_breakdown_json,
+          Number(row.similarity_score ?? row.ranking_score),
+          String(row.ranking_version)
+        ),
         relation: row.relation === null || row.relation === undefined ? null : String(row.relation) as PersistedRequirementMatchCandidate['relation'],
         decisionStatus: String(row.decision_status) as PersistedRequirementMatchCandidate['decisionStatus'],
+        confidenceStatus: String(row.confidence_status ?? 'low') as PersistedRequirementMatchCandidate['confidenceStatus'],
+        confidenceReasons: parseJsonArray(row.confidence_reasons_json),
         evidenceLevel: String(row.evidence_level) as PersistedRequirementMatchCandidate['evidenceLevel'],
         reasonCodes: parseJsonArray(row.reason_codes_json),
         degradationCodes: parseJsonArray(row.degradation_codes_json) as RequirementMatchDegradationCode[],
         stageScores: parseJsonValue(row.stage_scores_json, {}) as PersistedRequirementMatchCandidate['stageScores'],
         evidenceJson: parseJsonValue(row.evidence_json, {}),
+        explanationStatus: String(row.explanation_status ?? (row.explanation ? 'available' : 'not_requested')) as PersistedRequirementMatchCandidate['explanationStatus'],
         explanation: row.explanation === null || row.explanation === undefined ? null : String(row.explanation),
         recordSnapshotHash: String(row.record_snapshot_hash)
       }))
@@ -5902,8 +6026,10 @@ export class AppDatabase {
       JOIN pm_requirement_match_runs run ON run.id = c.run_id
       WHERE c.run_id = ? AND run.requirement_id = ?${filter}
     `).get(query.runId, query.requirementId) as SqlRow).count ?? 0)
+    const requirement = this.getProjectRequirement(query.requirementId)
+    const requirementCard = requirement ? buildProjectRequirementMatchCard(requirement) : null
     const rows = this.db.prepare(`
-      SELECT c.*, run.requirement_id, r.name, r.node_type, r.item_id, r.normalized_text,
+      SELECT c.*, run.requirement_id, r.name, r.node_type, r.item_id, r.raw_json, r.normalized_text,
              CASE WHEN a.record_uid IS NULL THEN 0 ELSE 1 END AS asset_linked,
              CASE WHEN ar.requirement_id IS NULL THEN 0 ELSE 1 END AS requirement_linked
       FROM pm_requirement_match_candidates c
@@ -5920,17 +6046,34 @@ export class AppDatabase {
       total,
       rows: rows.map((row): ProjectRequirementMatchCandidate => {
         const stage = parseJsonValue(row.stage_scores_json, {}) as Record<string, unknown>
+        const raw = parseJsonValue(row.raw_json, {})
+        const candidateCard = buildRequirementSourceView({
+          name: String(row.name ?? ''),
+          raw: raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : {}
+        })
         return {
           requirementId: String(row.requirement_id), runId: String(row.run_id), recordUid: String(row.record_uid),
           recordName: String(row.name ?? ''), nodeType: String(row.node_type ?? ''), itemId: String(row.item_id ?? ''),
           description: String(row.normalized_text ?? ''), finalRank: Number(row.final_rank),
+          similarityScore: Number(row.similarity_score ?? row.ranking_score),
           rankingScore: Number(row.ranking_score), rankingVersion: String(row.ranking_version),
+          scoreBreakdown: parseSimilarityBreakdown(
+            row.score_breakdown_json,
+            Number(row.similarity_score ?? row.ranking_score),
+            String(row.ranking_version)
+          ),
           relation: row.relation === null || row.relation === undefined ? null : String(row.relation) as ProjectRequirementMatchCandidate['relation'],
           decisionStatus: String(row.decision_status) as ProjectRequirementMatchCandidate['decisionStatus'],
+          confidenceStatus: String(row.confidence_status ?? 'low') as ProjectRequirementMatchCandidate['confidenceStatus'],
+          confidenceReasons: parseJsonArray(row.confidence_reasons_json),
           evidenceLevel: String(row.evidence_level) as ProjectRequirementMatchCandidate['evidenceLevel'],
           reasonCodes: parseJsonArray(row.reason_codes_json), degradationCodes: parseJsonArray(row.degradation_codes_json),
           evidenceJson: parseJsonValue(row.evidence_json, {}),
+          explanationStatus: String(row.explanation_status ?? (row.explanation ? 'available' : 'not_requested')) as ProjectRequirementMatchCandidate['explanationStatus'],
           explanation: row.explanation === null || row.explanation === undefined ? null : String(row.explanation),
+          deterministicAnalysis: requirementCard
+            ? buildDeterministicRequirementMatchAnalysis(requirementCard, candidateCard)
+            : { similarities: ['项目需求已不存在，无法生成确定性对比'], differences: ['请返回需求清单确认当前需求状态'], basis: 'business_facts_and_terms' },
           denseScore: stage.denseScore === null || stage.denseScore === undefined ? null : Number(stage.denseScore),
           lexicalScore: stage.lexicalScore === null || stage.lexicalScore === undefined ? null : Number(stage.lexicalScore),
           fusedScore: Number(stage.fusedScore ?? 0),

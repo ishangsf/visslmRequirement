@@ -216,6 +216,11 @@ type AppProps = {
 
 type SyncProgressListener = () => void
 
+const safeNonNegativeInteger = (value: unknown, fallback = 0): number => {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback
+  return Math.max(0, Math.floor(value))
+}
+
 let syncProgressSnapshot: SyncProgress | null = null
 let syncProgressPending: SyncProgress | null = null
 let syncProgressTimer: number | null = null
@@ -5182,6 +5187,7 @@ function ChatPage({
 }): React.JSX.Element {
   const { message, modal } = AntApp.useApp()
   const messageListRef = useRef<HTMLDivElement>(null)
+  const sourceListRefs = useRef<Record<string, HTMLDetailsElement | null>>({})
   const [activeDataView, setActiveDataView] = useState<ChatDataView | null>(null)
   const [activeDataGroup, setActiveDataGroup] = useState('')
   const [dataViewPage, setDataViewPage] = useState(1)
@@ -5315,6 +5321,24 @@ function ChatPage({
     setUserNearBottom(true)
     setShowScrollLatest(false)
     container.scrollTo({ top: container.scrollHeight, behavior })
+  }, [])
+
+  const focusAnswerSources = useCallback((
+    messageId: string,
+    sourceType: 'record' | 'document'
+  ): void => {
+    const sourceList = sourceListRefs.current[messageId]
+    if (!sourceList) return
+
+    sourceList.open = true
+    requestAnimationFrame(() => {
+      if (!sourceList.isConnected) return
+      sourceList.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+      const focusTarget = sourceList.querySelector<HTMLElement>(
+        `.source-group[data-source-type="${sourceType}"] .source-reference:not(:disabled)`
+      ) ?? sourceList.querySelector<HTMLElement>('.source-list-title')
+      focusTarget?.focus({ preventScroll: true })
+    })
   }, [])
 
   const handleMessageScroll = useCallback((): void => {
@@ -7150,7 +7174,7 @@ function ChatPage({
                                   requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>('.composer textarea')?.focus())
                                 }}
                               >
-                                <strong>{option.label}</strong>
+                                <strong>{option.label}{option.recommended ? '（推荐）' : ''}</strong>
                                 {option.description ? <small>{option.description}</small> : null}
                               </Button>
                             ))}
@@ -7255,26 +7279,28 @@ function ChatPage({
                               const view = block.dataViewId
                                 ? message.dataViews?.find((item) => item.id === block.dataViewId)
                                 : undefined
-                              const source = block.sourceIndexes
-                                ?.map((index) => message.sources?.[index])
-                                .find((item): item is ChatSource => Boolean(item))
-                              const sourceIsDocument = block.kind === 'document'
-                              const sourceDocumentId = sourceIsDocument
-                                ? normalizedChatSourceValueOf(source?.documentId)
-                                : ''
-                              const sourceRecordUid = !sourceIsDocument
-                                ? normalizedChatSourceValueOf(source?.uid)
-                                : ''
-                              const canOpen = Boolean(view || sourceDocumentId || sourceRecordUid)
+                              const sourceGroupType = block.kind === 'record'
+                                ? 'record'
+                                : block.kind === 'document'
+                                  ? 'document'
+                                  : undefined
+                              const sourceGroupBlock = sourceGroupType !== undefined
+                              const dataViewBlock = block.kind === 'aggregate' || block.kind === 'query_detail'
+                              const sourceGroupCount = sourceGroupType
+                                ? sourceGroups.filter((group) => group.sourceType === sourceGroupType).length
+                                : undefined
+                              const canOpen = sourceGroupCount !== undefined
+                                ? sourceGroupCount > 0
+                                : dataViewBlock && Boolean(view)
                               const evidenceCountUnit = block.kind === 'document'
                                 ? '份'
                                 : block.kind === 'aggregate'
                                   ? '项'
                                   : '条'
                               const blockSummary = block.kind === 'record'
-                                ? '回答引用的数据记录，可打开原始记录核验'
+                                ? '回答引用的数据记录，可展开回答依据列表选择具体记录核验'
                                 : block.kind === 'document'
-                                  ? '回答引用的知识文档，可打开原文核验'
+                                  ? '回答引用的知识文档，可展开回答依据列表选择具体文档核验'
                                   : block.summary
                               const icon = block.kind === 'document'
                                 ? <FileTextOutlined aria-hidden="true" />
@@ -7282,8 +7308,10 @@ function ChatPage({
                                   ? <DatabaseOutlined aria-hidden="true" />
                                   : <EyeOutlined aria-hidden="true" />
                               const countLabel = block.matchedCount === undefined
-                                ? `${block.count} ${evidenceCountUnit}`
-                                : `命中 ${block.matchedCount} ${evidenceCountUnit}${block.returnedCount === undefined ? '' : `，当前载入 ${block.returnedCount} ${evidenceCountUnit}`}`
+                                ? `${sourceGroupCount ?? block.count} ${evidenceCountUnit}`
+                                : sourceGroupCount !== undefined
+                                  ? `${sourceGroupCount} ${evidenceCountUnit}`
+                                  : `命中 ${block.matchedCount} ${evidenceCountUnit}${block.returnedCount === undefined ? '' : `，当前载入 ${block.returnedCount} ${evidenceCountUnit}`}`
                               const body = (
                                 <>
                                   <span className="chat-evidence-block-icon">{icon}</span>
@@ -7295,22 +7323,12 @@ function ChatPage({
                                 </>
                               )
                               const openEvidence = (): void => {
-                                if (view) {
+                                if (sourceGroupType) {
+                                  focusAnswerSources(message.id, sourceGroupType)
+                                  return
+                                }
+                                if (dataViewBlock && view) {
                                   openDataView(view)
-                                  return
-                                }
-                                if (sourceIsDocument && sourceDocumentId) {
-                                  void openKnowledgeDetail(sourceDocumentId, normalizedChatSourceValueOf(source?.chunkId) || undefined)
-                                  return
-                                }
-                                if (sourceRecordUid) {
-                                  void openRecordDetail({
-                                    uid: sourceRecordUid,
-                                    name: source?.name ?? '',
-                                    nodeType: source?.nodeType ?? '',
-                                    itemId: source?.itemId ?? '',
-                                    values: {}
-                                  }, true)
                                 }
                               }
                               return canOpen ? (
@@ -7318,8 +7336,8 @@ function ChatPage({
                                   type="button"
                                   key={block.id}
                                   className={`chat-evidence-block-item ${block.kind}`}
-                                  aria-label={`打开${block.title}：${blockSummary}，${countLabel}`}
-                                  title={`打开${block.title}`}
+                                  aria-label={`${sourceGroupBlock ? '查看' : '打开'}${block.title}：${blockSummary}，${countLabel}`}
+                                  title={`${sourceGroupBlock ? '查看' : '打开'}${block.title}`}
                                   onClick={openEvidence}
                                 >
                                   {body}
@@ -7334,7 +7352,12 @@ function ChatPage({
                         </section>
                       ) : null}
                       {message.role === 'assistant' && sourceGroups.length ? (
-                        <details className="source-list">
+                        <details
+                          ref={(node) => {
+                            sourceListRefs.current[message.id] = node
+                          }}
+                          className="source-list"
+                        >
                           <summary className="source-list-title">
                             <FileSearchOutlined aria-hidden="true" />
                             <Text strong>回答依据</Text>
@@ -8336,6 +8359,10 @@ function SyncPage({
       ? '采集完成'
       : '采集中'
   const progressMessage = progress?.message ?? '准备采集'
+  // Counts were added after the initial progress event contract. Keep the
+  // renderer compatible with older events and malformed IPC payloads.
+  const successfulCount = safeNonNegativeInteger(progress?.successfulCount)
+  const failedCount = safeNonNegativeInteger(progress?.failedCount)
 
   const filtersFor = (nodeType: string): SyncFieldFilter[] =>
     config.rules.find((rule) => rule.nodeType === nodeType)?.filters ?? []
@@ -8716,6 +8743,65 @@ function SyncPage({
         </Space>}
       </div>
 
+      {activeTab === 'config' && (progress || syncing) && (
+        <Card
+          className="sync-progress-card"
+          role="group"
+          aria-label={`采集进度：成功 ${successfulCount} 条，失败 ${failedCount} 条`}
+          title={
+            <Space>
+              <CloudDownloadOutlined />
+              采集进度
+            </Space>
+          }
+        >
+          <div
+            className={`sync-progress sync-progress--${progressState}`}
+            role={progressState === 'error' ? 'alert' : 'status'}
+            aria-live={progressState === 'error' ? 'assertive' : 'polite'}
+            aria-atomic="true"
+            aria-label={`${progressStateLabel}：${progressMessage}`}
+          >
+            <Progress
+              percent={progress?.phase === 'done' ? 100 : percent}
+              status={
+                progress?.phase === 'error'
+                  ? 'exception'
+                  : progress?.phase === 'done'
+                    ? 'success'
+                    : 'active'
+              }
+              aria-label={`${progressStateLabel}，${progress?.current ?? 0} / ${progress?.total ?? 0}`}
+            />
+            <div
+              className="sync-progress-counts"
+              aria-label={`采集结果：成功 ${successfulCount} 条，失败 ${failedCount} 条`}
+            >
+              <div className="sync-progress-stat sync-progress-stat--success">
+                <CheckCircleOutlined aria-hidden="true" />
+                <span className="sync-progress-stat-label">成功</span>
+                <strong className="sync-progress-stat-value">{successfulCount}</strong>
+                <span className="sync-progress-stat-unit">条</span>
+              </div>
+              <div className="sync-progress-stat sync-progress-stat--error">
+                <ExclamationCircleOutlined aria-hidden="true" />
+                <span className="sync-progress-stat-label">失败</span>
+                <strong className="sync-progress-stat-value">{failedCount}</strong>
+                <span className="sync-progress-stat-unit">条</span>
+              </div>
+            </div>
+            <div className="sync-progress-message">
+              <span className="sync-progress-state" aria-hidden="true">
+                {progressStateLabel}
+              </span>
+              <Text className="sync-progress-message-text" title={progressMessage}>
+                {progressMessage}
+              </Text>
+            </div>
+          </div>
+        </Card>
+      )}
+
       <Tabs
         className="page-inner-tabs"
         activeKey={activeTab}
@@ -8983,46 +9069,6 @@ function SyncPage({
               }
             ]}
           />
-        </Card>
-      )}
-
-      {activeTab === 'config' && (progress || syncing) && (
-        <Card
-          className="sync-progress-card"
-          title={
-            <Space>
-              <CloudDownloadOutlined />
-              采集进度
-            </Space>
-          }
-        >
-          <div
-            className={`sync-progress sync-progress--${progressState}`}
-            role={progressState === 'error' ? 'alert' : 'status'}
-            aria-live={progressState === 'error' ? 'assertive' : 'polite'}
-            aria-atomic="true"
-            aria-label={`${progressStateLabel}：${progressMessage}`}
-          >
-            <Progress
-              percent={progress?.phase === 'done' ? 100 : percent}
-              status={
-                progress?.phase === 'error'
-                  ? 'exception'
-                  : progress?.phase === 'done'
-                    ? 'success'
-                    : 'active'
-              }
-              aria-label={`${progressStateLabel}，${progress?.current ?? 0} / ${progress?.total ?? 0}`}
-            />
-            <div className="sync-progress-message">
-              <span className="sync-progress-state" aria-hidden="true">
-                {progressStateLabel}
-              </span>
-              <Text className="sync-progress-message-text" title={progressMessage}>
-                {progressMessage}
-              </Text>
-            </div>
-          </div>
         </Card>
       )}
 
@@ -11268,7 +11314,14 @@ function AppShell({ themeMode, onThemeModeChange }: AppProps): React.JSX.Element
 
   const startSync = async (config?: SyncScopeConfig): Promise<SyncResult | null> => {
     setSyncing(true)
-    publishSyncProgress({ phase: 'start', message: '准备采集', current: 0, total: 0 }, true)
+    publishSyncProgress({
+      phase: 'start',
+      message: '准备采集',
+      current: 0,
+      total: 0,
+      successfulCount: 0,
+      failedCount: 0
+    }, true)
     try {
       const result = await window.visslm.startSync(config)
       if (result.ok) {

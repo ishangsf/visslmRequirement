@@ -13,7 +13,10 @@ import type {
   RequirementMatchResult,
   RequirementMatchStageScores
 } from './requirement-match-domain'
-import { evaluateRequirementMatchPolicy } from './requirement-match-policy'
+import {
+  evaluateRequirementMatchPolicy,
+  requirementArtifactTypesCompatible
+} from './requirement-match-policy'
 import {
   FALLBACK_REQUIREMENT_RANKING_MANIFEST,
   FULL_REQUIREMENT_RANKING_MANIFEST,
@@ -22,9 +25,9 @@ import {
 } from './requirement-ranking-manifest'
 import { rankRequirementCandidates, type RequirementRankingInput } from './requirement-ranking'
 
-export const REQUIREMENT_MATCH_PIPELINE_VERSION = 'requirement-matching-pipeline-v1'
+export const REQUIREMENT_MATCH_PIPELINE_VERSION = 'requirement-matching-pipeline-v3'
 const RETRIEVAL_LIMIT = 50
-const RERANK_LIMIT = 20
+const RERANK_LIMIT = RETRIEVAL_LIMIT
 const EXPLANATION_LIMIT = 10
 
 export interface RequirementMatchingRetriever {
@@ -33,6 +36,7 @@ export interface RequirementMatchingRetriever {
 
 export interface RequirementMatchingExplainer {
   mode: 'local' | 'online' | (() => 'local' | 'online')
+  timeoutMs?: number
   explain(
     base: RequirementMatchRequest['base'],
     candidates: HybridRequirementCandidate[]
@@ -48,6 +52,11 @@ export interface RequirementMatchingDependencies {
     request: RequirementMatchRequest
   ): Promise<HybridRequirementCandidate[]>
   candidateEligible(candidate: HybridRequirementCandidate, request: RequirementMatchRequest): boolean
+}
+
+export interface RequirementExplanationOutcome {
+  explanations: ReadonlyMap<string, string>
+  degradationCodes: RequirementMatchDegradationCode[]
 }
 
 const auditableRerankerModelVersion = (reranker: RequirementReranker): string | null => {
@@ -106,7 +115,71 @@ const configHash = (manifest: RequirementRankingManifest, modelVersion: string |
   .digest('hex')
 
 export class RequirementMatchingCore {
+  private explainerFailureCount = 0
+  private explainerOpenUntil = 0
+
   constructor(private readonly deps: RequirementMatchingDependencies) {}
+
+  canExplain(request: RequirementMatchRequest): boolean {
+    const mode = typeof this.deps.explainer?.mode === 'function'
+      ? this.deps.explainer.mode()
+      : this.deps.explainer?.mode
+    return Boolean(this.deps.explainer) && request.explanationPolicy.mode !== 'disabled' &&
+      (mode === 'local' || request.explanationPolicy.allowExternalProcessing)
+  }
+
+  async explainCandidates(
+    request: RequirementMatchRequest,
+    candidates: HybridRequirementCandidate[]
+  ): Promise<RequirementExplanationOutcome> {
+    if (!candidates.length || request.explanationPolicy.mode === 'disabled') {
+      return { explanations: new Map(), degradationCodes: [] }
+    }
+    if (!this.canExplain(request) || !this.deps.explainer) {
+      return { explanations: new Map(), degradationCodes: ['EXPLAINER_UNAVAILABLE'] }
+    }
+    if (Date.now() < this.explainerOpenUntil) {
+      return { explanations: new Map(), degradationCodes: ['EXPLAINER_UNAVAILABLE'] }
+    }
+    const timeoutMs = Math.max(1_000, Math.min(120_000, this.deps.explainer.timeoutMs ?? 30_000))
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      const timeout = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          const error = new Error(`解释器超过 ${timeoutMs}ms 未完成`)
+          error.name = 'RequirementMatchExplanationTimeoutError'
+          reject(error)
+        }, timeoutMs)
+      })
+      const explanations = await Promise.race([
+        this.deps.explainer.explain(request.base, candidates),
+        timeout
+      ])
+      const expected = new Set(candidates.map((candidate) => candidate.record.uid))
+      if ([...explanations.keys()].some((uid) => !expected.has(uid))) {
+        const error = new Error('解释器返回未知候选 UID')
+        error.name = 'RequirementMatchExplanationProtocolError'
+        throw error
+      }
+      this.explainerFailureCount = 0
+      this.explainerOpenUntil = 0
+      return {
+        explanations,
+        degradationCodes: explanations.size < expected.size ? ['EXPLANATION_PARTIAL'] : []
+      }
+    } catch (error) {
+      this.explainerFailureCount += 1
+      if (this.explainerFailureCount >= 2) this.explainerOpenUntil = Date.now() + 60_000
+      return {
+        explanations: new Map(),
+        degradationCodes: [error instanceof Error && error.name === 'RequirementMatchExplanationProtocolError'
+          ? 'EXPLANATION_PROTOCOL_ERROR'
+          : 'EXPLAINER_UNAVAILABLE']
+      }
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  }
 
   async match(request: RequirementMatchRequest): Promise<RequirementMatchResult> {
     const baseBusinessHash = hashRequirementBusiness(request.base)
@@ -121,7 +194,8 @@ export class RequirementMatchingCore {
     for (const candidate of exactCandidates) {
       const uid = candidate.record.uid
       if (!uid || request.excludedUids.has(uid) || eligibleExactByUid.has(uid)) continue
-      if (!this.deps.candidateEligible(candidate, request)) continue
+      if (!this.deps.candidateEligible(candidate, request) ||
+          !requirementArtifactTypesCompatible(request.base, candidate.card)) continue
       eligibleExactByUid.set(uid, candidate)
     }
 
@@ -133,7 +207,8 @@ export class RequirementMatchingCore {
     for (const [index, candidate] of retrieved.entries()) {
       const uid = candidate.record.uid
       if (!uid || request.excludedUids.has(uid) || retrievedUids.has(uid)) continue
-      if (!this.deps.candidateEligible(candidate, request)) continue
+      if (!this.deps.candidateEligible(candidate, request) ||
+          !requirementArtifactTypesCompatible(request.base, candidate.card)) continue
       retrievedUids.add(uid)
       eligibleRetrieved.push({ candidate, fusedRank: index + 1 })
     }
@@ -147,17 +222,15 @@ export class RequirementMatchingCore {
       fusedRanks.set(uid, fusedRank)
     }
 
-    // Reserve the original retrieved Top20 first. Exact candidates then use
-    // the remaining Top50 capacity, followed by the rest of retrieved rows.
-    for (const entry of eligibleRetrieved.slice(0, RERANK_LIMIT)) {
-      addCandidate(entry.candidate, entry.fusedRank)
-    }
+    // Exact business identities have priority. Fill the remaining display
+    // capacity with retrieval order, then rerank every displayed candidate so
+    // all non-fixed scores use one comparable formula.
     let exactInjectionIndex = 0
     for (const candidate of eligibleExactByUid.values()) {
       addCandidate(candidate, RETRIEVAL_LIMIT + exactInjectionIndex + 1)
       exactInjectionIndex += 1
     }
-    for (const entry of eligibleRetrieved.slice(RERANK_LIMIT)) {
+    for (const entry of eligibleRetrieved) {
       addCandidate(entry.candidate, entry.fusedRank)
     }
     const candidates = [...candidatesByUid.values()]
@@ -166,9 +239,7 @@ export class RequirementMatchingCore {
     const maximumRetrieval = Math.max(0, ...eligibleRetrieved.map(({ candidate }) => candidate.retrievalScore))
 
     const degradationCodes: RequirementMatchDegradationCode[] = []
-    const rerankTarget = eligibleRetrieved
-      .slice(0, RERANK_LIMIT)
-      .map(({ candidate }) => candidate)
+    const rerankTarget = candidates.slice(0, RERANK_LIMIT)
     let rerankerByUid = new Map<string, { rank: number; score: number }>()
     let manifest: RequirementRankingManifest = FULL_REQUIREMENT_RANKING_MANIFEST
     if (rerankTarget.length) {
@@ -183,7 +254,7 @@ export class RequirementMatchingCore {
           seen.add(item.recordUid)
           rerankerByUid.set(item.recordUid, { rank: index + 1, score: finiteScore(item.score) })
         }
-        if (seen.size !== expected.size) throw new Error('Cross-Encoder 未覆盖全部 Top20 候选')
+        if (seen.size !== expected.size) throw new Error('Cross-Encoder 未覆盖全部展示候选')
       } catch {
         degradationCodes.push('RERANKER_UNAVAILABLE')
         rerankerByUid = new Map()
@@ -191,6 +262,8 @@ export class RequirementMatchingCore {
       }
     }
 
+    const explainLimit = Math.max(0, Math.min(EXPLANATION_LIMIT, Math.floor(request.explainTopN)))
+    const shouldExplain = this.canExplain(request)
     const inputs: RequirementRankingInput[] = candidates.map((candidate) => {
       const eligible = this.deps.candidateEligible(candidate, request)
       const candidateBusinessHash = hashRequirementBusiness(candidate.card)
@@ -221,43 +294,37 @@ export class RequirementMatchingCore {
         stageScores,
         deterministicAgreement: deterministicAgreement(request.base, candidate),
         degradationCodes: [...degradationCodes],
+        explanationStatus: 'not_requested',
         explanation: null
       }
     })
 
     let ranked = rankRequirementCandidates(inputs, manifest)
-    const explainLimit = Math.max(0, Math.min(EXPLANATION_LIMIT, Math.floor(request.explainTopN)))
-    const explainerMode = typeof this.deps.explainer?.mode === 'function'
-      ? this.deps.explainer.mode()
-      : this.deps.explainer?.mode
-    const shouldExplain = Boolean(this.deps.explainer) && request.explanationPolicy.mode !== 'disabled' &&
-      (explainerMode === 'local' || request.explanationPolicy.allowExternalProcessing)
     if (shouldExplain && explainLimit > 0) {
       const candidateByUid = new Map(candidates.map((candidate) => [candidate.record.uid, candidate]))
       const explainCandidates = ranked
         .filter((candidate) => candidate.decisionStatus !== 'rejected')
         .slice(0, explainLimit)
         .flatMap((result) => candidateByUid.get(result.recordUid) ?? [])
-      try {
-        const explanations = await this.deps.explainer!.explain(request.base, explainCandidates)
-        const expected = new Set(explainCandidates.map((candidate) => candidate.record.uid))
-        if ([...explanations.keys()].some((uid) => !expected.has(uid))) {
-          throw new Error('解释器返回未知候选 UID')
-        }
-        for (const input of inputs) input.explanation = explanations.get(input.recordUid) ?? null
-        ranked = rankRequirementCandidates(inputs, manifest)
-      } catch (error) {
-        const code: RequirementMatchDegradationCode = error instanceof Error &&
-          error.name === 'RequirementMatchExplanationProtocolError'
-          ? 'EXPLANATION_PROTOCOL_ERROR'
-          : 'EXPLAINER_UNAVAILABLE'
-        degradationCodes.push(code)
-        for (const input of inputs) input.degradationCodes = [...degradationCodes]
-        ranked = rankRequirementCandidates(inputs, manifest)
+      const pendingUids = new Set(explainCandidates.map((candidate) => candidate.record.uid))
+      for (const input of inputs) {
+        if (pendingUids.has(input.recordUid)) input.explanationStatus = 'pending'
       }
+      const outcome = await this.explainCandidates(request, explainCandidates)
+      degradationCodes.push(...outcome.degradationCodes.filter((code) => !degradationCodes.includes(code)))
+      for (const input of inputs) {
+        if (input.explanationStatus !== 'pending') continue
+        input.explanation = outcome.explanations.get(input.recordUid) ?? null
+        input.explanationStatus = input.explanation ? 'available' : 'unavailable'
+        input.degradationCodes = [...degradationCodes]
+      }
+      ranked = rankRequirementCandidates(inputs, manifest)
     } else if (request.explanationPolicy.mode !== 'disabled' && !this.deps.explainer) {
       degradationCodes.push('EXPLAINER_UNAVAILABLE')
-      for (const input of inputs) input.degradationCodes = [...degradationCodes]
+      for (const input of inputs) {
+        input.explanationStatus = 'unavailable'
+        input.degradationCodes = [...degradationCodes]
+      }
       ranked = rankRequirementCandidates(inputs, manifest)
     }
 

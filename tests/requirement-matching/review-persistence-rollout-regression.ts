@@ -279,8 +279,8 @@ const testShadowPersistsTechnicalOnlyComparison = async (): Promise<void> => {
       async match() {
         return {
           normalizationVersion: 'requirement-business-v1',
-          pipelineVersion: 'requirement-matching-pipeline-v1',
-          rankingVersion: 'requirement-ranking-v1-cross-encoder',
+          pipelineVersion: 'requirement-matching-pipeline-v3',
+          rankingVersion: 'requirement-similarity-v3-cross-encoder',
           configHash: 'shadow-config-v1',
           modelVersion: null,
           degradationCodes: [],
@@ -300,7 +300,7 @@ const testShadowPersistsTechnicalOnlyComparison = async (): Promise<void> => {
       requirementId,
       requirementSnapshotHash: hashProjectRequirementSnapshot(requirement),
       normalizationVersion: 'requirement-business-v1',
-      pipelineVersion: 'requirement-matching-pipeline-v1'
+      pipelineVersion: 'requirement-matching-pipeline-v3'
     })
     assert(persistedRun)
     assert.equal(persistedRun.status, 'succeeded')

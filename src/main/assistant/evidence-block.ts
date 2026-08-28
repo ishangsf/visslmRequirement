@@ -50,6 +50,15 @@ const viewSummaryOf = (view: ChatDataView): string => {
   return summary || view.title
 }
 
+const normalizedSourceIdentity = (...values: unknown[]): string | undefined => {
+  for (const value of values) {
+    if (typeof value !== 'string') continue
+    const normalized = value.trim()
+    if (normalized) return normalized
+  }
+  return undefined
+}
+
 const sourceBlock = (
   kind: 'record' | 'document',
   sources: ChatSource[]
@@ -58,14 +67,32 @@ const sourceBlock = (
     (source.sourceType === 'document' ? 'document' : 'record') === kind ? [index] : []
   ))
   if (!sourceIndexes.length) return undefined
+
+  // ChatSource is a reference/chunk ledger, so several entries may point to
+  // one record or document. Keep every reference index for auditability while
+  // counting distinct source identities for the user-facing evidence summary.
+  const uniqueSourceKeys = new Set(
+    sourceIndexes.map((index) => {
+      const source = sources[index]
+      const identity = kind === 'document'
+        ? normalizedSourceIdentity(source.documentId, source.fileName, source.name)
+        : normalizedSourceIdentity(source.uid, source.itemId, source.name)
+
+      // A source without any usable identity must remain distinct. Falling
+      // back to its source index avoids collapsing unrelated unknown entries.
+      return `${kind}:${identity ?? `index:${index}`}`
+    })
+  )
+  const uniqueSourceCount = uniqueSourceKeys.size
+
   return {
     id: `sources:${kind}`,
     kind,
     title: kind === 'record' ? '数据记录' : '知识文档',
     summary: kind === 'record'
-      ? `${sourceIndexes.length} 条记录依据，可打开原始记录核验`
-      : `${sourceIndexes.length} 份文档依据，保留文件与段落定位`,
-    count: sourceIndexes.length,
+      ? `${uniqueSourceCount} 条记录依据，可打开原始记录核验`
+      : `${uniqueSourceCount} 份文档依据，保留文件与段落定位`,
+    count: uniqueSourceCount,
     sourceIndexes
   }
 }

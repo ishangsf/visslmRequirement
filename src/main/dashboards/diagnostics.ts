@@ -34,6 +34,25 @@ export const diagnoseDashboard = (
   )
   const components: DashboardComponentDiagnostic[] = []
 
+  // Domain evidence gaps are quality warnings, not semantic failures. Keep
+  // one stable warning per category so the preview score remains auditable
+  // and does not scale with the number of individual process bindings.
+  const domainReceipt = spec.domainReceipt
+  if (domainReceipt?.evidenceMissing?.length) {
+    issues.push({
+      code: 'domain-evidence-missing',
+      severity: 'warning',
+      message: `领域过程证据缺失（${domainReceipt.evidenceMissing.length} 项），需补齐后再评估。`
+    })
+  }
+  if (domainReceipt?.evidenceInsufficient?.length) {
+    issues.push({
+      code: 'domain-evidence-insufficient',
+      severity: 'warning',
+      message: `领域过程证据不足（${domainReceipt.evidenceInsufficient.length} 项），需补充核验后再评估。`
+    })
+  }
+
   for (const filter of spec.globalFilters ?? []) {
     if (sensitiveFieldPattern.test(filter.field)) {
       issues.push({

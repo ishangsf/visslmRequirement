@@ -145,7 +145,7 @@ const codes = (spec: DashboardSpec): string[] =>
 
 assert.deepEqual(codes(base), [], '合法 blueprint 与绑定必须零语义错误')
 assert.equal(totalTitle, '缺陷数量')
-assert.equal(trendTitle, 'updatedAt · 缺陷数量趋势')
+assert.equal(trendTitle, '更新时间 · 缺陷数量趋势')
 
 const clone = (spec: DashboardSpec): DashboardSpec =>
   JSON.parse(JSON.stringify(spec)) as DashboardSpec

@@ -18,12 +18,12 @@ try {
   const requirement = db.getProjectRequirement('requirement-ipc')!
   const run = db.createRequirementMatchRun({
     requirementId: requirement.id, requirementSnapshotHash: hashProjectRequirementSnapshot(requirement),
-    normalizationVersion: 'requirement-business-v1', pipelineVersion: 'requirement-matching-pipeline-v1',
-    rankingVersion: 'requirement-ranking-v1-cross-encoder', configHash: 'config', modelVersion: 'model'
+    normalizationVersion: 'requirement-business-v1', pipelineVersion: 'requirement-matching-pipeline-v3',
+    rankingVersion: 'requirement-similarity-v3-cross-encoder', configHash: 'config', modelVersion: 'model'
   })
   db.completeRequirementMatchRun(run.id, [{
     recordUid: 'candidate-ipc', finalRank: 1, rankingScore: 87.4,
-    rankingVersion: 'requirement-ranking-v1-cross-encoder', relation: 'highly_similar',
+    rankingVersion: 'requirement-similarity-v3-cross-encoder', relation: 'highly_similar',
     decisionStatus: 'suggested', evidenceLevel: 'deterministic_rule', reasonCodes: [], degradationCodes: [],
     stageScores: { denseRank: 1, denseScore: 80, lexicalRank: 1, lexicalScore: 70, fusedRank: 1, fusedScore: 85, rerankerRank: 1, rerankerScore: 90 },
     explanation: '订单查询目标一致', recordSnapshotHash: 'record'
@@ -35,9 +35,13 @@ try {
   })
   const service = new ProjectManagementService(db, {} as KnowledgeService, () => ({ source: 'local', provider: 'ollama', baseUrl: '', model: '', thinking: false }), undefined, undefined, core)
   const page = service.listMatches({ requirementId: requirement.id, page: 1, pageSize: 20 })
-  assert.equal(page.run?.rankingVersion, 'requirement-ranking-v1-cross-encoder')
+  assert.equal(page.run?.rankingVersion, 'requirement-similarity-v3-cross-encoder')
   assert.equal(page.rows[0]?.finalRank, 1)
   assert.equal(page.rows[0]?.rankingScore, 87.4)
+  assert.equal(page.rows[0]?.similarityScore, 87.4)
+  assert.equal(page.rows[0]?.scoreBreakdown.total, 87.4)
+  assert.match(page.rows[0]?.deterministicAnalysis.similarities.join('；') ?? '', /查询|订单/)
+  assert.equal(page.rows[0]?.deterministicAnalysis.basis, 'business_facts_and_terms')
   assert.equal(page.rows[0]?.decisionStatus, 'suggested')
   assert.deepEqual(page.rows[0]?.degradationCodes, [])
   assert.equal('finalScore' in page.rows[0]!, false)

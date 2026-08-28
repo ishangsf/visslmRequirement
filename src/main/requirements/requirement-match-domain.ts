@@ -13,8 +13,14 @@ export const MATCH_EVIDENCE_LEVELS = [
 ] as const
 export type MatchEvidenceLevel = typeof MATCH_EVIDENCE_LEVELS[number]
 
+export const MATCH_CONFIDENCE_STATUSES = ['high', 'medium', 'low', 'abstain'] as const
+export type MatchConfidenceStatus = typeof MATCH_CONFIDENCE_STATUSES[number]
+
+export const MATCH_EXPLANATION_STATUSES = ['not_requested', 'pending', 'available', 'unavailable'] as const
+export type MatchExplanationStatus = typeof MATCH_EXPLANATION_STATUSES[number]
+
 export const REQUIREMENT_MATCH_DEGRADATION_CODES = [
-  'RERANKER_UNAVAILABLE', 'EXPLAINER_UNAVAILABLE', 'EXPLANATION_PROTOCOL_ERROR'
+  'RERANKER_UNAVAILABLE', 'EXPLAINER_UNAVAILABLE', 'EXPLANATION_PARTIAL', 'EXPLANATION_PROTOCOL_ERROR'
 ] as const
 export type RequirementMatchDegradationCode = typeof REQUIREMENT_MATCH_DEGRADATION_CODES[number]
 
@@ -37,6 +43,23 @@ export interface RequirementMatchStageScores {
   rerankerScore: number | null
 }
 
+export interface RequirementSimilarityScoreComponent {
+  rawScore: number | null
+  normalizedScore: number
+  weight: number
+  contribution: number
+  available: boolean
+}
+
+export interface RequirementSimilarityScoreBreakdown {
+  formulaVersion: string
+  dense: RequirementSimilarityScoreComponent
+  lexical: RequirementSimilarityScoreComponent
+  reranker: RequirementSimilarityScoreComponent
+  businessAlignment: RequirementSimilarityScoreComponent
+  total: number
+}
+
 export interface RequirementMatchRequest {
   base: RequirementMatchCard
   excludedUids: ReadonlySet<string>
@@ -53,16 +76,23 @@ export interface RequirementMatchRequest {
 export interface RequirementMatchCandidateResult {
   recordUid: string
   finalRank: number
+  /** Evidence-based 0..100 similarity for this requirement/candidate pair. */
+  similarityScore: number
+  /** Compatibility alias retained for existing ranking consumers. */
   rankingScore: number
   rankingVersion: string
+  scoreBreakdown: RequirementSimilarityScoreBreakdown
   relation: MatchRelation
   decisionStatus: MatchDecisionStatus
+  confidenceStatus: MatchConfidenceStatus
+  confidenceReasons: string[]
   evidenceLevel: MatchEvidenceLevel
   reasonCodes: string[]
   degradationCodes: RequirementMatchDegradationCode[]
   stageScores: RequirementMatchStageScores
   /** Source-derived evidence only; model explanations must not invent this data. */
   evidenceJson?: unknown
+  explanationStatus: MatchExplanationStatus
   explanation: string | null
 }
 
@@ -78,6 +108,7 @@ export interface RequirementMatchResult {
 
 export type RequirementMatchRunStatus = 'running' | 'succeeded' | 'failed' | 'stale'
 export type RequirementMatchFailureCode =
+  | 'MATCH_CANCELLED'
   | 'INDEX_VERSION_MISMATCH'
   | 'REQUIREMENT_SNAPSHOT_CHANGED'
   | 'NORMALIZATION_VERSION_UNAVAILABLE'

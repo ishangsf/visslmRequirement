@@ -99,9 +99,27 @@ export interface DashboardSemanticBinding {
   questionId: string
   metricIds: string[]
   dimensionFields: string[]
+  /** Optional process/evidence links for domain-aware dashboards. */
+  processBindingIds?: string[]
   titleMode: 'auto' | 'custom'
   titleTemplate?: string
   confidence: number
+}
+
+/**
+ * Auditable domain-generation outcome persisted with a dashboard.  The
+ * fields are optional so legacy v1 dashboards and rejected/partial receipts
+ * remain representable; ready domain artifacts populate the complete set.
+ */
+export interface DashboardDomainReceipt {
+  adoptedMetricIds?: readonly string[]
+  missingMetricIds?: readonly string[]
+  evidenceMissing?: readonly string[]
+  evidenceInsufficient?: readonly string[]
+  confidence?: number
+  warnings?: readonly string[]
+  confirmations?: readonly string[]
+  vetoCodes?: readonly string[]
 }
 
 export interface DashboardDataPoint {
@@ -160,6 +178,16 @@ export interface DashboardSpec {
   globalFilters?: DashboardFilter[]
   /** Optional P0 semantic sidecar. Legacy v1 dashboards remain valid without it. */
   analysisBlueprint?: DashboardAnalysisBlueprint
+  /** Optional domain context. Legacy v1 dashboards remain valid without it. */
+  domainContext?: {
+    role: string
+    scenario: string
+    catalogVersion: string
+    tailoringBaselineId: string
+    artifactStatus: 'preview' | 'formal'
+  }
+  /** Optional auditable domain-generation receipt. Legacy v1 remains valid. */
+  domainReceipt?: DashboardDomainReceipt
   updatedAt: string
   components: DashboardComponentSpec[]
 }

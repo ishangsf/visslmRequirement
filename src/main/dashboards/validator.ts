@@ -87,6 +87,45 @@ export const validateDashboardSpec = (
     errors.push('components 至少包含一个组件')
     return errors
   }
+
+  const domainReceipt = spec.domainReceipt
+  if (domainReceipt !== undefined) {
+    if (!domainReceipt || typeof domainReceipt !== 'object' || Array.isArray(domainReceipt)) {
+      errors.push('domainReceipt 必须是对象')
+    } else {
+      const confidence = domainReceipt.confidence
+      if (confidence !== undefined &&
+          (!Number.isFinite(confidence) || confidence < 0 || confidence > 1)) {
+        errors.push('domainReceipt confidence 必须是 0-1 范围内的有限数值')
+      }
+      if (Array.isArray(domainReceipt.vetoCodes) && domainReceipt.vetoCodes.length) {
+        errors.push(`领域质量一票否决: ${domainReceipt.vetoCodes.join(', ')}`)
+      }
+    }
+  }
+
+  const domainContext = spec.domainContext
+  const artifactStatus = domainContext?.artifactStatus
+  if (artifactStatus === 'formal') {
+    if (!domainReceipt || typeof domainReceipt !== 'object' || Array.isArray(domainReceipt)) {
+      errors.push('formal 领域 dashboard 必须包含 domainReceipt 回执')
+    } else {
+      const confidence = domainReceipt.confidence
+      if (typeof confidence !== 'number' ||
+          !Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
+        errors.push('formal 领域 dashboard 的 domainReceipt confidence 必须是 0-1 范围内的有限数值')
+      } else if (confidence !== 1) {
+        errors.push('formal 领域 dashboard 的 domainReceipt confidence 必须为 1')
+      }
+      if (!Array.isArray(domainReceipt.evidenceMissing) || domainReceipt.evidenceMissing.length) {
+        errors.push('formal 领域 dashboard 仍存在缺失证据，不能通过正式门禁')
+      }
+      if (!Array.isArray(domainReceipt.evidenceInsufficient) || domainReceipt.evidenceInsufficient.length) {
+        errors.push('formal 领域 dashboard 仍存在不足证据，不能通过正式门禁')
+      }
+    }
+  }
+
   if (spec.components.length > 10) errors.push('首屏组件不能超过 10 个')
   const ids = new Set<string>()
   const occupied = new Set<string>()

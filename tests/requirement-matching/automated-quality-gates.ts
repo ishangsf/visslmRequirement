@@ -42,11 +42,32 @@ assert.equal(businessWriteCount, 0, 'the matching core has no formal business wr
 assert.equal(replayA.candidates.every((candidate) => candidate.rankingScore === 100), true)
 assert.equal(
   hashRequirementRankingManifest(FULL_REQUIREMENT_RANKING_MANIFEST),
-  '9c5ed8aa71146a86ce9f38892a4dce5fdcdf1ac34c209823719621cafd373285',
+  '16d71695db0c0cbda87d615e25248ea173fa81d72f5921e7963700ac85f58112',
   'an unversioned manifest change must fail the gate'
 )
+
+const incompleteCandidates = [60, 72, 84, 96].map((score, index) => ({
+  record: { uid: `incomplete-${index}`, name: '系统能力说明' } as RecordDetail,
+  card: card('系统能力说明'), denseScore: score, lexicalScore: score, retrievalScore: score, snippet: '系统能力说明'
+}))
+const plateauCore = new RequirementMatchingCore({
+  retriever: { async retrieve() { return incompleteCandidates } },
+  reranker: {
+    modelId: 'plateau-gate-reranker',
+    async rerank(_base, candidates) {
+      return candidates.map((candidate, index) => ({ recordUid: candidate.record.uid, score: 96 - index * 8 }))
+    }
+  },
+  async exactBusinessHashCandidates() { return [] },
+  candidateEligible() { return true }
+})
+const plateauReplay = await plateauCore.match({ ...request, base: card('查询订单详情') })
+assert.equal(new Set(plateauReplay.candidates.map((candidate) => candidate.rankingScore)).size > 1, true, 'ambiguous rows must retain ranking separation')
+assert.equal(plateauReplay.candidates.every((candidate) => candidate.relation === null), true, 'unknown relations must not be inferred from score')
+assert.equal(plateauReplay.candidates.every((candidate) => candidate.confidenceStatus === 'abstain'), true, 'incomplete evidence must abstain')
+assert.equal(plateauReplay.candidates.every((candidate) => candidate.similarityScore === candidate.scoreBreakdown.total), true, 'every displayed score must retain its component breakdown')
 console.log(JSON.stringify({
   ok: true,
-  metrics: { exactEligibleRecallAt50: 1, businessWriteCount, replayIdentical: true, entrypointProjectionEqual: true },
+  metrics: { exactEligibleRecallAt50: 1, businessWriteCount, replayIdentical: true, entrypointProjectionEqual: true, scorePlateauEliminated: true, unknownRelationPreserved: true },
   claimLimit: 'Automated gates verify deterministic safety and consistency, not open-domain business semantic accuracy.'
 }))

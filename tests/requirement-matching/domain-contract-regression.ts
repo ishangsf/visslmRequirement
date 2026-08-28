@@ -1,11 +1,13 @@
 import { strict as assert } from 'node:assert'
 import {
   MATCH_DECISION_STATUSES,
+  MATCH_CONFIDENCE_STATUSES,
   isMatchRelation,
   isRankingScore
 } from '../../src/main/requirements/requirement-match-domain'
 
 assert.deepEqual(MATCH_DECISION_STATUSES, ['confirmed', 'suggested', 'ambiguous', 'rejected'])
+assert.deepEqual(MATCH_CONFIDENCE_STATUSES, ['high', 'medium', 'low', 'abstain'])
 assert.equal(isMatchRelation('topic_only'), true)
 assert.equal(isMatchRelation('related'), false)
 assert.equal(isRankingScore(0), true)
