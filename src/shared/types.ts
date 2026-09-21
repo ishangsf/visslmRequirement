@@ -761,6 +761,18 @@ export interface SyncRun {
   errorMessage: string
 }
 
+export interface SyncFailureDetail {
+  runId: number
+  stage: string
+  reason: string
+  suggestion: string
+  nodeType?: string
+  recordUid?: string
+  itemId?: string
+  recordName?: string
+  batchCount?: number
+}
+
 export interface SyncProgress {
   phase: string
   message: string
@@ -768,8 +780,9 @@ export interface SyncProgress {
   total: number
   /** Number of valid records accepted or processed by the current run. */
   successfulCount?: number
-  /** Number of records that could not be accepted or processed by the current run. */
+  /** Rejected records plus a terminal task error, if any; not always a failed-row count. */
   failedCount?: number
+  errorDetail?: SyncFailureDetail
 }
 
 export interface SyncResult {
@@ -783,6 +796,7 @@ export interface SyncResult {
   reviewBatchId?: string
   duplicates: DataReviewItem[]
   message: string
+  errorDetail?: SyncFailureDetail
 }
 
 export type SyncFilterOperator =

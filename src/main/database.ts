@@ -9498,7 +9498,11 @@ export class AppDatabase {
     this.db.exec('BEGIN IMMEDIATE')
     try {
       for (const uid of uids) insert.run(uid)
+      // Full-scope collection prunes records just like explicit asset deletion.
+      // Remove only their RESTRICT references and roll back both on failure.
       this.db.exec(`
+        DELETE FROM pm_requirement_match_candidates
+        WHERE record_uid NOT IN (SELECT uid FROM sync_record_keep);
         DELETE FROM records
         WHERE uid NOT IN (SELECT uid FROM sync_record_keep);
         COMMIT;

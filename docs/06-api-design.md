@@ -100,7 +100,7 @@ React 页面 -> window.visslm -> preload/index.ts -> ipcRenderer.invoke(channel)
 | 编号 | IPC channel / preload 方法 | 请求参数 | 响应与错误 | 调用页面；Handler / Service / 表 |
 | --- | --- | --- | --- | --- |
 | API-IPC-044 | `push:preview` / `previewPush` | `PushConfig {recordUids,nodeType,projectId,componentId?,parentId?,insertAfterId?,insertBeforeId?,fieldMappings?}`；显式传入 `fieldMappings` 时按映射表 allow-list 构造 body | `PushResult`，`preview:true`，每条 request 显示脱敏参数和“未发送 POST”响应；未出现在映射表中的本地属性不会进入 body | `PushPage`：`App.tsx:2920`；`index.ts:841` / `PushService.preview`；`records` |
-| API-IPC-045 | `push:start` / `startPush` | 同 `PushConfig`；源/目标 field key、重复映射和保留字段会校验 | `PushResult`，逐条统计图片总数、上传/本次记录内复用/失败；显式映射只发送映射内容；每次推送都先登录并用 `JSESSIONID` 调用 `UploadRichImg`，用返回路径替换正文令牌后再创建 `/rest/items`；原始平台路径与历史上传缓存均不能跳过本次上传；图片失败时不创建记录，单条失败继续处理其他记录 | `PushPage`：`App.tsx:2955`；`index.ts` / `PushService.push -> VisslmClient.uploadRichImage/createItem`；`records`,`push_logs` |
+| API-IPC-045 | `push:start` / `startPush` | 同 `PushConfig`；源/目标 field key、重复映射和保留字段会校验 | `PushResult`，逐条统计图片总数、上传/本次记录内复用/失败；显式映射只发送映射内容；每次推送都先登录并用 `JSESSIONID` 调用 `UploadRichImg`，用返回路径替换正文令牌后再创建 `/rest/items`；原始平台路径与历史上传缓存均不能跳过本次上传；图片缺失或上传失败时用占位文本替换并继续创建记录，图片警告与记录创建失败分开统计；单条创建失败继续处理其他记录 | `PushPage`：`App.tsx:2955`；`index.ts` / `PushService.push -> VisslmClient.uploadRichImage/createItem`；`records`,`push_logs` |
 | API-IPC-046 | `push:logs` / `listPushLogs` | `page?:number,pageSize?:number` | `PushLogPage`；日志 body/response 可能含业务敏感数据 | `PushPage`：`App.tsx:2843`；`index.ts:843-845` / DB；`push_logs` |
 
 ### 2.6 知识库

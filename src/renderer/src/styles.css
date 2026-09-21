@@ -2435,6 +2435,158 @@ body {
   background: var(--state-success) !important;
 }
 
+.sync-failure-details {
+  min-width: 0;
+  margin-top: var(--ds-space-2);
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--state-error) 42%, var(--stroke));
+  border-radius: 8px;
+  color: var(--text-main);
+  background: var(--surface-raised);
+}
+
+.sync-failure-details > summary {
+  display: flex;
+  min-height: 36px;
+  align-items: center;
+  padding: 8px 12px;
+  cursor: pointer;
+  color: var(--text-main);
+  font-size: 12px;
+  font-weight: 600;
+  list-style: none;
+}
+
+.sync-failure-details > summary::before {
+  flex: 0 0 auto;
+  margin-right: 8px;
+  color: var(--accent);
+  content: '▸';
+}
+
+.sync-failure-details[open] > summary::before {
+  content: '▾';
+}
+
+.sync-failure-details > summary:hover {
+  background: var(--accent-soft);
+}
+
+.sync-failure-details > summary:focus-visible {
+  outline: 2px solid var(--focus-ring, var(--accent));
+  outline-offset: -2px;
+}
+
+.sync-failure-details[open] > summary {
+  border-bottom: 1px solid var(--stroke);
+}
+
+.sync-failure-detail-content {
+  display: flex;
+  min-width: 0;
+  max-height: max(160px, min(360px, calc(100vh - 280px)));
+  flex-direction: column;
+  gap: var(--ds-space-3);
+  overflow: auto;
+  padding: var(--ds-space-3);
+}
+
+.sync-failure-detail-context {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(auto-fit, minmax(min(180px, 100%), 1fr));
+  gap: var(--ds-space-2);
+}
+
+.sync-failure-detail-item {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+  padding: var(--ds-space-2);
+  border: 1px solid var(--stroke);
+  border-radius: 6px;
+  background: var(--surface-soft);
+}
+
+.sync-failure-detail-label {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.sync-failure-detail-value {
+  min-width: 0;
+  color: var(--text-main);
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.sync-failure-detail-section {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sync-failure-reason,
+.collection-request-log-error {
+  max-height: 220px;
+  margin: 0;
+  overflow: auto;
+  padding: var(--ds-space-2) var(--ds-space-3);
+  border: 1px solid var(--stroke);
+  border-radius: 6px;
+  color: var(--text-main);
+  background: var(--surface-base);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.sync-failure-suggestion {
+  margin: 0;
+  color: var(--text-main);
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.sync-failure-actions {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: var(--ds-space-1);
+}
+
+.collection-request-log-mode {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.collection-request-log-endpoint {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.collection-request-endpoint {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--ds-space-1);
+}
+
+.collection-request-endpoint > .ant-typography {
+  min-width: 0;
+  flex: 1;
+}
+
 .sync-progress-card {
   position: static;
   box-shadow: 0 5px 18px rgba(20, 38, 63, 0.055);

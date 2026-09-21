@@ -187,6 +187,7 @@ import type {
   RecordReleaseValue,
   RecordRow,
   SystemSettingsInput,
+  SyncFailureDetail,
   SyncFieldFilter,
   SyncPreviewResult,
   SyncProgress,
@@ -220,6 +221,26 @@ type SyncProgressListener = () => void
 const safeNonNegativeInteger = (value: unknown, fallback = 0): number => {
   if (typeof value !== 'number' || !Number.isFinite(value)) return fallback
   return Math.max(0, Math.floor(value))
+}
+
+const publishSyncFailureFallback = (message: string, errorDetail?: SyncFailureDetail): void => {
+  const current = syncProgressPending ?? syncProgressSnapshot
+  const currentSuccessfulCount = safeNonNegativeInteger(current?.successfulCount)
+  const currentFailedCount = safeNonNegativeInteger(current?.failedCount)
+  const detail = errorDetail ?? current?.errorDetail
+
+  // A terminal IPC event can be missed while startSync still receives the
+  // result. Keep the last known counters and position so the fallback does
+  // not turn a partially processed run into a misleading 0 / 0 error.
+  publishSyncProgress({
+    phase: 'error',
+    message,
+    current: safeNonNegativeInteger(current?.current),
+    total: safeNonNegativeInteger(current?.total),
+    successfulCount: currentSuccessfulCount,
+    failedCount: Math.max(currentFailedCount, 1),
+    ...(detail ? { errorDetail: detail } : {})
+  }, true)
 }
 
 let syncProgressSnapshot: SyncProgress | null = null
@@ -2616,6 +2637,9 @@ const pushImageStats = (result: PushResult): {
     available: hasResultStats || hasRequestStats
   }
 }
+
+const pushCreationFailureCount = (result: PushResult): number =>
+  result.requests.filter((request) => Boolean(request.error)).length
 
 const renderPushStatus = (record: Pick<
   RecordRow,
@@ -8377,6 +8401,21 @@ function SyncPage({
   // renderer compatible with older events and malformed IPC payloads.
   const successfulCount = safeNonNegativeInteger(progress?.successfulCount)
   const failedCount = safeNonNegativeInteger(progress?.failedCount)
+  const failureDetail = progressState === 'error' ? progress?.errorDetail : undefined
+  const failureCountLabel = failureDetail ? '异常' : '失败'
+  const failureCountUnit = failureDetail ? '项' : '条'
+  const failureReason = failureDetail?.reason || progressMessage
+  const failureSuggestion = failureDetail?.suggestion || '请查看请求日志中的完整错误信息，确认平台连接和本地数据状态后重试。'
+  const failureContextItems: Array<{ label: string; value: string }> = []
+  if (failureDetail?.runId !== undefined) failureContextItems.push({ label: '采集任务', value: String(failureDetail.runId) })
+  if (failureDetail?.stage) failureContextItems.push({ label: '失败阶段', value: failureDetail.stage })
+  if (failureDetail?.nodeType) failureContextItems.push({ label: '数据类型', value: failureDetail.nodeType })
+  if (failureDetail?.recordName) failureContextItems.push({ label: '记录名称', value: failureDetail.recordName })
+  if (failureDetail?.itemId) failureContextItems.push({ label: '对象编号', value: failureDetail.itemId })
+  if (failureDetail?.recordUid) failureContextItems.push({ label: '记录 UID', value: failureDetail.recordUid })
+  if (failureDetail?.batchCount !== undefined) {
+    failureContextItems.push({ label: '写入批次', value: `${failureDetail.batchCount} 条（未定位到单条记录）` })
+  }
 
   const filtersFor = (nodeType: string): SyncFieldFilter[] =>
     config.rules.find((rule) => rule.nodeType === nodeType)?.filters ?? []
@@ -8761,7 +8800,7 @@ function SyncPage({
         <Card
           className="sync-progress-card"
           role="group"
-          aria-label={`采集进度：成功 ${successfulCount} 条，失败 ${failedCount} 条`}
+          aria-label={`采集进度：成功 ${successfulCount} 条，${failureCountLabel} ${failedCount} ${failureCountUnit}`}
           title={
             <Space>
               <CloudDownloadOutlined />
@@ -8789,7 +8828,7 @@ function SyncPage({
             />
             <div
               className="sync-progress-counts"
-              aria-label={`采集结果：成功 ${successfulCount} 条，失败 ${failedCount} 条`}
+              aria-label={`采集结果：成功 ${successfulCount} 条，${failureCountLabel} ${failedCount} ${failureCountUnit}`}
             >
               <div className="sync-progress-stat sync-progress-stat--success">
                 <CheckCircleOutlined aria-hidden="true" />
@@ -8799,9 +8838,9 @@ function SyncPage({
               </div>
               <div className="sync-progress-stat sync-progress-stat--error">
                 <ExclamationCircleOutlined aria-hidden="true" />
-                <span className="sync-progress-stat-label">失败</span>
+                <span className="sync-progress-stat-label">{failureCountLabel}</span>
                 <strong className="sync-progress-stat-value">{failedCount}</strong>
-                <span className="sync-progress-stat-unit">条</span>
+                <span className="sync-progress-stat-unit">{failureCountUnit}</span>
               </div>
             </div>
             <div className="sync-progress-message">
@@ -8812,6 +8851,46 @@ function SyncPage({
                 {progressMessage}
               </Text>
             </div>
+            {progressState === 'error' && (
+              <>
+                <details className="sync-failure-details" open>
+                  <summary>查看失败详情</summary>
+                  <div className="sync-failure-detail-content">
+                    {failureContextItems.length > 0 && (
+                      <div className="sync-failure-detail-context">
+                        {failureContextItems.map((item) => (
+                          <div className="sync-failure-detail-item" key={item.label}>
+                            <span className="sync-failure-detail-label">{item.label}</span>
+                            <span className="sync-failure-detail-value">{item.value}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    <div className="sync-failure-detail-section">
+                      <span className="sync-failure-detail-label">原始原因</span>
+                      <pre className="sync-failure-reason">{failureReason}</pre>
+                    </div>
+                    <div className="sync-failure-detail-section">
+                      <span className="sync-failure-detail-label">处理建议</span>
+                      <p className="sync-failure-suggestion">{failureSuggestion}</p>
+                    </div>
+                  </div>
+                </details>
+                <div className="sync-failure-actions">
+                  <Button
+                    type="link"
+                    size="small"
+                    icon={<FileSearchOutlined />}
+                    onClick={() => {
+                      setActiveTab('logs')
+                      void loadRequestLogs()
+                    }}
+                  >
+                    查看请求日志
+                  </Button>
+                </div>
+              </>
+            )}
           </div>
         </Card>
       )}
@@ -9016,20 +9095,24 @@ function SyncPage({
             locale={{ emptyText: '暂无真实数据采集请求日志' }}
             expandable={{
               expandedRowRender: (log) => (
-                <div className="preview-request-detail">
+                <div className="preview-request-detail collection-request-log-detail">
+                  <Text strong>处理方式</Text>
+                  <div className="collection-request-log-mode">
+                    {log.endpoint.startsWith('local://collection/') ? '本地处理' : log.method}
+                  </div>
                   <Text strong>请求接口</Text>
-                  <pre className="json-preview">{log.endpoint}</pre>
+                  <pre className="json-preview collection-request-log-endpoint">{log.endpoint}</pre>
                   <Text strong>请求参数（Token 已脱敏）</Text>
                   <pre className="json-preview">{JSON.stringify(log.params, null, 2)}</pre>
-                  <Text strong>{log.errorMessage ? '错误与返回摘要' : '返回摘要'}</Text>
+                  {log.errorMessage && (
+                    <>
+                      <Text strong>完整错误信息</Text>
+                      <pre className="collection-request-log-error">{log.errorMessage}</pre>
+                    </>
+                  )}
+                  <Text strong>{log.errorMessage ? '返回摘要' : '返回值'}</Text>
                   <pre className="json-preview">
-                    {JSON.stringify(
-                      log.errorMessage
-                        ? { error: log.errorMessage, response: log.response }
-                        : log.response,
-                      null,
-                      2
-                    )}
+                    {JSON.stringify(log.response, null, 2) || '—'}
                   </pre>
                 </div>
               )
@@ -9050,13 +9133,22 @@ function SyncPage({
               {
                 title: '请求接口',
                 dataIndex: 'endpoint',
-                ellipsis: true
+                ellipsis: true,
+                render: (endpoint: string) => (
+                  <div className="collection-request-endpoint">
+                    {endpoint.startsWith('local://collection/') && <Tag color="processing">本地处理</Tag>}
+                    <Text ellipsis title={endpoint}>{endpoint}</Text>
+                  </div>
+                )
               },
               {
                 title: 'HTTP',
                 dataIndex: 'httpStatus',
                 width: 90,
-                render: (status: number) => status || '—'
+                render: (status: number, log: CollectionRequestLogRow) =>
+                  log.endpoint.startsWith('local://collection/')
+                    ? '—'
+                    : status || '—'
               },
               {
                 title: '返回记录',
@@ -9368,11 +9460,17 @@ function PushPage({
       setResult(preview)
       setActiveTab('logs')
       const imageStats = pushImageStats(preview)
-      message.success(
-        imageStats.available
-          ? `已生成 ${preview.total} 条 POST 请求预览，图片资源 ${imageStats.total} 个（未上传，未访问真实平台）`
-          : `已生成 ${preview.total} 条 POST 请求预览，未访问真实平台`
-      )
+      if (imageStats.failed) {
+        message.warning(
+          `已生成 ${preview.total} 条 POST 请求预览，发现 ${imageStats.failed} 个缺失图片资源；缺失图片将跳过，真实推送仍会创建记录`
+        )
+      } else {
+        message.success(
+          imageStats.available
+            ? `已生成 ${preview.total} 条 POST 请求预览，图片资源 ${imageStats.total} 个（未上传，未访问真实平台）`
+            : `已生成 ${preview.total} 条 POST 请求预览，未访问真实平台`
+        )
+      }
     } catch (error) {
       message.error(error instanceof Error ? error.message : String(error))
     } finally {
@@ -9393,10 +9491,10 @@ function PushPage({
       content: (
         <div className="push-confirm-copy">
           <span>
-            图片资源会先逐项调用 <code>UploadRichImg</code>，同一记录内相同内容只复用本次上传结果，然后才调用 <code>/alm/rest/items</code> 执行真实 POST 写入。
+            图片资源会先逐项尝试调用 <code>UploadRichImg</code>，同一记录内相同内容只复用本次上传结果；缺失或上传失败的图片会跳过，仍会调用 <code>/alm/rest/items</code> 创建记录。
           </span>
           <span className="push-confirm-warning">
-            任一记录的图片上传失败时，该记录不会创建；请先检查请求预览中的资源状态、参数和消息体。
+            图片缺失或上传失败不会单独阻止记录创建；最终是否创建成功以每条请求的状态和错误信息为准。
           </span>
         </div>
       ),
@@ -9409,13 +9507,17 @@ function PushPage({
           setResult(pushed)
           setActiveTab('logs')
           const imageStats = pushImageStats(pushed)
-          if (imageStats.failed) {
-            message.warning(
-              `图片资源失败 ${imageStats.failed} 个；对应记录未创建。成功 ${pushed.successCount} 条，失败 ${pushed.failedCount} 条`
+          const creationFailedCount = pushCreationFailureCount(pushed)
+          if (creationFailedCount) {
+            const imageWarning = imageStats.failed
+              ? `；另有 ${imageStats.failed} 个图片资源未上传，缺失图片已跳过`
+              : ''
+            message.error(
+              `推送完成：已创建 ${pushed.successCount} 条，创建失败 ${creationFailedCount} 条${imageWarning}`
             )
-          } else if (pushed.failedCount) {
+          } else if (imageStats.failed) {
             message.warning(
-              `推送完成：成功 ${pushed.successCount} 条，失败 ${pushed.failedCount} 条`
+              `已创建 ${pushed.successCount} 条（部分图片未上传）；${imageStats.failed} 个缺失图片资源已跳过`
             )
           } else {
             message.success(`推送成功，共 ${pushed.successCount} 条`)
@@ -9625,8 +9727,8 @@ function PushPage({
           showIcon
           type="warning"
           className="compact-push-alert"
-          title="图片先上传；失败会阻止对应记录创建"
-          description="请求消息体仅保留字段映射表中的属性；测试预览不上传图片也不发送请求；真实推送会先完成全部图片资源处理，再调用 /alm/rest/items，并强制移除 _valm_Uid、_valm_NodeType 和 _valm_ItemID。"
+          title="图片缺失或上传失败不会阻止记录创建"
+          description="请求消息体仅保留字段映射表中的属性；测试预览不上传图片也不发送请求；真实推送会尝试处理图片，缺失或上传失败的图片将跳过，仍会调用 /alm/rest/items，并强制移除 _valm_Uid、_valm_NodeType 和 _valm_ItemID。最终是否创建成功以每条请求的错误信息为准。"
         />
       </Card>}
 
@@ -9752,10 +9854,24 @@ function PushPage({
           className="push-debug-card"
           title="接口调试信息"
           extra={
-            <Tag color={result.preview ? 'processing' : result.failedCount ? 'warning' : 'success'}>
+            <Tag
+              color={
+                result.preview
+                  ? 'processing'
+                  : pushCreationFailureCount(result)
+                    ? 'error'
+                    : resultImageStats?.failed
+                      ? 'warning'
+                      : 'success'
+              }
+            >
               {result.preview
                 ? '仅预览，未发送'
-                : `成功 ${result.successCount} / 失败 ${result.failedCount}`}
+                : pushCreationFailureCount(result)
+                  ? `已创建 ${result.successCount} / 创建失败 ${pushCreationFailureCount(result)}`
+                  : resultImageStats?.failed
+                    ? '已创建（部分图片未上传）'
+                    : `成功 ${result.successCount}`}
             </Tag>
           }
         >
@@ -9767,21 +9883,21 @@ function PushPage({
               <Tag color="processing">图片资源 {resultImageStats.total}</Tag>
               <Tag color="success">本次上传 {resultImageStats.uploaded}</Tag>
               <Tag color="default">复用已有 {resultImageStats.reused}</Tag>
-              <Tag color={resultImageStats.failed ? 'error' : 'default'}>
-                失败 {resultImageStats.failed}
+              <Tag color={resultImageStats.failed ? 'warning' : 'default'}>
+                未上传 {resultImageStats.failed}
               </Tag>
             </div>
           )}
           {resultImageStats && resultImageStats.failed > 0 && (
             <Alert
               showIcon
-              type="error"
+              type="warning"
               className="push-image-blocking-alert"
-              title="图片资源失败会阻止对应记录创建"
+              title="图片资源未上传，不影响记录创建"
               description={
                 result.preview
-                  ? '预览已标记失败资源；真实推送时必须先完成全部图片上传，才会调用 /alm/rest/items。'
-                  : `有 ${resultImageStats.failed} 个图片资源未上传成功，对应记录未调用 /alm/rest/items。`
+                  ? '预览发现缺失图片；真实推送时缺失图片将跳过，仍会调用 /alm/rest/items 创建记录。'
+                  : `有 ${resultImageStats.failed} 个图片资源未上传成功；图片缺失不会单独阻止记录创建，实际创建失败请查看对应请求的错误信息。`
               }
             />
           )}
@@ -9795,12 +9911,14 @@ function PushPage({
                   <Text>{request.recordName}</Text>
                   <Text ellipsis title={request.endpoint}>{request.endpoint}</Text>
                   <Tag
-                    color={request.imageFailed ? 'error' : request.error ? 'error' : result.preview ? 'default' : 'success'}
+                    color={request.error ? 'error' : request.imageFailed ? 'warning' : result.preview ? 'default' : 'success'}
                   >
-                    {request.imageFailed
-                      ? '未创建（图片失败）'
-                      : request.error
-                        ? '失败'
+                    {request.error
+                      ? '失败'
+                      : request.imageFailed
+                        ? result.preview
+                          ? '缺失图片将跳过'
+                          : '已创建（部分图片未上传）'
                         : result.preview
                           ? '未发送'
                           : '成功'}
@@ -9813,11 +9931,15 @@ function PushPage({
                     <div className="push-request-image-summary" aria-label="当前记录图片资源状态">
                       <Text strong>图片资源</Text>
                       <Text type="secondary">
-                        共 {request.imageTotal} 个 · 上传 {request.imageUpload ?? 0} · 复用 {request.imageReuse ?? 0} · 失败 {request.imageFailed ?? 0}
+                        共 {request.imageTotal} 个 · 上传 {request.imageUpload ?? 0} · 复用 {request.imageReuse ?? 0} · 未上传 {request.imageFailed ?? 0}
                       </Text>
                       {request.imageFailed ? (
-                        <Text type="danger">
-                          图片失败，当前记录不会创建
+                        <Text type={request.error ? 'danger' : 'warning'}>
+                          {request.error
+                            ? '创建请求失败；图片缺失不会单独阻止记录创建。'
+                            : result.preview
+                              ? '缺失图片将跳过，真实推送仍会创建记录。'
+                              : '已创建（部分图片未上传），缺失图片已跳过。'}
                         </Text>
                       ) : null}
                       {request.imageErrors?.length ? (
@@ -11350,11 +11472,14 @@ function AppShell({ themeMode, onThemeModeChange }: AppProps): React.JSX.Element
         message.success(`${result.message}${imageMeta}`)
         setRefreshKey((key) => key + 1)
       } else {
-        message.error(result.message)
+        publishSyncFailureFallback(result.message || '采集失败', result.errorDetail)
+        message.error(result.message || '采集失败')
       }
       return result
     } catch (error) {
-      message.error(error instanceof Error ? error.message : String(error))
+      const failureMessage = error instanceof Error ? error.message : String(error)
+      publishSyncFailureFallback(failureMessage || '采集失败')
+      message.error(failureMessage || '采集失败')
       return null
     } finally {
       setSyncing(false)

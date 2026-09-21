@@ -8,6 +8,7 @@ import type {
   PushRequestTrace,
   PushResult,
   SyncFieldFilter,
+  SyncFailureDetail,
   SyncPreviewResult,
   SyncProgress,
   SyncResult,
@@ -95,22 +96,6 @@ const retryAfterDelayMs = (response: Response): number | undefined => {
   const timestamp = Date.parse(value)
   if (!Number.isFinite(timestamp)) return undefined
   return Math.min(10_000, Math.max(0, timestamp - Date.now()))
-}
-
-class AssetPreparationError extends Error {
-  constructor(
-    message: string,
-    readonly stats: {
-      imageTotal: number
-      imageUpload: number
-      imageReuse: number
-      imageFailed: number
-      imageErrors?: string[]
-    }
-  ) {
-    super(message)
-    this.name = 'AssetPreparationError'
-  }
 }
 
 const value = (obj: JsonObject, key: string): string =>
@@ -2397,7 +2382,8 @@ export class PushService {
         for (const field of pushForbiddenTargetFields) delete body[field]
         if (!body._valm_Name) body._valm_Name = detail.name
       }
-      const previewAssets = this.inspectBodyAssets(body)
+      const preparedBody = this.bindBodyImageSources(detail.uid, body)
+      const previewAssets = this.inspectBodyAssets(preparedBody)
       return {
         id: index + 1,
         recordUid: detail.uid,
@@ -2405,7 +2391,7 @@ export class PushService {
         method: 'POST' as const,
         endpoint: client.createItemEndpoint(),
         params: client.createItemTraceParams(params),
-        body,
+        body: preparedBody,
         ...(previewAssets.imageTotal || previewAssets.imageFailed ? previewAssets : {})
       }
     })
@@ -2434,6 +2420,38 @@ export class PushService {
     return this.execute(client, requests)
   }
 
+  private bindBodyImageSources(recordUid: string, body: Record<string, unknown>): Record<string, unknown> {
+    // A mapped field can retain an original URL while another field already
+    // has its token. Only use exact, unambiguous provenance from this record;
+    // never forward an old platform URL or infer identity from a filename.
+    const bySource = new Map<string, { sha256: string; token: string } | null>()
+    for (const reference of this.db.listRecordImageReferences(recordUid)) {
+      const source = reference.originalSource
+      if (!source || parseAssetToken(source)) continue
+      const previous = bySource.get(source)
+      if (previous === null) continue
+      if (previous && previous.sha256 !== reference.assetSha256) {
+        bySource.set(source, null)
+      } else {
+        bySource.set(source, {
+          sha256: reference.assetSha256,
+          token: `visslm-asset://${reference.assetSha256}/${reference.id}`
+        })
+      }
+    }
+    const visit = (input: unknown): unknown => {
+      if (typeof input === 'string') {
+        return replaceRichTextImageSources(input, (source) =>
+          parseAssetToken(source.source) ? undefined : bySource.get(source.source)?.token
+        ).html
+      }
+      if (Array.isArray(input)) return input.map(visit)
+      if (!input || typeof input !== 'object') return input
+      return Object.fromEntries(Object.entries(input as JsonObject).map(([key, valueInput]) => [key, visit(valueInput)]))
+    }
+    return visit(body) as Record<string, unknown>
+  }
+
   private inspectBodyAssets(
     body: Record<string, unknown>
   ): Pick<PushRequestTrace, 'imageTotal' | 'imageUpload' | 'imageReuse' | 'imageFailed' | 'imageErrors'> {
@@ -2447,7 +2465,7 @@ export class PushService {
     const addError = (message: string): void => {
       if (imageErrors.length < 20 && !imageErrors.includes(message)) imageErrors.push(message)
     }
-    const visit = (input: unknown): void => {
+    const visit = (input: unknown, fieldPath: string): void => {
       if (typeof input === 'string') {
         const matches = [...input.matchAll(tokenPattern)]
         imageTotal += matches.length
@@ -2458,26 +2476,29 @@ export class PushService {
           if (!this.db.getAssetBlob(sha256) || !this.db.readAssetBytes(sha256)) {
             imageFailed += 1
             failedHashes.add(sha256)
-            addError(`图片资源 ${sha256.slice(0, 12)}… 不存在或校验失败`)
+            addError(`字段 ${fieldPath}：图片资源 ${sha256.slice(0, 12)}… 不存在或校验失败，请重新采集或导入包含图片的资源包。`)
           }
         }
         for (const source of findRichTextImageSources(input)) {
           if (parseAssetToken(source.source)) continue
           imageTotal += 1
           imageFailed += 1
-          addError('富文本中存在未解析图片')
+          const sourceLabel = /^data:/i.test(source.source)
+            ? 'data: 内嵌图片（内容已省略）'
+            : sanitizeImageErrorMessage(source.source).slice(0, 240)
+          addError(`字段 ${fieldPath}，第 ${source.occurrence + 1} 处图片（${source.attribute}）：富文本中存在未解析图片；来源 ${sourceLabel}。当前记录没有可唯一对应的本地图片资源，请重新采集或导入包含图片的资源包。`)
         }
         return
       }
       if (Array.isArray(input)) {
-        input.forEach(visit)
+        input.forEach((valueInput, index) => visit(valueInput, `${fieldPath}[${index}]`))
         return
       }
       if (input && typeof input === 'object') {
-        Object.values(input as JsonObject).forEach(visit)
+        Object.entries(input as JsonObject).forEach(([key, valueInput]) => visit(valueInput, fieldPath ? `${fieldPath}.${key}` : key))
       }
     }
-    visit(body)
+    visit(body, '')
     const imageReuse = [...occurrences.entries()]
       .filter(([sha256]) => !failedHashes.has(sha256))
       .reduce((total, [, count]) => total + Math.max(0, count - 1), 0)
@@ -2522,15 +2543,17 @@ export class PushService {
         imageUpload += prepared.imageUpload
         imageReuse += prepared.imageReuse
         imageFailed += prepared.imageFailed
+        imageErrors.push(...prepared.imageErrors)
         const created = await client.createItem(params, prepared.body)
         const response = created.data
         const pushedUid = extractCreatedItemUid(response)
         this.db.finishPushLog(logId, 'success', {
           httpStatus: created.httpStatus,
           response,
-          remoteUid: pushedUid
+          remoteUid: pushedUid,
+          errorMessage: prepared.imageFailed ? `记录已创建，部分图片未上传：\n${prepared.imageErrors.join('\n')}` : ''
         })
-        this.db.markPushResult(request.recordUid, 'success', '推送成功', pushedUid)
+        this.db.markPushResult(request.recordUid, 'success', prepared.imageFailed ? '推送成功，部分图片未上传' : '推送成功', pushedUid)
         completed.push({
           ...request,
           body: prepared.body,
@@ -2539,20 +2562,13 @@ export class PushService {
             imageTotal: prepared.imageTotal,
             imageUpload: prepared.imageUpload,
             imageReuse: prepared.imageReuse,
-            imageFailed: prepared.imageFailed
+            imageFailed: prepared.imageFailed,
+            imageErrors: prepared.imageErrors
           } : {})
         })
         successCount += 1
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
-        const assetStats = error instanceof AssetPreparationError ? error.stats : undefined
-        if (assetStats) {
-          imageTotal += assetStats.imageTotal
-          imageUpload += assetStats.imageUpload
-          imageReuse += assetStats.imageReuse
-          imageFailed += assetStats.imageFailed
-          imageErrors.push(...(assetStats.imageErrors ?? []))
-        }
         this.db.finishPushLog(logId, 'failed', {
           httpStatus: error instanceof VisslmRequestError ? error.httpStatus : 0,
           response: error instanceof VisslmRequestError ? error.response : undefined,
@@ -2562,7 +2578,6 @@ export class PushService {
         completed.push({
           ...request,
           ...requestImageStats,
-          ...(assetStats ? assetStats : {}),
           error: message
         })
         failedCount += 1
@@ -2595,110 +2610,117 @@ export class PushService {
     imageUpload: number
     imageReuse: number
     imageFailed: number
+    imageErrors: string[]
   }> {
-    let imageTotal = 0
+    const normalizedBody = this.bindBodyImageSources(recordUid, body)
+    const inspected = this.inspectBodyAssets(normalizedBody)
+    const imageTotal = inspected.imageTotal ?? 0
     let imageUpload = 0
     let imageReuse = 0
     let imageFailed = 0
-    const fail = (message: string): never => {
-      throw new AssetPreparationError(message, {
-        imageTotal,
-        imageUpload,
-        imageReuse,
-        imageFailed,
-        imageErrors: [message]
-      })
+    const imageErrors: string[] = []
+    const warn = (message: string): void => {
+      imageFailed += 1
+      if (imageErrors.length < 50) imageErrors.push(message)
     }
-    if (!projectId) fail('图片上传缺少目标项目 UID')
     const references = new Map(
       this.db.listRecordImageReferences(recordUid).map((reference) => [reference.id, reference])
     )
     const tokenPattern = /visslm-asset:\/\/([a-f0-9]{64})\/([A-Za-z0-9_-]{1,128})/gi
     const remoteBySha = new Map<string, string>()
-    const resolveString = async (valueInput: string): Promise<string> => {
+    const failedBySha = new Map<string, string>()
+    const resolveString = async (valueInput: string, fieldPath: string): Promise<string> => {
       const richSources = findRichTextImageSources(valueInput)
       const matches = [...valueInput.matchAll(tokenPattern)]
       const replacements: Array<{ start: number; end: number; value: string }> = []
+      const failedRanges: Array<{ start: number; end: number }> = []
       for (const match of matches) {
         const token = match[0]
         const parsed = parseAssetToken(token)
         if (!parsed) continue
-        imageTotal += 1
+        const start = match.index ?? 0
         let remotePath = remoteBySha.get(parsed.sha256)
         if (!remotePath) {
-          const reference = references.get(parsed.referenceId)
-          const blob = this.db.getAssetBlob(parsed.sha256)
-          const bytes = this.db.readAssetBytes(parsed.sha256)
-          if (!blob) {
-            imageFailed += 1
-            fail(`图片资源 ${parsed.sha256.slice(0, 12)}… 不存在或校验失败`)
-          }
-          if (!bytes) {
-            imageFailed += 1
-            fail(`图片资源 ${parsed.sha256.slice(0, 12)}… 不存在或校验失败`)
-          }
-          const resolvedBlob = blob as NonNullable<typeof blob>
-          const resolvedBytes = bytes as Buffer
           try {
+            const previousFailure = failedBySha.get(parsed.sha256)
+            if (previousFailure) throw new Error(previousFailure)
+            if (!projectId) throw new Error('图片上传缺少目标项目 UID')
+            const reference = references.get(parsed.referenceId)
+            const blob = this.db.getAssetBlob(parsed.sha256)
+            const bytes = this.db.readAssetBytes(parsed.sha256)
+            if (!blob || !bytes) throw new Error('本地图片资源不存在或校验失败')
             const uploaded = await client.uploadRichImage({
               projectId,
-              bytes: resolvedBytes,
-              mimeType: resolvedBlob.mimeType,
+              bytes,
+              mimeType: blob.mimeType,
               fileName: reference?.sourceName || `image-${parsed.sha256.slice(0, 12)}`
             })
             remotePath = uploaded.remotePath
+            if (!remotePath) throw new Error('图片上传未返回远端路径')
             imageUpload += 1
+            remoteBySha.set(parsed.sha256, remotePath)
           } catch (error) {
-            imageFailed += 1
-            fail(error instanceof Error ? error.message : String(error))
+            const reason = sanitizeImageErrorMessage(error instanceof Error ? error.message : String(error))
+            failedBySha.set(parsed.sha256, reason)
+            warn(`字段 ${fieldPath}，图片 ${parsed.sha256.slice(0, 12)}… 已跳过：${reason}`)
+            failedRanges.push({ start, end: start + token.length })
+            replacements.push({ start, end: start + token.length, value: '[图片未能上传]' })
+            continue
           }
-          const resolvedRemotePath = remotePath || fail(`图片资源 ${parsed.sha256.slice(0, 12)}… 未返回远端路径`)
-          remoteBySha.set(parsed.sha256, resolvedRemotePath)
         } else {
           imageReuse += 1
         }
-        const resolvedRemotePath = remotePath || fail(`图片资源 ${parsed.sha256.slice(0, 12)}… 未返回远端路径`)
-        const start = match.index ?? 0
-        replacements.push({ start, end: start + token.length, value: resolvedRemotePath })
+        replacements.push({ start, end: start + token.length, value: remotePath! })
       }
-      // An un-tokenized image means collection/import could not retain the
-      // binary resource.  Refuse to create a partial remote record.
+      // Images are best-effort. Keep the text and replace unavailable images
+      // with readable placeholders instead of preventing record creation.
       for (const source of richSources) {
         if (!parseAssetToken(source.source)) {
-          imageFailed += 1
-          fail('富文本中存在未解析图片，已阻止推送')
+          const sourceLabel = /^data:/i.test(source.source) ? 'data: 内嵌图片' : sanitizeImageErrorMessage(source.source).slice(0, 240)
+          warn(`字段 ${fieldPath}，第 ${source.occurrence + 1} 处图片（${source.attribute}）已跳过：未找到可唯一对应的本地资源；来源 ${sourceLabel}`)
+          failedRanges.push({ start: source.start, end: source.end })
+        }
+      }
+      const failedTags: Array<{ start: number; end: number; value: string }> = []
+      for (const tag of valueInput.matchAll(/<(img|source)\b[^>]*>/gi)) {
+        const start = tag.index ?? 0
+        const end = start + tag[0].length
+        if (failedRanges.some((range) => range.start >= start && range.end <= end)) {
+          failedTags.push({ start, end, value: tag[1].toLowerCase() === 'img' ? '<span>[图片未能上传]</span>' : '' })
         }
       }
       let result = valueInput
-      for (const replacement of replacements.sort((left, right) => right.start - left.start)) {
+      const effectiveReplacements = replacements.filter((range) => !failedTags.some((tag) => range.start >= tag.start && range.end <= tag.end))
+      for (const replacement of [...effectiveReplacements, ...failedTags].sort((left, right) => right.start - left.start)) {
         result = result.slice(0, replacement.start) + replacement.value + result.slice(replacement.end)
       }
       return result
     }
 
-    const visit = async (input: unknown): Promise<unknown> => {
-      if (typeof input === 'string') return resolveString(input)
+    const visit = async (input: unknown, fieldPath: string): Promise<unknown> => {
+      if (typeof input === 'string') return resolveString(input, fieldPath)
       if (Array.isArray(input)) {
         // Uploads are non-idempotent.  Visit one record's fields in order so
         // duplicate SHA tokens cannot race and create two remote files.
         const result: unknown[] = []
-        for (const item of input) result.push(await visit(item))
+        for (let index = 0; index < input.length; index += 1) result.push(await visit(input[index], `${fieldPath}[${index}]`))
         return result
       }
       if (!input || typeof input !== 'object') return input
       const result: JsonObject = {}
       for (const [key, valueInput] of Object.entries(input as JsonObject)) {
-        result[key] = await visit(valueInput)
+        result[key] = await visit(valueInput, fieldPath ? `${fieldPath}.${key}` : key)
       }
       return result
     }
-    const prepared = await visit(body)
+    const prepared = await visit(normalizedBody, '')
     return {
       body: prepared as Record<string, unknown>,
       imageTotal,
       imageUpload,
       imageReuse,
-      imageFailed
+      imageFailed,
+      imageErrors
     }
   }
 }
@@ -2725,6 +2747,11 @@ export class SyncService {
     let invalidItemIdCount = 0
     let successfulCount = 0
     let failedCount = 0
+    let context: Omit<SyncFailureDetail, 'runId' | 'reason' | 'suggestion'> = { stage: '验证连接' }
+    let lastProgress = { current: 0, total: 0 }
+    const recordContext = (stage: string, record: RecordInput): void => {
+      context = { stage, nodeType: record.nodeType, recordUid: record.uid, itemId: record.itemId, recordName: record.name }
+    }
     try {
       const client = this.clientFactory()
       const pendingRecords: RecordInput[] = []
@@ -2732,6 +2759,7 @@ export class SyncService {
       const emitProgress = (
         progress: Omit<SyncProgress, 'successfulCount' | 'failedCount'>
       ): void => {
+        lastProgress = { current: progress.current, total: progress.total }
         this.progress({ ...progress, successfulCount, failedCount })
       }
       const flushPendingRecords = async (): Promise<void> => {
@@ -2744,6 +2772,7 @@ export class SyncService {
         // remains unchanged.
         for (const record of batch) {
           if (record.nodeType === 'Project') {
+            recordContext('写入项目', record)
             this.db.upsertProject({
               uid: record.uid,
               name: record.name,
@@ -2753,8 +2782,10 @@ export class SyncService {
             })
           }
         }
+        context = { stage: '写入数据', nodeType: batch[0]?.nodeType, batchCount: batch.length }
         this.db.upsertRecords(batch)
         for (const record of batch) {
+          recordContext('同步图片', record)
           const imageSync = await this.syncImages(client, record.uid, record.raw)
           counts.images += imageSync.count
           if (JSON.stringify(imageSync.raw) !== JSON.stringify(record.raw)) {
@@ -2774,6 +2805,7 @@ export class SyncService {
       emitProgress({ phase: 'connect', message: '正在验证平台连接', current: 0, total: 1 })
       const connection = await client.test()
       if (!connection.ok) throw new Error(connection.message)
+      context = { stage: '校验采集配置' }
       if (!config?.selectedTypes.length) {
         throw new Error('请先保存至少一种采集数据类型')
       }
@@ -2781,6 +2813,7 @@ export class SyncService {
       const rules = new Map(config.rules.map((rule) => [rule.nodeType, rule]))
       for (let typeIndex = 0; typeIndex < config.selectedTypes.length; typeIndex += 1) {
         const configuredType = config.selectedTypes[typeIndex]
+        context = { stage: '请求数据', nodeType: configuredType }
         const rule = rules.get(configuredType)
         const filters = rule?.filters ?? []
         emitProgress({
@@ -2860,6 +2893,7 @@ export class SyncService {
               ? uid
               : value(raw, '_valm_ProjectId') || value(raw, '_valm_ProjectUid')
           const name = value(raw, '_valm_Name') || uid
+          context = { stage: '校验数据', nodeType, recordUid: uid, itemId, recordName: name }
           const lastModifyTime = value(raw, '_valm_LastModifyTime')
           const normalizedRaw = {
             ...raw,
@@ -2890,6 +2924,7 @@ export class SyncService {
           // and the latest occurrence wins deterministically.
           const itemKey = itemId.toLowerCase()
           if (pendingItemIds.has(itemKey)) await flushPendingRecords()
+          recordContext('校验数据', record)
           const existing = this.db.findRecordByItemId(itemId)
           if (existing) {
             retainedUids.push(existing.uid)
@@ -2950,6 +2985,7 @@ export class SyncService {
               JSON.stringify(existingDetail.raw) !== JSON.stringify(mergedRaw) ||
               existingDetail.normalizedText !== mergedNormalizedText
             if (recordChanged) {
+              context = { stage: '写入数据', nodeType: mergedNodeType, recordUid: existing.uid, itemId, recordName: mergedName }
               this.db.upsertRecord({
                 ...record,
                 uid: existing.uid,
@@ -2962,6 +2998,7 @@ export class SyncService {
                 normalizedText: mergedNormalizedText
               })
             }
+            context = { stage: '同步图片', nodeType: mergedNodeType, recordUid: existing.uid, itemId, recordName: mergedName }
             const imageSync = recordChanged || record.uid !== existing.uid
               ? await this.syncImages(client, existing.uid, mergedRaw, record.uid)
               : { count: 0, raw: mergedRaw }
@@ -2979,6 +3016,7 @@ export class SyncService {
               )
             }
             if (mergedNodeType === 'Project') {
+              context = { ...context, stage: '写入项目' }
               this.db.upsertProject({
                 uid: existing.uid,
                 name: mergedName,
@@ -3018,7 +3056,10 @@ export class SyncService {
         })
       }
 
+      context = { stage: '清理旧数据' }
+      emitProgress({ phase: 'cleanup', message: '正在清理本次采集范围外的旧数据及匹配引用', current: 0, total: 1 })
       this.db.retainRecords(retainedUids)
+      context = { stage: '保存采集结果' }
       this.db.finishSync(runId, 'success', counts)
       emitProgress({
         phase: 'done',
@@ -3044,16 +3085,44 @@ export class SyncService {
           (invalidItemIdCount ? `，${invalidItemIdCount} 条缺少 _valm_ItemID` : '')
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
+      const reason = error instanceof Error ? error.message : String(error)
+      const foreignKeyFailure = /FOREIGN KEY constraint failed/i.test(reason)
+      const suggestion = context.stage === '清理旧数据'
+        ? '已处理的数据已保留。旧数据清理未完成，请查看下方原始原因并修复后重新采集；无需先清空资产中心。'
+        : context.stage === '验证连接' || context.stage === '请求数据'
+          ? '请检查平台连接、登录凭据、采集条件和请求日志后重试。'
+          : '请根据涉及的数据类型、对象编号或批次数量排查原始错误；已完成的写入不会因本次任务失败全部撤销。'
+      const errorDetail: SyncFailureDetail = { runId, ...context, reason, suggestion }
+      const message = `${context.stage}失败：${foreignKeyFailure ? '本地数据关联约束冲突' : reason}`
+      const detailMessage = [
+        message,
+        `采集任务：${runId}`,
+        context.nodeType && `数据类型：${context.nodeType}`,
+        context.itemId && `对象编号：${context.itemId}`,
+        context.recordUid && `记录 UID：${context.recordUid}`,
+        context.recordName && `名称：${context.recordName}`,
+        context.batchCount !== undefined && `写入批次：${context.batchCount} 条（批次异常，未定位到单条记录）`,
+        `原始原因：${reason}`,
+        `处理建议：${suggestion}`
+      ].filter(Boolean).join('\n')
       failedCount += 1
-      this.db.finishSync(runId, 'failed', counts, message)
+      // Recording diagnostics must not mask the original collection failure.
+      try { this.db.finishSync(runId, 'failed', counts, detailMessage) } catch { /* database may be unavailable */ }
+      try {
+        const logId = this.db.beginCollectionRequestLog({
+          nodeType: context.nodeType ?? '本地采集流程',
+          endpoint: `local://collection/${context.stage}`,
+          params: { runId: String(runId), stage: context.stage }
+        })
+        this.db.finishCollectionRequestLog(logId, 'failed', { errorMessage: detailMessage })
+      } catch { /* errorDetail still reaches the renderer if diagnostic storage fails */ }
       this.progress({
         phase: 'error',
         message,
-        current: 0,
-        total: 0,
+        ...lastProgress,
         successfulCount,
-        failedCount
+        failedCount,
+        errorDetail
       })
       return {
         ok: false,
@@ -3064,7 +3133,8 @@ export class SyncService {
         skippedCount,
         invalidItemIdCount,
         duplicates: [],
-        message
+        message,
+        errorDetail
       }
     } finally {
       this.running = false

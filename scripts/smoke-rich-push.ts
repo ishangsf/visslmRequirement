@@ -93,7 +93,11 @@ const fakeClient = {
     createCount += 1
     createCalls.push({ params, body })
     const description = String(body._valm_Description ?? '')
-    assert.match(description, /FileCenterImg\/Index\//)
+    if (failUpload) {
+      assert.match(description, /图片未能上传/)
+    } else {
+      assert.match(description, /FileCenterImg\/Index\//)
+    }
     assert.equal(description.includes('visslm-asset://'), false)
     if (createCount === 1) {
       return { data: { ErrorCode: 0, propList: [{ _valm_Uid: 'remote-prop-list' }] }, httpStatus: 200 }
@@ -526,15 +530,25 @@ const failed = await service.push({ ...config, recordUids: ['push-record-fail'],
 assert.equal(failed.total, 1)
 assert.equal(failed.requests.length, 1)
 assert.equal(failed.requests[0].recordUid, 'push-record-fail')
-assert.equal(failed.failedCount, 1)
-assert.equal(createCount, createCountBeforeFailure)
+assert.equal(failed.successCount, 1)
+assert.equal(failed.failedCount, 0)
+assert.equal(createCount, createCountBeforeFailure + 1)
 assert.equal(failed.imageFailed, 1)
-assert.deepEqual(callEvents.slice(failedPushEventStart), ['upload'])
-assert.equal(db.getRecord('push-record-fail', false)?.pushedUid, '')
+assert.equal(failed.requests[0].error, undefined)
+assert.equal(failed.requests[0].imageFailed, 1)
+assert.deepEqual(callEvents.slice(failedPushEventStart), ['upload', 'create'])
 assert.equal(
-  db.listPushLogs(1, 20).rows.find((row) => row.recordUid === 'push-record-fail')?.status,
-  'failed'
+  createCalls[createCountBeforeFailure]?.body._valm_Description,
+  '<p><span>[图片未能上传]</span></p>'
 )
+assert.equal(db.getRecord('push-record-fail', false)?.pushedUid, 'remote-prop')
+const failedPushLog = db.listPushLogs(1, 20).rows.find((row) => row.recordUid === 'push-record-fail')
+assert.equal(
+  failedPushLog?.status,
+  'success'
+)
+assert.match(failedPushLog?.errorMessage ?? '', /部分图片未上传/)
+assert.match(failedPushLog?.errorMessage ?? '', /模拟图片上传失败/)
 
 db.close()
 console.log(JSON.stringify({ uploadCount, createCount, preview, pushed, retried, singular, safe, intranetRoot, intranetRelative, intranetDirectRoot, historicalCache, failed }))
