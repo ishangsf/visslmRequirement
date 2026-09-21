@@ -2003,10 +2003,14 @@ export class ModelClient {
     thinking: boolean,
     reasoningEffort?: ModelReasoningEffort
   ): Record<string, unknown> {
-    if (this.settings.provider === 'deepseek' || this.settings.provider === 'zhipu') {
+    const compatibleModelFamily = this.openAiCompatibleModelFamily()
+    if (this.settings.provider === 'deepseek' || compatibleModelFamily === 'deepseek') {
       return { thinking: { type: thinking ? 'enabled' : 'disabled' } }
     }
-    if (this.settings.provider === 'qwen') {
+    if (this.settings.provider === 'zhipu' || compatibleModelFamily === 'zhipu') {
+      return { thinking: { type: thinking ? 'enabled' : 'disabled' } }
+    }
+    if (this.settings.provider === 'qwen' || compatibleModelFamily === 'qwen') {
       return { enable_thinking: thinking }
     }
     if (this.settings.provider === 'openai' && this.isOpenAiReasoningModel()) {
@@ -2017,6 +2021,23 @@ export class ModelClient {
       return { reasoning_effort: thinking ? 'medium' : 'none' }
     }
     return {}
+  }
+
+  /**
+   * Some gateways are configured as `openai`/`openai-compatible` even though
+   * the selected model is a DeepSeek, GLM, or Qwen model.  Those providers do
+   * not expose a provider-specific setting, so infer the wire-level thinking
+   * switch only from an unambiguous model-family prefix.
+   */
+  private openAiCompatibleModelFamily(): 'deepseek' | 'zhipu' | 'qwen' | undefined {
+    if (this.settings.provider !== 'openai' && this.settings.provider !== 'openai-compatible') {
+      return undefined
+    }
+    const model = this.settings.model.trim().toLowerCase()
+    if (/^(?:deepseek)(?:[-_:./]|\d|$)/.test(model)) return 'deepseek'
+    if (/^(?:glm)(?:[-_:./]|\d|$)/.test(model)) return 'zhipu'
+    if (/^(?:qwen|qwq)(?:[-_:./]|\d|$)/.test(model)) return 'qwen'
+    return undefined
   }
 
   private isOpenAiReasoningModel(): boolean {

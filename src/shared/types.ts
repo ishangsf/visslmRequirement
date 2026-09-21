@@ -1,6 +1,7 @@
 import type {
   DashboardAiChangeSummary,
   DashboardExportResult,
+  DashboardDomainReceipt,
   DashboardAuditLog,
   DashboardComponentRepairResult,
   DashboardQualityReport,
@@ -11,6 +12,12 @@ import type {
   VisualizationRun
 } from './dashboard'
 import type { AgentEvent, AgentProgressUpdate, AssistantExecutionSummary, ExpertId } from './expert-types'
+import type {
+  DashboardDomainPlatformAdapter,
+  DashboardScenarioDraft,
+  DashboardScenarioGenerationResult,
+  DashboardScenarioReadiness
+} from './dashboard-domain'
 import type {
   DataScope,
   FieldProfile,
@@ -174,6 +181,33 @@ export interface AppSettings {
   projectMatching: ProjectMatchingSettings
   features: FeatureModuleSettings
   navigationOrder: FeatureNavigationOrder
+  /** Versioned, validated mappings used by the domain dashboard generator. */
+  dashboardDomainPlatformAdapters: DashboardDomainPlatformAdapter[]
+  /** Configuration errors are surfaced to the settings UI; invalid configs are never used at runtime. */
+  dashboardDomainPlatformAdapterErrors: string[]
+}
+
+export interface DashboardDomainPlatformAdapterSaveInput {
+  adapters: DashboardDomainPlatformAdapter[]
+}
+
+export interface DashboardDomainPlatformAdapterPreviewInput {
+  adapter: DashboardDomainPlatformAdapter
+  projectId: string
+}
+
+export interface DashboardDomainPlatformAdapterPreviewResult {
+  ok: boolean
+  status: 'ready' | 'rejected'
+  adapterId?: string
+  sourceSystem?: string
+  scenario?: string
+  title?: string
+  subtitle?: string
+  componentCount?: number
+  metricFields?: Array<{ metricId: string; field: string; aggregation: string }>
+  receipt?: DashboardDomainReceipt
+  reason?: string
 }
 
 export type ModelCapabilityStatus = 'supported' | 'limited' | 'unsupported' | 'unknown' | 'error'
@@ -1419,6 +1453,16 @@ export interface AppApi {
   saveProjectMatchingSettings(input: ProjectMatchingSettings): Promise<AppSettings>
   saveFeatureSettings(input: FeatureModuleSettings): Promise<AppSettings>
   saveNavigationOrder(input: FeatureNavigationOrder): Promise<AppSettings>
+  saveDashboardDomainPlatformAdapters(input: DashboardDomainPlatformAdapterSaveInput): Promise<AppSettings>
+  previewDashboardDomainPlatformAdapter(
+    input: DashboardDomainPlatformAdapterPreviewInput
+  ): Promise<DashboardDomainPlatformAdapterPreviewResult>
+  getDashboardScenarioReadiness(
+    input: DashboardScenarioDraft
+  ): Promise<DashboardScenarioReadiness>
+  generateDashboardFromScenario(
+    input: DashboardScenarioDraft
+  ): Promise<DashboardScenarioGenerationResult>
   testPlatform(input?: PlatformSettingsInput): Promise<ConnectionResult>
   testModel(input?: ModelSettings, probeChat?: boolean, probeCapabilities?: boolean): Promise<ConnectionResult>
   listProjects(): Promise<ProjectRow[]>
@@ -1500,7 +1544,7 @@ export interface AppApi {
   uploadKnowledgeDocuments(): Promise<KnowledgeUploadResult>
   retryKnowledgeDocument(id: string): Promise<KnowledgeDocument | null>
   updateKnowledgeDocumentTags(id: string, tags: string[]): Promise<KnowledgeDocument | null>
-  deleteKnowledgeDocument(id: string): Promise<{ ok: boolean; message: string }>
+  deleteKnowledgeDocument(id: string): Promise<{ ok: boolean; message: string; code?: 'DOCUMENT_IN_USE' }>
   rebuildKnowledgeIndex(): Promise<KnowledgeRebuildResult>
   cancelKnowledgeTask(taskId: string): Promise<boolean>
   getKnowledgeStats(): Promise<KnowledgeStats>

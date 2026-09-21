@@ -59,25 +59,18 @@ assert.deepEqual(
   expectedScenarioIds,
   'GJB 必须固定八个黄金场景 ID'
 )
-assert.equal(catalog.scenarios.filter((scenario) => scenario.status === 'active').length, 6)
+assert.equal(catalog.scenarios.filter((scenario) => scenario.status === 'active').length, 8)
 assert.equal(catalog.scenarios.find((scenario) => scenario.id === 'project-overview')?.status, 'active')
 assert.equal(catalog.scenarios.find((scenario) => scenario.id === 'requirements-delivery')?.status, 'active')
 assert.equal(catalog.scenarios.find((scenario) => scenario.id === 'plan-milestone')?.status, 'active')
 assert.equal(catalog.scenarios.find((scenario) => scenario.id === 'software-quality')?.status, 'active')
 assert.equal(catalog.scenarios.find((scenario) => scenario.id === 'test-validation')?.status, 'active')
 assert.equal(catalog.scenarios.find((scenario) => scenario.id === 'configuration-change')?.status, 'active')
+assert.equal(catalog.scenarios.find((scenario) => scenario.id === 'gjb5000b-compliance')?.status, 'active')
+assert.equal(catalog.scenarios.find((scenario) => scenario.id === 'organization-improvement')?.status, 'active')
 assert.ok(
-  catalog.scenarios
-    .filter((scenario) => ![
-      'project-overview',
-      'requirements-delivery',
-      'plan-milestone',
-      'software-quality',
-      'test-validation',
-      'configuration-change'
-    ].includes(scenario.id))
-    .every((scenario) => scenario.status === 'planned'),
-  '第二期当前只能激活前六个场景，其余场景必须 planned'
+  catalog.scenarios.every((scenario) => scenario.status === 'active'),
+  '八个黄金场景收口后必须全部 active'
 )
 
 const requiredMetricFields: Array<keyof MetricCatalogEntry> = [

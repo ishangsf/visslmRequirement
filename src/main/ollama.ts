@@ -47,6 +47,8 @@ import {
   selectHistoryWithSummary
 } from './context-budget'
 import { resolveNaturalLanguageDeliveryIntent } from '../shared/assistant-natural-language'
+import { parseRegionalRequirementRequest } from './assistant/regional-requirements'
+import type { RegionalRequirementResult } from './assistant/regional-requirements'
 
 type AgentStatusEvent = Extract<AgentEvent, { type: 'status' }>
 
@@ -756,6 +758,16 @@ export class OllamaAgent {
     const rawGroundingQuestion = String(groundingQuestionInput ?? request.question).trim()
     const parsedDelivery = resolveNaturalLanguageDeliveryIntent(rawGroundingQuestion)
     const groundingQuestion = parsedDelivery?.queryText.trim() || rawGroundingQuestion
+    const regionalRequirements = parseRegionalRequirementRequest(groundingQuestion)
+    if (regionalRequirements) {
+      return {
+        sourceMode: 'records', needsClarification: false, intent: 'analyze_records', resultMode: 'answer',
+        explanation: '按用户给定区域及完整编号精确核对需求，再基于命中内容分析',
+        regionalRequirements, groupEntities: regionalRequirements.groups.map((group) => group.name),
+        searchTerms: [...new Set(regionalRequirements.groups.flatMap((group) => group.codes))],
+        searchMode: 'any', filters: [], fields: [], limit: 200, scope: request.dataScope
+      }
+    }
     const naturalDeliveryQuery = parsedDelivery?.queryText.trim() ?? ''
     const naturalDeliveryRecordRequest = Boolean(naturalDeliveryQuery)
     const conversationContext = selectHistoryMessages(request.history, 6, 1_200)
@@ -1495,7 +1507,7 @@ export class OllamaAgent {
     // path: besides adding latency, an empty reasoning response could turn a
     // successful local query into AGENT_REQUEST_FAILED. Analysis and all
     // knowledge/mixed paths still use the final model below.
-    const deterministicRecordAnswer = plan.sourceMode === 'records' && recordExecution
+    const deterministicRecordAnswer = plan.sourceMode === 'records' && recordExecution && !plan.regionalRequirements
       ? this.dataCenterAgent.renderVerifiedAnswer(plan, recordExecution.result, '')
       : ''
     if (deterministicRecordAnswer.trim()) {
@@ -1520,7 +1532,19 @@ export class OllamaAgent {
           !hasKnowledgeEvidence ? '知识库文档' : ''
         ].filter(Boolean)
       : []
-    const queryResult = recordExecution
+    const queryResult = plan.regionalRequirements && recordExecution
+      ? (() => {
+          const regional = recordExecution.result as RegionalRequirementResult
+          return {
+            requestedCodeCount: regional.requestedCodeCount, matchedCodeCount: regional.matchedCodeCount,
+            matchedCount: regional.matchedCount, regionalGroups: regional.regionalGroups.map(({ recordUids: _uids, ...group }) => group),
+            records: regional.records.map((record) => ({
+              source: record.source,
+              text: record.text.slice(0, Math.max(100, Math.floor(18_000 / Math.max(1, regional.records.length))))
+            }))
+          }
+        })()
+      : recordExecution
       ? this.compactModelResult(recordExecution.result)
       : undefined
     const knowledgeEvidence = knowledgeExecution?.hits.map((hit) => {
@@ -1574,15 +1598,18 @@ export class OllamaAgent {
       think: finalAnswerThinkingEnabled(request.thinkingMode),
       temperature: 0.1,
       numPredict: 1400
+    }).catch((error: unknown) => {
+      if (!plan.regionalRequirements || (error instanceof Error && error.name === 'AbortError')) throw error
+      return { message: { role: 'assistant' as const, content: '' } }
     })
-    const modelAnswer = response.message?.content?.trim() || '模型没有生成可验证的回答。'
+    const modelAnswer = response.message?.content?.trim() || (plan.regionalRequirements ? '' : '模型没有生成可验证的回答。')
     let answer = plan.sourceMode === 'records' && recordExecution
       ? this.dataCenterAgent.renderVerifiedAnswer(plan, recordExecution.result, modelAnswer)
       : this.ensureVerifiableCitations(modelAnswer, [...sources.values()])
     if (missingSources.length) {
       answer = `${answer.trim()}\n\n未获得${missingSources.join('、')}证据，本次回答仅基于已返回来源。`
     }
-    answer = this.ensureVerifiableCitations(answer, [...sources.values()])
+    answer = this.ensureVerifiableCitations(answer, [...sources.values()], plan.regionalRequirements ? 200 : 20)
     this.activity(workLogForVerification())
     this.activity(workLogForDelivery())
     return {
@@ -1636,10 +1663,10 @@ export class OllamaAgent {
     }
   }
 
-  private ensureVerifiableCitations(answer: string, sources: ChatSource[]): string {
+  private ensureVerifiableCitations(answer: string, sources: ChatSource[], sourceLimit = 20): string {
     const boundedSources = sources
       .filter((source) => typeof source.uid === 'string' && source.uid.trim())
-      .slice(0, 20)
+      .slice(0, sourceLimit)
     const documentSources = boundedSources.filter((source) => source.sourceType === 'document')
     const citationsByHref = new Map<string, { source: ChatSource; markdown: string }>()
     for (const source of documentSources) {

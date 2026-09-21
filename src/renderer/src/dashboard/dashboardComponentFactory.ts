@@ -25,6 +25,8 @@ import { componentDefinitionByType } from './componentRegistry'
 
 export type ManualDashboardComponentPlan = {
   component: DashboardComponentSpec
+  /** Stable dashboard-level scope retained even when the source component is later removed. */
+  dataScope?: DataScope
   analysisBlueprint?: DashboardAnalysisBlueprint
   /** Populated when a legacy query-backed dashboard is upgraded atomically. */
   components?: DashboardComponentSpec[]
@@ -32,6 +34,8 @@ export type ManualDashboardComponentPlan = {
 
 export type ManualDashboardComponentRemovalPlan = {
   components: DashboardComponentSpec[]
+  /** Scope captured before removal so deleting the final query component is reversible. */
+  dataScope?: DataScope
   analysisBlueprint?: DashboardAnalysisBlueprint
 }
 
@@ -49,7 +53,12 @@ export const planDashboardComponentRemoval = (
   const components = dashboard.components
     .filter((component) => component.id !== componentId)
     .map((component) => clone(component))
-  if (!dashboard.analysisBlueprint) return { components }
+  const dataScope = dashboard.dataScope
+    ?? dashboard.components.find((component) => component.query)?.query?.scope
+  const stableScope = dataScope ? clone(dataScope) : undefined
+  if (!dashboard.analysisBlueprint) {
+    return { components, ...(stableScope ? { dataScope: stableScope } : {}) }
+  }
   const analysisBlueprint = clone(dashboard.analysisBlueprint)
   const removedQuestionId = removed.semanticBinding?.questionId
   if (removedQuestionId && !components.some((component) =>
@@ -61,7 +70,11 @@ export const planDashboardComponentRemoval = (
         : question
     )
   }
-  return { components, analysisBlueprint }
+  return {
+    components,
+    ...(stableScope ? { dataScope: stableScope } : {}),
+    analysisBlueprint
+  }
 }
 
 const fieldLabel = (profile?: FieldProfile, fallback = ''): string =>
@@ -269,7 +282,7 @@ const buildQuery = (
   profiles: FieldProfile[]
 ): { query: QuerySpec; encoding: NonNullable<DashboardComponentSpec['encoding']>; dimensionProfile?: FieldProfile } | { error: string } => {
   const template = dashboard.components.find((component) => component.query)?.query
-  const scope: DataScope | undefined = template?.scope
+  const scope: DataScope | undefined = dashboard.dataScope ?? template?.scope
   if (!scope) return { error: '当前大屏没有可用的数据范围，无法新增绑定查询的组件。' }
 
   const primary = createMeasure(undefined)
@@ -285,7 +298,10 @@ const buildQuery = (
     'scatter',
     'table',
     'treemap',
-    'combo'
+    'combo',
+    'data-matrix',
+    'description-list',
+    'comparison-bars'
   ].includes(type)
   if (needsDimension && !dimensionProfile && type !== 'table') {
     return { error: `${componentDefinitionByType.get(type)?.name ?? '该组件'}需要一个可用的分类或时间字段，请先完成字段画像。` }
@@ -327,6 +343,100 @@ const buildQuery = (
     ...(type === 'scatter' || type === 'combo' ? { secondaryValue: measures[1].id } : {})
   }
   return { query, encoding, dimensionProfile }
+}
+
+const inlineDataFor = (type: DashboardComponentType): DashboardComponentSpec['data'] => {
+  if (['kpi', 'progress', 'gauge', 'insight'].includes(type)) {
+    return [{ name: '数值', value: 0 }]
+  }
+  const dualMeasure = type === 'scatter' || type === 'combo' || type === 'comparison-bars'
+  return ['数据项 1', '数据项 2', '数据项 3'].map((name) => ({
+    name,
+    value: 0,
+    ...(dualMeasure ? { secondaryValue: 0 } : {})
+  }))
+}
+
+const inlineContentFor = (
+  type: DashboardComponentType,
+  componentId: string,
+  data: DashboardComponentSpec['data']
+): DashboardComponentSpec['content'] | undefined => {
+  if (type === 'data-matrix') {
+    return {
+      kind: 'data-matrix',
+      leadingLabel: '对象',
+      columns: ['状态', '数量', '结论'],
+      rows: data.map((item, rowIndex) => ({
+        id: `${componentId}-row-${rowIndex + 1}`,
+        label: item.name,
+        tone: 'neutral',
+        cells: [
+          { id: `${componentId}-status-${rowIndex + 1}`, label: '待配置', tone: 'neutral' },
+          { id: `${componentId}-value-${rowIndex + 1}`, label: String(item.value), tone: 'info' },
+          { id: `${componentId}-conclusion-${rowIndex + 1}`, label: '待研判', tone: 'warning' }
+        ]
+      })),
+      pageSize: 8,
+      expansionMode: 'none'
+    }
+  }
+  if (type === 'description-list') {
+    return {
+      kind: 'description-list',
+      heading: '对象详情',
+      status: { label: '待配置', tone: 'neutral' },
+      fields: data.map((item, index) => ({
+        id: `${componentId}-field-${index + 1}`,
+        label: item.name,
+        value: String(item.value)
+      }))
+    }
+  }
+  if (type === 'comparison-bars') {
+    return {
+      kind: 'comparison-bars',
+      valueLabel: '当前值',
+      secondaryLabel: '参考值',
+      items: data.map((item, index) => ({
+        id: `${componentId}-item-${index + 1}`,
+        label: item.name,
+        value: item.value,
+        secondaryValue: item.secondaryValue
+      }))
+    }
+  }
+  return undefined
+}
+
+const createInlineManualComponent = (
+  dashboard: DashboardSpec,
+  type: DashboardComponentType
+): ManualDashboardComponentPlan | { error: string } => {
+  const definition = componentDefinitionByType.get(type)
+  if (!definition?.supportsManualAdd) return { error: '该组件暂不支持手工添加。' }
+  const layout = findFirstAvailableDashboardLayout(dashboard.components, type)
+  if (!layout) return { error: '画布没有满足该组件最小尺寸的空位，请先调整或删除一个组件。' }
+  const id = createDashboardComponentId(
+    `manual-${slug(type)}`,
+    new Set(dashboard.components.map((component) => component.id))
+  )
+  const data = inlineDataFor(type)
+  const content = inlineContentFor(type, id, data)
+  return {
+    component: {
+      id,
+      type,
+      title: definition.name,
+      subtitle: '手动数据 · 可在右侧属性面板配置',
+      layout,
+      data,
+      ...(content ? { content } : {}),
+      ...(type === 'insight' ? { insight: '请在右侧属性面板填写洞察内容。' } : {}),
+      slotRole: definition.compatibleSlotRoles[0]
+    },
+    ...(dashboard.dataScope ? { dataScope: clone(dashboard.dataScope) } : {})
+  }
 }
 
 const metricForMeasure = (
@@ -422,6 +532,9 @@ export const createManualDashboardComponent = (
   if (!definition?.supportsManualAdd || !definition.requiresQuery) {
     return { error: '该组件暂不支持手工添加。' }
   }
+  if (!dashboard.analysisBlueprint && !dashboard.components.some((component) => component.query)) {
+    return createInlineManualComponent(dashboard, type)
+  }
   const queryResult = buildQuery(dashboard, type, profiles)
   if ('error' in queryResult) return queryResult
   const { query, encoding, dimensionProfile } = queryResult
@@ -471,6 +584,7 @@ export const createManualDashboardComponent = (
   component.title = semantic.title || fallbackTitle
   return {
     component,
+    dataScope: clone(query.scope),
     analysisBlueprint: semantic.blueprint,
     ...(legacyUpgrade ? {
       components: [...semanticDashboard.components, component]

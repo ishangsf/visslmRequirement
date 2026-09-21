@@ -1421,8 +1421,15 @@ export class KnowledgeService {
     return this.db.updateKnowledgeDocument(id, { tags: normalized })
   }
 
-  deleteDocument(id: string): { ok: boolean; message: string } {
+  deleteDocument(id: string): { ok: boolean; message: string; code?: 'DOCUMENT_IN_USE' } {
     const result = this.db.deleteKnowledgeDocument(id)
+    if (result.code === 'DOCUMENT_IN_USE') {
+      return {
+        ok: false,
+        code: result.code,
+        message: result.message ?? '知识库文档仍被项目引用，请先解除项目协议关联后再删除'
+      }
+    }
     if (result.deleted) this.clearVectorCaches()
     return result.deleted
       ? { ok: true, message: `已从知识库删除 ${id}` }

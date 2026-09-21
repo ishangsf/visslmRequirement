@@ -111,9 +111,19 @@ const incompatibleSwap = swapDashboardComponentLayouts([
 assert.ok(incompatibleSwap?.errors.length)
 
 const registeredTypes = new Set(dashboardComponentRegistry.map((component) => component.type))
-assert.equal(dashboardComponentRegistry.length, 14, 'P1 Manifest 必须覆盖全部 14 个内置组件')
+assert.equal(dashboardComponentRegistry.length, 17, '公共组件 Manifest 必须覆盖全部 17 个内置组件')
 assert.equal(registeredTypes.size, dashboardComponentRegistry.length, 'Manifest type 必须唯一')
-for (const type of ['gauge', 'funnel', 'radar', 'scatter', 'treemap', 'combo'] as const) {
+for (const type of [
+  'gauge',
+  'funnel',
+  'radar',
+  'scatter',
+  'treemap',
+  'combo',
+  'data-matrix',
+  'description-list',
+  'comparison-bars'
+] as const) {
   assert.ok(registeredTypes.has(type), `missing component type: ${type}`)
 }
 
@@ -566,10 +576,55 @@ assert.deepEqual(validateDashboardSemanticConsistency({
 assert.ok('error' in planDashboardComponentRemoval(blueprintDashboard, semanticKpi.id),
   '大屏必须至少保留一个组件')
 
+const deleteThenAddDashboard: DashboardSpec = {
+  ...base,
+  id: 'editor-delete-then-add-smoke',
+  dataScope: undefined,
+  components: [
+    { ...base.components[0], id: 'query-source' },
+    {
+      ...base.components[0],
+      id: 'manual-survivor',
+      title: '手动保留组件',
+      layout: { x: 6, y: 0, w: 6, h: 2 },
+      query: undefined,
+      encoding: undefined
+    }
+  ]
+}
+const deleteThenAddSource = JSON.stringify(deleteThenAddDashboard)
+const querySourceRemoval = planDashboardComponentRemoval(deleteThenAddDashboard, 'query-source')
+if ('error' in querySourceRemoval) throw new Error(querySourceRemoval.error)
+assert.deepEqual(querySourceRemoval.dataScope, {},
+  '删除最后一个 QuerySpec 组件时必须把数据范围提升到大屏级状态')
+const afterQuerySourceRemoval: DashboardSpec = {
+  ...deleteThenAddDashboard,
+  components: querySourceRemoval.components,
+  dataScope: querySourceRemoval.dataScope
+}
+const afterRemovalAddPlan = createManualDashboardComponent(
+  afterQuerySourceRemoval,
+  'comparison-bars',
+  []
+)
+assert.ok(!('error' in afterRemovalAddPlan), '删除查询组件后必须仍可新增公共基础组件')
+if ('error' in afterRemovalAddPlan) throw new Error(afterRemovalAddPlan.error)
+assert.equal(afterRemovalAddPlan.component.query, undefined,
+  '纯手动大屏在无字段画像时应新增可编辑的手动数据组件')
+assert.equal(afterRemovalAddPlan.component.content?.kind, 'comparison-bars',
+  '结构化公共组件必须带可在属性面板编辑的默认内容')
+assert.deepEqual(validateDashboardSpec({
+  ...afterQuerySourceRemoval,
+  components: [...afterQuerySourceRemoval.components, afterRemovalAddPlan.component]
+}, undefined, { allowInlineData: true }), [],
+'删除后新增的手动组件必须形成有效的展示快照')
+assert.equal(JSON.stringify(deleteThenAddDashboard), deleteThenAddSource,
+  '删除后新增规划不得修改源 Spec')
+
 console.log(JSON.stringify({
   ok: true,
   globalFilterCount: base.globalFilters?.length ?? 0,
   encoding: base.components[0].encoding,
   componentTypeCount: dashboardComponentRegistry.length,
-  checks: ['dashboard-validation', 'query-shape', 'accent-safety', 'style-ranges', 'filter-whitelist', 'horizontal-swap', 'vertical-swap', 'sized-slot-swap', 'component-registry', 'type-adaptation', 'date-dimension', 'scatter-measures', 'immutable-planning', 'manifest-shape', 'manual-add-contract', 'scatter-dual-measure', 'slot-role-contract', 'manual-factory-bar', 'manual-factory-line', 'manual-factory-scatter', 'manual-factory-treemap', 'manual-factory-combo', 'manual-layout-placement', 'manual-blueprint-binding', 'manual-semantic-validation', 'manual-combo-blueprint-binding', 'manual-legacy-query-upgrade', 'manual-mixed-legacy-rejection', 'manual-delete-cleanup', 'minimum-one-component']
+  checks: ['dashboard-validation', 'query-shape', 'accent-safety', 'style-ranges', 'filter-whitelist', 'horizontal-swap', 'vertical-swap', 'sized-slot-swap', 'component-registry', 'type-adaptation', 'date-dimension', 'scatter-measures', 'immutable-planning', 'manifest-shape', 'manual-add-contract', 'scatter-dual-measure', 'slot-role-contract', 'manual-factory-bar', 'manual-factory-line', 'manual-factory-scatter', 'manual-factory-treemap', 'manual-factory-combo', 'manual-layout-placement', 'manual-blueprint-binding', 'manual-semantic-validation', 'manual-combo-blueprint-binding', 'manual-legacy-query-upgrade', 'manual-mixed-legacy-rejection', 'manual-delete-cleanup', 'delete-then-add-scope-retention', 'inline-component-fallback', 'minimum-one-component']
 }, null, 2))

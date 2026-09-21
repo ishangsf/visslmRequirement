@@ -76,6 +76,11 @@ const checks = await evaluate(`(async () => {
       rect.left < window.innerWidth &&
       rect.top < window.innerHeight
   }
+  const isDisplayedTabContent = (element) => {
+    const panel = element?.closest('[role="tabpanel"]')
+    return Boolean(element && panel) && panel.getAttribute('aria-hidden') !== 'true' &&
+      getComputedStyle(panel).display !== 'none'
+  }
   const waitForVisible = async (selector, timeout = 10000) => {
     const started = Date.now()
     let element = null
@@ -107,11 +112,23 @@ const checks = await evaluate(`(async () => {
     libraryPanel?.getAttribute('aria-hidden') === 'true'
   const componentRailButton = [...document.querySelectorAll('.dashboard-workbench-rail button')]
     .find((button) => button.textContent?.includes('组件'))
+  const outlineRailButton = [...document.querySelectorAll('.dashboard-workbench-rail button')]
+    .find((button) => button.textContent?.includes('大纲'))
   componentRailButton?.click()
   await new Promise((resolve) => setTimeout(resolve, 240))
   const libraryPanelOpensAsOverlay = Boolean(libraryPanel) &&
     libraryPanel?.getAttribute('aria-hidden') === 'false' &&
     libraryPanel.getBoundingClientRect().width >= 280
+  const componentLibraryOnlyWhenActive = isDisplayedTabContent(
+    document.querySelector('.dashboard-component-library')
+  ) && !isDisplayedTabContent(document.querySelector('.dashboard-component-outline'))
+  outlineRailButton?.click()
+  await new Promise((resolve) => setTimeout(resolve, 180))
+  const outlineOnlyWhenActive = isDisplayedTabContent(
+    document.querySelector('.dashboard-component-outline')
+  ) && !isDisplayedTabContent(document.querySelector('.dashboard-component-library'))
+  componentRailButton?.click()
+  await new Promise((resolve) => setTimeout(resolve, 180))
   const componentDescriptionsUseTwoLines = [...document.querySelectorAll(
     '.dashboard-component-library-card-copy small'
   )].every((description) => getComputedStyle(description).webkitLineClamp === '2')
@@ -258,6 +275,43 @@ const checks = await evaluate(`(async () => {
   const selectionKeepsStudioHeight = Math.abs(studioBodyHeightBeforeBlur - studioBodyHeightAfterBlur) <= 1 &&
     Math.abs(studioBodyHeightAfterBlur - studioBodyHeightAfterRestore) <= 1
 
+  const widgetCountBeforeDelete = document.querySelectorAll('.dashboard-widget').length
+  document.querySelector('button[aria-label="删除当前组件"]')?.click()
+  const deleteConfirm = await waitForVisible('.ant-popconfirm-buttons .ant-btn-primary')
+  deleteConfirm?.click()
+  const deleteStarted = Date.now()
+  while (document.querySelectorAll('.dashboard-widget').length !== widgetCountBeforeDelete - 1 &&
+      Date.now() - deleteStarted < 3000) {
+    await new Promise((resolve) => setTimeout(resolve, 60))
+  }
+  const deleteRemovesOneComponent = document.querySelectorAll('.dashboard-widget').length ===
+    widgetCountBeforeDelete - 1
+  componentRailButton?.click()
+  await new Promise((resolve) => setTimeout(resolve, 220))
+  const comparisonBarsAddButton = document.querySelector(
+    'button[aria-label^="添加比较条形："]'
+  )
+  comparisonBarsAddButton?.click()
+  const addStarted = Date.now()
+  while (!document.querySelector('.dashboard-widget.widget-comparison-bars') &&
+      Date.now() - addStarted < 3000) {
+    await new Promise((resolve) => setTimeout(resolve, 60))
+  }
+  const deleteThenAddRestoresComponentCount = document.querySelectorAll('.dashboard-widget').length ===
+    widgetCountBeforeDelete
+  const addedManualComparisonBars = Boolean(
+    document.querySelector('.dashboard-widget.widget-comparison-bars.selected') &&
+    [...document.querySelectorAll('.dashboard-component-data-editor .ant-tag')]
+      .some((tag) => tag.textContent?.includes('手动数据')) &&
+    document.querySelector('.dashboard-component-content-editor')
+  )
+  const noDataScopeWarning = ![...document.querySelectorAll('.ant-message-notice-content')]
+    .some((notice) => notice.textContent?.includes('没有可用的数据范围'))
+  document.querySelector('.dashboard-widget:not(.widget-comparison-bars)')?.click()
+  await new Promise((resolve) => setTimeout(resolve, 180))
+  document.querySelector('button[aria-label="关闭左侧面板"]')?.click()
+  await new Promise((resolve) => setTimeout(resolve, 160))
+
   const qualityButton = [...document.querySelectorAll('button')]
     .find((button) => button.textContent?.trim() === '检查' && isVisibleInViewport(button))
   qualityButton?.click()
@@ -397,6 +451,8 @@ const checks = await evaluate(`(async () => {
     canvasUsesAvailableWidth,
     libraryInitiallyOnDemand,
     libraryPanelOpensAsOverlay,
+    componentLibraryOnlyWhenActive,
+    outlineOnlyWhenActive,
     componentDescriptionsUseTwoLines,
     focusModeHidesPanels,
     resizerAccessible,
@@ -405,6 +461,10 @@ const checks = await evaluate(`(async () => {
     inspectorWidthPersisted,
     selectionKeepsCanvasLayout,
     selectionKeepsStudioHeight,
+    deleteRemovesOneComponent,
+    deleteThenAddRestoresComponentCount,
+    addedManualComparisonBars,
+    noDataScopeWarning,
     initiallySelected,
     dashboardInfoHiddenWhenSelected,
     componentDataVisible,

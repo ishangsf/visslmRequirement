@@ -131,11 +131,24 @@ export function DashboardGrid({
   const [swapTargetId, setSwapTargetId] = useState<string | null>(null)
   const [dropState, setDropState] = useState<DropState>(null)
   const [layoutResetKey, setLayoutResetKey] = useState(0)
+  const [runtimeSelections, setRuntimeSelections] = useState<Record<string, string>>({})
   const interactionRef = useRef<GridInteraction | null>(null)
   const pendingLayoutRef = useRef<GridLayout | null>(null)
   const interactionFrameRef = useRef<number | null>(null)
   const rowCount = dashboardRowCount(components)
   const initialGridLayout = useMemo(() => toGridLayout(components), [components])
+  const defaultSelections = useMemo(() => Object.fromEntries(
+    components.flatMap((component) => {
+      const content = component.content
+      return content?.kind === 'data-matrix' && content.selectionChannel
+        ? [[content.selectionChannel, content.selectedRowId ?? content.rows[0]?.id ?? '']]
+        : []
+    }).filter((entry) => Boolean(entry[1]))
+  ), [components])
+  const selectionByChannel = useMemo(
+    () => ({ ...defaultSelections, ...runtimeSelections }),
+    [defaultSelections, runtimeSelections]
+  )
   const gridSpacing = theme === 'business-light'
     ? { gap: 10, padding: 14 }
     : theme === 'minimal-light'
@@ -431,7 +444,14 @@ export function DashboardGrid({
                   </div>
                 </header>
                 <div className="dashboard-widget-content">
-                  <DashboardComponentRenderer component={component} theme={theme} />
+                  <DashboardComponentRenderer
+                    component={component}
+                    theme={theme}
+                    selectionByChannel={selectionByChannel}
+                    onSelectionChange={(channel, selectionId) => {
+                      setRuntimeSelections((current) => ({ ...current, [channel]: selectionId }))
+                    }}
+                  />
                 </div>
               </section>
             )

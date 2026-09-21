@@ -200,7 +200,7 @@ const assertRejected = (input: PlannerInput, message: RegExp): void => {
   assert.throws(() => compile(input), message)
 }
 assertRejected({ ...completeInput, projectIds: [] }, /ready|project|scope|范围/i)
-assertRejected({ ...completeInput, scenario: 'gjb5000b-compliance' as 'project-overview' },
+assertRejected({ ...completeInput, scenario: 'future-scenario' as 'project-overview' },
   /planned|active|scenario|场景/i)
 
 console.log(JSON.stringify({

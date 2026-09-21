@@ -125,9 +125,15 @@ import type {
   ProjectRequirementQuery,
   ProjectRequirementReviewStatus,
   ProjectRequirementSetSummary,
+  ProjectRequirementSetSnapshot,
+  ProjectRequirementMatchRunSnapshot,
+  ProjectRequirementMatchCandidateSnapshot,
+  ProjectRequirementTraceMetadata,
+  ProjectRequirementTraceSnapshot,
   ProjectRequirementSplitInput,
   ProjectRequirementStatus,
-  ProjectRequirementStatusSource
+  ProjectRequirementStatusSource,
+  ProjectTraceStatus
 } from '../shared/project-types'
 import { normalizeProjectRequirementText } from '../shared/project-requirement-utils'
 import {
@@ -229,6 +235,8 @@ type SqlRow = Record<string, unknown>
 type SqlStatement = ReturnType<DatabaseSync['prepare']>
 
 const nowIso = (): string => new Date().toISOString()
+const PROJECT_BASE_ESTIMATE_CATEGORY = '项目预估'
+const PROJECT_BASE_ESTIMATE_DESCRIPTION = '项目创建时的预计成本'
 const KNOWLEDGE_VECTOR_COARSE_STEP = 8
 const TASK_RETENTION_DAYS = 30
 const KNOWLEDGE_RECORD_SNAPSHOT_PAGE_SIZE = 256
@@ -591,6 +599,123 @@ const parseJsonArray = (value: unknown): string[] => {
       : []
   } catch {
     return []
+  }
+}
+
+const projectTraceStatuses = new Set<ProjectTraceStatus>(['valid', 'suspect', 'invalid'])
+
+const compactProjectRequirementValue = (value: unknown): string => String(value ?? '')
+  .replace(/[\s\p{P}\p{S}]+/gu, '')
+  .toLocaleLowerCase()
+
+/**
+ * The fingerprint deliberately uses the normalized business text and terms,
+ * rather than a database id or source location.  That lets a regenerated
+ * review checkpoint inherit identity while still allowing split/merge paths
+ * (which explicitly allocate a new logical id) to remain new identities.
+ */
+const projectRequirementFingerprint = (input: {
+  module?: unknown
+  title?: unknown
+  content?: unknown
+  category?: unknown
+  keyInfoTerms?: unknown
+}): string => {
+  const normalized = normalizeProjectRequirementText(input)
+  const terms = Array.isArray(input.keyInfoTerms)
+    ? [...new Set(input.keyInfoTerms.map(compactProjectRequirementValue).filter(Boolean))].sort()
+    : []
+  return createHash('sha256').update(JSON.stringify({
+    module: compactProjectRequirementValue(normalized.module),
+    title: compactProjectRequirementValue(normalized.title),
+    content: compactProjectRequirementValue(normalized.content),
+    // Category is a material requirement field.  Keep source-location and
+    // evidence fields out of the identity so provenance-only edits do not
+    // invalidate existing traces.
+    category: compactProjectRequirementValue(input.category),
+    keyInfoTerms: terms
+  })).digest('hex')
+}
+
+const projectRequirementFingerprintFromRow = (row: SqlRow): string => projectRequirementFingerprint({
+  module: row.module,
+  title: row.title,
+  content: row.content,
+  category: row.category,
+  keyInfoTerms: parseJsonArray(row.key_info_terms_json)
+})
+
+const legacyProjectRequirementLogicalId = (
+  projectId: string,
+  fingerprint: string,
+  requirementId: string
+): string => `legacy:${createHash('sha256')
+  .update(`${projectId}\u0000${fingerprint}\u0000${requirementId}`)
+  .digest('hex')}`
+
+const projectRequirementSetFingerprint = (fingerprints: string[]): string => createHash('sha256')
+  .update(JSON.stringify([...fingerprints].filter(Boolean).sort()))
+  .digest('hex')
+
+// Keep imported match runs compatible with the mapped requirement row. This
+// mirrors the canonical snapshot used by requirement-match-run-service without
+// importing that service back into the database module (which would create a
+// runtime dependency cycle).
+const projectRequirementRuntimeSnapshotHash = (requirement: ProjectRequirement): string => createHash('sha256')
+  .update(JSON.stringify({
+    id: requirement.id,
+    projectId: requirement.projectId,
+    version: requirement.version,
+    category: requirement.category,
+    module: requirement.module,
+    title: requirement.title,
+    content: requirement.content,
+    keyInfoTerms: [...requirement.keyInfoTerms].sort(),
+    updatedAt: requirement.updatedAt
+  }))
+  .digest('hex')
+
+const safeTraceStatus = (value: unknown, fallback: ProjectTraceStatus = 'suspect'): ProjectTraceStatus => {
+  const normalized = String(value ?? '') as ProjectTraceStatus
+  return projectTraceStatuses.has(normalized) ? normalized : fallback
+}
+
+const parseProjectTraceMetadata = (
+  value: unknown,
+  fallback: ProjectRequirementTraceMetadata
+): ProjectRequirementTraceMetadata => {
+  let parsed: unknown
+  try {
+    parsed = typeof value === 'string' ? JSON.parse(value || '{}') : value
+  } catch {
+    parsed = undefined
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return fallback
+  const record = parsed as Record<string, unknown>
+  const sourceRequirementId = String(record.sourceRequirementId ?? fallback.sourceRequirementId).trim()
+  const sourceSetId = String(record.sourceSetId ?? fallback.sourceSetId).trim()
+  const targetRequirementIdValue = record.targetRequirementId
+  const targetRequirementId = targetRequirementIdValue === null || targetRequirementIdValue === undefined || String(targetRequirementIdValue).trim() === ''
+    ? fallback.targetRequirementId
+    : String(targetRequirementIdValue).trim()
+  const sourceBaselineVersion = Math.max(0, Math.trunc(Number(record.sourceBaselineVersion ?? fallback.sourceBaselineVersion)))
+  const sourceRequirementVersion = Math.max(0, Math.trunc(Number(record.sourceRequirementVersion ?? fallback.sourceRequirementVersion)))
+  const targetCurrentVersionRaw = record.targetCurrentVersion
+  const targetCurrentVersion = targetCurrentVersionRaw === null || targetCurrentVersionRaw === undefined || targetCurrentVersionRaw === ''
+    ? fallback.targetCurrentVersion
+    : Math.max(0, Math.trunc(Number(targetCurrentVersionRaw)))
+  return {
+    sourceRequirementId,
+    sourceSetId,
+    sourceBaselineVersion: Number.isFinite(sourceBaselineVersion) ? sourceBaselineVersion : fallback.sourceBaselineVersion,
+    sourceRequirementVersion: Number.isFinite(sourceRequirementVersion) ? sourceRequirementVersion : fallback.sourceRequirementVersion,
+    targetRequirementId,
+    targetCurrentVersion: targetCurrentVersion !== null && Number.isFinite(targetCurrentVersion)
+      ? targetCurrentVersion
+      : fallback.targetCurrentVersion,
+    validatedAt: String(record.validatedAt ?? fallback.validatedAt),
+    validationReason: String(record.validationReason ?? fallback.validationReason),
+    validatedBy: String(record.validatedBy ?? fallback.validatedBy ?? '')
   }
 }
 
@@ -1609,6 +1734,7 @@ export class AppDatabase {
         warnings_json TEXT NOT NULL DEFAULT '[]',
         external_processing INTEGER NOT NULL DEFAULT 0,
         model_name TEXT NOT NULL DEFAULT '',
+        fingerprint TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL,
         published_at TEXT NOT NULL DEFAULT '',
         UNIQUE(project_id, version),
@@ -1679,6 +1805,8 @@ export class AppDatabase {
         project_id TEXT NOT NULL,
         document_id TEXT NOT NULL,
         set_id TEXT NOT NULL DEFAULT '',
+        logical_id TEXT NOT NULL DEFAULT '',
+        fingerprint TEXT NOT NULL DEFAULT '',
         version INTEGER NOT NULL DEFAULT 1,
         requirement_no INTEGER NOT NULL,
         category TEXT NOT NULL DEFAULT 'functional',
@@ -1788,6 +1916,11 @@ export class AppDatabase {
         confirmed_by TEXT NOT NULL DEFAULT '',
         confirmed_at TEXT NOT NULL DEFAULT '',
         match_run_id TEXT,
+        source_baseline_version INTEGER NOT NULL DEFAULT 0,
+        source_requirement_version INTEGER NOT NULL DEFAULT 0,
+        target_current_version INTEGER,
+        trace_status TEXT NOT NULL DEFAULT 'suspect',
+        trace_metadata_json TEXT NOT NULL DEFAULT '{}',
         PRIMARY KEY(project_id, record_uid, requirement_id),
         FOREIGN KEY(project_id) REFERENCES pm_projects(id) ON DELETE CASCADE,
         FOREIGN KEY(record_uid) REFERENCES records(uid) ON DELETE CASCADE,
@@ -1802,6 +1935,11 @@ export class AppDatabase {
         task_id TEXT NOT NULL,
         requirement_id TEXT NOT NULL,
         linked_at TEXT NOT NULL,
+        source_baseline_version INTEGER NOT NULL DEFAULT 0,
+        source_requirement_version INTEGER NOT NULL DEFAULT 0,
+        target_current_version INTEGER,
+        trace_status TEXT NOT NULL DEFAULT 'suspect',
+        trace_metadata_json TEXT NOT NULL DEFAULT '{}',
         PRIMARY KEY(task_id, requirement_id),
         FOREIGN KEY(project_id) REFERENCES pm_projects(id) ON DELETE CASCADE,
         FOREIGN KEY(task_id) REFERENCES pm_project_tasks(id) ON DELETE CASCADE,
@@ -1929,6 +2067,23 @@ export class AppDatabase {
         UNIQUE(base_url, project_id, sha256)
       );
     `)
+    // Phase 2-5 trace review/AI/governance storage was retired.  Remove any
+    // legacy tables atomically during bootstrap and deliberately do not
+    // recreate them on subsequent starts.
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      this.db.exec(`
+        DROP TABLE IF EXISTS pm_project_governance_acknowledgements;
+        DROP TABLE IF EXISTS pm_project_trace_ai_results;
+        DROP TABLE IF EXISTS pm_project_trace_ai_runs;
+        DROP TABLE IF EXISTS pm_project_trace_decision_audits;
+        DROP TABLE IF EXISTS pm_project_trace_reviews;
+      `)
+      this.db.exec('COMMIT')
+    } catch (error) {
+      try { this.db.exec('ROLLBACK') } catch {}
+      throw error
+    }
     this.migrateLegacyImageFiles()
     const maintenanceTimestamp = nowIso()
     this.db.prepare(`
@@ -1980,6 +2135,8 @@ export class AppDatabase {
       "ALTER TABLE pm_requirements ADD COLUMN key_info_terms_source TEXT NOT NULL DEFAULT 'ai'",
       "ALTER TABLE pm_requirements ADD COLUMN module TEXT NOT NULL DEFAULT ''",
       "ALTER TABLE pm_requirements ADD COLUMN set_id TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE pm_requirements ADD COLUMN logical_id TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE pm_requirements ADD COLUMN fingerprint TEXT NOT NULL DEFAULT ''",
       "ALTER TABLE pm_requirements ADD COLUMN version INTEGER NOT NULL DEFAULT 1",
       "ALTER TABLE pm_requirements ADD COLUMN category TEXT NOT NULL DEFAULT 'functional'",
       "ALTER TABLE pm_requirements ADD COLUMN evidence_quote TEXT NOT NULL DEFAULT ''",
@@ -2010,6 +2167,17 @@ export class AppDatabase {
       "ALTER TABLE pm_analysis_logs ADD COLUMN output_chars INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE pm_analysis_logs ADD COLUMN done_reason TEXT NOT NULL DEFAULT ''",
       "ALTER TABLE pm_analysis_logs ADD COLUMN model_name TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE pm_requirement_sets ADD COLUMN fingerprint TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE pm_project_task_requirements ADD COLUMN source_baseline_version INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE pm_project_task_requirements ADD COLUMN source_requirement_version INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE pm_project_task_requirements ADD COLUMN target_current_version INTEGER",
+      "ALTER TABLE pm_project_task_requirements ADD COLUMN trace_status TEXT NOT NULL DEFAULT 'suspect'",
+      "ALTER TABLE pm_project_task_requirements ADD COLUMN trace_metadata_json TEXT NOT NULL DEFAULT '{}'",
+      "ALTER TABLE pm_project_asset_requirements ADD COLUMN source_baseline_version INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE pm_project_asset_requirements ADD COLUMN source_requirement_version INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE pm_project_asset_requirements ADD COLUMN target_current_version INTEGER",
+      "ALTER TABLE pm_project_asset_requirements ADD COLUMN trace_status TEXT NOT NULL DEFAULT 'suspect'",
+      "ALTER TABLE pm_project_asset_requirements ADD COLUMN trace_metadata_json TEXT NOT NULL DEFAULT '{}'",
       "ALTER TABLE knowledge_index_tasks ADD COLUMN elapsed_ms INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE knowledge_index_tasks ADD COLUMN throughput_per_second REAL NOT NULL DEFAULT 0",
       "ALTER TABLE data_import_runs ADD COLUMN file_size INTEGER NOT NULL DEFAULT 0",
@@ -2077,9 +2245,12 @@ export class AppDatabase {
         throw error
       }
     }
+    this.migrateProjectRequirementTraceability()
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_records_push_status ON records(push_status)')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_pm_cost_entries_responsible ON pm_cost_entries(responsible_participant_id)')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_pm_requirements_set ON pm_requirements(set_id, requirement_no)')
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_pm_requirements_logical ON pm_requirements(project_id, logical_id, version)')
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_pm_requirement_sets_fingerprint ON pm_requirement_sets(project_id, fingerprint, version)')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_pm_requirements_review ON pm_requirements(project_id, review_status)')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_pm_analysis_logs_kind ON pm_analysis_logs(project_id, log_kind, created_at DESC)')
 
@@ -2234,6 +2405,238 @@ export class AppDatabase {
       phase: 'ready',
       message: '本地数据库准备完成'
     })
+  }
+
+  /**
+   * Backfill requirement identity and link trace columns for databases created
+   * before baseline-aware project management.  Every value is deterministic or
+   * derived from the current published set, so running this at every startup
+   * is safe and idempotent.
+   */
+  private migrateProjectRequirementTraceability(): void {
+    const requirementRows = this.db.prepare('SELECT * FROM pm_requirements ORDER BY project_id, version, requirement_no, id').all() as SqlRow[]
+    const updateRequirement = this.db.prepare(`
+      UPDATE pm_requirements
+      SET logical_id = ?, fingerprint = ?
+      WHERE id = ?
+    `)
+    const fingerprintsByRequirementId = new Map<string, string>()
+    const logicalIdsByRequirementId = new Map<string, string>()
+    // Older set-based rows did not persist an identity.  Reuse one identity for
+    // the same normalized requirement across versions, while keeping duplicate
+    // rows in a single set separate (split/merge cannot be inferred safely).
+    const canonicalLogicalIdByProjectFingerprint = new Map<string, string>()
+    const usedLogicalIdsBySetFingerprint = new Map<string, number>()
+    for (const row of requirementRows) {
+      const id = String(row.id ?? '').trim()
+      if (!id) continue
+      const projectId = String(row.project_id ?? '')
+      const setId = String(row.set_id ?? '').trim()
+      const fingerprint = String(row.fingerprint ?? '').trim() || projectRequirementFingerprintFromRow(row)
+      const identityKey = `${projectId}\u0000${fingerprint}`
+      const setIdentityKey = `${setId}\u0000${identityKey}`
+      const occurrence = usedLogicalIdsBySetFingerprint.get(setIdentityKey) ?? 0
+      usedLogicalIdsBySetFingerprint.set(setIdentityKey, occurrence + 1)
+      let logicalId = String(row.logical_id ?? '').trim()
+      if (!logicalId) {
+        if (!setId) {
+          // The legacy replace API uses set_id='' and has no baseline version;
+          // retain a deterministic id that does not accidentally join a newer
+          // set-based requirement with the same text.
+          logicalId = legacyProjectRequirementLogicalId(projectId, fingerprint, id)
+        } else {
+          const canonical = canonicalLogicalIdByProjectFingerprint.get(identityKey)
+          if (canonical && occurrence === 0) {
+            logicalId = canonical
+          } else {
+            const suffix = occurrence === 0 ? '' : `\u0000duplicate:${occurrence}`
+            logicalId = `logical:${createHash('sha256').update(`${identityKey}${suffix}`).digest('hex')}`
+          }
+        }
+      }
+      if (setId && !canonicalLogicalIdByProjectFingerprint.has(identityKey)) {
+        canonicalLogicalIdByProjectFingerprint.set(identityKey, logicalId)
+      }
+      fingerprintsByRequirementId.set(id, fingerprint)
+      logicalIdsByRequirementId.set(id, logicalId)
+      if (String(row.fingerprint ?? '').trim() !== fingerprint || String(row.logical_id ?? '').trim() !== logicalId) {
+        updateRequirement.run(logicalId, fingerprint, id)
+      }
+    }
+
+    const setRows = this.db.prepare('SELECT * FROM pm_requirement_sets ORDER BY project_id, version, id').all() as SqlRow[]
+    const requirementIdsBySet = new Map<string, string[]>()
+    for (const row of requirementRows) {
+      const setId = String(row.set_id ?? '').trim()
+      if (!setId) continue
+      const ids = requirementIdsBySet.get(setId) ?? []
+      const id = String(row.id ?? '').trim()
+      if (id) ids.push(id)
+      requirementIdsBySet.set(setId, ids)
+    }
+    const updateSet = this.db.prepare('UPDATE pm_requirement_sets SET fingerprint = ? WHERE id = ?')
+    for (const row of setRows) {
+      const setId = String(row.id ?? '').trim()
+      if (!setId) continue
+      const current = String(row.fingerprint ?? '').trim()
+      if (current) continue
+      updateSet.run(projectRequirementSetFingerprint(
+        (requirementIdsBySet.get(setId) ?? []).map((id) => fingerprintsByRequirementId.get(id) ?? '')
+      ), setId)
+    }
+
+    const currentPublishedByProject = new Map<string, { setId: string; version: number }>()
+    for (const row of setRows) {
+      if (String(row.status ?? '') !== 'published') continue
+      const projectId = String(row.project_id ?? '')
+      const version = Math.max(0, Math.trunc(Number(row.version ?? 0)))
+      const previous = currentPublishedByProject.get(projectId)
+      if (!previous || version > previous.version) {
+        currentPublishedByProject.set(projectId, { setId: String(row.id ?? ''), version })
+      }
+    }
+    const requirementContext = (requirementId: string): {
+      logicalId: string
+      sourceSetId: string
+      sourceBaselineVersion: number
+      sourceRequirementVersion: number
+      targetCurrentVersion: number | null
+      traceStatus: ProjectTraceStatus
+      validationReason: string
+    } => {
+      const row = requirementRows.find((item) => String(item.id ?? '') === requirementId) ??
+        this.db.prepare('SELECT * FROM pm_requirements WHERE id = ?').get(requirementId) as SqlRow | undefined
+      if (!row) {
+        return {
+          logicalId: '', sourceSetId: '', sourceBaselineVersion: 0,
+          sourceRequirementVersion: 0, targetCurrentVersion: null,
+          traceStatus: 'invalid', validationReason: 'source requirement is missing'
+        }
+      }
+      const projectId = String(row.project_id ?? '')
+      const sourceSetId = String(row.set_id ?? '')
+      const sourceRequirementVersion = Math.max(1, Math.trunc(Number(row.version ?? 1)))
+      const set = sourceSetId
+        ? setRows.find((item) => String(item.id ?? '') === sourceSetId)
+        : undefined
+      const sourceBaselineVersion = Math.max(1, Math.trunc(Number(set?.version ?? sourceRequirementVersion)))
+      const current = currentPublishedByProject.get(projectId)
+      const isLegacyPublished = !sourceSetId && String(row.review_status ?? 'approved') === 'approved'
+      const isCurrentPublished = Boolean(current && sourceSetId === current.setId && String(row.review_status ?? '') === 'approved')
+      const traceStatus: ProjectTraceStatus = !logicalIdsByRequirementId.get(requirementId)
+        ? 'invalid'
+        : (isLegacyPublished || isCurrentPublished ? 'valid' : 'suspect')
+      const targetCurrentVersion = traceStatus === 'valid'
+        ? (isLegacyPublished ? sourceRequirementVersion : current?.version ?? sourceRequirementVersion)
+        : null
+      return {
+        logicalId: logicalIdsByRequirementId.get(requirementId) ?? String(row.logical_id ?? ''),
+        sourceSetId,
+        sourceBaselineVersion,
+        sourceRequirementVersion,
+        targetCurrentVersion,
+        traceStatus,
+        validationReason: traceStatus === 'valid' ? '' : 'source requirement is not in the current published baseline'
+      }
+    }
+    const updateTrace = (table: 'pm_project_task_requirements' | 'pm_project_asset_requirements'): void => {
+      const rows = this.db.prepare(`
+        SELECT link.project_id, link.requirement_id,
+               ${table === 'pm_project_task_requirements' ? 'link.task_id' : 'link.record_uid'},
+               link.source_baseline_version,
+               link.source_requirement_version, link.target_current_version,
+               link.trace_status, link.trace_metadata_json, q.logical_id,
+               q.set_id, q.version, q.project_id AS requirement_project_id,
+               q.review_status
+        FROM ${table} link
+        LEFT JOIN pm_requirements q ON q.id = link.requirement_id
+      `).all() as SqlRow[]
+      const update = this.db.prepare(`
+        UPDATE ${table}
+        SET source_baseline_version = ?, source_requirement_version = ?,
+            target_current_version = ?, trace_status = ?, trace_metadata_json = ?
+        WHERE project_id = ? AND requirement_id = ?
+          ${table === 'pm_project_task_requirements' ? 'AND task_id = ?' : 'AND record_uid = ?'}
+      `)
+      const migrationTimestamp = nowIso()
+      for (const row of rows) {
+        const requirementId = String(row.requirement_id ?? '')
+        const context = requirementContext(requirementId)
+        const ownerId = table === 'pm_project_task_requirements'
+          ? String(row.task_id ?? '')
+          : String(row.record_uid ?? '')
+        const existingStatus = String(row.trace_status ?? '').trim()
+        const existingSourceBaselineVersion = Number(row.source_baseline_version ?? 0)
+        const existingSourceRequirementVersion = Number(row.source_requirement_version ?? 0)
+        const existingMetadata = parseProjectTraceMetadata(row.trace_metadata_json, {
+          sourceRequirementId: requirementId,
+          sourceSetId: String(row.set_id ?? ''),
+          sourceBaselineVersion: existingSourceBaselineVersion,
+          sourceRequirementVersion: existingSourceRequirementVersion,
+          targetRequirementId: row.target_requirement_id === null || row.target_requirement_id === undefined
+            ? null
+            : String(row.target_requirement_id),
+          targetCurrentVersion: row.target_current_version === null || row.target_current_version === undefined
+            ? null
+            : Number(row.target_current_version),
+          validatedAt: '',
+          validationReason: ''
+        })
+        const metadataJson = String(row.trace_metadata_json ?? '').trim()
+        let metadataIsValid = false
+        if (metadataJson) {
+          try {
+            const parsed = JSON.parse(metadataJson) as Partial<ProjectRequirementTraceMetadata>
+            metadataIsValid = Boolean(parsed && typeof parsed === 'object' &&
+              String(parsed.sourceRequirementId ?? '').trim() &&
+              Number(parsed.sourceBaselineVersion) > 0 &&
+              Number(parsed.sourceRequirementVersion) > 0 &&
+              String(parsed.validatedAt ?? '').trim() &&
+              (parsed.targetCurrentVersion === null || parsed.targetCurrentVersion === undefined ||
+                Number.isFinite(Number(parsed.targetCurrentVersion))))
+          } catch {
+            metadataIsValid = false
+          }
+        }
+        const traceFieldsAreValid = Number.isFinite(existingSourceBaselineVersion) && existingSourceBaselineVersion > 0 &&
+          Number.isFinite(existingSourceRequirementVersion) && existingSourceRequirementVersion > 0 &&
+          projectTraceStatuses.has(existingStatus as ProjectTraceStatus) && metadataIsValid
+        // A fully populated row is already an explicit historical decision.
+        // Do not recalculate it on every startup (especially suspect/invalid
+        // links), because that would rewrite validatedAt and lose audit data.
+        if (traceFieldsAreValid) continue
+        const metadata: ProjectRequirementTraceMetadata = {
+          sourceRequirementId: String(existingMetadata.sourceRequirementId || requirementId),
+          sourceSetId: String(existingMetadata.sourceSetId || context.sourceSetId),
+          sourceBaselineVersion: Number(existingMetadata.sourceBaselineVersion) > 0
+            ? Number(existingMetadata.sourceBaselineVersion) : context.sourceBaselineVersion,
+          sourceRequirementVersion: Number(existingMetadata.sourceRequirementVersion) > 0
+            ? Number(existingMetadata.sourceRequirementVersion) : context.sourceRequirementVersion,
+          targetRequirementId: context.traceStatus === 'valid' ? requirementId : null,
+          targetCurrentVersion: context.targetCurrentVersion,
+          validatedAt: String(existingMetadata.validatedAt ?? '').trim() || String(row.linked_at ?? '').trim() || migrationTimestamp,
+          validationReason: context.validationReason
+        }
+        update.run(
+          metadata.sourceBaselineVersion,
+          metadata.sourceRequirementVersion,
+          context.targetCurrentVersion,
+          context.traceStatus,
+          JSON.stringify(metadata),
+          String(row.project_id ?? ''), requirementId, ownerId
+        )
+      }
+    }
+
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      updateTrace('pm_project_task_requirements')
+      updateTrace('pm_project_asset_requirements')
+      this.db.exec('COMMIT')
+    } catch (error) {
+      try { this.db.exec('ROLLBACK') } catch {}
+      throw error
+    }
   }
 
   close(): void {
@@ -3309,11 +3712,46 @@ export class AppDatabase {
     return { ...this.mapKnowledgeDocument(row), chunks: chunks.map((item) => this.mapKnowledgeChunk(item)) }
   }
 
-  deleteKnowledgeDocument(id: string): { filePath: string; deleted: boolean } {
-    const row = this.db.prepare('SELECT file_path FROM knowledge_documents WHERE id = ?').get(id) as SqlRow | undefined
+  deleteKnowledgeDocument(id: string): {
+    filePath: string
+    deleted: boolean
+    code?: 'DOCUMENT_IN_USE'
+    message?: string
+    projectIds?: string[]
+  } {
+    const documentId = id.trim()
+    const row = this.db.prepare('SELECT file_path FROM knowledge_documents WHERE id = ?').get(documentId) as SqlRow | undefined
     if (!row) return { filePath: '', deleted: false }
-    this.db.prepare('DELETE FROM knowledge_documents WHERE id = ?').run(id)
-    return { filePath: String(row.file_path), deleted: true }
+
+    const references = this.db.prepare(`
+      SELECT DISTINCT p.id AS project_id, p.project_name
+      FROM pm_projects p
+      WHERE p.id IN (
+        SELECT project_id FROM pm_project_documents WHERE document_id = ?
+        UNION
+        SELECT project_id FROM pm_requirement_sets WHERE document_id = ?
+        UNION
+        SELECT project_id FROM pm_requirements WHERE document_id = ?
+      )
+      ORDER BY p.project_name COLLATE NOCASE ASC, p.id ASC
+    `).all(documentId, documentId, documentId) as SqlRow[]
+    if (references.length) {
+      const projectNames = references.map((reference) => {
+        const projectId = String(reference.project_id ?? '')
+        const projectName = String(reference.project_name ?? '').trim()
+        return projectName || projectId
+      }).filter(Boolean)
+      return {
+        filePath: String(row.file_path ?? ''),
+        deleted: false,
+        code: 'DOCUMENT_IN_USE',
+        message: `知识库文档仍被项目引用（${projectNames.join('、')}），请先解除项目协议关联后再删除`,
+        projectIds: references.map((reference) => String(reference.project_id ?? '')).filter(Boolean)
+      }
+    }
+
+    this.db.prepare('DELETE FROM knowledge_documents WHERE id = ?').run(documentId)
+    return { filePath: String(row.file_path ?? ''), deleted: true }
   }
 
   replaceKnowledgeDocumentChunks(
@@ -3447,8 +3885,8 @@ export class AppDatabase {
       INSERT INTO knowledge_chunks(
         id, document_id, record_uid, source_type, source_name, source_hash,
         content, chunk_index, page_number, sheet_name, location,
-        char_start, char_end, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         char_start, char_end, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
     const timestamp = nowIso()
     for (const chunk of chunks) {
@@ -4174,8 +4612,8 @@ export class AppDatabase {
     if (estimatedCost > 0) {
       this.insertProjectCostEntry(id, {
         type: 'estimated',
-        category: '项目预估',
-        description: '项目创建时的预计成本',
+        category: PROJECT_BASE_ESTIMATE_CATEGORY,
+        description: PROJECT_BASE_ESTIMATE_DESCRIPTION,
         amount: estimatedCost,
         occurredAt: timestamp
       })
@@ -4185,28 +4623,97 @@ export class AppDatabase {
 
   updateManagedProject(id: string, input: ManagedProjectInput): ManagedProject | null {
     const timestamp = nowIso()
-    const result = this.db.prepare(`
-      UPDATE pm_projects SET
-        project_name = ?, customer_name = ?, contract_amount = ?, risk_factor = ?,
-        delivery_reminder_days = ?, planned_delivery_date = ?, sales_owner = ?,
-        technical_owner = ?, development_owner = ?, estimated_duration_days = ?,
-        updated_at = ?
-      WHERE id = ?
-    `).run(
-      input.projectName.trim(),
-      input.customerName?.trim() ?? '',
-      Number(input.contractAmount ?? 0),
-      Number(input.riskFactor ?? 0),
-      Math.max(0, Math.trunc(input.deliveryReminderDays ?? 0)),
-      input.plannedDeliveryDate?.trim() ?? '',
-      input.salesOwner?.trim() ?? '',
-      input.technicalOwner?.trim() ?? '',
-      input.developmentOwner?.trim() ?? '',
-      Math.max(0, Math.trunc(input.estimatedDurationDays ?? 0)),
-      timestamp,
-      id
-    )
-    return Number(result.changes) ? this.getManagedProject(id) : null
+    const requestedEstimatedCost = input.estimatedCost === undefined
+      ? undefined
+      : Number(input.estimatedCost)
+    const shouldUpdateEstimatedCost = requestedEstimatedCost !== undefined && Number.isFinite(requestedEstimatedCost)
+    const estimatedCost = shouldUpdateEstimatedCost
+      ? Math.max(0, requestedEstimatedCost as number)
+      : undefined
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const result = this.db.prepare(`
+        UPDATE pm_projects SET
+          project_name = ?, customer_name = ?, contract_amount = ?, risk_factor = ?,
+          delivery_reminder_days = ?, planned_delivery_date = ?, sales_owner = ?,
+          technical_owner = ?, development_owner = ?, estimated_cost = COALESCE(?, estimated_cost),
+          estimated_duration_days = ?, updated_at = ?
+        WHERE id = ?
+      `).run(
+        input.projectName.trim(),
+        input.customerName?.trim() ?? '',
+        Number(input.contractAmount ?? 0),
+        Number(input.riskFactor ?? 0),
+        Math.max(0, Math.trunc(input.deliveryReminderDays ?? 0)),
+        input.plannedDeliveryDate?.trim() ?? '',
+        input.salesOwner?.trim() ?? '',
+        input.technicalOwner?.trim() ?? '',
+        input.developmentOwner?.trim() ?? '',
+        estimatedCost ?? null,
+        Math.max(0, Math.trunc(input.estimatedDurationDays ?? 0)),
+        timestamp,
+        id
+      )
+      if (!Number(result.changes)) {
+        this.db.exec('ROLLBACK')
+        return null
+      }
+
+      if (shouldUpdateEstimatedCost) {
+        const baseEntry = this.db.prepare(`
+          SELECT id FROM pm_cost_entries
+          WHERE project_id = ? AND cost_type = 'estimated'
+            AND category = ? AND description = ?
+          ORDER BY created_at ASC, id ASC LIMIT 1
+        `).get(id, PROJECT_BASE_ESTIMATE_CATEGORY, PROJECT_BASE_ESTIMATE_DESCRIPTION) as SqlRow | undefined
+        const baseEntryId = baseEntry?.id ? String(baseEntry.id) : ''
+        const otherEstimatedRow = this.db.prepare(`
+          SELECT COALESCE(SUM(amount), 0) AS amount
+          FROM pm_cost_entries
+          WHERE project_id = ? AND cost_type = 'estimated'
+            AND (? = '' OR id <> ?)
+        `).get(id, baseEntryId, baseEntryId) as SqlRow
+        const laborEstimatedRow = this.db.prepare(`
+          SELECT COALESCE(SUM(estimated_cost), 0) AS amount
+          FROM pm_project_participants
+          WHERE project_id = ?
+        `).get(id) as SqlRow
+        const otherEstimatedCost = Number(otherEstimatedRow.amount ?? 0)
+        const laborEstimatedCost = Number(laborEstimatedRow.amount ?? 0)
+        const estimatedCostValue = Math.max(
+          0,
+          (estimatedCost ?? 0) -
+            (Number.isFinite(laborEstimatedCost) ? laborEstimatedCost : 0) -
+            (Number.isFinite(otherEstimatedCost) ? otherEstimatedCost : 0)
+        )
+        if (estimatedCostValue > 0) {
+          if (baseEntry?.id) {
+            this.db.prepare(`
+              UPDATE pm_cost_entries SET amount = ?, updated_at = ? WHERE id = ?
+            `).run(estimatedCostValue, timestamp, String(baseEntry.id))
+          } else {
+            this.db.prepare(`
+              INSERT INTO pm_cost_entries(
+                id, project_id, cost_type, category, description, amount,
+                occurred_at, created_at, updated_at, asset_record_uid,
+                responsible_participant_id, responsible_person_name
+              ) VALUES (?, ?, 'estimated', ?, ?, ?, ?, ?, ?, NULL, NULL, '')
+            `).run(
+              randomUUID(), id, PROJECT_BASE_ESTIMATE_CATEGORY,
+              PROJECT_BASE_ESTIMATE_DESCRIPTION, estimatedCostValue, timestamp, timestamp, timestamp
+            )
+          }
+        } else if (baseEntry?.id) {
+          this.db.prepare('DELETE FROM pm_cost_entries WHERE id = ?').run(String(baseEntry.id))
+        }
+        this.refreshProjectCostTotals(id)
+      }
+      this.db.exec('COMMIT')
+      return this.getManagedProject(id)
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
   }
 
   listManagedProjects(query: ManagedProjectListQuery): ManagedProjectPage {
@@ -4457,6 +4964,11 @@ export class AppDatabase {
         UPDATE pm_analysis_logs SET status = 'failed', message = message || '（应用退出中断）'
         WHERE status = 'running'
       `).run()
+      this.db.prepare(`
+        UPDATE pm_requirement_match_runs
+        SET status = 'failed', failure_code = 'MATCH_INTERRUPTED', completed_at = ?
+        WHERE status = 'running'
+      `).run(timestamp)
       this.db.exec('COMMIT')
       return Number(result.changes)
     } catch (error) {
@@ -4518,7 +5030,7 @@ export class AppDatabase {
     }))
   }
 
-  exportManagedProjectSnapshot(projectId: string): ProjectDataSnapshot | null {
+  exportManagedProjectSnapshot(projectId: string, formatVersion: 1 | 2 = 1): ProjectDataSnapshot | null {
     const project = this.getManagedProject(projectId)
     if (!project) return null
     const rawProject = this.db.prepare('SELECT estimated_cost FROM pm_projects WHERE id = ?').get(projectId) as SqlRow | undefined
@@ -4585,9 +5097,16 @@ export class AppDatabase {
       assetLinked: Number(row.asset_linked ?? 0) === 1,
       requirementLinked: Number(row.requirement_linked ?? 0) === 1
     }))
-    return {
+    const requirements = formatVersion === 2
+      ? (this.db.prepare(`
+          SELECT * FROM pm_requirements
+          WHERE project_id = ?
+          ORDER BY set_id ASC, version ASC, requirement_no ASC, id ASC
+        `).all(projectId) as SqlRow[]).map((row) => this.mapProjectRequirement(row))
+      : this.listAllProjectRequirements(projectId)
+    const snapshot: ProjectDataSnapshot = {
       format: 'visslm-project',
-      version: 1,
+      version: formatVersion,
       exportedAt: nowIso(),
       project: {
         ...project,
@@ -4599,13 +5118,175 @@ export class AppDatabase {
       costs: this.listProjectCostEntries(projectId),
       assets: this.listProjectAssets(projectId),
       tasks: this.listProjectTasks(projectId),
-      requirements: this.listAllProjectRequirements(projectId),
+      requirements,
       matches
     }
+    if (formatVersion === 2) {
+      snapshot.requirementSets = (this.db.prepare(`
+        SELECT s.*,
+          COUNT(q.id) AS requirement_count,
+          SUM(CASE WHEN q.review_status = 'pending' THEN 1 ELSE 0 END) AS pending_count,
+          SUM(CASE WHEN q.review_status = 'approved' THEN 1 ELSE 0 END) AS approved_count,
+          SUM(CASE WHEN q.review_status = 'rejected' THEN 1 ELSE 0 END) AS rejected_count
+        FROM pm_requirement_sets s
+        LEFT JOIN pm_requirements q ON q.set_id = s.id
+        WHERE s.project_id = ?
+        GROUP BY s.id
+        ORDER BY s.version ASC, s.id ASC
+      `).all(projectId) as SqlRow[]).map((row): ProjectRequirementSetSnapshot => ({
+        ...this.mapProjectRequirementSet(row),
+        externalProcessing: Number(row.external_processing ?? 0) === 1,
+        modelName: String(row.model_name ?? '')
+      }))
+      snapshot.matchRuns = (this.db.prepare(`
+        SELECT run.*, q.logical_id AS requirement_logical_id, q.version AS requirement_version,
+               COALESCE(s.version, q.version) AS baseline_version
+        FROM pm_requirement_match_runs run
+        JOIN pm_requirements q ON q.id = run.requirement_id
+        LEFT JOIN pm_requirement_sets s ON s.id = q.set_id
+        WHERE q.project_id = ?
+        ORDER BY run.created_at ASC, run.id ASC
+      `).all(projectId) as SqlRow[]).map((row): ProjectRequirementMatchRunSnapshot => ({
+        id: String(row.id),
+        requirementId: String(row.requirement_id),
+        requirementLogicalId: String(row.requirement_logical_id ?? ''),
+        requirementVersion: Math.max(1, Math.trunc(Number(row.requirement_version ?? 1))),
+        baselineVersion: Math.max(1, Math.trunc(Number(row.baseline_version ?? row.requirement_version ?? 1))),
+        requirementSnapshotHash: String(row.requirement_snapshot_hash ?? ''),
+        requirementBusinessHash: String(row.requirement_business_hash ?? ''),
+        normalizationVersion: String(row.normalization_version ?? ''),
+        indexVersion: String(row.index_version ?? ''),
+        pipelineVersion: String(row.pipeline_version ?? ''),
+        rankingVersion: String(row.ranking_version ?? ''),
+        configHash: String(row.config_hash ?? ''),
+        modelVersion: row.model_version === null || row.model_version === undefined ? null : String(row.model_version),
+        status: ['running', 'succeeded', 'failed', 'stale'].includes(String(row.status))
+          ? String(row.status) as ProjectRequirementMatchRunSnapshot['status']
+          : 'failed',
+        degradationCodes: parseJsonArray(row.degradation_codes_json),
+        failureCode: row.failure_code === null || row.failure_code === undefined ? null : String(row.failure_code),
+        startedAt: String(row.started_at ?? row.created_at ?? ''),
+        createdAt: String(row.created_at ?? ''),
+        completedAt: row.completed_at === null || row.completed_at === undefined ? null : String(row.completed_at)
+      }))
+      snapshot.matchCandidates = (this.db.prepare(`
+        SELECT c.*, run.requirement_id
+        FROM pm_requirement_match_candidates c
+        JOIN pm_requirement_match_runs run ON run.id = c.run_id
+        JOIN pm_requirements q ON q.id = run.requirement_id
+        WHERE q.project_id = ?
+        ORDER BY c.run_id ASC, c.final_rank ASC, c.record_uid ASC
+      `).all(projectId) as SqlRow[]).map((row): ProjectRequirementMatchCandidateSnapshot => ({
+        runId: String(row.run_id),
+        requirementId: String(row.requirement_id),
+        recordUid: String(row.record_uid),
+        finalRank: Math.max(0, Math.trunc(Number(row.final_rank ?? 0))),
+        rankingScore: Number(row.ranking_score ?? 0),
+        similarityScore: row.similarity_score === null || row.similarity_score === undefined ? null : Number(row.similarity_score),
+        rankingVersion: String(row.ranking_version ?? ''),
+        relation: row.relation === null || row.relation === undefined ? null : String(row.relation),
+        decisionStatus: String(row.decision_status ?? 'rejected'),
+        confidenceStatus: String(row.confidence_status ?? 'low'),
+        confidenceReasons: parseJsonArray(row.confidence_reasons_json),
+        evidenceLevel: String(row.evidence_level ?? 'none'),
+        reasonCodes: parseJsonArray(row.reason_codes_json),
+        degradationCodes: parseJsonArray(row.degradation_codes_json),
+        stageScores: parseJsonValue(row.stage_scores_json, {}),
+        scoreBreakdown: parseJsonValue(row.score_breakdown_json, {}),
+        evidenceJson: parseJsonValue(row.evidence_json, {}),
+        explanationStatus: String(row.explanation_status ?? 'not_requested'),
+        explanation: row.explanation === null || row.explanation === undefined ? null : String(row.explanation),
+        recordSnapshotHash: String(row.record_snapshot_hash ?? '')
+      }))
+      const traceMetadata: ProjectRequirementTraceSnapshot[] = []
+      const taskTraceRows = this.db.prepare(`
+        SELECT l.*, q.logical_id, q.set_id, q.version,
+               COALESCE(s.version, q.version) AS baseline_version
+        FROM pm_project_task_requirements l
+        JOIN pm_requirements q ON q.id = l.requirement_id
+        LEFT JOIN pm_requirement_sets s ON s.id = q.set_id
+        WHERE l.project_id = ?
+        ORDER BY l.task_id ASC, l.requirement_id ASC
+      `).all(projectId) as SqlRow[]
+      for (const row of taskTraceRows) {
+        const requirementId = String(row.requirement_id)
+        const requirementVersion = Math.max(1, Math.trunc(Number(row.source_requirement_version ?? row.version ?? 1)))
+        const sourceBaselineVersion = Math.max(1, Math.trunc(Number(row.source_baseline_version ?? row.baseline_version ?? requirementVersion)))
+        const traceStatus = safeTraceStatus(row.trace_status, 'suspect')
+        const fallback: ProjectRequirementTraceMetadata = {
+          sourceRequirementId: requirementId,
+          sourceSetId: String(row.set_id ?? ''),
+          sourceBaselineVersion,
+          sourceRequirementVersion: requirementVersion,
+          targetRequirementId: traceStatus === 'valid' ? requirementId : null,
+          targetCurrentVersion: row.target_current_version === null || row.target_current_version === undefined
+            ? (traceStatus === 'valid' ? Number(row.version ?? requirementVersion) : null)
+            : Number(row.target_current_version),
+          validatedAt: String(row.linked_at ?? ''),
+          validationReason: traceStatus === 'valid' ? '' : 'trace metadata unavailable'
+        }
+        const metadata = parseProjectTraceMetadata(row.trace_metadata_json, fallback)
+        traceMetadata.push({
+          entityType: 'task',
+          taskId: String(row.task_id),
+          projectId,
+          requirementId,
+          logicalId: String(row.logical_id ?? ''),
+          linkedAt: String(row.linked_at ?? ''),
+          traceStatus,
+          ...metadata,
+          validatedBy: String(metadata.validatedBy ?? '')
+        })
+      }
+      const assetTraceRows = this.db.prepare(`
+        SELECT l.*, q.logical_id, q.set_id, q.version,
+               COALESCE(s.version, q.version) AS baseline_version
+        FROM pm_project_asset_requirements l
+        JOIN pm_requirements q ON q.id = l.requirement_id
+        LEFT JOIN pm_requirement_sets s ON s.id = q.set_id
+        WHERE l.project_id = ?
+        ORDER BY l.record_uid ASC, l.requirement_id ASC
+      `).all(projectId) as SqlRow[]
+      for (const row of assetTraceRows) {
+        const requirementId = String(row.requirement_id)
+        const requirementVersion = Math.max(1, Math.trunc(Number(row.source_requirement_version ?? row.version ?? 1)))
+        const sourceBaselineVersion = Math.max(1, Math.trunc(Number(row.source_baseline_version ?? row.baseline_version ?? requirementVersion)))
+        const traceStatus = safeTraceStatus(row.trace_status, 'suspect')
+        const fallback: ProjectRequirementTraceMetadata = {
+          sourceRequirementId: requirementId,
+          sourceSetId: String(row.set_id ?? ''),
+          sourceBaselineVersion,
+          sourceRequirementVersion: requirementVersion,
+          targetRequirementId: traceStatus === 'valid' ? requirementId : null,
+          targetCurrentVersion: row.target_current_version === null || row.target_current_version === undefined
+            ? (traceStatus === 'valid' ? Number(row.version ?? requirementVersion) : null)
+            : Number(row.target_current_version),
+          validatedAt: String(row.linked_at ?? ''),
+          validationReason: traceStatus === 'valid' ? '' : 'trace metadata unavailable'
+        }
+        const metadata = parseProjectTraceMetadata(row.trace_metadata_json, fallback)
+        traceMetadata.push({
+          entityType: 'asset',
+          recordUid: String(row.record_uid),
+          projectId,
+          requirementId,
+          logicalId: String(row.logical_id ?? ''),
+          linkedAt: String(row.linked_at ?? ''),
+          linkSource: String(row.link_source ?? 'legacy_unknown') as ProjectRequirementTraceSnapshot['linkSource'],
+          confirmedBy: String(row.confirmed_by ?? ''),
+          confirmedAt: String(row.confirmed_at ?? ''),
+          traceStatus,
+          ...metadata,
+          validatedBy: String(metadata.validatedBy ?? row.confirmed_by ?? '')
+        })
+      }
+      snapshot.traceMetadata = traceMetadata
+    }
+    return snapshot
   }
 
   importManagedProjectSnapshot(snapshot: ProjectDataSnapshot): { projectId: string; warnings: string[] } {
-    if (snapshot.format !== 'visslm-project' || snapshot.version !== 1) {
+    if (snapshot.format !== 'visslm-project' || (snapshot.version !== 1 && snapshot.version !== 2)) {
       throw new Error('项目数据文件格式或版本不受支持')
     }
     const sourceProject = snapshot.project
@@ -4617,7 +5298,11 @@ export class AppDatabase {
     const timestamp = nowIso()
     const peopleMap = new Map<string, string>()
     const documentMap = new Map<string, string>()
+    const requirementSetMap = new Map<string, string>()
     const requirementMap = new Map<string, string>()
+    const importedRequirementVersionBySourceId = new Map<string, number>()
+    const matchRunMap = new Map<string, string>()
+    const matchRunRequirementBySourceId = new Map<string, string>()
     const participantMap = new Map<string, string>()
     const taskMap = new Map<string, string>()
     const validValue = <T extends string>(value: unknown, values: readonly T[], fallback: T): T => {
@@ -4783,27 +5468,85 @@ export class AppDatabase {
         `).run(projectId, getFallbackDocumentId(), timestamp)
       }
 
+      if (snapshot.version === 2) {
+        for (const requirementSet of snapshot.requirementSets ?? []) {
+          const sourceSetId = String(requirementSet.id ?? '').trim()
+          const sourceDocumentId = String(requirementSet.documentId ?? '').trim()
+          const targetDocumentId = documentMap.get(sourceDocumentId) ?? getFallbackDocumentId()
+          if (sourceDocumentId && !documentMap.has(sourceDocumentId)) {
+            warnings.push(`需求版本 V${String(requirementSet.version ?? '?')} 未找到协议引用，已挂载到导入协议元数据`)
+          }
+          const targetSetId = randomUUID()
+          try {
+            this.db.prepare(`
+              INSERT INTO pm_requirement_sets(
+                id, project_id, document_id, version, status, total_chunks, analyzed_chunks,
+                warnings_json, external_processing, model_name, fingerprint, created_at, published_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `).run(
+              targetSetId,
+              projectId,
+              targetDocumentId,
+              Math.max(1, Math.trunc(Number(requirementSet.version ?? 1))),
+              validValue(requirementSet.status, ['reviewing', 'published', 'superseded'] as const, 'superseded'),
+              Math.max(0, Math.trunc(Number(requirementSet.totalChunks ?? 0))),
+              Math.max(0, Math.trunc(Number(requirementSet.analyzedChunks ?? 0))),
+              JSON.stringify(Array.isArray(requirementSet.warnings) ? requirementSet.warnings.map(String) : []),
+              requirementSet.externalProcessing ? 1 : 0,
+              String((requirementSet as ProjectRequirementSetSnapshot & { modelName?: string }).modelName ?? ''),
+              String(requirementSet.fingerprint ?? ''),
+              sourceTimestamp(requirementSet.createdAt),
+              String(requirementSet.publishedAt ?? '')
+            )
+            if (sourceSetId) requirementSetMap.set(sourceSetId, targetSetId)
+          } catch (error) {
+            if (String(error).includes('UNIQUE')) {
+              warnings.push(`需求版本 V${String(requirementSet.version ?? '?')} 与已有版本号冲突，已跳过该版本`)
+            } else {
+              throw error
+            }
+          }
+        }
+      }
+
       for (const requirement of snapshot.requirements ?? []) {
         const sourceRequirementId = String(requirement.id ?? '').trim()
+        if (sourceRequirementId && requirementMap.has(sourceRequirementId)) {
+          warnings.push(`跳过重复需求“${String(requirement.title ?? '未命名需求')}”`)
+          continue
+        }
         const targetRequirementId = randomUUID()
         const targetDocumentId = documentMap.get(String(requirement.documentId ?? '').trim()) ?? getFallbackDocumentId()
         if (!documentMap.has(String(requirement.documentId ?? '').trim())) {
           warnings.push(`需求“${String(requirement.title ?? '未命名需求')}”未找到协议引用，已挂载到导入协议元数据`)
         }
+        const sourceSetId = snapshot.version === 2 ? String(requirement.setId ?? '').trim() : ''
+        const targetSetId = sourceSetId ? (requirementSetMap.get(sourceSetId) ?? '') : ''
+        if (sourceSetId && !targetSetId) {
+          warnings.push(`需求“${String(requirement.title ?? '未命名需求')}”的需求版本不存在，已保留为未归档需求`)
+        }
+        const logicalId = String(requirement.logicalId ?? '').trim() || randomUUID()
+        const fingerprint = projectRequirementFingerprint(requirement)
+        const requirementVersion = Math.max(1, Math.trunc(Number(requirement.version ?? 1)))
+        const reviewStatus = snapshot.version === 2
+          ? validValue(requirement.reviewStatus, ['pending', 'approved', 'rejected'] as const, 'pending')
+          : 'approved'
         this.db.prepare(`
           INSERT INTO pm_requirements(
-            id, project_id, document_id, set_id, version, requirement_no, category, module, title, content,
+            id, project_id, document_id, set_id, logical_id, fingerprint, version, requirement_no, category, module, title, content,
             key_info_terms_json, key_info_terms_source, source_location, source_chunk_id,
             evidence_quote, confidence, review_status, review_note,
-            status, status_source, status_reason, highest_match_score, match_count,
-            created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            status, status_source, status_reason, highest_match_score, highest_similarity_score,
+            latest_similarity_run_id, similar_candidate_count, match_count, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           targetRequirementId,
           projectId,
           targetDocumentId,
-          '',
-          Math.max(1, Math.trunc(Number(requirement.version ?? 1))),
+          targetSetId,
+          logicalId,
+          fingerprint,
+          requirementVersion,
           Math.max(1, Math.trunc(Number(requirement.requirementNo ?? 0))),
           validValue(requirement.category, ['functional', 'interface', 'data', 'performance', 'security', 'deployment', 'operations', 'acceptance', 'business'] as const, 'functional'),
           String(requirement.module ?? '').trim(),
@@ -4815,7 +5558,7 @@ export class AppDatabase {
           String(requirement.sourceChunkId ?? ''),
           String(requirement.evidenceQuote ?? ''),
           Math.max(0, Math.min(1, Number(requirement.confidence ?? 1))),
-          'approved',
+          reviewStatus,
           String(requirement.reviewNote ?? ''),
           validValue(requirement.status, ['unmarked', 'satisfied', 'to_develop', 'to_negotiate'] as const, 'unmarked'),
           validValue(
@@ -4825,11 +5568,16 @@ export class AppDatabase {
           ),
           String(requirement.statusReason ?? ''),
           Math.max(0, Number(requirement.highestMatchScore ?? 0)),
+          requirement.highestSimilarityScore === null || requirement.highestSimilarityScore === undefined
+            ? null : Number(requirement.highestSimilarityScore),
+          requirement.latestSimilarityRunId ?? null,
+          Math.max(0, Math.trunc(Number(requirement.similarCandidateCount ?? 0))),
           Math.max(0, Math.trunc(Number(requirement.matchCount ?? 0))),
           sourceTimestamp(requirement.createdAt),
           timestamp
         )
         if (sourceRequirementId) requirementMap.set(sourceRequirementId, targetRequirementId)
+        if (sourceRequirementId) importedRequirementVersionBySourceId.set(sourceRequirementId, requirementVersion)
       }
 
       for (const participant of snapshot.participants ?? []) {
@@ -4870,6 +5618,59 @@ export class AppDatabase {
         const sourceTaskId = String(task.id ?? '').trim()
         if (sourceTaskId && !taskMap.has(sourceTaskId)) taskMap.set(sourceTaskId, randomUUID())
       }
+      const importedTrace = (link: unknown, sourceRequirementId: string, targetRequirementId: string): {
+        sourceBaselineVersion: number
+        sourceRequirementVersion: number
+        targetCurrentVersion: number | null
+        traceStatus: ProjectTraceStatus
+        traceMetadataJson: string
+      } => {
+        const row = link && typeof link === 'object' ? link as Record<string, unknown> : {}
+        const rawMetadata = row.traceMetadata
+        const metadata = rawMetadata && typeof rawMetadata === 'object' && !Array.isArray(rawMetadata)
+          ? rawMetadata as Partial<ProjectRequirementTraceMetadata>
+          : {}
+        const sourceBaselineVersion = Math.max(1, Math.trunc(Number(
+          row.sourceBaselineVersion ?? metadata.sourceBaselineVersion ?? importedRequirementVersionBySourceId.get(sourceRequirementId) ?? 1
+        )))
+        const sourceRequirementVersion = Math.max(1, Math.trunc(Number(
+          row.sourceRequirementVersion ?? metadata.sourceRequirementVersion ?? importedRequirementVersionBySourceId.get(sourceRequirementId) ?? 1
+        )))
+        const rawTargetVersion = row.targetCurrentVersion ?? metadata.targetCurrentVersion
+        const targetCurrentVersion = rawTargetVersion === null || rawTargetVersion === undefined || rawTargetVersion === ''
+          ? null : Math.max(1, Math.trunc(Number(rawTargetVersion)))
+        const traceStatus = safeTraceStatus(row.traceStatus, 'valid')
+        const sourceSourceRequirementId = String(metadata.sourceRequirementId ?? sourceRequirementId).trim()
+        const sourceSetId = String(metadata.sourceSetId ?? '').trim()
+        const targetSourceRequirementId = metadata.targetRequirementId === null
+          ? null
+          : String(metadata.targetRequirementId ?? sourceRequirementId).trim()
+        const mappedMetadata: ProjectRequirementTraceMetadata = {
+          // Source identifiers intentionally remain the identifiers from the
+          // imported snapshot; only the live target link points at the newly
+          // generated local requirement id.
+          sourceRequirementId: sourceSourceRequirementId || sourceRequirementId,
+          sourceSetId,
+          sourceBaselineVersion,
+          sourceRequirementVersion,
+          targetRequirementId: targetSourceRequirementId
+            ? (requirementMap.get(targetSourceRequirementId) ?? targetRequirementId)
+            : null,
+          targetCurrentVersion: targetCurrentVersion ?? (traceStatus === 'valid'
+            ? importedRequirementVersionBySourceId.get(sourceRequirementId) ?? sourceRequirementVersion
+            : null),
+          validatedAt: String(metadata.validatedAt ?? '').trim() || timestamp,
+          validationReason: String(metadata.validationReason ?? '').trim(),
+          validatedBy: String(row.validatedBy ?? metadata.validatedBy ?? '').trim()
+        }
+        return {
+          sourceBaselineVersion,
+          sourceRequirementVersion,
+          targetCurrentVersion: mappedMetadata.targetCurrentVersion,
+          traceStatus,
+          traceMetadataJson: JSON.stringify(mappedMetadata)
+        }
+      }
       for (const task of snapshot.tasks ?? []) {
         const targetTaskId = taskMap.get(String(task.id ?? '').trim()) ?? randomUUID()
         const sourceParentId = String(task.parentTaskId ?? '').trim()
@@ -4906,11 +5707,20 @@ export class AppDatabase {
             warnings.push(`任务“${String(task.title ?? '未命名任务')}”的关联需求未找到对应记录，已跳过`)
             continue
           }
+          const trace = importedTrace(linkedRequirement, sourceRequirementId, targetRequirementId)
           this.db.prepare(`
-            INSERT INTO pm_project_task_requirements(project_id, task_id, requirement_id, linked_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO pm_project_task_requirements(
+              project_id, task_id, requirement_id, linked_at,
+              source_baseline_version, source_requirement_version, target_current_version,
+              trace_status, trace_metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(task_id, requirement_id) DO NOTHING
-          `).run(projectId, targetTaskId, targetRequirementId, sourceTimestamp(linkedRequirement.linkedAt || task.updatedAt || task.createdAt))
+          `).run(
+            projectId, targetTaskId, targetRequirementId,
+            sourceTimestamp(linkedRequirement.linkedAt || task.updatedAt || task.createdAt),
+            trace.sourceBaselineVersion, trace.sourceRequirementVersion, trace.targetCurrentVersion,
+            trace.traceStatus, trace.traceMetadataJson
+          )
         }
       }
 
@@ -4923,9 +5733,18 @@ export class AppDatabase {
           continue
         }
         this.db.prepare(`
-          INSERT INTO pm_project_assets(project_id, record_uid, linked_at)
-          VALUES (?, ?, ?)
-        `).run(projectId, recordUid, sourceTimestamp(asset.linkedAt))
+          INSERT INTO pm_project_assets(
+            project_id, record_uid, linked_at, link_source, confirmed_by, confirmed_at, match_run_id
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          projectId,
+          recordUid,
+          sourceTimestamp(asset.linkedAt),
+          validValue(asset.linkSource, ['manual', 'exact_business_hash', 'legacy_unknown'] as const, 'legacy_unknown'),
+          String(asset.confirmedBy ?? ''),
+          String(asset.confirmedAt ?? ''),
+          asset.matchRunId ?? null
+        )
         linkedRecordIds.add(recordUid)
       }
 
@@ -4939,11 +5758,164 @@ export class AppDatabase {
             warnings.push(`项目资产“${String(asset.name ?? recordUid)}”的需求关联未找到对应需求，已跳过`)
             continue
           }
+          const trace = importedTrace(linkedRequirement, sourceRequirementId, targetRequirementId)
           this.db.prepare(`
-            INSERT INTO pm_project_asset_requirements(project_id, record_uid, requirement_id, linked_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO pm_project_asset_requirements(
+              project_id, record_uid, requirement_id, linked_at,
+              link_source, confirmed_by, confirmed_at, match_run_id,
+              source_baseline_version, source_requirement_version, target_current_version,
+              trace_status, trace_metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(project_id, record_uid, requirement_id) DO NOTHING
-          `).run(projectId, recordUid, targetRequirementId, sourceTimestamp(linkedRequirement.linkedAt || asset.linkedAt))
+          `).run(
+            projectId,
+            recordUid,
+            targetRequirementId,
+            sourceTimestamp(linkedRequirement.linkedAt || asset.linkedAt),
+            validValue(linkedRequirement.linkSource, ['manual', 'exact_business_hash', 'legacy_unknown'] as const, 'legacy_unknown'),
+            String(linkedRequirement.confirmedBy ?? asset.confirmedBy ?? ''),
+            String(linkedRequirement.confirmedAt ?? asset.confirmedAt ?? ''),
+            linkedRequirement.matchRunId ?? asset.matchRunId ?? null,
+            trace.sourceBaselineVersion,
+            trace.sourceRequirementVersion,
+            trace.targetCurrentVersion,
+            trace.traceStatus,
+            trace.traceMetadataJson
+          )
+        }
+      }
+
+      if (snapshot.version === 2) {
+        for (const run of snapshot.matchRuns ?? []) {
+          const sourceRunId = String(run.id ?? '').trim()
+          const sourceRequirementId = String(run.requirementId ?? '').trim()
+          const targetRequirementId = requirementMap.get(sourceRequirementId)
+          if (!targetRequirementId) {
+            warnings.push(`匹配运行“${sourceRunId || '未命名运行'}”的需求不存在，已跳过`)
+            continue
+          }
+          const targetRequirement = this.getProjectRequirement(targetRequirementId)
+          const targetRunId = randomUUID()
+          const sourceStatus = String(run.status ?? 'failed')
+          const wasRunning = sourceStatus === 'running'
+          const status = ['running', 'succeeded', 'failed', 'stale'].includes(sourceStatus)
+            ? (wasRunning ? 'failed' : sourceStatus) as ProjectRequirementMatchRunSnapshot['status']
+            : 'failed'
+          const failureCode = wasRunning ? 'MATCH_INTERRUPTED' : (run.failureCode ?? null)
+          const completedAt = wasRunning ? timestamp : (run.completedAt ?? null)
+          this.db.prepare(`
+            INSERT INTO pm_requirement_match_runs(
+              id, requirement_id, requirement_snapshot_hash, requirement_business_hash,
+              normalization_version, index_version, pipeline_version, ranking_version,
+              config_hash, model_version, status, degradation_codes_json, failure_code,
+              started_at, created_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            targetRunId,
+            targetRequirementId,
+            targetRequirement
+              ? projectRequirementRuntimeSnapshotHash(targetRequirement)
+              : String(run.requirementSnapshotHash ?? ''),
+            String(run.requirementBusinessHash ?? ''),
+            String(run.normalizationVersion ?? ''),
+            String(run.indexVersion ?? ''),
+            String(run.pipelineVersion ?? ''),
+            String(run.rankingVersion ?? ''),
+            String(run.configHash ?? ''),
+            run.modelVersion ?? null,
+            status,
+            JSON.stringify(Array.isArray(run.degradationCodes) ? run.degradationCodes.map(String) : []),
+            failureCode,
+            sourceTimestamp(run.startedAt),
+            sourceTimestamp(run.createdAt),
+            completedAt
+          )
+          if (sourceRunId) matchRunMap.set(sourceRunId, targetRunId)
+          if (sourceRunId) matchRunRequirementBySourceId.set(sourceRunId, sourceRequirementId)
+        }
+        for (const candidate of snapshot.matchCandidates ?? []) {
+          const sourceRunId = String(candidate.runId ?? '').trim()
+          const targetRunId = matchRunMap.get(sourceRunId)
+          const sourceCandidateRequirementId = String(candidate.requirementId ?? '').trim()
+          const targetRequirementId = requirementMap.get(sourceCandidateRequirementId)
+          const recordUid = String(candidate.recordUid ?? '').trim()
+          const sourceRunRequirementId = matchRunRequirementBySourceId.get(sourceRunId)
+          if (sourceRunRequirementId && sourceCandidateRequirementId && sourceRunRequirementId !== sourceCandidateRequirementId) {
+            warnings.push(`候选记录“${recordUid || '未命名记录'}”与匹配运行所属需求不一致，已跳过`)
+            continue
+          }
+          if (!targetRunId || !targetRequirementId) {
+            warnings.push(`候选记录“${recordUid || '未命名记录'}”的匹配运行或需求不存在，已跳过`)
+            continue
+          }
+          if (!recordUid || !recordExists(recordUid)) {
+            warnings.push(`候选记录“${recordUid || '未命名记录'}”未找到数据中心数据，已跳过`)
+            continue
+          }
+          this.db.prepare(`
+            INSERT OR IGNORE INTO pm_requirement_match_candidates(
+              run_id, record_uid, final_rank, ranking_score, similarity_score, ranking_version, relation,
+              decision_status, confidence_status, confidence_reasons_json, evidence_level,
+              reason_codes_json, degradation_codes_json, stage_scores_json, score_breakdown_json, evidence_json,
+              explanation_status, explanation, record_snapshot_hash
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            targetRunId,
+            recordUid,
+            Math.max(0, Math.trunc(Number(candidate.finalRank ?? 0))),
+            Number(candidate.rankingScore ?? 0),
+            candidate.similarityScore === null || candidate.similarityScore === undefined ? null : Number(candidate.similarityScore),
+            String(candidate.rankingVersion ?? ''),
+            candidate.relation ?? null,
+            String(candidate.decisionStatus ?? 'rejected'),
+            String(candidate.confidenceStatus ?? 'low'),
+            JSON.stringify(Array.isArray(candidate.confidenceReasons) ? candidate.confidenceReasons.map(String) : []),
+            String(candidate.evidenceLevel ?? 'none'),
+            JSON.stringify(Array.isArray(candidate.reasonCodes) ? candidate.reasonCodes.map(String) : []),
+            JSON.stringify(Array.isArray(candidate.degradationCodes) ? candidate.degradationCodes.map(String) : []),
+            JSON.stringify(candidate.stageScores ?? {}),
+            JSON.stringify(candidate.scoreBreakdown ?? {}),
+            JSON.stringify(candidate.evidenceJson ?? {}),
+            String(candidate.explanationStatus ?? 'not_requested'),
+            candidate.explanation ?? null,
+            String(candidate.recordSnapshotHash ?? '')
+          )
+        }
+        // The v2 payload may point at a source run from requirement/asset
+        // snapshots. Once run ids have been remapped, repair those references
+        // to avoid leaving dangling ids in the imported project.
+        for (const requirement of snapshot.requirements ?? []) {
+          const sourceRequirementId = String(requirement.id ?? '').trim()
+          const targetRequirementId = requirementMap.get(sourceRequirementId)
+          if (!targetRequirementId) continue
+          const sourceRunId = requirement.latestSimilarityRunId
+          const targetRunId = sourceRunId ? (matchRunMap.get(String(sourceRunId)) ?? null) : null
+          this.db.prepare(
+            'UPDATE pm_requirements SET latest_similarity_run_id = ? WHERE id = ?'
+          ).run(targetRunId, targetRequirementId)
+        }
+        for (const asset of snapshot.assets ?? []) {
+          const recordUid = String(asset.recordUid ?? '').trim()
+          if (!recordUid || !linkedRecordIds.has(recordUid)) continue
+          const sourceRunId = asset.matchRunId ? String(asset.matchRunId) : null
+          const targetRunId = sourceRunId ? (matchRunMap.get(sourceRunId) ?? null) : null
+          this.db.prepare(
+            'UPDATE pm_project_assets SET match_run_id = ? WHERE project_id = ? AND record_uid = ?'
+          ).run(targetRunId, projectId, recordUid)
+          for (const linkedRequirement of asset.requirements ?? []) {
+            const sourceRequirementId = String(linkedRequirement.requirementId ?? '').trim()
+            const targetRequirementId = requirementMap.get(sourceRequirementId)
+            if (!targetRequirementId) continue
+            const linkedSourceRunId = linkedRequirement.matchRunId
+              ? String(linkedRequirement.matchRunId) : sourceRunId
+            const linkedTargetRunId = linkedSourceRunId
+              ? (matchRunMap.get(linkedSourceRunId) ?? null) : null
+            this.db.prepare(`
+              UPDATE pm_project_asset_requirements
+              SET match_run_id = ?
+              WHERE project_id = ? AND record_uid = ? AND requirement_id = ?
+            `).run(linkedTargetRunId, projectId, recordUid, targetRequirementId)
+          }
         }
       }
 
@@ -5180,21 +6152,78 @@ export class AppDatabase {
     }
     this.db.exec('BEGIN IMMEDIATE')
     try {
+      const previousRows = this.db.prepare(
+        'SELECT * FROM pm_requirements WHERE set_id = ? ORDER BY requirement_no ASC, id ASC'
+      ).all(setId) as SqlRow[]
+      const publishedRows = this.db.prepare(`
+        SELECT q.*
+        FROM pm_requirements q
+        WHERE q.project_id = ? AND q.review_status = 'approved'
+          AND (q.set_id = '' OR q.set_id = (
+            SELECT id FROM pm_requirement_sets
+            WHERE project_id = ? AND status = 'published'
+            ORDER BY version DESC LIMIT 1
+          ))
+        ORDER BY q.requirement_no ASC, q.id ASC
+      `).all(projectId, projectId) as SqlRow[]
+      const byFingerprint = (rows: SqlRow[]): Map<string, SqlRow[]> => {
+        const result = new Map<string, SqlRow[]>()
+        for (const row of rows) {
+          // Recompute from material fields so rows created before the category
+          // field was included in the persisted fingerprint remain comparable.
+          const fingerprint = projectRequirementFingerprintFromRow(row)
+          const values = result.get(fingerprint) ?? []
+          values.push(row)
+          result.set(fingerprint, values)
+        }
+        return result
+      }
+      const previousByFingerprint = byFingerprint(previousRows)
+      const publishedByFingerprint = byFingerprint(publishedRows)
+      const previousById = new Map(previousRows.map((row) => [String(row.id ?? '').trim(), row]))
+      const usedLogicalIds = new Set<string>()
+      const takeReusableLogicalId = (requirementId: string, fingerprint: string): string | undefined => {
+        const sameReviewRow = previousById.get(requirementId)
+        const sameReviewLogicalId = String(sameReviewRow?.logical_id ?? '').trim()
+        if (sameReviewLogicalId && !usedLogicalIds.has(sameReviewLogicalId)) {
+          usedLogicalIds.add(sameReviewLogicalId)
+          return sameReviewLogicalId
+        }
+        for (const rows of [previousByFingerprint.get(fingerprint) ?? [], publishedByFingerprint.get(fingerprint) ?? []]) {
+          while (rows.length) {
+            const row = rows.shift() as SqlRow
+            const logicalId = String(row.logical_id ?? '').trim()
+            if (logicalId && !usedLogicalIds.has(logicalId)) {
+              usedLogicalIds.add(logicalId)
+              return logicalId
+            }
+          }
+        }
+        return undefined
+      }
       this.db.prepare('DELETE FROM pm_requirements WHERE set_id = ?').run(setId)
       const insert = this.db.prepare(`
         INSERT INTO pm_requirements(
-          id, project_id, document_id, set_id, version, requirement_no, category, module,
+          id, project_id, document_id, set_id, logical_id, fingerprint, version, requirement_no, category, module,
           title, content, key_info_terms_json, key_info_terms_source, source_location,
           source_chunk_id, evidence_quote, confidence, review_status, review_note,
           status, status_source, status_reason, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ai', ?, ?, ?, ?, 'pending', '', 'unmarked', 'ai', '待人工审核', ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ai', ?, ?, ?, ?, 'pending', '', 'unmarked', 'ai', '待人工审核', ?, ?)
       `)
       const timestamp = nowIso()
-      requirements.forEach((item, index) => insert.run(
-        item.id,
+      const insertedFingerprints: string[] = []
+      requirements.forEach((item, index) => {
+        const fingerprint = projectRequirementFingerprint(item)
+        const requirementId = String(item.id ?? '').trim() || randomUUID()
+        const logicalId = takeReusableLogicalId(requirementId, fingerprint) ?? randomUUID()
+        insertedFingerprints.push(fingerprint)
+        insert.run(
+        requirementId,
         projectId,
         item.documentId ?? documentId,
         setId,
+        logicalId,
+        fingerprint,
         set.version,
         index + 1,
         item.category,
@@ -5208,7 +6237,10 @@ export class AppDatabase {
         Math.max(0, Math.min(1, item.confidence)),
         timestamp,
         timestamp
-      ))
+        )
+      })
+      this.db.prepare('UPDATE pm_requirement_sets SET fingerprint = ? WHERE id = ?')
+        .run(projectRequirementSetFingerprint(insertedFingerprints), setId)
       this.db.exec('COMMIT')
     } catch (error) {
       this.db.exec('ROLLBACK')
@@ -5224,6 +6256,262 @@ export class AppDatabase {
     const timestamp = nowIso()
     this.db.exec('BEGIN IMMEDIATE')
     try {
+      // Capture the old published baseline before changing set/review status.
+      // Legacy set_id='' rows are included for compatibility with projects
+      // created through replaceProjectRequirements().
+      const previousRows = this.db.prepare(`
+        SELECT q.*, COALESCE(s.version, q.version) AS baseline_version
+        FROM pm_requirements q
+        LEFT JOIN pm_requirement_sets s ON s.id = q.set_id
+        WHERE q.project_id = ? AND q.review_status = 'approved'
+          AND (q.set_id = '' OR q.set_id = (
+            SELECT id FROM pm_requirement_sets
+            WHERE project_id = ? AND status = 'published'
+            ORDER BY version DESC LIMIT 1
+          ))
+        ORDER BY q.requirement_no ASC, q.id ASC
+      `).all(projectId, projectId) as SqlRow[]
+      const nextRows = this.db.prepare(`
+        SELECT q.*, COALESCE(s.version, q.version) AS baseline_version
+        FROM pm_requirements q
+        LEFT JOIN pm_requirement_sets s ON s.id = q.set_id
+        WHERE q.project_id = ? AND q.set_id = ? AND q.review_status = 'approved'
+        ORDER BY q.requirement_no ASC, q.id ASC
+      `).all(projectId, set.id) as SqlRow[]
+      const previousById = new Map(previousRows.map((row) => [String(row.id), row]))
+      const nextByLogicalId = new Map<string, SqlRow[]>()
+      for (const row of nextRows) {
+        const logicalId = String(row.logical_id ?? '').trim()
+        if (!logicalId) continue
+        const rows = nextByLogicalId.get(logicalId) ?? []
+        rows.push(row)
+        nextByLogicalId.set(logicalId, rows)
+      }
+      const allTaskLinks = this.db.prepare(`
+        SELECT l.*, q.logical_id, q.set_id, q.version,
+               COALESCE(s.version, q.version) AS baseline_version
+        FROM pm_project_task_requirements l
+        JOIN pm_requirements q ON q.id = l.requirement_id
+        LEFT JOIN pm_requirement_sets s ON s.id = q.set_id
+        WHERE l.project_id = ?
+      `).all(projectId) as SqlRow[]
+      const allAssetLinks = this.db.prepare(`
+        SELECT l.*, q.logical_id, q.set_id, q.version,
+               COALESCE(s.version, q.version) AS baseline_version
+        FROM pm_project_asset_requirements l
+        JOIN pm_requirements q ON q.id = l.requirement_id
+        LEFT JOIN pm_requirement_sets s ON s.id = q.set_id
+        WHERE l.project_id = ?
+      `).all(projectId) as SqlRow[]
+
+      const updateTaskTrace = this.db.prepare(`
+        UPDATE pm_project_task_requirements
+        SET source_baseline_version = ?, source_requirement_version = ?,
+            target_current_version = ?, trace_status = ?, trace_metadata_json = ?
+        WHERE project_id = ? AND task_id = ? AND requirement_id = ?
+      `)
+      const insertTaskLink = this.db.prepare(`
+        INSERT OR IGNORE INTO pm_project_task_requirements(
+          project_id, task_id, requirement_id, linked_at,
+          source_baseline_version, source_requirement_version, target_current_version,
+          trace_status, trace_metadata_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      const deleteTaskLink = this.db.prepare(
+        'DELETE FROM pm_project_task_requirements WHERE project_id = ? AND task_id = ? AND requirement_id = ?'
+      )
+      for (const link of allTaskLinks) {
+        const oldRequirementId = String(link.requirement_id ?? '')
+        const oldRequirement = previousById.get(oldRequirementId)
+        if (!oldRequirement) continue
+        const logicalId = String(oldRequirement.logical_id ?? link.logical_id ?? '').trim()
+        const candidates = logicalId ? (nextByLogicalId.get(logicalId) ?? []) : []
+        const linkedRequirementVersion = Number(link.source_requirement_version ?? 0)
+        const sourceRequirementVersion = Math.max(
+          1,
+          Math.trunc(linkedRequirementVersion > 0 ? linkedRequirementVersion : Number(oldRequirement.version ?? 1))
+        )
+        const linkedBaselineVersion = Number(link.source_baseline_version ?? 0)
+        const sourceBaselineVersion = Math.max(
+          1,
+          Math.trunc(linkedBaselineVersion > 0
+            ? linkedBaselineVersion
+            : Number(oldRequirement.baseline_version ?? sourceRequirementVersion))
+        )
+        const fallbackMetadata: ProjectRequirementTraceMetadata = {
+          sourceRequirementId: oldRequirementId,
+          sourceSetId: String(oldRequirement.set_id ?? ''),
+          sourceBaselineVersion,
+          sourceRequirementVersion,
+          targetRequirementId: oldRequirementId,
+          targetCurrentVersion: sourceRequirementVersion,
+          validatedAt: String(link.linked_at ?? timestamp),
+          validationReason: ''
+        }
+        const existingMetadata = parseProjectTraceMetadata(link.trace_metadata_json, fallbackMetadata)
+        const taskId = String(link.task_id ?? '')
+        if (candidates.length === 1) {
+          const target = candidates[0]
+          const targetRequirementId = String(target.id)
+          const targetVersion = Math.max(1, Math.trunc(Number(target.version ?? set.version)))
+           const fingerprintChanged = projectRequirementFingerprintFromRow(oldRequirement) !== projectRequirementFingerprintFromRow(target)
+           const traceStatus: ProjectTraceStatus = fingerprintChanged ? 'suspect' : 'valid'
+          const metadata: ProjectRequirementTraceMetadata = {
+            ...existingMetadata,
+            sourceRequirementId: existingMetadata.sourceRequirementId || oldRequirementId,
+            sourceSetId: existingMetadata.sourceSetId || String(oldRequirement.set_id ?? ''),
+            sourceBaselineVersion,
+            sourceRequirementVersion,
+            targetRequirementId,
+            targetCurrentVersion: targetVersion,
+            validatedAt: timestamp,
+             validationReason: fingerprintChanged ? 'published baseline material fields changed' : ''
+          }
+          if (targetRequirementId !== oldRequirementId) {
+            insertTaskLink.run(
+              projectId, taskId, targetRequirementId, String(link.linked_at ?? timestamp),
+              sourceBaselineVersion, sourceRequirementVersion, targetVersion, traceStatus, JSON.stringify(metadata)
+            )
+            // If a task already had the target link, merge into that row rather
+            // than failing on the composite key or dropping either source.
+            updateTaskTrace.run(
+              sourceBaselineVersion, sourceRequirementVersion, targetVersion, traceStatus, JSON.stringify(metadata),
+              projectId, taskId, targetRequirementId
+            )
+            deleteTaskLink.run(projectId, taskId, oldRequirementId)
+          } else {
+            updateTaskTrace.run(
+              sourceBaselineVersion, sourceRequirementVersion, targetVersion, traceStatus, JSON.stringify(metadata),
+              projectId, taskId, oldRequirementId
+            )
+          }
+        } else {
+          const metadata: ProjectRequirementTraceMetadata = {
+            ...existingMetadata,
+            sourceRequirementId: existingMetadata.sourceRequirementId || oldRequirementId,
+            sourceSetId: existingMetadata.sourceSetId || String(oldRequirement.set_id ?? ''),
+            sourceBaselineVersion,
+            sourceRequirementVersion,
+            targetRequirementId: null,
+            targetCurrentVersion: null,
+            validatedAt: existingMetadata.validatedAt || String(link.linked_at ?? timestamp),
+            validationReason: candidates.length > 1
+              ? 'current published baseline has multiple requirements with the same logical identity'
+              : 'current published baseline has no matching logical identity'
+          }
+          updateTaskTrace.run(
+            sourceBaselineVersion, sourceRequirementVersion, null, 'suspect', JSON.stringify(metadata),
+            projectId, taskId, oldRequirementId
+          )
+        }
+      }
+
+      const updateAssetTrace = this.db.prepare(`
+        UPDATE pm_project_asset_requirements
+        SET source_baseline_version = ?, source_requirement_version = ?,
+            target_current_version = ?, trace_status = ?, trace_metadata_json = ?
+        WHERE project_id = ? AND record_uid = ? AND requirement_id = ?
+      `)
+      const insertAssetLink = this.db.prepare(`
+        INSERT OR IGNORE INTO pm_project_asset_requirements(
+          project_id, record_uid, requirement_id, linked_at,
+          link_source, confirmed_by, confirmed_at, match_run_id,
+          source_baseline_version, source_requirement_version, target_current_version,
+          trace_status, trace_metadata_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      const deleteAssetLink = this.db.prepare(
+        'DELETE FROM pm_project_asset_requirements WHERE project_id = ? AND record_uid = ? AND requirement_id = ?'
+      )
+      for (const link of allAssetLinks) {
+        const oldRequirementId = String(link.requirement_id ?? '')
+        const oldRequirement = previousById.get(oldRequirementId)
+        if (!oldRequirement) continue
+        const logicalId = String(oldRequirement.logical_id ?? link.logical_id ?? '').trim()
+        const candidates = logicalId ? (nextByLogicalId.get(logicalId) ?? []) : []
+        const linkedRequirementVersion = Number(link.source_requirement_version ?? 0)
+        const sourceRequirementVersion = Math.max(
+          1,
+          Math.trunc(linkedRequirementVersion > 0 ? linkedRequirementVersion : Number(oldRequirement.version ?? 1))
+        )
+        const linkedBaselineVersion = Number(link.source_baseline_version ?? 0)
+        const sourceBaselineVersion = Math.max(
+          1,
+          Math.trunc(linkedBaselineVersion > 0
+            ? linkedBaselineVersion
+            : Number(oldRequirement.baseline_version ?? sourceRequirementVersion))
+        )
+        const fallbackMetadata: ProjectRequirementTraceMetadata = {
+          sourceRequirementId: oldRequirementId,
+          sourceSetId: String(oldRequirement.set_id ?? ''),
+          sourceBaselineVersion,
+          sourceRequirementVersion,
+          targetRequirementId: oldRequirementId,
+          targetCurrentVersion: sourceRequirementVersion,
+          validatedAt: String(link.linked_at ?? timestamp),
+          validationReason: ''
+        }
+        const existingMetadata = parseProjectTraceMetadata(link.trace_metadata_json, fallbackMetadata)
+        const recordUid = String(link.record_uid ?? '')
+        if (candidates.length === 1) {
+          const target = candidates[0]
+          const targetRequirementId = String(target.id)
+          const targetVersion = Math.max(1, Math.trunc(Number(target.version ?? set.version)))
+           const fingerprintChanged = projectRequirementFingerprintFromRow(oldRequirement) !== projectRequirementFingerprintFromRow(target)
+           const traceStatus: ProjectTraceStatus = fingerprintChanged ? 'suspect' : 'valid'
+          const metadata: ProjectRequirementTraceMetadata = {
+            ...existingMetadata,
+            sourceRequirementId: existingMetadata.sourceRequirementId || oldRequirementId,
+            sourceSetId: existingMetadata.sourceSetId || String(oldRequirement.set_id ?? ''),
+            sourceBaselineVersion,
+            sourceRequirementVersion,
+            targetRequirementId,
+            targetCurrentVersion: targetVersion,
+            validatedAt: timestamp,
+             validationReason: fingerprintChanged ? 'published baseline material fields changed' : ''
+          }
+          if (targetRequirementId !== oldRequirementId) {
+            insertAssetLink.run(
+              projectId, recordUid, targetRequirementId, String(link.linked_at ?? timestamp),
+              String(link.link_source ?? 'legacy_unknown'), String(link.confirmed_by ?? ''),
+              String(link.confirmed_at ?? ''),
+              link.match_run_id === null || link.match_run_id === undefined ? null : String(link.match_run_id),
+              sourceBaselineVersion, sourceRequirementVersion, targetVersion, traceStatus, JSON.stringify(metadata)
+            )
+            // Keep existing manual/confirmed provenance on a conflicting target
+            // row; only the trace fields are merged from the old source.
+            updateAssetTrace.run(
+              sourceBaselineVersion, sourceRequirementVersion, targetVersion, traceStatus, JSON.stringify(metadata),
+              projectId, recordUid, targetRequirementId
+            )
+            deleteAssetLink.run(projectId, recordUid, oldRequirementId)
+          } else {
+            updateAssetTrace.run(
+              sourceBaselineVersion, sourceRequirementVersion, targetVersion, traceStatus, JSON.stringify(metadata),
+              projectId, recordUid, oldRequirementId
+            )
+          }
+        } else {
+          const metadata: ProjectRequirementTraceMetadata = {
+            ...existingMetadata,
+            sourceRequirementId: existingMetadata.sourceRequirementId || oldRequirementId,
+            sourceSetId: existingMetadata.sourceSetId || String(oldRequirement.set_id ?? ''),
+            sourceBaselineVersion,
+            sourceRequirementVersion,
+            targetRequirementId: null,
+            targetCurrentVersion: null,
+            validatedAt: existingMetadata.validatedAt || String(link.linked_at ?? timestamp),
+            validationReason: candidates.length > 1
+              ? 'current published baseline has multiple requirements with the same logical identity'
+              : 'current published baseline has no matching logical identity'
+          }
+          updateAssetTrace.run(
+            sourceBaselineVersion, sourceRequirementVersion, null, 'suspect', JSON.stringify(metadata),
+            projectId, recordUid, oldRequirementId
+          )
+        }
+      }
+
       this.db.prepare(
         "UPDATE pm_requirement_sets SET status = 'superseded' WHERE project_id = ? AND status = 'published'"
       ).run(projectId)
@@ -5234,6 +6522,23 @@ export class AppDatabase {
       this.db.prepare(
         "UPDATE pm_requirement_sets SET status = 'published', published_at = ? WHERE id = ? AND status = 'reviewing'"
       ).run(timestamp, set.id)
+      if (previousRows.length) {
+        const previousRequirementIds = previousRows.map((row) => String(row.id)).filter(Boolean)
+        const placeholders = previousRequirementIds.map(() => '?').join(', ')
+        this.db.prepare(`
+          UPDATE pm_requirement_match_runs
+          SET status = 'stale',
+              failure_code = COALESCE(failure_code, 'REQUIREMENT_BASELINE_SUPERSEDED'),
+              completed_at = COALESCE(completed_at, ?)
+          WHERE status = 'succeeded' AND requirement_id IN (${placeholders})
+        `).run(timestamp, ...previousRequirementIds)
+        this.db.prepare(`
+          UPDATE pm_requirements
+          SET highest_similarity_score = NULL, latest_similarity_run_id = NULL,
+              similar_candidate_count = 0
+          WHERE id IN (${placeholders})
+        `).run(...previousRequirementIds)
+      }
       this.db.prepare(`
         DELETE FROM pm_requirement_matches WHERE requirement_id IN (
           SELECT id FROM pm_requirements WHERE project_id = ? AND set_id <> ?
@@ -5273,11 +6578,11 @@ export class AppDatabase {
       this.db.prepare('DELETE FROM pm_requirements WHERE project_id = ?').run(projectId)
       const insert = this.db.prepare(`
         INSERT INTO pm_requirements(
-          id, project_id, document_id, requirement_no, module, title, content,
+          id, project_id, document_id, logical_id, fingerprint, requirement_no, module, title, content,
           key_info_terms_json, key_info_terms_source, source_location, source_chunk_id,
           status, status_source, status_reason,
           created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ai', ?, ?, ?, 'ai', ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ai', ?, ?, ?, 'ai', ?, ?, ?)
       `)
       const timestamp = nowIso()
       for (const item of requirements) {
@@ -5285,6 +6590,8 @@ export class AppDatabase {
           item.id,
           projectId,
           documentId,
+          randomUUID(),
+          projectRequirementFingerprint(item),
           item.requirementNo,
           item.module ?? '',
           item.title,
@@ -5359,17 +6666,18 @@ export class AppDatabase {
     const timestamp = nowIso()
     this.db.prepare(`
       INSERT INTO pm_requirements(
-        id, project_id, document_id, set_id, version, requirement_no, category, module,
+        id, project_id, document_id, set_id, logical_id, fingerprint, version, requirement_no, category, module,
         title, content, key_info_terms_json, key_info_terms_source, source_location,
         source_chunk_id, evidence_quote, confidence, review_status, review_note,
         status, status_source, status_reason, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?, 'pending', ?, 'unmarked', 'manual', '人工补录，待审核', ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?, 'pending', ?, 'unmarked', 'manual', '人工补录，待审核', ?, ?)
     `).run(
-      id, projectId, set.documentId, set.id, set.version, nextNo, input.category,
+      id, projectId, set.documentId, set.id, randomUUID(), projectRequirementFingerprint(input), set.version, nextNo, input.category,
       input.module ?? '', input.title, input.content, JSON.stringify(input.keyInfoTerms ?? []),
       input.sourceLocation ?? '', input.sourceChunkId ?? '', input.evidenceQuote ?? '',
       Math.max(0, Math.min(1, input.confidence ?? 1)), input.reviewNote ?? '', timestamp, timestamp
     )
+    this.refreshProjectRequirementSetFingerprint(set.id)
     return this.getProjectRequirement(id)!
   }
 
@@ -5377,17 +6685,21 @@ export class AppDatabase {
     const timestamp = nowIso()
     const result = this.db.prepare(`
       UPDATE pm_requirements SET category = ?, module = ?, title = ?, content = ?,
-        key_info_terms_json = ?, key_info_terms_source = 'manual', source_location = ?,
+        key_info_terms_json = ?, key_info_terms_source = 'manual', fingerprint = ?, source_location = ?,
         source_chunk_id = ?, evidence_quote = ?, confidence = ?, review_status = 'pending',
         review_note = ?, updated_at = ?
       WHERE id = ? AND set_id IN (SELECT id FROM pm_requirement_sets WHERE status = 'reviewing')
     `).run(
       input.category, input.module ?? '', input.title, input.content,
-      JSON.stringify(input.keyInfoTerms ?? []), input.sourceLocation ?? '', input.sourceChunkId ?? '',
+      JSON.stringify(input.keyInfoTerms ?? []), projectRequirementFingerprint(input),
+      input.sourceLocation ?? '', input.sourceChunkId ?? '',
       input.evidenceQuote ?? '', Math.max(0, Math.min(1, input.confidence ?? 1)),
       input.reviewNote ?? '', timestamp, id
     )
-    return Number(result.changes) ? this.getProjectRequirement(id) : null
+    if (!Number(result.changes)) return null
+    const updated = this.getProjectRequirement(id)
+    if (updated?.setId) this.refreshProjectRequirementSetFingerprint(updated.setId)
+    return updated
   }
 
   reviewProjectRequirements(ids: string[], status: ProjectRequirementReviewStatus): number {
@@ -5414,17 +6726,17 @@ export class AppDatabase {
       this.db.prepare('DELETE FROM pm_requirements WHERE id = ?').run(id)
       const insert = this.db.prepare(`
         INSERT INTO pm_requirements(
-          id, project_id, document_id, set_id, version, requirement_no, category, module,
+          id, project_id, document_id, set_id, logical_id, fingerprint, version, requirement_no, category, module,
           title, content, key_info_terms_json, key_info_terms_source, source_location,
           source_chunk_id, evidence_quote, confidence, review_status, review_note,
           status, status_source, status_reason, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?, 'pending', ?, 'unmarked', 'manual', '人工拆分，待审核', ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?, 'pending', ?, 'unmarked', 'manual', '人工拆分，待审核', ?, ?)
       `)
       input.parts.forEach((part, index) => {
         const childId = randomUUID()
         createdIds.push(childId)
         insert.run(
-          childId, current.projectId, current.documentId, current.setId, current.version,
+          childId, current.projectId, current.documentId, current.setId, randomUUID(), projectRequirementFingerprint(part), current.version,
           current.requirementNo + index, part.category, part.module ?? current.module,
           part.title, part.content, JSON.stringify(part.keyInfoTerms ?? current.keyInfoTerms),
           part.sourceLocation ?? current.sourceLocation, part.sourceChunkId ?? current.sourceChunkId,
@@ -5433,6 +6745,7 @@ export class AppDatabase {
         )
       })
       this.renumberRequirementSet(current.setId)
+      this.refreshProjectRequirementSetFingerprint(current.setId)
       this.db.exec('COMMIT')
     } catch (error) {
       this.db.exec('ROLLBACK')
@@ -5457,19 +6770,20 @@ export class AppDatabase {
       this.db.prepare(`DELETE FROM pm_requirements WHERE id IN (${placeholders})`).run(...ids)
       this.db.prepare(`
         INSERT INTO pm_requirements(
-          id, project_id, document_id, set_id, version, requirement_no, category, module,
+          id, project_id, document_id, set_id, logical_id, fingerprint, version, requirement_no, category, module,
           title, content, key_info_terms_json, key_info_terms_source, source_location,
           source_chunk_id, evidence_quote, confidence, review_status, review_note,
           status, status_source, status_reason, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?, 'pending', ?, 'unmarked', 'manual', '人工合并，待审核', ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?, 'pending', ?, 'unmarked', 'manual', '人工合并，待审核', ?, ?)
       `).run(
-        mergedId, first.projectId, first.documentId, first.setId, first.version,
+        mergedId, first.projectId, first.documentId, first.setId, randomUUID(), projectRequirementFingerprint(input), first.version,
         Math.min(...rows.map((item) => item.requirementNo)), input.category, input.module ?? '',
         input.title, input.content, JSON.stringify(input.keyInfoTerms ?? []), input.sourceLocation ?? '',
         input.sourceChunkId ?? '', input.evidenceQuote ?? '', Math.max(0, Math.min(1, input.confidence ?? 1)),
         input.reviewNote ?? '', timestamp, timestamp
       )
       this.renumberRequirementSet(first.setId)
+      this.refreshProjectRequirementSetFingerprint(first.setId)
       this.db.exec('COMMIT')
     } catch (error) {
       this.db.exec('ROLLBACK')
@@ -5486,8 +6800,24 @@ export class AppDatabase {
     rows.forEach((row, index) => update.run(index + 1, String(row.id)))
   }
 
+  private refreshProjectRequirementSetFingerprint(setId: string): void {
+    const normalizedSetId = setId.trim()
+    if (!normalizedSetId) return
+    const rows = this.db.prepare(`
+      SELECT fingerprint, module, title, content, key_info_terms_json
+      FROM pm_requirements
+      WHERE set_id = ?
+      ORDER BY requirement_no ASC, id ASC
+    `).all(normalizedSetId) as SqlRow[]
+    const fingerprints = rows.map((row) =>
+      String(row.fingerprint ?? '').trim() || projectRequirementFingerprintFromRow(row)
+    )
+    this.db.prepare('UPDATE pm_requirement_sets SET fingerprint = ? WHERE id = ?')
+      .run(projectRequirementSetFingerprint(fingerprints), normalizedSetId)
+  }
+
   deleteProjectRequirement(id: string): { ok: boolean; message: string } {
-    const current = this.db.prepare('SELECT id FROM pm_requirements WHERE id = ?').get(id) as SqlRow | undefined
+    const current = this.db.prepare('SELECT id, set_id FROM pm_requirements WHERE id = ?').get(id) as SqlRow | undefined
     if (!current) return { ok: false, message: '功能需求不存在' }
     this.db.exec('BEGIN IMMEDIATE')
     try {
@@ -5497,6 +6827,8 @@ export class AppDatabase {
         this.db.exec('ROLLBACK')
         return { ok: false, message: '功能需求不存在' }
       }
+      const setId = String(current.set_id ?? '').trim()
+      if (setId) this.refreshProjectRequirementSetFingerprint(setId)
       this.db.exec('COMMIT')
       return { ok: true, message: '功能需求已删除，匹配结果已清除' }
     } catch (error) {
@@ -5520,6 +6852,11 @@ export class AppDatabase {
       projectId: String(row.project_id),
       documentId: String(row.document_id),
       setId: String(row.set_id ?? ''),
+      logicalId: String(row.logical_id ?? '').trim() || legacyProjectRequirementLogicalId(
+        String(row.project_id ?? ''),
+        String(row.fingerprint ?? '').trim() || projectRequirementFingerprintFromRow(row),
+        String(row.id ?? '')
+      ),
       version: Number(row.version ?? 1),
       requirementNo: Number(row.requirement_no ?? 0),
       category: String(row.category ?? 'functional') as ProjectRequirementCategory,
@@ -5566,7 +6903,8 @@ export class AppDatabase {
       approvedCount: Number(row.approved_count ?? 0),
       rejectedCount: Number(row.rejected_count ?? 0),
       createdAt: String(row.created_at ?? ''),
-      publishedAt: String(row.published_at ?? '')
+      publishedAt: String(row.published_at ?? ''),
+      fingerprint: String(row.fingerprint ?? '')
     }
   }
 
@@ -5587,7 +6925,7 @@ export class AppDatabase {
   }
 
   updateProjectRequirementKeyInfoTerms(id: string, terms: string[]): ProjectRequirement | null {
-    const current = this.db.prepare('SELECT project_id FROM pm_requirements WHERE id = ?').get(id) as SqlRow | undefined
+    const current = this.db.prepare('SELECT * FROM pm_requirements WHERE id = ?').get(id) as SqlRow | undefined
     if (!current) return null
     const projectId = String(current.project_id)
     const timestamp = nowIso()
@@ -5596,12 +6934,24 @@ export class AppDatabase {
       this.db.prepare('DELETE FROM pm_requirement_matches WHERE requirement_id = ?').run(id)
       this.db.prepare(`
         UPDATE pm_requirements
-        SET key_info_terms_json = ?, key_info_terms_source = 'manual',
+        SET key_info_terms_json = ?, key_info_terms_source = 'manual', fingerprint = ?,
             highest_match_score = 0, match_count = 0,
             highest_similarity_score = NULL, latest_similarity_run_id = NULL,
             similar_candidate_count = 0, updated_at = ?
         WHERE id = ?
-      `).run(JSON.stringify(terms), timestamp, id)
+      `).run(
+        JSON.stringify(terms),
+        projectRequirementFingerprint({
+          module: current.module,
+          title: current.title,
+          content: current.content,
+          keyInfoTerms: terms
+        }),
+        timestamp,
+        id
+      )
+      const setId = String(current.set_id ?? '').trim()
+      if (setId) this.refreshProjectRequirementSetFingerprint(setId)
       this.db.prepare(`
         UPDATE pm_projects
         SET match_status = 'stale', match_message = '关键功能信息词已修改，请重新匹配', updated_at = ?
@@ -5922,35 +7272,68 @@ export class AppDatabase {
   }
 
   linkRequirementMatchesAboveScore(requirementId: string, minScore: number): number {
-    const requirement = this.db.prepare(
-      'SELECT id FROM pm_requirements WHERE id = ?'
-    ).get(requirementId) as SqlRow | undefined
-    if (!requirement) return 0
+    const requirement = this.db.prepare(`
+      SELECT q.id, q.project_id, q.set_id, q.version, q.review_status,
+             COALESCE(s.version, q.version) AS baseline_version,
+             CASE WHEN q.review_status = 'approved' AND (
+               q.set_id = '' OR q.set_id = (
+                 SELECT id FROM pm_requirement_sets
+                 WHERE project_id = q.project_id AND status = 'published'
+                 ORDER BY version DESC LIMIT 1
+               )
+             ) THEN 1 ELSE 0 END AS is_current_published
+      FROM pm_requirements q
+      LEFT JOIN pm_requirement_sets s ON s.id = q.set_id
+      WHERE q.id = ?
+    `).get(requirementId) as SqlRow | undefined
+    if (!requirement || Number(requirement.is_current_published ?? 0) !== 1) return 0
     const threshold = Math.max(
       0,
       Math.min(100, Number.isFinite(Number(minScore)) ? Number(minScore) : 80)
     )
     const timestamp = nowIso()
+    const requirementVersion = Math.max(1, Math.trunc(Number(requirement.version ?? 1)))
+    const sourceBaselineVersion = Math.max(1, Math.trunc(Number(requirement.baseline_version ?? requirementVersion)))
+    const traceMetadata: ProjectRequirementTraceMetadata = {
+      sourceRequirementId: requirementId,
+      sourceSetId: String(requirement.set_id ?? ''),
+      sourceBaselineVersion,
+      sourceRequirementVersion: requirementVersion,
+      targetRequirementId: requirementId,
+      targetCurrentVersion: requirementVersion,
+      validatedAt: timestamp,
+      validationReason: ''
+    }
     this.db.exec('BEGIN IMMEDIATE')
     try {
       this.db.prepare(`
-        INSERT OR IGNORE INTO pm_project_assets(project_id, record_uid, linked_at)
+        INSERT OR IGNORE INTO pm_project_assets(
+          project_id, record_uid, linked_at, link_source, confirmed_by, confirmed_at, match_run_id
+        )
         SELECT q.project_id, m.record_uid, ?
+             , 'exact_business_hash', 'matching', ?, NULL
         FROM pm_requirement_matches m
         JOIN pm_requirements q ON q.id = m.requirement_id
         JOIN records r ON r.uid = m.record_uid
         WHERE m.requirement_id = ? AND m.final_score >= ?
-      `).run(timestamp, requirementId, threshold)
+      `).run(timestamp, timestamp, requirementId, threshold)
       const linked = this.db.prepare(`
         INSERT OR IGNORE INTO pm_project_asset_requirements(
-          project_id, record_uid, requirement_id, linked_at
+          project_id, record_uid, requirement_id, linked_at,
+          link_source, confirmed_by, confirmed_at, match_run_id,
+          source_baseline_version, source_requirement_version, target_current_version,
+          trace_status, trace_metadata_json
         )
-        SELECT q.project_id, m.record_uid, m.requirement_id, ?
+        SELECT q.project_id, m.record_uid, m.requirement_id, ?,
+          'exact_business_hash', 'matching', ?, NULL,
+          COALESCE(s.version, q.version), q.version, q.version,
+          'valid', ?
         FROM pm_requirement_matches m
         JOIN pm_requirements q ON q.id = m.requirement_id
+        LEFT JOIN pm_requirement_sets s ON s.id = q.set_id
         JOIN records r ON r.uid = m.record_uid
         WHERE m.requirement_id = ? AND m.final_score >= ?
-      `).run(timestamp, requirementId, threshold)
+      `).run(timestamp, timestamp, JSON.stringify(traceMetadata), requirementId, threshold)
       this.db.exec('COMMIT')
       return Number(linked.changes)
     } catch (error) {
@@ -6187,7 +7570,10 @@ export class AppDatabase {
       ORDER BY pt.sort_order ASC, pt.start_date ASC, pt.created_at ASC
     `).all(projectId) as SqlRow[]
     const requirementRows = this.db.prepare(`
-      SELECT tr.task_id, tr.linked_at, q.id AS requirement_id,
+      SELECT tr.task_id, tr.linked_at, tr.source_baseline_version,
+             tr.source_requirement_version, tr.target_current_version,
+             tr.trace_status, tr.trace_metadata_json,
+             q.id AS requirement_id, q.logical_id, q.set_id, q.version,
              q.requirement_no, q.title, q.status
       FROM pm_project_task_requirements tr
       JOIN pm_requirements q ON q.id = tr.requirement_id
@@ -6198,12 +7584,42 @@ export class AppDatabase {
     for (const row of requirementRows) {
       const taskId = String(row.task_id ?? '')
       const requirements = requirementsByTask.get(taskId) ?? []
+      const requirementId = String(row.requirement_id ?? '')
+      const requirementVersion = Math.max(0, Math.trunc(Number(row.version ?? 0)))
+      const sourceBaselineVersion = Math.max(0, Math.trunc(Number(row.source_baseline_version ?? 0))) || requirementVersion
+      const sourceRequirementVersion = Math.max(0, Math.trunc(Number(row.source_requirement_version ?? 0))) || requirementVersion
+      const traceStatus = safeTraceStatus(row.trace_status, 'valid')
+      const targetCurrentVersion = row.target_current_version === null || row.target_current_version === undefined
+        ? (traceStatus === 'valid' ? requirementVersion : null)
+        : Math.max(0, Math.trunc(Number(row.target_current_version)))
+      const fallbackMetadata: ProjectRequirementTraceMetadata = {
+        sourceRequirementId: requirementId,
+        sourceSetId: String(row.set_id ?? ''),
+        sourceBaselineVersion,
+        sourceRequirementVersion,
+        targetRequirementId: traceStatus === 'valid' ? requirementId : null,
+        targetCurrentVersion,
+        validatedAt: String(row.linked_at ?? ''),
+        validationReason: traceStatus === 'valid' ? '' : 'source requirement is not in the current published baseline'
+      }
+      const traceMetadata = parseProjectTraceMetadata(row.trace_metadata_json, fallbackMetadata)
       requirements.push({
-        requirementId: String(row.requirement_id ?? ''),
+        requirementId,
+        logicalId: String(row.logical_id ?? ''),
+        logicalRequirementId: String(row.logical_id ?? ''),
         requirementNo: Number(row.requirement_no ?? 0),
         title: String(row.title ?? ''),
         status: String(row.status ?? 'unmarked') as ProjectPlanTaskRequirement['status'],
-        linkedAt: String(row.linked_at ?? '')
+        linkedAt: String(row.linked_at ?? ''),
+        sourceBaselineVersion,
+        sourceRequirementVersion,
+        targetCurrentVersion,
+        traceStatus,
+        targetVersion: targetCurrentVersion,
+        validatedBy: String(traceMetadata.validatedBy ?? ''),
+        validatedAt: String(traceMetadata.validatedAt ?? row.linked_at ?? ''),
+        sourceBaselineId: String(traceMetadata.sourceSetId ?? row.set_id ?? ''),
+        traceMetadata
       })
       requirementsByTask.set(taskId, requirements)
     }
@@ -6409,23 +7825,103 @@ export class AppDatabase {
     linkedAt: string
   ): void {
     const normalizedIds = [...new Set(requirementIds.map((id) => String(id).trim()).filter(Boolean))]
+    const existingRows = this.db.prepare(`
+      SELECT requirement_id, source_baseline_version, source_requirement_version,
+             target_current_version, trace_status, trace_metadata_json
+      FROM pm_project_task_requirements
+      WHERE project_id = ? AND task_id = ?
+    `).all(projectId, taskId) as SqlRow[]
+    const existingByRequirementId = new Map(existingRows.map((row) => [String(row.requirement_id), row]))
     if (normalizedIds.length) {
       const placeholders = normalizedIds.map(() => '?').join(', ')
       const rows = this.db.prepare(`
-        SELECT id
-        FROM pm_requirements
-        WHERE project_id = ? AND id IN (${placeholders})
-      `).all(projectId, ...normalizedIds) as SqlRow[]
+        SELECT q.id, q.logical_id, q.set_id, q.version, q.review_status,
+               CASE WHEN q.review_status = 'approved' AND (
+                 q.set_id = '' OR q.set_id = (
+                   SELECT id FROM pm_requirement_sets
+                   WHERE project_id = ? AND status = 'published'
+                   ORDER BY version DESC LIMIT 1
+                 )
+               ) THEN 1 ELSE 0 END AS is_current_published
+        FROM pm_requirements q
+        WHERE q.project_id = ? AND q.id IN (${placeholders})
+      `).all(projectId, projectId, ...normalizedIds) as SqlRow[]
       const validIds = new Set(rows.map((row) => String(row.id)))
       const invalidId = normalizedIds.find((id) => !validIds.has(id))
       if (invalidId) throw new Error('计划任务关联的需求不存在或不属于当前项目')
+      const blockedId = rows.find((row) => Number(row.is_current_published ?? 0) !== 1 && !existingByRequirementId.has(String(row.id)))
+      if (blockedId) throw new Error('只能新增当前已发布且审核通过版本的需求关联')
     }
     this.db.prepare('DELETE FROM pm_project_task_requirements WHERE project_id = ? AND task_id = ?').run(projectId, taskId)
     const insert = this.db.prepare(`
-      INSERT INTO pm_project_task_requirements(project_id, task_id, requirement_id, linked_at)
-      VALUES (?, ?, ?, ?)
+      INSERT INTO pm_project_task_requirements(
+        project_id, task_id, requirement_id, linked_at,
+        source_baseline_version, source_requirement_version, target_current_version,
+        trace_status, trace_metadata_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
-    for (const requirementId of normalizedIds) insert.run(projectId, taskId, requirementId, linkedAt)
+    for (const requirementId of normalizedIds) {
+      const requirement = this.db.prepare(`
+        SELECT q.id, q.logical_id, q.set_id, q.version, q.review_status,
+               COALESCE(s.version, q.version) AS baseline_version,
+               CASE WHEN q.review_status = 'approved' AND (
+                 q.set_id = '' OR q.set_id = (
+                   SELECT id FROM pm_requirement_sets
+                   WHERE project_id = ? AND status = 'published'
+                   ORDER BY version DESC LIMIT 1
+                 )
+               ) THEN 1 ELSE 0 END AS is_current_published
+        FROM pm_requirements q
+        LEFT JOIN pm_requirement_sets s ON s.id = q.set_id
+        WHERE q.project_id = ? AND q.id = ?
+      `).get(projectId, projectId, requirementId) as SqlRow | undefined
+      if (!requirement) continue
+      const existing = existingByRequirementId.get(requirementId)
+      const isCurrentPublished = Number(requirement.is_current_published ?? 0) === 1
+      if (existing && !isCurrentPublished) {
+        const sourceBaselineVersion = Math.max(0, Math.trunc(Number(existing.source_baseline_version ?? 0))) || Math.max(1, Math.trunc(Number(requirement.baseline_version ?? requirement.version ?? 1)))
+        const sourceRequirementVersion = Math.max(0, Math.trunc(Number(existing.source_requirement_version ?? 0))) || Math.max(1, Math.trunc(Number(requirement.version ?? 1)))
+        const targetCurrentVersion = existing.target_current_version === null || existing.target_current_version === undefined
+          ? null
+          : Math.max(0, Math.trunc(Number(existing.target_current_version)))
+        const traceStatus = safeTraceStatus(existing.trace_status, 'suspect')
+        const fallbackMetadata: ProjectRequirementTraceMetadata = {
+          sourceRequirementId: requirementId,
+          sourceSetId: String(requirement.set_id ?? ''),
+          sourceBaselineVersion,
+          sourceRequirementVersion,
+          targetRequirementId: traceStatus === 'valid' ? requirementId : null,
+          targetCurrentVersion,
+          validatedAt: linkedAt,
+          validationReason: traceStatus === 'valid' ? '' : 'historical requirement retained during task update'
+        }
+        insert.run(
+          projectId, taskId, requirementId, linkedAt,
+          sourceBaselineVersion, sourceRequirementVersion, targetCurrentVersion,
+          traceStatus, JSON.stringify(parseProjectTraceMetadata(existing.trace_metadata_json, fallbackMetadata))
+        )
+        continue
+      }
+      const sourceRequirementVersion = Math.max(1, Math.trunc(Number(requirement.version ?? 1)))
+      const sourceBaselineVersion = Math.max(1, Math.trunc(Number(requirement.baseline_version ?? sourceRequirementVersion)))
+      const targetCurrentVersion = isCurrentPublished ? sourceRequirementVersion : null
+      const traceStatus: ProjectTraceStatus = isCurrentPublished ? 'valid' : 'suspect'
+      const metadata: ProjectRequirementTraceMetadata = {
+        sourceRequirementId: requirementId,
+        sourceSetId: String(requirement.set_id ?? ''),
+        sourceBaselineVersion,
+        sourceRequirementVersion,
+        targetRequirementId: isCurrentPublished ? requirementId : null,
+        targetCurrentVersion,
+        validatedAt: linkedAt,
+        validationReason: isCurrentPublished ? '' : 'source requirement is not in the current published baseline'
+      }
+      insert.run(
+        projectId, taskId, requirementId, linkedAt,
+        sourceBaselineVersion, sourceRequirementVersion, targetCurrentVersion,
+        traceStatus, JSON.stringify(metadata)
+      )
+    }
   }
 
   private refreshProjectTaskDates(projectId: string, taskId: string | null): void {
@@ -6592,7 +8088,10 @@ export class AppDatabase {
     `).all(projectId) as SqlRow[]
     const requirementRows = this.db.prepare(`
       SELECT ar.record_uid, ar.linked_at, ar.link_source, ar.confirmed_by,
-             ar.confirmed_at, ar.match_run_id, q.id AS requirement_id,
+             ar.confirmed_at, ar.match_run_id, ar.source_baseline_version,
+             ar.source_requirement_version, ar.target_current_version,
+             ar.trace_status, ar.trace_metadata_json,
+             q.id AS requirement_id, q.logical_id, q.set_id, q.version,
              q.requirement_no, q.title, m.final_score AS match_score
       FROM pm_project_asset_requirements ar
       JOIN pm_requirements q ON q.id = ar.requirement_id
@@ -6605,8 +8104,29 @@ export class AppDatabase {
     for (const row of requirementRows) {
       const recordUid = String(row.record_uid ?? '')
       const requirements = requirementsByRecord.get(recordUid) ?? []
+      const requirementId = String(row.requirement_id ?? '')
+      const requirementVersion = Math.max(0, Math.trunc(Number(row.version ?? 0)))
+      const sourceBaselineVersion = Math.max(0, Math.trunc(Number(row.source_baseline_version ?? 0))) || requirementVersion
+      const sourceRequirementVersion = Math.max(0, Math.trunc(Number(row.source_requirement_version ?? 0))) || requirementVersion
+      const traceStatus = safeTraceStatus(row.trace_status, 'valid')
+      const targetCurrentVersion = row.target_current_version === null || row.target_current_version === undefined
+        ? (traceStatus === 'valid' ? requirementVersion : null)
+        : Math.max(0, Math.trunc(Number(row.target_current_version)))
+      const fallbackMetadata: ProjectRequirementTraceMetadata = {
+        sourceRequirementId: requirementId,
+        sourceSetId: String(row.set_id ?? ''),
+        sourceBaselineVersion,
+        sourceRequirementVersion,
+        targetRequirementId: traceStatus === 'valid' ? requirementId : null,
+        targetCurrentVersion,
+        validatedAt: String(row.linked_at ?? ''),
+        validationReason: traceStatus === 'valid' ? '' : 'source requirement is not in the current published baseline'
+      }
+      const traceMetadata = parseProjectTraceMetadata(row.trace_metadata_json, fallbackMetadata)
       requirements.push({
-        requirementId: String(row.requirement_id ?? ''),
+        requirementId,
+        logicalId: String(row.logical_id ?? ''),
+        logicalRequirementId: String(row.logical_id ?? ''),
         requirementNo: Number(row.requirement_no ?? 0),
         title: String(row.title ?? ''),
         linkedAt: String(row.linked_at ?? ''),
@@ -6614,7 +8134,16 @@ export class AppDatabase {
         confirmedBy: String(row.confirmed_by ?? ''),
         confirmedAt: String(row.confirmed_at ?? ''),
         matchRunId: row.match_run_id === null || row.match_run_id === undefined ? null : String(row.match_run_id),
-        ...(row.match_score === null || row.match_score === undefined ? {} : { matchScore: Number(row.match_score) })
+        ...(row.match_score === null || row.match_score === undefined ? {} : { matchScore: Number(row.match_score) }),
+        sourceBaselineVersion,
+        sourceRequirementVersion,
+        targetCurrentVersion,
+        traceStatus,
+        targetVersion: targetCurrentVersion,
+        validatedBy: String(traceMetadata.validatedBy ?? row.confirmed_by ?? ''),
+        validatedAt: String(traceMetadata.validatedAt ?? row.confirmed_at ?? row.linked_at ?? ''),
+        sourceBaselineId: String(traceMetadata.sourceSetId ?? row.set_id ?? ''),
+        traceMetadata
       })
       requirementsByRecord.set(recordUid, requirements)
     }
@@ -6651,10 +8180,21 @@ export class AppDatabase {
     const exists = this.db.prepare('SELECT uid FROM records WHERE uid = ?').get(recordUid)
     if (!exists) return null
     if (requirementId) {
-      const requirement = this.db.prepare(
-        'SELECT id FROM pm_requirements WHERE id = ? AND project_id = ?'
-      ).get(requirementId, projectId)
-      if (!requirement) return null
+      const requirement = this.db.prepare(`
+        SELECT q.id, q.set_id, q.version, q.review_status,
+               COALESCE(s.version, q.version) AS baseline_version,
+               CASE WHEN q.review_status = 'approved' AND (
+                 q.set_id = '' OR q.set_id = (
+                   SELECT id FROM pm_requirement_sets
+                   WHERE project_id = ? AND status = 'published'
+                   ORDER BY version DESC LIMIT 1
+                 )
+               ) THEN 1 ELSE 0 END AS is_current_published
+        FROM pm_requirements q
+        LEFT JOIN pm_requirement_sets s ON s.id = q.set_id
+        WHERE q.id = ? AND q.project_id = ?
+      `).get(projectId, requirementId, projectId) as SqlRow | undefined
+      if (!requirement || Number(requirement.is_current_published ?? 0) !== 1) return null
     }
     const confirmedAt = provenance.confirmedAt?.trim() || nowIso()
     const matchRunId = provenance.matchRunId?.trim() || null
@@ -6671,16 +8211,42 @@ export class AppDatabase {
         AND excluded.link_source <> 'legacy_unknown'
     `).run(projectId, recordUid, confirmedAt, provenance.linkSource, provenance.confirmedBy.trim(), confirmedAt, matchRunId)
     if (requirementId) {
+      const requirement = this.db.prepare(`
+        SELECT q.id, q.set_id, q.version, COALESCE(s.version, q.version) AS baseline_version
+        FROM pm_requirements q
+        LEFT JOIN pm_requirement_sets s ON s.id = q.set_id
+        WHERE q.id = ? AND q.project_id = ?
+      `).get(requirementId, projectId) as SqlRow | undefined
+      if (!requirement) return null
+      const requirementVersion = Math.max(1, Math.trunc(Number(requirement.version ?? 1)))
+      const sourceBaselineVersion = Math.max(1, Math.trunc(Number(requirement.baseline_version ?? requirementVersion)))
+      const traceMetadata: ProjectRequirementTraceMetadata = {
+        sourceRequirementId: requirementId,
+        sourceSetId: String(requirement.set_id ?? ''),
+        sourceBaselineVersion,
+        sourceRequirementVersion: requirementVersion,
+        targetRequirementId: requirementId,
+        targetCurrentVersion: requirementVersion,
+        validatedAt: confirmedAt,
+        validationReason: ''
+      }
       this.db.prepare(`
         INSERT INTO pm_project_asset_requirements(
           project_id, record_uid, requirement_id, linked_at,
-          link_source, confirmed_by, confirmed_at, match_run_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          link_source, confirmed_by, confirmed_at, match_run_id,
+          source_baseline_version, source_requirement_version, target_current_version,
+          trace_status, trace_metadata_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(project_id, record_uid, requirement_id) DO UPDATE SET
           link_source = excluded.link_source,
           confirmed_by = excluded.confirmed_by,
           confirmed_at = excluded.confirmed_at,
-          match_run_id = excluded.match_run_id
+          match_run_id = excluded.match_run_id,
+          source_baseline_version = excluded.source_baseline_version,
+          source_requirement_version = excluded.source_requirement_version,
+          target_current_version = excluded.target_current_version,
+          trace_status = excluded.trace_status,
+          trace_metadata_json = excluded.trace_metadata_json
         WHERE pm_project_asset_requirements.link_source <> 'manual'
           AND excluded.link_source <> 'legacy_unknown'
       `).run(
@@ -6691,17 +8257,22 @@ export class AppDatabase {
         provenance.linkSource,
         provenance.confirmedBy.trim(),
         confirmedAt,
-        matchRunId
+        matchRunId,
+        sourceBaselineVersion,
+        requirementVersion,
+        requirementVersion,
+        'valid',
+        JSON.stringify(traceMetadata)
       )
     }
     return this.listProjectAssets(projectId).find((asset) => asset.recordUid === recordUid) ?? null
   }
 
-  unlinkProjectAssetRequirement(projectId: string, recordUid: string, _requirementId: string): { ok: boolean; message: string } {
+  unlinkProjectAssetRequirement(projectId: string, recordUid: string, requirementId: string): { ok: boolean; message: string } {
     const result = this.db.prepare(`
-      DELETE FROM pm_project_assets
-      WHERE project_id = ? AND record_uid = ?
-    `).run(projectId, recordUid)
+      DELETE FROM pm_project_asset_requirements
+      WHERE project_id = ? AND record_uid = ? AND requirement_id = ?
+    `).run(projectId, recordUid, requirementId)
     return Number(result.changes)
       ? { ok: true, message: '当前需求已取消数据关联' }
       : { ok: false, message: '当前需求与数据的关联不存在' }
@@ -7765,6 +9336,20 @@ export class AppDatabase {
     `).run(rawJson, normalizedText, contentHash, semanticHash, uid)
     this.syncRequirementSearchIndex(uid)
     this.markRecordMaintenanceDataWritten(uid)
+  }
+
+  /** Exact batch identity lookup, independent of the full-text index. */
+  findRecordsByItemIds(itemIds: readonly string[]): RecordRow[] {
+    const ids = [...new Set(itemIds.map((value) => value.trim()).filter(Boolean))]
+    if (!ids.length) return []
+    if (ids.length > 200) throw new Error('一次最多核对 200 个需求编号')
+    const rows = this.db.prepare(`
+      SELECT r.*, COUNT(i.id) AS image_count
+      FROM records r LEFT JOIN images i ON i.record_uid = r.uid
+      WHERE r.item_id COLLATE NOCASE IN (${ids.map(() => '?').join(', ')})
+      GROUP BY r.uid ORDER BY r.uid
+    `).all(...ids) as SqlRow[]
+    return rows.map((row) => this.mapRecord(row))
   }
 
   findRecordByItemId(itemId: string): RecordRow | null {
@@ -10556,6 +12141,10 @@ export class AppDatabase {
     this.db.exec('BEGIN IMMEDIATE')
     let recordCount = 0
     try {
+      // Match candidates intentionally use RESTRICT to protect matching writes.
+      // Explicit asset deletion must remove these references first, in the same
+      // transaction, while retaining runs, requirements and unrelated candidates.
+      this.db.prepare(`DELETE FROM pm_requirement_match_candidates ${where}`).run(...selected)
       if (deleteAll) {
         recordCount = Number(
           (this.db.prepare('SELECT COUNT(*) AS count FROM records').get() as SqlRow).count

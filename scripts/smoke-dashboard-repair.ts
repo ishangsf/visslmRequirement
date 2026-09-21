@@ -5,6 +5,12 @@ import {
   adaptDashboardComponentQuery,
   repairDashboardComponent
 } from '../src/main/dashboards/component-repair'
+import { diagnoseDashboard } from '../src/main/dashboards/diagnostics'
+import { validateDashboardSpec } from '../src/main/dashboards/validator'
+import {
+  createDashboardDomainControlledScenarioContext,
+  createDashboardQueryEngineForSpec
+} from '../src/main/experts/dashboard-domain-controlled-fixtures'
 import type { DashboardComponentSpec, DashboardSpec } from '../src/shared/dashboard'
 import type { DataScope } from '../src/shared/query-spec'
 
@@ -132,6 +138,22 @@ const repairedTreemap = repairDashboardComponent(treemap, 'treemap', engine).spe
 assert.ok(['status', 'category'].includes(repairedTreemap.query!.dimensions![0].field))
 assert.equal(repairedTreemap.encoding?.label, repairedTreemap.query!.dimensions![0].field)
 
+const stableDomainMeasureId = 'domain.process.activity-execution-rate.measure'
+const domainMeasure = dashboard([component({
+  id: 'domain-measure',
+  type: 'kpi',
+  query: {
+    source: 'records',
+    scope,
+    measures: [{ id: stableDomainMeasureId, field: 'amount', aggregation: 'avg' }]
+  },
+  encoding: { value: stableDomainMeasureId }
+})])
+const repairedDomainMeasure = repairDashboardComponent(domainMeasure, 'domain-measure', engine)
+  .spec.components[0]
+assert.equal(repairedDomainMeasure.query!.measures[0].id, stableDomainMeasureId)
+assert.equal(repairedDomainMeasure.encoding?.value, stableDomainMeasureId)
+
 const combo = dashboard([component({
   id: 'combo',
   type: 'combo',
@@ -242,6 +264,54 @@ assert.throws(
 )
 assert.equal(JSON.stringify(executionFailure), executionFailureBefore)
 
+const controlledContext = createDashboardDomainControlledScenarioContext('gjb5000b-compliance')
+assert.ok(controlledContext)
+const controlledActivity = dashboard([component({
+  id: 'controlled-activity',
+  type: 'kpi',
+  query: {
+    source: 'records',
+    scope: { projectIds: [controlledContext.fixture.projectId] },
+    measures: [{
+      id: 'activity-execution-rate',
+      field: 'activityExecutionRate',
+      aggregation: 'avg'
+    }],
+    limit: 1
+  },
+  encoding: { value: 'activity-execution-rate' }
+})])
+controlledActivity.title = 'GJB5000B 过程符合度与证据审计（受控样例）'
+controlledActivity.subtitle = 'controlled sample · preview'
+controlledActivity.domainContext = {
+  role: 'qa-epg',
+  scenario: 'gjb5000b-compliance',
+  catalogVersion: 'test',
+  tailoringBaselineId: 'sample-tailoring-baseline-v1',
+  artifactStatus: 'preview',
+  dataMode: 'controlled-sample'
+}
+assert.ok(validateDashboardSpec(controlledActivity, engine).some((error) =>
+  error.includes('activityExecutionRate')
+))
+const resolvedControlledEngine = createDashboardQueryEngineForSpec(controlledActivity, fakeDb)
+assert.deepEqual(validateDashboardSpec(controlledActivity, resolvedControlledEngine), [])
+const controlledReport = diagnoseDashboard(controlledActivity, resolvedControlledEngine)
+assert.equal(controlledReport.components[0].status, 'ok')
+assert.ok(!controlledReport.issues.some((issue) => issue.code === 'query-error'))
+const controlledRepair = repairDashboardComponent(
+  controlledActivity,
+  'controlled-activity',
+  resolvedControlledEngine
+)
+assert.equal(controlledRepair.report.components[0].status, 'ok')
+assert.ok(controlledRepair.spec.components[0].data.length > 0)
+
+const legacyControlled = JSON.parse(JSON.stringify(controlledActivity)) as DashboardSpec
+delete legacyControlled.domainContext!.dataMode
+const legacyControlledEngine = createDashboardQueryEngineForSpec(legacyControlled, fakeDb)
+assert.deepEqual(validateDashboardSpec(legacyControlled, legacyControlledEngine), [])
+
 console.log(JSON.stringify({
   ok: true,
   repairedCases: [
@@ -251,9 +321,12 @@ console.log(JSON.stringify({
     'encoding',
     'scatter',
     'treemap',
+    'stable-domain-measure-id',
     'combo',
     'layout',
-    'partial-dashboard-sequential'
+    'partial-dashboard-sequential',
+    'controlled-sample-source-context',
+    'legacy-controlled-sample-source-context'
   ],
   rollbackCases: ['query-failure', 'no-layout-slot']
 }, null, 2))

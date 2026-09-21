@@ -33,8 +33,11 @@ import type {
   SyncProgress,
   SyncScopeConfig,
   UpdateStatus,
-  KnowledgeDocumentPreview
+  KnowledgeDocumentPreview,
+  DashboardDomainPlatformAdapterPreviewInput,
+  DashboardDomainPlatformAdapterSaveInput
 } from '../shared/types'
+import type { DashboardScenarioDraft } from '../shared/dashboard-domain'
 import type {
   DataScope,
   FieldProfileSemanticPatch,
@@ -99,6 +102,14 @@ const api: AppApi = {
     ipcRenderer.invoke('settings:save-features', input),
   saveNavigationOrder: (input: FeatureNavigationOrder) =>
     ipcRenderer.invoke('settings:save-navigation-order', input),
+  saveDashboardDomainPlatformAdapters: (input: DashboardDomainPlatformAdapterSaveInput) =>
+    ipcRenderer.invoke('settings:save-dashboard-domain-platform-adapters', input),
+  previewDashboardDomainPlatformAdapter: (input: DashboardDomainPlatformAdapterPreviewInput) =>
+    ipcRenderer.invoke('dashboard-domain:preview-platform-adapter', input),
+  getDashboardScenarioReadiness: (input: DashboardScenarioDraft) =>
+    ipcRenderer.invoke('dashboard-domain:readiness', input),
+  generateDashboardFromScenario: (input: DashboardScenarioDraft) =>
+    ipcRenderer.invoke('dashboard-domain:generate-from-scenario', input),
   testPlatform: (input?: PlatformSettingsInput) =>
     ipcRenderer.invoke('connections:test-platform', input),
   testModel: (input?: ModelSettings, probeChat = false, probeCapabilities = false) =>

@@ -65,18 +65,15 @@ assert.equal(generic.role, undefined)
 assert.equal(generic.scenario, undefined)
 assert.equal(generic.tailoringBaselineId, undefined)
 
-const plannedKeywordCases: Array<{ question: string; scenario: string }> = [
-  { question: 'QA/EPG 生成 GJB5000B 过程证据符合度大屏', scenario: 'gjb5000b-compliance' },
-  { question: '型号组织管理负责人生成组织改进大屏', scenario: 'organization-improvement' }
+const scenarioKeywordCases: Array<{ question: string; scenario: string; status: 'active' }> = [
+  { question: '型号组织管理负责人生成组织级度量与过程改进大屏', scenario: 'organization-improvement', status: 'active' }
 ]
-for (const item of plannedKeywordCases) {
+for (const item of scenarioKeywordCases) {
   const result = resolve(item.question, scope)
   preserveInput(item.question, result)
   assert.equal(result.recognized, true, `${item.question} 必须识别为领域请求`)
   assert.equal(result.scenario, item.scenario)
-  assert.equal(result.scenarioStatus, 'planned',
-    `${item.scenario} 只能识别 planned，不得在请求解析阶段激活`)
-  assert.notEqual(result.scenarioStatus, 'active')
+  assert.equal(result.scenarioStatus, item.status)
   assert.notEqual((result as unknown as { status?: string }).status, 'ready')
 }
 
@@ -97,7 +94,7 @@ console.log(JSON.stringify({
     tailoringBaselineId: baselineAmbiguous.tailoringBaselineId
   },
   generic: { recognized: generic.recognized },
-  planned: plannedKeywordCases.map(({ question, scenario }) => ({
+  scenarios: scenarioKeywordCases.map(({ question, scenario }) => ({
     question,
     scenario,
     status: resolve(question, scope).scenarioStatus

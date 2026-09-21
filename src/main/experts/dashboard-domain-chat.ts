@@ -10,16 +10,23 @@ import {
   type DashboardDomainRequestResult
 } from './dashboard-domain-request'
 import type {
+  DashboardDomainPlatformAdapter,
   DashboardDomainRole,
   DashboardScenarioStatus
 } from '../../shared/dashboard-domain'
 import { dashboardDomainCatalog } from './dashboard-domain-catalog'
+import { validateDashboardDomainAdapterAccess } from './dashboard-domain-adapter'
 import type { DashboardDomainPlanClarificationReason } from './dashboard-domain-planner'
 
 export interface DashboardDomainChatInput {
   question: string
   scope: DataScope
   generatedAt: string
+  /** Caller capabilities; intersected with the selected adapter capabilities. */
+  permissions?: readonly string[]
+  platformAdapter?: DashboardDomainPlatformAdapter
+  platformAdapters?: readonly DashboardDomainPlatformAdapter[]
+  platformAdapterConfigurationErrors?: readonly string[]
 }
 
 export type DashboardDomainChatClarificationReason =
@@ -274,11 +281,14 @@ const readyResult = (
   }
   const receipt = normalizeReceipt(generation.receipt ?? dashboard.domainReceipt)
   const name = scenarioName(generation.scenario ?? request.scenario)
+  const platformMode = generation.dataMode === 'platform-adapter'
   return {
     recognized: true,
     status: 'ready',
     needsClarification: false,
-    answer: `已生成${name}受控样例预览：组件使用受控 QuerySpec 查询，数据由本地计算得出；当前仅供预览，待真实数据适配与证据核验后再评估正式使用。`,
+    answer: platformMode
+      ? `已生成 ${name} 平台数据预览：使用适配器 ${generation.adapterId ?? 'unknown'} 映射 ${generation.sourceSystem ?? '平台'} 数据，并由受控 QuerySpec 在本地计算；正式发布前仍需复核字段口径和过程证据。`
+      : `已生成 ${name} 受控样例预览：组件使用受控 QuerySpec 查询，数据由本地计算得出；当前仅供预览，待真实数据适配与证据核验后再评估正式使用。`,
     scenario: generation.scenario ?? request.scenario,
     dashboard,
     receipt
@@ -305,6 +315,16 @@ export const runDashboardDomainChatRequest = async (
     }
   }
 
+  if (input.platformAdapterConfigurationErrors?.length) {
+    return {
+      recognized: true,
+      status: 'rejected',
+      reason: 'invalid-platform-adapter-configuration',
+      scenario: request.scenario,
+      answer: `平台适配器配置无效：${input.platformAdapterConfigurationErrors.join('；')}`
+    }
+  }
+
   if (request.scenarioStatus === 'planned') {
     const scenario = request.scenario ?? 'project-overview'
     return {
@@ -318,14 +338,56 @@ export const runDashboardDomainChatRequest = async (
     }
   }
 
+  const platformAdapter = input.platformAdapter ?? (!request.tailoringBaselineId
+    ? input.platformAdapters?.find((adapter) => adapter.scenarioId === request.scenario)
+    : undefined)
+  const requestedPermissions = input.permissions ?? request.permissions
+  const adapterAccess = platformAdapter
+    ? validateDashboardDomainAdapterAccess(request.scope, requestedPermissions, platformAdapter)
+    : undefined
+  if (adapterAccess && !adapterAccess.ok) {
+    if (adapterAccess.reason === 'insufficient-permission') {
+      return {
+        recognized: true,
+        status: 'clarification',
+        needsClarification: true,
+        reason: 'insufficient-permission',
+        scenario: request.scenario,
+        answer: `${adapterAccess.message}，请补充授权后再生成大屏。`,
+        clarificationOptions: [
+          {
+            id: 'confirm-platform-permissions',
+            label: '确认平台读取授权',
+            prompt: `请确认项目与过程证据读取授权后，重新生成${scenarioName(request.scenario)}大屏`,
+            action: 'compose',
+            recommended: true
+          },
+          {
+            id: 'cancel-platform-permission-request',
+            label: '暂不生成',
+            prompt: `暂不生成${scenarioName(request.scenario)}大屏`,
+            action: 'submit'
+          }
+        ]
+      }
+    }
+    return {
+      recognized: true,
+      status: 'rejected',
+      reason: adapterAccess.reason,
+      scenario: request.scenario,
+      answer: `${adapterAccess.message}，未执行平台数据查询。`
+    }
+  }
   const generation = await generateDashboardDomainArtifact({
     request: request.request,
-    scope: request.scope,
+    scope: adapterAccess?.ok ? adapterAccess.scope : request.scope,
     role: request.role,
     scenario: request.scenario,
     tailoringBaselineId: request.tailoringBaselineId,
-    permissions: request.permissions,
-    generatedAt: input.generatedAt
+    permissions: adapterAccess?.ok ? adapterAccess.permissions : requestedPermissions,
+    generatedAt: input.generatedAt,
+    platformAdapter
   }, queryEngine)
 
   if (generation.status === 'ready') return readyResult(request, generation)

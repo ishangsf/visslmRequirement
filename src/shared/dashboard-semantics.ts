@@ -44,7 +44,10 @@ const componentTitleSuffix: Partial<Record<DashboardComponentSpec['type'], strin
   radar: '多维对比',
   scatter: '相关性分布',
   treemap: '层级构成',
-  combo: '组合趋势'
+  combo: '组合趋势',
+  'data-matrix': '数据矩阵',
+  'description-list': '详情',
+  'comparison-bars': '比较条形'
 }
 
 const normalizeSemanticText = (value: string): string =>

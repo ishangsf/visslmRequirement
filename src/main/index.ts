@@ -28,6 +28,9 @@ import type {
   AssistantRunHistory,
   AssistantArtifactExportRequest,
   AssistantArtifactExportResult,
+  DashboardDomainPlatformAdapterPreviewInput,
+  DashboardDomainPlatformAdapterPreviewResult,
+  DashboardDomainPlatformAdapterSaveInput,
   DataDeleteProgress,
   DataImportResult,
   DataImportRunSnapshot,
@@ -78,6 +81,12 @@ import type {
   VisualizationRunInput
 } from '../shared/dashboard'
 import type { AgentEvent } from '../shared/expert-types'
+import type {
+  DashboardDomainRole,
+  DashboardScenarioDraft,
+  DashboardScenarioGenerationResult,
+  DashboardScenarioReadiness
+} from '../shared/dashboard-domain'
 import { compareDashboardSpecValues } from '../shared/dashboard'
 import { QueryEngine } from './analytics/query-engine'
 import { AppDatabase } from './database'
@@ -126,6 +135,16 @@ import { renderAssistantArtifact } from './assistant/artifact-exporter'
 import { RequirementAnalysisAgent } from './experts/requirement-analysis-agent'
 import { VisualizationAgent } from './experts/visualization-agent'
 import { runDashboardDomainChatRequest } from './experts/dashboard-domain-chat'
+import { evaluateDashboardDomainReadiness } from './experts/dashboard-domain-readiness'
+import { dashboardDomainCatalog } from './experts/dashboard-domain-catalog'
+import {
+  createDashboardDomainControlledScenarioContext,
+  createDashboardQueryEngineForSpec
+} from './experts/dashboard-domain-controlled-fixtures'
+import {
+  dashboardDomainPlatformAdaptersSettingKey,
+  parseDashboardDomainPlatformAdapters
+} from './experts/dashboard-domain-adapter'
 import { resolveVisualizationRequestMode } from './experts/visualization-intent'
 import { OllamaAgent } from './ollama'
 import { PlainChatAgent } from './plain-chat'
@@ -859,6 +878,195 @@ const registerIpc = (): void => {
   ipcMain.handle('settings:save-navigation-order', (_event, input: FeatureNavigationOrder) =>
     settings.saveNavigationOrder(input)
   )
+  ipcMain.handle('settings:save-dashboard-domain-platform-adapters', (
+    _event,
+    input: DashboardDomainPlatformAdapterSaveInput
+  ) => settings.saveDashboardDomainPlatformAdapters(input))
+  ipcMain.handle('dashboard-domain:preview-platform-adapter', async (
+    _event,
+    input: DashboardDomainPlatformAdapterPreviewInput
+  ): Promise<DashboardDomainPlatformAdapterPreviewResult> => {
+    const adapter = input?.adapter
+    const projectId = typeof input?.projectId === 'string' ? input.projectId.trim() : ''
+    if (!adapter || !projectId) {
+      return { ok: false, status: 'rejected', reason: '请填写平台适配器和项目范围' }
+    }
+    const role = adapter.scenarioId === 'gjb5000b-compliance'
+      ? 'qa-epg'
+      : adapter.scenarioId === 'organization-improvement'
+        ? 'model-org-manager'
+        : 'project-owner'
+    const scenarioNames: Record<string, string> = {
+      'project-overview': '项目综合态势',
+      'requirements-delivery': '需求到交付全链路',
+      'plan-milestone': '计划与里程碑执行',
+      'software-quality': '软件质量与缺陷闭环',
+      'test-validation': '测试与验证充分性',
+      'configuration-change': '配置管理与变更控制',
+      'gjb5000b-compliance': 'GJB5000B 过程符合度与证据审计',
+      'organization-improvement': '组织级度量与过程改进'
+    }
+    const scenarioName = scenarioNames[adapter.scenarioId] ?? adapter.scenarioId
+    const result = await runDashboardDomainChatRequest({
+      question: `${role}生成${scenarioName}大屏`,
+      scope: { projectIds: [projectId] },
+      generatedAt: new Date().toISOString(),
+      platformAdapter: adapter
+    }, new QueryEngine(db))
+    if (result.status !== 'ready' || !result.dashboard) {
+      return {
+        ok: false,
+        status: 'rejected',
+        adapterId: adapter.id,
+        scenario: adapter.scenarioId,
+        reason: result.answer ?? result.reason ?? '平台适配器预览失败',
+        ...(result.receipt ? { receipt: result.receipt } : {})
+      }
+    }
+    return {
+      ok: true,
+      status: 'ready',
+      adapterId: adapter.id,
+      sourceSystem: adapter.sourceSystem,
+      scenario: adapter.scenarioId,
+      title: result.dashboard.title,
+      subtitle: result.dashboard.subtitle,
+      componentCount: result.dashboard.components.length,
+      metricFields: adapter.metricBindings.map((binding) => ({
+        metricId: binding.metricId,
+        field: binding.field,
+        aggregation: binding.aggregation
+      })),
+      receipt: result.receipt
+    }
+  })
+  ipcMain.handle('dashboard-domain:readiness', (
+    _event,
+    input: DashboardScenarioDraft
+  ): DashboardScenarioReadiness => {
+    const value = input && typeof input === 'object'
+      ? input as Partial<DashboardScenarioDraft>
+      : {}
+    const scenarioId = typeof value.scenarioId === 'string' ? value.scenarioId.trim() : ''
+    const role = typeof value.role === 'string'
+      ? value.role as DashboardDomainRole
+      : 'project-owner'
+    const dataMode = value.dataMode === 'platform-adapter'
+      ? 'platform-adapter' as const
+      : 'controlled-sample' as const
+    const scope = value.scope && typeof value.scope === 'object' ? value.scope : {}
+    const controlledContext = dataMode === 'controlled-sample'
+      ? createDashboardDomainControlledScenarioContext(scenarioId)
+      : undefined
+    const readinessScope = controlledContext
+      ? { projectIds: [controlledContext.fixture.projectId] }
+      : dataMode === 'controlled-sample'
+        ? {}
+        : scope
+    const queryEngine = controlledContext?.queryEngine ?? (
+      dataMode === 'platform-adapter' ? new QueryEngine(db) : undefined
+    )
+    const profile = queryEngine
+      ? (profileScope: DataScope) => queryEngine.profile(profileScope)
+      : () => []
+    return evaluateDashboardDomainReadiness({
+      scenarioId,
+      role,
+      dataMode,
+      scope: readinessScope,
+      ...(dataMode === 'platform-adapter' && value.adapter ? { adapter: value.adapter } : {}),
+      ...(Array.isArray(value.requestedPermissions)
+        ? { requestedPermissions: value.requestedPermissions }
+        : {})
+    }, {
+      profile
+    })
+  })
+  ipcMain.handle('dashboard-domain:generate-from-scenario', async (
+    _event,
+    input: DashboardScenarioDraft
+  ): Promise<DashboardScenarioGenerationResult> => {
+    const value = input && typeof input === 'object'
+      ? input as Partial<DashboardScenarioDraft>
+      : {}
+    const scenarioId = typeof value.scenarioId === 'string' ? value.scenarioId.trim() : ''
+    const scenario = dashboardDomainCatalog.scenarios.find((item) => item.id === scenarioId)
+    if (!scenario) {
+      return {
+        status: 'rejected',
+        reason: 'scenario-not-found',
+        answer: `黄金场景不存在：${scenarioId}`
+      }
+    }
+    const role = typeof value.role === 'string'
+      ? value.role as DashboardDomainRole
+      : 'project-owner'
+    const dataMode = value.dataMode === 'platform-adapter'
+      ? 'platform-adapter' as const
+      : 'controlled-sample' as const
+    const scope = value.scope && typeof value.scope === 'object' ? value.scope : {}
+    const roleLabels: Record<DashboardDomainRole, string> = {
+      'project-owner': '项目负责人',
+      'qa-epg': '质量与过程负责人',
+      'rd-lead': '研发负责人',
+      'model-org-manager': '型号/组织管理负责人'
+    }
+    const controlledContext = dataMode === 'controlled-sample'
+      ? createDashboardDomainControlledScenarioContext(scenarioId)
+      : undefined
+    if (dataMode === 'controlled-sample' && !controlledContext) {
+      return {
+        status: 'rejected',
+        scenario: scenarioId,
+        dataMode,
+        reason: 'controlled-sample-fixture-not-found',
+        answer: `黄金场景缺少受控样例：${scenario.name}`
+      }
+    }
+    const generationScope = controlledContext
+      ? { projectIds: [controlledContext.fixture.projectId] }
+      : scope
+    const question = `${roleLabels[role] ?? '业务负责人'}${dataMode === 'controlled-sample' ? '基于受控样例' : ''}生成${scenario.name}大屏`
+    const result = await runDashboardDomainChatRequest({
+      question,
+      scope: generationScope,
+      generatedAt: typeof value.generatedAt === 'string' && value.generatedAt.trim()
+        ? value.generatedAt
+        : new Date().toISOString(),
+      ...(Array.isArray(value.requestedPermissions)
+        ? { permissions: value.requestedPermissions }
+        : {}),
+      ...(dataMode === 'platform-adapter' && value.adapter
+        ? { platformAdapter: value.adapter }
+        : {})
+    }, controlledContext?.queryEngine ?? new QueryEngine(db))
+    const response: DashboardScenarioGenerationResult = {
+      status: result.status,
+      ...(result.dashboard ? { dashboard: result.dashboard } : {}),
+      ...(result.scenario ? { scenario: result.scenario } : {}),
+      ...(result.dashboard?.domainReceipt ? { receipt: result.dashboard.domainReceipt } : {}),
+      ...(result.reason ? { reason: result.reason } : {}),
+      ...(result.answer ? { answer: result.answer } : {}),
+      ...(result.clarificationOptions?.length
+        ? {
+            clarification: {
+              ...(result.reason ? { reason: result.reason } : {}),
+              options: result.clarificationOptions.map((option) => ({
+                id: option.id,
+                label: option.label,
+                recommended: Boolean(option.recommended)
+              }))
+            }
+          }
+        : {}),
+      dataMode,
+      ...(result.dashboard && dataMode === 'platform-adapter' && value.adapter ? {
+          adapterId: value.adapter.id,
+          sourceSystem: value.adapter.sourceSystem
+        } : {})
+    }
+    return response
+  })
 
   ipcMain.handle(
     'connections:test-platform',
@@ -1610,7 +1818,8 @@ const registerIpc = (): void => {
           error: { code: 'DASHBOARD_COMPONENT_NOT_FOUND', message }
         })
       }
-      const scope = request.dataScope ?? activeArtifact?.dashboard.components
+      const scope = request.dataScope ?? activeArtifact?.dashboard.dataScope
+        ?? activeArtifact?.dashboard.components
         .find((component) => component.query?.scope)?.query?.scope ?? {
         ...(request.projectId ? { projectIds: [request.projectId] } : {})
       }
@@ -1623,10 +1832,15 @@ const registerIpc = (): void => {
       const isPatchRequest = requestMode === 'patch'
       emitActivity(workLogForStatus('execute'))
       if (!isPatchRequest) {
+        const platformAdapterConfiguration = parseDashboardDomainPlatformAdapters(
+          db.getSetting(dashboardDomainPlatformAdaptersSettingKey) ?? undefined
+        )
         const domainChatResult = await runDashboardDomainChatRequest({
           question: route.question,
           scope,
-          generatedAt: new Date().toISOString()
+          generatedAt: new Date().toISOString(),
+          platformAdapters: platformAdapterConfiguration.adapters,
+          platformAdapterConfigurationErrors: platformAdapterConfiguration.errors
         }, queryEngine)
         if (!domainChatResult.recognized) {
           // Keep non-domain requests on the existing model-assisted path.
@@ -2027,9 +2241,10 @@ const registerIpc = (): void => {
   )
   ipcMain.handle('dashboards:save', (_event, input: DashboardSaveInput) => {
     try {
-      const errors = validateDashboardSpec(input.spec, new QueryEngine(db))
+      const dashboardQueryEngine = createDashboardQueryEngineForSpec(input.spec, db)
+      const errors = validateDashboardSpec(input.spec, dashboardQueryEngine)
       if (errors.length) throw new Error(`大屏校验失败：${errors.join('；')}`)
-      const domainSaveGate = evaluateDashboardDomainSaveGate(input.spec, new QueryEngine(db))
+      const domainSaveGate = evaluateDashboardDomainSaveGate(input.spec, dashboardQueryEngine)
       if (!domainSaveGate.allowed) {
         throw new Error(
           `领域大屏保存门禁未通过（${domainSaveGate.score} 分，${domainSaveGate.status}）：${domainSaveGate.reasons.join('；')}`
@@ -2082,7 +2297,7 @@ const registerIpc = (): void => {
   })
   ipcMain.handle('dashboards:diagnose', (_event, spec: DashboardSpec) => {
     try {
-      const report = diagnoseDashboard(spec, new QueryEngine(db))
+      const report = diagnoseDashboard(spec, createDashboardQueryEngineForSpec(spec, db))
       recordDashboardAudit({
         dashboardId: spec.id,
         action: 'diagnose',
@@ -2109,7 +2324,11 @@ const registerIpc = (): void => {
     'dashboards:repair-component',
     (_event, spec: DashboardSpec, componentId: string) => {
       try {
-        const result = repairDashboardComponent(spec, componentId, new QueryEngine(db))
+        const result = repairDashboardComponent(
+          spec,
+          componentId,
+          createDashboardQueryEngineForSpec(spec, db)
+        )
         recordDashboardAudit({
           dashboardId: spec.id,
           action: 'repair-component',
@@ -2143,7 +2362,7 @@ const registerIpc = (): void => {
   )
   ipcMain.handle('dashboards:export-json', async (_event, spec: DashboardSpec, version?: number) => {
     try {
-      const errors = validateDashboardSpec(spec, new QueryEngine(db))
+      const errors = validateDashboardSpec(spec, createDashboardQueryEngineForSpec(spec, db))
       if (errors.length) throw new Error(`导出前校验失败：${errors.join('；')}`)
       const safeTitle = spec.title.replace(/[<>:"/\\|?*\u0000-\u001F]/g, '-').slice(0, 80)
       const result = await dialog.showSaveDialog(mainWindow!, {
@@ -2187,7 +2406,11 @@ const registerIpc = (): void => {
   })
   ipcMain.handle('dashboards:export-offline', async (_event, spec: DashboardSpec, version?: number) => {
     try {
-      const errors = validateDashboardSpec(spec, new QueryEngine(db), { allowInlineData: true })
+      const errors = validateDashboardSpec(
+        spec,
+        createDashboardQueryEngineForSpec(spec, db),
+        { allowInlineData: true }
+      )
       if (errors.length) throw new Error(`离线导出前校验失败：${errors.join('；')}`)
       if (!mainWindow) throw new Error('主窗口尚未就绪')
       const safeTitle = spec.title.replace(/[<>:"/\\|?*\u0000-\u001F]/g, '-').slice(0, 80)
@@ -2246,7 +2469,7 @@ const registerIpc = (): void => {
   })
   ipcMain.handle('dashboards:export-pdf', async (_event, spec: DashboardSpec, version?: number) => {
     try {
-      const errors = validateDashboardSpec(spec, new QueryEngine(db))
+      const errors = validateDashboardSpec(spec, createDashboardQueryEngineForSpec(spec, db))
       if (errors.length) throw new Error(`导出前校验失败：${errors.join('；')}`)
       if (!mainWindow) throw new Error('主窗口尚未就绪')
       const safeTitle = spec.title.replace(/[<>:"/\\|?*\u0000-\u001F]/g, '-').slice(0, 80)
@@ -2302,7 +2525,7 @@ const registerIpc = (): void => {
     version?: number
   ) => {
     try {
-      const errors = validateDashboardSpec(spec, new QueryEngine(db))
+      const errors = validateDashboardSpec(spec, createDashboardQueryEngineForSpec(spec, db))
       if (errors.length) throw new Error(`导出前校验失败：${errors.join('；')}`)
       const prefix = 'data:image/png;base64,'
       if (typeof dataUrl !== 'string' || !dataUrl.startsWith(prefix)) {

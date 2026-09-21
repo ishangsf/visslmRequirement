@@ -78,12 +78,14 @@ import type {
   ProjectAnalysisProgress,
   ProjectAnalysisStartResult,
   ProjectAsset,
+  ProjectAssetRequirement,
   ProjectCostEntry,
   ProjectCostEntryInput,
   ProjectDocumentSnapshot,
   ProjectParticipant,
   ProjectParticipantInput,
   ProjectPlanTask,
+  ProjectPlanTaskRequirement,
   ProjectPlanTaskInput,
   ProjectPlanTaskMoveInput,
   ProjectPlanTaskStatus,
@@ -96,7 +98,8 @@ import type {
   ProjectRequirementReviewStatus,
   ProjectRequirementSetSummary,
   ProjectRequirementStatus,
-  ProjectRequirementStatusSource
+  ProjectRequirementStatusSource,
+  ProjectTraceStatus
 } from '../../../shared/project-types'
 
 type ProjectRequirementMatch = ProjectRequirementMatchCandidate
@@ -514,6 +517,86 @@ const projectTaskStatusMeta: Record<ProjectPlanTaskStatus, { label: string; colo
 
 const projectTaskStatusOptions = Object.entries(projectTaskStatusMeta).map(([value, meta]) => ({ value, label: meta.label }))
 const projectTaskTypeOptions = Object.entries(projectTaskTypeMeta).map(([value, meta]) => ({ value, label: meta.label }))
+
+type ProjectRequirementTraceStatus = ProjectTraceStatus
+
+type ProjectRequirementTraceRelation = ProjectPlanTaskRequirement | ProjectAssetRequirement
+
+type ProjectRequirementTraceSummary = {
+  status: ProjectRequirementTraceStatus
+  logicalId: string
+  sourceBaselineVersion: string
+  sourceRequirementVersion: string
+  targetCurrentVersion: string
+  versionSummary: string
+  tooltip: string
+}
+
+type ProjectRequirementTraceCounts = Record<ProjectRequirementTraceStatus, number>
+
+const projectRequirementTraceStatusMeta: Record<ProjectRequirementTraceStatus, { label: string; color: string; description: string }> = {
+  valid: { label: '有效', color: 'success', description: '关系仍与当前需求基线和目标版本一致。' },
+  suspect: { label: '需复核', color: 'warning', description: '源基线或目标版本发生变化，保存任务前请核对这条历史关系。' },
+  invalid: { label: '失效', color: 'error', description: '关系指向的源基线或目标需求已失效，不计入有效关联。' }
+}
+
+const projectRequirementTraceDisplayLabels: Record<ProjectRequirementTraceStatus, string> = {
+  valid: '有效',
+  suspect: '待确认',
+  invalid: '已失效'
+}
+
+const formatProjectRequirementTraceVersion = (value: number | null | undefined): string =>
+  value === undefined || value === null || !Number.isFinite(value) ? '' : `V${value}`
+
+const getProjectRequirementTraceSummary = (relation: ProjectRequirementTraceRelation): ProjectRequirementTraceSummary => {
+  const status = relation.traceStatus
+  const logicalId = String(relation.logicalId ?? '').trim()
+  const sourceBaselineVersion = formatProjectRequirementTraceVersion(relation.sourceBaselineVersion)
+  const sourceRequirementVersion = formatProjectRequirementTraceVersion(relation.sourceRequirementVersion)
+  const targetCurrentVersion = formatProjectRequirementTraceVersion(relation.targetCurrentVersion)
+  const validationReason = String(relation.traceMetadata?.validationReason ?? '').trim()
+  const versionSummary = sourceBaselineVersion || sourceRequirementVersion || targetCurrentVersion
+    ? `${sourceBaselineVersion ? `源基线 ${sourceBaselineVersion}` : '源基线 未知'}${sourceRequirementVersion ? ` · 需求版本 ${sourceRequirementVersion}` : ''} → ${targetCurrentVersion ? `目标当前版本 ${targetCurrentVersion}` : '目标当前版本 未知'}`
+    : ''
+  const meta = projectRequirementTraceStatusMeta[status]
+  const details = [
+    meta.description,
+    versionSummary || '版本信息待补充。',
+    logicalId ? `逻辑 ID：${logicalId}` : '',
+    validationReason ? `校验说明：${validationReason}` : ''
+  ].filter(Boolean).join(' ')
+  return { status, logicalId, sourceBaselineVersion, sourceRequirementVersion, targetCurrentVersion, versionSummary, tooltip: details }
+}
+
+const getProjectRequirementTraceStatus = (relation: ProjectRequirementTraceRelation): ProjectRequirementTraceStatus =>
+  getProjectRequirementTraceSummary(relation).status
+
+const summarizeProjectRequirementTraces = (relations: ProjectRequirementTraceRelation[]): ProjectRequirementTraceCounts => {
+  const counts: ProjectRequirementTraceCounts = { valid: 0, suspect: 0, invalid: 0 }
+  relations.forEach((relation) => { counts[getProjectRequirementTraceStatus(relation)] += 1 })
+  return counts
+}
+
+const projectRequirementTraceReviewCount = (counts: ProjectRequirementTraceCounts): number => counts.suspect + counts.invalid
+
+const formatProjectRequirementOptionLabel = (requirementNo: number, title: string): string =>
+  `${requirementNo > 0 ? `REQ-${String(requirementNo).padStart(3, '0')} · ` : ''}${title}`
+
+function ProjectRequirementTraceTag({ relation, showVersion = true, impactContext = false }: { relation: ProjectRequirementTraceRelation; showVersion?: boolean; impactContext?: boolean }): React.JSX.Element {
+  const trace = getProjectRequirementTraceSummary(relation)
+  const meta = projectRequirementTraceStatusMeta[trace.status]
+  const label = impactContext ? projectRequirementTraceDisplayLabels[trace.status] : meta.label
+  const icon = trace.status === 'valid' ? <CheckCircleOutlined aria-hidden="true" /> : <WarningOutlined aria-hidden="true" />
+  return (
+    <span className="project-requirement-trace-meta">
+      <Tooltip title={trace.tooltip}>
+        <Tag color={trace.status === 'valid' ? 'default' : meta.color} icon={icon} aria-label={`需求追溯状态：${meta.label}`}>{label}</Tag>
+      </Tooltip>
+      {showVersion && trace.versionSummary && <Text type="secondary" title={trace.versionSummary} style={{ whiteSpace: 'nowrap' }}>{trace.versionSummary}</Text>}
+    </span>
+  )
+}
 
 const formatRate = (value: number): string => `¥${Number(value || 0).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}/小时`
 
@@ -1074,6 +1157,7 @@ function ResizableHeaderCell({
 function MatchDrawer({
   requirement,
   open,
+  readOnly = false,
   onClose,
   onOpenRecord,
   onLinkAsset,
@@ -1085,6 +1169,7 @@ function MatchDrawer({
 }: {
   requirement: ProjectRequirement | null
   open: boolean
+  readOnly?: boolean
   onClose: () => void
   onOpenRecord: (uid: string) => void
   onLinkAsset: (recordUid: string, requirementId: string) => Promise<boolean>
@@ -1133,7 +1218,11 @@ function MatchDrawer({
     setPage(1)
     setEditingKeyInfoTerms(false)
     setKeyInfoTermsDraft(requirement?.keyInfoTerms ?? [])
-  }, [open, requirement?.id])
+  }, [open, readOnly, requirement?.id])
+
+  useEffect(() => {
+    if (readOnly) setEditingKeyInfoTerms(false)
+  }, [readOnly])
 
   useEffect(() => {
     setMatchingTaskId(null)
@@ -1163,7 +1252,7 @@ function MatchDrawer({
   }, [explanationPending, load, open])
 
   const saveKeyInfoTerms = async (): Promise<void> => {
-    if (!requirement) return
+    if (!requirement || readOnly) return
     setMatchingTaskId(null)
     setMatchingProgress(null)
     setSavingKeyInfoTerms(true)
@@ -1177,7 +1266,7 @@ function MatchDrawer({
   }
 
   const restartMatching = async (): Promise<void> => {
-    if (!requirement) return
+    if (!requirement || readOnly) return
     setMatchingTaskId(null)
     setMatchingProgress(null)
     setSavingKeyInfoTerms(true)
@@ -1234,7 +1323,7 @@ function MatchDrawer({
   )
 
   const linkMatchAsset = useCallback(async (row: ProjectRequirementMatch): Promise<void> => {
-    if (!requirement) return
+    if (!requirement || readOnly) return
     setLinkingRecordUid(row.recordUid)
     try {
       const linked = await onLinkAsset(row.recordUid, requirement.id)
@@ -1253,23 +1342,32 @@ function MatchDrawer({
     } finally {
       setLinkingRecordUid(null)
     }
-  }, [onLinkAsset, requirement])
+  }, [onLinkAsset, readOnly, requirement])
 
   const linkedAssets = useMemo(() => {
     if (!requirement) return []
-    return assets.filter((asset) => !hiddenLinkedAssetUids.has(asset.recordUid) && asset.requirements.some((item) => item.requirementId === requirement.id))
-  }, [assets, hiddenLinkedAssetUids, requirement])
+    return assets.filter((asset) => !hiddenLinkedAssetUids.has(asset.recordUid) && asset.requirements.some((item) => item.requirementId === requirement.id && (readOnly || item.traceStatus === 'valid')))
+  }, [assets, hiddenLinkedAssetUids, readOnly, requirement])
+  const validLinkedRecordUids = useMemo(() => new Set(
+    assets
+      .filter((asset) => asset.requirements.some((item) => item.requirementId === requirement?.id && item.traceStatus === 'valid'))
+      .map((asset) => asset.recordUid)
+  ), [assets, requirement?.id])
+  const linkedAssetTraceCounts = useMemo(
+    () => summarizeProjectRequirementTraces(linkedAssets.flatMap((asset) => asset.requirements.filter((item) => item.requirementId === requirement?.id))),
+    [linkedAssets, requirement?.id]
+  )
 
   useEffect(() => {
     if (!requirement) return
     setHiddenLinkedAssetUids((current) => {
-      const next = new Set([...current].filter((recordUid) => assets.some((asset) => asset.recordUid === recordUid && asset.requirements.some((item) => item.requirementId === requirement.id))))
+      const next = new Set([...current].filter((recordUid) => assets.some((asset) => asset.recordUid === recordUid && asset.requirements.some((item) => item.requirementId === requirement.id && (readOnly || item.traceStatus === 'valid')))))
       return next.size === current.size ? current : next
     })
-  }, [assets, requirement])
+  }, [assets, readOnly, requirement])
 
   const unlinkMatchAsset = useCallback(async (asset: ProjectAsset): Promise<void> => {
-    if (!requirement) return
+    if (!requirement || readOnly) return
     setUnlinkingRecordUid(asset.recordUid)
     try {
       const unlinked = await onUnlinkAssetRequirement(asset.recordUid, requirement.id)
@@ -1283,7 +1381,7 @@ function MatchDrawer({
     } finally {
       setUnlinkingRecordUid(null)
     }
-  }, [onUnlinkAssetRequirement, requirement])
+  }, [onUnlinkAssetRequirement, readOnly, requirement])
 
   const sharedGuidance = useMemo(() => {
     if (matches.length < 2) return null
@@ -1418,7 +1516,11 @@ function MatchDrawer({
         onResize: (width: number) => resizeColumn('asset', width),
         onResizeEnd: (width: number) => commitColumnResize('asset', width)
       } as ResizableHeaderCellProps),
-      render: (_value, row) => row.requirementLinked
+      render: (_value, row) => {
+        const requirementLinked = validLinkedRecordUids.has(row.recordUid)
+        return readOnly
+        ? <Tag color="default">历史只读</Tag>
+        : requirementLinked
         ? <Tag color="success" icon={<CheckCircleOutlined />}>需求已关联</Tag>
         : (
           <Space size={4} wrap>
@@ -1434,13 +1536,14 @@ function MatchDrawer({
             </Button>
           </Space>
         )
+      }
     }
-  ], [columnWidths, commitColumnResize, linkMatchAsset, linkingRecordUid, onOpenRecord, resizeColumn])
+  ], [columnWidths, commitColumnResize, linkMatchAsset, linkingRecordUid, onOpenRecord, readOnly, resizeColumn, validLinkedRecordUids])
 
   return (
     <Drawer
       className="project-match-drawer-shell"
-      title={requirement ? `匹配明细：${requirement.title}` : '匹配明细'}
+      title={requirement ? `匹配明细${readOnly ? '（历史只读）' : ''}：${requirement.title}` : '匹配明细'}
       open={open}
       onClose={onClose}
       size={900}
@@ -1471,6 +1574,15 @@ function MatchDrawer({
               description="现在即可查看和关联候选；说明生成不会阻塞匹配任务，完成后本页会自动刷新。"
             />
           )}
+          {readOnly && (
+            <Alert
+              className="project-match-explanation-alert"
+              type="info"
+              showIcon
+              message="历史需求只读查看"
+              description="这条关系来自历史基线，当前不计入有效覆盖；如需继续使用，请在当前需求基线下重新关联。"
+            />
+          )}
           {explanationUnavailable && (
             <Alert
               className="project-match-explanation-alert"
@@ -1478,7 +1590,7 @@ function MatchDrawer({
               showIcon
               message="本次没有生成逐项相似点和差异点"
               description="解释模型的整批请求未完成，所以同一需求下的候选都会显示这一状态；候选排序仍可查看。这不是每条数据分别失败，也不表示必须修改需求。可先按下方建议核对原文；如需自动说明，请确认系统配置中的模型可用后重新匹配。"
-              action={<Button size="small" icon={<ReloadOutlined />} loading={savingKeyInfoTerms} onClick={() => void restartMatching()}>重新匹配</Button>}
+              action={!readOnly && <Button size="small" icon={<ReloadOutlined />} loading={savingKeyInfoTerms} onClick={() => void restartMatching()}>重新匹配</Button>}
             />
           )}
           {rerankerUnavailable && (
@@ -1494,7 +1606,7 @@ function MatchDrawer({
             size="small"
             className="project-key-info-terms-card"
             title="关键功能信息词"
-            extra={!editingKeyInfoTerms && <Button type="link" size="small" icon={<EditOutlined />} onClick={() => { setKeyInfoTermsDraft(requirement.keyInfoTerms); setEditingKeyInfoTerms(true) }}>编辑</Button>}
+            extra={!readOnly && !editingKeyInfoTerms && <Button type="link" size="small" icon={<EditOutlined />} onClick={() => { setKeyInfoTermsDraft(requirement.keyInfoTerms); setEditingKeyInfoTerms(true) }}>编辑</Button>}
           >
             {editingKeyInfoTerms ? (
               <div className="project-key-info-terms-editor">
@@ -1525,7 +1637,10 @@ function MatchDrawer({
             title={(
               <div className="project-linked-assets-heading">
                 <span>已关联数据中心数据</span>
-                <span className="project-linked-assets-count">{linkedAssets.length} 条</span>
+                <Space size={6} wrap>
+                  <span className="project-linked-assets-count">有效 {linkedAssetTraceCounts.valid} 条</span>
+                  {projectRequirementTraceReviewCount(linkedAssetTraceCounts) > 0 && <Tooltip title="需复核和失效关系会继续展示在列表中，但不计入有效关联数量。"><Tag color="warning" icon={<WarningOutlined aria-hidden="true" />}>{projectRequirementTraceDisplayLabels.suspect} {projectRequirementTraceReviewCount(linkedAssetTraceCounts)}</Tag></Tooltip>}
+                </Space>
               </div>
             )}
           >
@@ -1551,6 +1666,7 @@ function MatchDrawer({
                         <Text type="secondary">
                           {asset.nodeType || '数据中心记录'}{asset.itemId ? ` / ${asset.itemId}` : ''}
                         </Text>
+                        {linkedRequirement && <ProjectRequirementTraceTag relation={linkedRequirement} impactContext />}
                         {matchScore !== undefined ? (
                           <strong
                             className="project-linked-asset-score"
@@ -1563,23 +1679,25 @@ function MatchDrawer({
                         )}
                       </div>
                     </div>
-                    <Popconfirm
-                      title="取消当前需求与该数据的关联？"
-                      description="项目资产和其他需求关联不会受到影响。"
-                      onConfirm={() => void unlinkMatchAsset(asset)}
-                    >
-                      <Button
-                        type="link"
-                        danger
-                        size="small"
-                        icon={<DisconnectOutlined />}
-                        loading={unlinkingRecordUid === asset.recordUid}
-                        disabled={Boolean(unlinkingRecordUid && unlinkingRecordUid !== asset.recordUid)}
-                        aria-label={`取消当前需求与数据 ${asset.name || asset.recordUid} 的关联`}
+                    {!readOnly && (
+                      <Popconfirm
+                        title="取消当前需求与该数据的关联？"
+                        description="项目资产和其他需求关联不会受到影响。"
+                        onConfirm={() => void unlinkMatchAsset(asset)}
                       >
-                        取消关联
-                      </Button>
-                    </Popconfirm>
+                        <Button
+                          type="link"
+                          danger
+                          size="small"
+                          icon={<DisconnectOutlined />}
+                          loading={unlinkingRecordUid === asset.recordUid}
+                          disabled={Boolean(unlinkingRecordUid && unlinkingRecordUid !== asset.recordUid)}
+                          aria-label={`取消当前需求与数据 ${asset.name || asset.recordUid} 的关联`}
+                        >
+                          取消关联
+                        </Button>
+                      </Popconfirm>
+                    )}
                     </div>
                   )
                 })}
@@ -1630,9 +1748,9 @@ function MatchDrawer({
                   <Text type="secondary">建议：{sharedGuidance.guidance.action}</Text>
                 </div>
               )}
-              action={sharedGuidance.guidance.actionKind === 'improve_recall'
+              action={!readOnly && sharedGuidance.guidance.actionKind === 'improve_recall'
                 ? <Button size="small" icon={<EditOutlined />} onClick={() => { setKeyInfoTermsDraft(requirement.keyInfoTerms); setEditingKeyInfoTerms(true) }}>编辑信息词</Button>
-                : sharedGuidance.guidance.actionKind === 'rerun'
+                : !readOnly && sharedGuidance.guidance.actionKind === 'rerun'
                   ? <Button size="small" icon={<ReloadOutlined />} loading={savingKeyInfoTerms} onClick={() => void restartMatching()}>重新匹配</Button>
                   : undefined}
             />
@@ -2156,7 +2274,7 @@ function ProjectPlanPanel({
   onMove: (id: string, input: ProjectPlanTaskMoveInput) => Promise<void>
   organizationPeople: OrganizationPerson[]
   onDelete: (id: string) => Promise<void>
-  onOpenRequirement: (requirementId: string) => void
+  onOpenRequirement: (requirementId: string, readOnly?: boolean) => void
 }): React.JSX.Element {
   const { widths, resize, commitResize } = useProjectColumnWidths(projectTaskColumnStorageKey, projectTaskColumnDefaults, projectTaskColumnMinWidths, projectTaskColumnMaxWidths)
   const [inlineEditingId, setInlineEditingId] = useState<string | null>(null)
@@ -2174,7 +2292,53 @@ function ProjectPlanPanel({
   const completed = tasks.filter((task) => task.status === 'completed').length
   const inProgress = tasks.filter((task) => task.status === 'in_progress').length
   const blocked = tasks.filter((task) => task.status === 'blocked').length
+  const taskTraceCounts = useMemo(
+    () => summarizeProjectRequirementTraces(tasks.flatMap((task) => task.requirements)),
+    [tasks]
+  )
   const taskById = useMemo(() => new Map(tasks.map((task) => [task.id, task])), [tasks])
+  const historicalRequirementIds = useMemo(() => new Set(
+    tasks.flatMap((task) => task.requirements)
+      .filter((relation) => getProjectRequirementTraceStatus(relation) !== 'valid')
+      .map((relation) => relation.requirementId)
+      .filter(Boolean)
+  ), [tasks])
+  const editingTask = inlineEditingId && inlineEditingId !== newProjectTaskRowId
+    ? taskById.get(inlineEditingId)
+    : undefined
+  const preservedHistoricalRequirementIds = useMemo(() => editingTask?.requirements
+    .filter((relation) => getProjectRequirementTraceStatus(relation) !== 'valid')
+    .map((relation) => relation.requirementId)
+    .filter(Boolean) ?? [], [editingTask])
+  const requirementSelectOptions = useMemo(() => {
+    const options = new Map<string, { value: string; label: string; relation?: ProjectPlanTask['requirements'][number] }>()
+    allRequirements.forEach((requirement) => options.set(requirement.id, {
+      value: requirement.id,
+      label: formatProjectRequirementOptionLabel(requirement.requirementNo, requirement.title)
+    }))
+    editingTask?.requirements.forEach((relation) => {
+      if (!options.has(relation.requirementId)) options.set(relation.requirementId, {
+        value: relation.requirementId,
+        label: formatProjectRequirementOptionLabel(relation.requirementNo, relation.title),
+        relation
+      })
+      else options.get(relation.requirementId)!.relation = relation
+    })
+    const preserved = new Set(preservedHistoricalRequirementIds)
+    return [...options.values()].map((option) => {
+      const historical = historicalRequirementIds.has(option.value)
+      const relationStatus = option.relation ? getProjectRequirementTraceStatus(option.relation) : undefined
+      const statusLabel = relationStatus && relationStatus !== 'valid'
+        ? ` · ${projectRequirementTraceDisplayLabels[relationStatus]}`
+        : ''
+      const restrictedForOtherTask = historical && !preserved.has(option.value)
+      return {
+        value: option.value,
+        label: `${option.label}${statusLabel}${restrictedForOtherTask ? ' · 仅保留历史关系' : ''}`,
+        disabled: restrictedForOtherTask
+      }
+    })
+  }, [allRequirements, editingTask, historicalRequirementIds, preservedHistoricalRequirementIds])
   const draftDepth = inlineDraft?.parentTaskId ? (taskById.get(inlineDraft.parentTaskId)?.depth ?? -1) + 1 : 0
   const displayTree = useMemo<ProjectTaskTreeRow[]>(() => {
     const tree = buildProjectTaskTree(tasks)
@@ -2469,31 +2633,30 @@ function ProjectPlanPanel({
           showSearch
           optionFilterProp="label"
           value={inlineDraft.requirementIds ?? []}
-          options={allRequirements.map((requirement) => ({
-            value: requirement.id,
-            label: `${requirement.requirementNo > 0 ? `REQ-${String(requirement.requirementNo).padStart(3, '0')} · ` : ''}${requirement.title}`
-          }))}
+          options={requirementSelectOptions}
           maxTagCount="responsive"
           placeholder="选择关联需求"
-          onChange={(next) => updateInlineDraft('requirementIds', next.map((value) => String(value)))}
+          onChange={(next) => updateInlineDraft('requirementIds', [...new Set(next.map((value) => String(value)))])}
           aria-label="关联需求清单"
           style={{ width: '100%' }}
         />
         : row.requirements.length
           ? <div className="project-task-requirements">
             {row.requirements.map((requirement) => (
-              <Button
-                key={requirement.requirementId}
-                type="link"
-                size="small"
-                className="project-task-requirement-link"
-                icon={<FileSearchOutlined />}
-                title={`打开需求匹配明细：${requirement.title}`}
-                aria-label={`打开需求匹配明细：${requirement.title}`}
-                onClick={() => onOpenRequirement(requirement.requirementId)}
-              >
-                <span>{requirement.requirementNo > 0 ? `REQ-${String(requirement.requirementNo).padStart(3, '0')} · ` : ''}{requirement.title}</span>
-              </Button>
+              <Space key={requirement.requirementId} size={4} wrap>
+                <Button
+                  type="link"
+                  size="small"
+                  className="project-task-requirement-link"
+                  icon={<FileSearchOutlined />}
+                  title={`打开需求匹配明细：${requirement.title}`}
+                  aria-label={`打开需求匹配明细：${requirement.title}`}
+                  onClick={() => onOpenRequirement(requirement.requirementId)}
+                >
+                  <span>{formatProjectRequirementOptionLabel(requirement.requirementNo, requirement.title)}</span>
+                </Button>
+                <ProjectRequirementTraceTag relation={requirement} impactContext />
+              </Space>
             ))}
           </div>
           : <Text type="secondary">未关联需求</Text>
@@ -2584,7 +2747,14 @@ function ProjectPlanPanel({
         <Button type="primary" icon={<PlusOutlined />} onClick={() => startNewTask()} disabled={Boolean(inlineEditingId)}>新增计划项</Button>
       </div>
       <Card className="project-table-card project-plan-table-card">
-        <div className="project-plan-section-heading"><div><Title level={4}>里程碑 / 任务列表</Title><Text type="secondary">拖拽任务到其他行上方、下方或行内可调整顺序和层级；日期、负责人、状态等字段可直接编辑</Text></div></div>
+        <div className="project-plan-section-heading">
+          <div><Title level={4}>里程碑 / 任务列表</Title><Text type="secondary">拖拽任务到其他行上方、下方或行内可调整顺序和层级；日期、负责人、状态等字段可直接编辑</Text></div>
+          <Space size={6} wrap aria-label="任务需求追溯统计">
+            <Text type="secondary">有效需求关系 {taskTraceCounts.valid} 条</Text>
+            {taskTraceCounts.suspect > 0 && <Tooltip title="这些关系的源基线或目标版本发生变化，保存任务时会保留，但需要复核。"><Tag color="warning" icon={<WarningOutlined aria-hidden="true" />}>{projectRequirementTraceDisplayLabels.suspect} {taskTraceCounts.suspect}</Tag></Tooltip>}
+            {taskTraceCounts.invalid > 0 && <Tooltip title="这些关系已失效，不计入有效关联；请确认是否需要重新关联。"><Tag color="error" icon={<WarningOutlined aria-hidden="true" />}>{projectRequirementTraceDisplayLabels.invalid} {taskTraceCounts.invalid}</Tag></Tooltip>}
+          </Space>
+        </div>
         {draggingTaskId && <div className="project-plan-root-drop-zone"><HolderOutlined /> 拖到这里移动到顶层</div>}
         {displayTree.length ? <Table<ProjectTaskTreeRow> rowKey="id" loading={loading} dataSource={displayTree} columns={columns} components={{ header: { cell: ResizableHeaderCell } }} expandable={{ expandedRowKeys: expandedTaskKeys, onExpand: (expanded, row) => setExpandedTaskKeys((current) => expanded ? [...new Set([...current, row.id])] : current.filter((id) => id !== row.id)), childrenColumnName: 'children', indentSize: 18 }} scroll={{ x: Object.values(widths).reduce((sum, width) => sum + width, 0), y: projectDetailTableScrollY }} pagination={inlineEditingId === newProjectTaskRowId ? false : { pageSize: 10, showTotal: (count) => `共 ${count} 项` }} rowClassName={taskRowClassName} /> : <Empty description="尚未建立项目计划" />}
       </Card>
@@ -2612,6 +2782,8 @@ function ProjectPlanPanel({
     </div>
   )
 }
+
+
 
 function ProjectDetail({
   project,
@@ -2654,12 +2826,17 @@ function ProjectDetail({
   const [records, setRecords] = useState<RecordRow[]>([])
   const [recordTotal, setRecordTotal] = useState(0)
   const [recordSearch, setRecordSearch] = useState('')
+  const [recordSearchQuery, setRecordSearchQuery] = useState('')
+  const [recordPage, setRecordPage] = useState(1)
+  const [recordPageSize, setRecordPageSize] = useState(50)
+  const [recordLoading, setRecordLoading] = useState(false)
   const [loading, setLoading] = useState(false)
   const [stoppingMatching, setStoppingMatching] = useState(false)
   const [assetModalOpen, setAssetModalOpen] = useState(false)
   const [costModalOpen, setCostModalOpen] = useState(false)
   const [editingCost, setEditingCost] = useState<ProjectCostEntry | null>(null)
   const [matchRequirement, setMatchRequirement] = useState<ProjectRequirement | null>(null)
+  const [matchRequirementReadOnly, setMatchRequirementReadOnly] = useState(false)
   const [recordDetail, setRecordDetail] = useState<RecordDetail | null>(null)
   const [documentPreviewOpen, setDocumentPreviewOpen] = useState(false)
   const [documentPreview, setDocumentPreview] = useState<KnowledgeDocumentPreview | null>(null)
@@ -2678,6 +2855,18 @@ function ProjectDetail({
   const analysisLogRefreshTimerRef = useRef<number | null>(null)
   const lastAnalysisLogRefreshAtRef = useRef(Date.now())
   const terminalProgressReloadKeyRef = useRef<string | null>(null)
+
+  const requirementCheckpointMessage = '技术协议正在分析，需求审核动作暂不可用；请等待分析完成后继续。'
+  const requirementActionsDisabled = current.analysisStatus === 'processing'
+  const ensureRequirementActionsEnabled = (): boolean => {
+    if (!requirementActionsDisabled) return true
+    message.info(requirementCheckpointMessage)
+    return false
+  }
+
+  useEffect(() => {
+    if (requirementActionsDisabled) setSelectedRequirementIds([])
+  }, [requirementActionsDisabled])
 
   const applyAnalysisLogs = useCallback((nextLogs: ProjectAnalysisLogEntry[]): void => {
     setAnalysisLogs(nextLogs)
@@ -2726,14 +2915,13 @@ function ProjectDetail({
       applyAnalysisLogs(nextLogs)
       setParticipants(nextParticipants)
       setTasks(nextTasks)
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '项目详情加载失败，请稍后重试')
     } finally {
       setLoading(false)
     }
-  }, [applyAnalysisLogs, project.id, requirementPage, requirementPageSize, requirementStatusFilter])
+  }, [applyAnalysisLogs, message, project.id, requirementPage, requirementPageSize, requirementStatusFilter])
 
-  useEffect(() => {
-    void reload()
-  }, [reload])
 
   useEffect(() => {
     if (!progress || progress.projectId !== current.id) return
@@ -2799,16 +2987,24 @@ function ProjectDetail({
 
   useEffect(() => {
     if (!participantModalOpen && !editModalOpen && activeTab !== 'plan') return
-    void window.visslm.listOrganizationPeople({ page: 1, pageSize: 100 }).then((result) => setOrganizationPeople(result.rows))
-  }, [activeTab, editModalOpen, participantModalOpen])
+    void window.visslm.listOrganizationPeople({ page: 1, pageSize: 100 })
+      .then((result) => setOrganizationPeople(result.rows))
+      .catch((error: unknown) => message.error(error instanceof Error ? error.message : '加载组织人员失败'))
+  }, [activeTab, editModalOpen, message, participantModalOpen])
 
   const saveProject = async (values: ManagedProjectInput): Promise<void> => {
-    const updated = await window.visslm.updateManagedProject(current.id, values)
-    if (updated) {
-      setCurrent(updated)
-      setEditModalOpen(false)
-      message.success('项目基本信息已保存')
-      onChanged()
+    try {
+      const updated = await window.visslm.updateManagedProject(current.id, values)
+      if (updated) {
+        setCurrent(updated)
+        setEditModalOpen(false)
+        message.success('项目基本信息已保存')
+        onChanged()
+      } else {
+        message.error('项目基本信息保存失败，请稍后重试')
+      }
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '项目基本信息保存失败')
     }
   }
 
@@ -2865,11 +3061,20 @@ function ProjectDetail({
   }
 
   const confirmProject = async (): Promise<void> => {
-    const confirmed = await window.visslm.confirmManagedProject(current.id)
-    if (confirmed) {
+    try {
+      const confirmed = await window.visslm.confirmManagedProject(current.id)
+      if (!confirmed) {
+        message.error('项目确认失败，请稍后重试')
+        return
+      }
       setCurrent(confirmed)
-      message.success('项目已确认，匹配任务已启动')
+      const statusMessage = confirmed.matchMessage?.trim()
+        ? `项目已确认：${confirmed.matchMessage}`
+        : '项目已确认，后续匹配状态请在项目详情中查看'
+      message.success(statusMessage)
       onChanged()
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '项目确认失败')
     }
   }
 
@@ -2889,16 +3094,20 @@ function ProjectDetail({
   }
 
   const uploadAgreement = async (): Promise<void> => {
-    const allowExternalProcessing = await confirmExternalProcessing()
-    if (!allowExternalProcessing) return
-    const result = await window.visslm.startProjectTechnicalAgreementUpload(current.id, { allowExternalProcessing })
-    if (result.canceled) return
-    if (!result.ok) {
-      message.error(result.message)
-      return
+    try {
+      const allowExternalProcessing = await confirmExternalProcessing()
+      if (!allowExternalProcessing) return
+      const result = await window.visslm.startProjectTechnicalAgreementUpload(current.id, { allowExternalProcessing })
+      if (result.canceled) return
+      if (!result.ok) {
+        message.error(result.message)
+        return
+      }
+      message.success(result.message || '技术协议已加入处理队列')
+      onChanged()
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '技术协议上传失败')
     }
-    message.success('技术协议已加入处理队列')
-    onChanged()
   }
 
   const retryAnalysis = (): void => {
@@ -2910,20 +3119,24 @@ function ProjectDetail({
       cancelText: '取消',
       okButtonProps: { danger: true },
       onOk: async () => {
-        if (modelSettings?.source === 'online') {
-          const allowExternalProcessing = await confirmExternalProcessing()
-          if (!allowExternalProcessing) return
-          const upload = await window.visslm.startProjectTechnicalAgreementUpload(current.id, { allowExternalProcessing })
-          if (!upload.ok && !upload.canceled) message.error(upload.message)
-          return
+        try {
+          if (modelSettings?.source === 'online') {
+            const allowExternalProcessing = await confirmExternalProcessing()
+            if (!allowExternalProcessing) return
+            const upload = await window.visslm.startProjectTechnicalAgreementUpload(current.id, { allowExternalProcessing })
+            if (!upload.ok && !upload.canceled) message.error(upload.message)
+            return
+          }
+          const result = await window.visslm.retryProjectAnalysis(current.id)
+          if (!result.ok) {
+            message.error(result.message)
+            return
+          }
+          message.success(result.message)
+          onChanged()
+        } catch (error) {
+          message.error(error instanceof Error ? error.message : '重新执行协议识别失败')
         }
-        const result = await window.visslm.retryProjectAnalysis(current.id)
-        if (!result.ok) {
-          message.error(result.message)
-          return
-        }
-        message.success(result.message)
-        onChanged()
       }
     })
   }
@@ -2937,17 +3150,21 @@ function ProjectDetail({
   }
 
   const startMatching = async (): Promise<void> => {
-    setStoppingMatching(false)
-    const result = await window.visslm.startProjectMatching(current.id)
-    if (!result.ok) message.error(result.message)
-    else {
-      setCurrent((projectSnapshot) => ({
-        ...projectSnapshot,
-        matchStatus: 'processing',
-        matchMessage: result.message
-      }))
-      onChanged()
-      message.success(result.message)
+    try {
+      setStoppingMatching(false)
+      const result = await window.visslm.startProjectMatching(current.id)
+      if (!result.ok) message.error(result.message)
+      else {
+        setCurrent((projectSnapshot) => ({
+          ...projectSnapshot,
+          matchStatus: 'processing',
+          matchMessage: result.message
+        }))
+        onChanged()
+        message.success(result.message)
+      }
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '启动匹配失败')
     }
   }
 
@@ -2985,28 +3202,44 @@ function ProjectDetail({
   }
 
   const saveRequirementKeyInfoTerms = async (id: string, terms: string[]): Promise<ProjectAnalysisStartResult> => {
-    const updated = await window.visslm.updateProjectRequirementKeyInfoTerms(id, terms)
-    if (!updated) {
-      message.error('关键功能信息词保存失败')
-      return { ok: false, message: '关键功能信息词保存失败' }
-    }
-    setMatchRequirement((selected) => selected?.id === id ? updated : selected)
-    const result = await window.visslm.startProjectRequirementMatching(id)
-    if (!result.ok) {
-      message.error(result.message)
+    if (!ensureRequirementActionsEnabled()) return { ok: false, message: requirementCheckpointMessage }
+    try {
+      const updated = await window.visslm.updateProjectRequirementKeyInfoTerms(id, terms)
+      if (!updated) {
+        message.error('关键功能信息词保存失败')
+        return { ok: false, message: '关键功能信息词保存失败' }
+      }
+      setMatchRequirement((selected) => selected?.id === id ? updated : selected)
+      const result = await window.visslm.startProjectRequirementMatching(id)
+      if (!result.ok) {
+        message.error(result.message)
+        await reload()
+        return result
+      }
+      message.success('补充信息词已保存，正在重新执行语义匹配')
       await reload()
+      onChanged()
       return result
+    } catch (error) {
+      const messageText = error instanceof Error ? error.message : '关键功能信息词保存或匹配失败'
+      message.error(messageText)
+      return { ok: false, message: messageText }
     }
-    message.success('补充信息词已保存，正在重新执行语义匹配')
-    await reload()
-    onChanged()
-    return result
   }
 
   const updateRequirementStatus = async (id: string, status: ProjectRequirementStatus): Promise<void> => {
-    await window.visslm.updateProjectRequirementStatus(id, status)
-    await reload()
-    onChanged()
+    if (!ensureRequirementActionsEnabled()) return
+    try {
+      const updated = await window.visslm.updateProjectRequirementStatus(id, status)
+      if (!updated) {
+        message.error('需求状态更新失败，请稍后重试')
+        return
+      }
+      await reload()
+      onChanged()
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '需求状态更新失败')
+    }
   }
 
   const selectRequirementStatus = (status: ProjectRequirementStatus): void => {
@@ -3031,6 +3264,7 @@ function ProjectDetail({
   }
 
   const deleteRequirement = async (id: string): Promise<void> => {
+    if (!ensureRequirementActionsEnabled()) return
     try {
       const result = await window.visslm.deleteProjectRequirement(id)
       if (!result.ok) {
@@ -3051,6 +3285,7 @@ function ProjectDetail({
   }
 
   const openRequirementEditor = (mode: 'create' | 'edit' | 'merge', requirement?: ProjectRequirement): void => {
+    if (!ensureRequirementActionsEnabled()) return
     const selected = requirements.filter((item) => selectedRequirementIds.includes(item.id))
     setRequirementEditorMode(mode)
     setEditingRequirement(requirement ?? null)
@@ -3088,6 +3323,7 @@ function ProjectDetail({
   }
 
   const saveRequirementEditor = async (values: ProjectRequirementInput): Promise<void> => {
+    if (!ensureRequirementActionsEnabled()) return
     try {
       if (requirementEditorMode === 'edit' && editingRequirement) {
         await window.visslm.updateProjectRequirement(editingRequirement.id, values)
@@ -3107,52 +3343,67 @@ function ProjectDetail({
   }
 
   const reviewRequirements = async (status: ProjectRequirementReviewStatus, ids = selectedRequirementIds.map(String)): Promise<void> => {
-    const result = await window.visslm.reviewProjectRequirements(ids, status)
-    if (!result.ok) {
-      message.warning(result.message)
-      return
+    if (!ensureRequirementActionsEnabled()) return
+    try {
+      const result = await window.visslm.reviewProjectRequirements(ids, status)
+      if (!result.ok) {
+        message.warning(result.message)
+        return
+      }
+      setSelectedRequirementIds([])
+      await reload()
+      onChanged()
+      message.success(result.message)
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '需求审核状态更新失败')
     }
-    setSelectedRequirementIds([])
-    await reload()
-    onChanged()
-    message.success(result.message)
   }
 
   const splitRequirement = async (values: { parts: string }): Promise<void> => {
     if (!splitRequirementTarget) return
+    if (!ensureRequirementActionsEnabled()) return
     const parts = values.parts.split(/\n+/).map((item) => item.trim()).filter(Boolean)
     if (parts.length < 2) {
       message.warning('请至少输入两行拆分后的需求')
       return
     }
-    await window.visslm.splitProjectRequirement(splitRequirementTarget.id, {
-      parts: parts.map((content, index) => ({
-        category: splitRequirementTarget.category,
-        module: splitRequirementTarget.module,
-        title: content.split(/[，。；;：:]/)[0]?.slice(0, 40) || `拆分需求 ${index + 1}`,
-        content,
-        keyInfoTerms: splitRequirementTarget.keyInfoTerms,
-        sourceLocation: splitRequirementTarget.sourceLocation,
-        sourceChunkId: splitRequirementTarget.sourceChunkId,
-        evidenceQuote: splitRequirementTarget.evidenceQuote,
-        confidence: splitRequirementTarget.confidence
-      }))
-    })
-    setSplitRequirementTarget(null)
-    splitForm.resetFields()
-    await reload()
-    message.success('需求已拆分并回到待审核状态')
+    try {
+      await window.visslm.splitProjectRequirement(splitRequirementTarget.id, {
+        parts: parts.map((content, index) => ({
+          category: splitRequirementTarget.category,
+          module: splitRequirementTarget.module,
+          title: content.split(/[，。；;：:]/)[0]?.slice(0, 40) || `拆分需求 ${index + 1}`,
+          content,
+          keyInfoTerms: splitRequirementTarget.keyInfoTerms,
+          sourceLocation: splitRequirementTarget.sourceLocation,
+          sourceChunkId: splitRequirementTarget.sourceChunkId,
+          evidenceQuote: splitRequirementTarget.evidenceQuote,
+          confidence: splitRequirementTarget.confidence
+        }))
+      })
+      setSplitRequirementTarget(null)
+      splitForm.resetFields()
+      await reload()
+      message.success('需求已拆分并回到待审核状态')
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '需求拆分失败')
+    }
   }
 
   const publishRequirements = async (): Promise<void> => {
-    const result = await window.visslm.publishProjectRequirements(current.id)
-    if (!result.ok) {
-      message.error(result.message)
-      return
+    if (!ensureRequirementActionsEnabled()) return
+    try {
+      const result = await window.visslm.publishProjectRequirements(current.id)
+      if (!result.ok) {
+        message.error(result.message)
+        return
+      }
+      await reload()
+      onChanged()
+      message.success(result.message)
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '需求基线发布失败')
     }
-    await reload()
-    onChanged()
-    message.success(result.message)
   }
 
   const openCostEditor = (entry?: ProjectCostEntry): void => {
@@ -3174,24 +3425,46 @@ function ProjectDetail({
   }
 
   const deleteCost = async (id: string): Promise<void> => {
-    const result = await window.visslm.deleteProjectCostEntry(id)
-    if (result.ok) {
+    try {
+      const result = await window.visslm.deleteProjectCostEntry(id)
+      if (!result.ok) {
+        message.warning(result.message)
+        return
+      }
       await reload()
       onChanged()
       message.success(result.message)
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '删除成本明细失败')
     }
   }
 
-  const loadRecords = async (): Promise<void> => {
-    const result = await window.visslm.listRecords({
-      page: 1,
-      pageSize: 50,
-      search: recordSearch,
-      excludeProjectAssetProjectId: current.id
-    })
-    setRecords(result.rows)
-    setRecordTotal(result.total)
-  }
+  const loadRecords = useCallback(async (
+    nextPage = recordPage,
+    nextPageSize = recordPageSize,
+    nextSearch = recordSearchQuery
+  ): Promise<void> => {
+    setRecordLoading(true)
+    try {
+      const result = await window.visslm.listRecords({
+        page: nextPage,
+        pageSize: nextPageSize,
+        search: nextSearch,
+        excludeProjectAssetProjectId: current.id
+      })
+      setRecords(result.rows)
+      setRecordTotal(result.total)
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '加载数据中心记录失败')
+    } finally {
+      setRecordLoading(false)
+    }
+  }, [current.id, message, recordPage, recordPageSize, recordSearchQuery])
+
+  useEffect(() => {
+    if (!assetModalOpen) return
+    void loadRecords()
+  }, [assetModalOpen, loadRecords])
 
   const linkAsset = async (recordUid: string, requirementId?: string): Promise<boolean> => {
     try {
@@ -3212,36 +3485,23 @@ function ProjectDetail({
   }
 
   const unlinkAsset = async (recordUid: string): Promise<void> => {
-    const result = await window.visslm.unlinkProjectAsset(current.id, recordUid)
-    if (result.ok) {
+    try {
+      const result = await window.visslm.unlinkProjectAsset(current.id, recordUid)
+      if (!result.ok) {
+        message.warning(result.message)
+        return
+      }
       await reload()
       message.success(result.message)
       onChanged()
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '取消项目资产关联失败')
     }
   }
 
   const unlinkAssetRequirement = async (recordUid: string, requirementId: string): Promise<boolean> => {
     try {
-      let result: { ok: boolean; message: string }
-      if (typeof window.visslm.unlinkProjectAssetRequirement === 'function') {
-        result = await window.visslm.unlinkProjectAsset(current.id, recordUid)
-      } else {
-        // Keep already-open windows usable while their preload still comes from the previous build.
-        const asset = assets.find((item) => item.recordUid === recordUid)
-        const otherRequirementIds = asset?.requirements
-          .filter((item) => item.requirementId !== requirementId)
-          .map((item) => item.requirementId) ?? []
-        const removed = await window.visslm.unlinkProjectAsset(current.id, recordUid)
-        if (!removed.ok) {
-          result = removed
-        } else {
-          for (const otherRequirementId of [] as string[]) {
-            const restored = await window.visslm.linkProjectAsset(current.id, recordUid, otherRequirementId)
-            if (!restored) throw new Error('恢复其他需求关联失败')
-          }
-          result = { ok: true, message: '当前需求已取消数据关联' }
-        }
-      }
+      const result = await window.visslm.unlinkProjectAssetRequirement(current.id, recordUid, requirementId)
       if (!result.ok) {
         message.warning(result.message)
         return false
@@ -3256,10 +3516,11 @@ function ProjectDetail({
     }
   }
 
-  const openRequirementMatch = async (requirementId: string): Promise<void> => {
+  const openRequirementMatch = async (requirementId: string, readOnly = false): Promise<void> => {
     const localRequirement = requirements.find((item) => item.id === requirementId)
     if (localRequirement) {
       setMatchRequirement(localRequirement)
+      setMatchRequirementReadOnly(readOnly)
       return
     }
     try {
@@ -3269,6 +3530,7 @@ function ProjectDetail({
         return
       }
       setMatchRequirement(requirement)
+      setMatchRequirementReadOnly(readOnly)
     } catch (error) {
       message.error(error instanceof Error ? error.message : '打开需求匹配明细失败')
     }
@@ -3365,7 +3627,16 @@ function ProjectDetail({
   }
 
   const openRecord = async (uid: string): Promise<void> => {
-    setRecordDetail(await window.visslm.getRecord(uid))
+    try {
+      const detail = await window.visslm.getRecord(uid)
+      if (!detail) {
+        message.warning('数据中心记录不存在或已被删除')
+        return
+      }
+      setRecordDetail(detail)
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '加载数据中心记录详情失败')
+    }
   }
 
   const openDocumentPreview = async (requestedDocumentId?: string): Promise<void> => {
@@ -3395,7 +3666,7 @@ function ProjectDetail({
   // Persisted project state is authoritative. Progress events enrich the live
   // detail panel, but a stale/missed terminal event must not keep the header
   // status stuck in "执行中" after polling has observed completion.
-  const isProcessing = current.analysisStatus === 'processing' || current.matchStatus === 'processing'
+  const isProcessing = projectProgress?.status === 'running' || current.analysisStatus === 'processing' || current.matchStatus === 'processing'
   const isMatchingProcessing = current.matchStatus === 'processing'
   const isFailed = current.analysisStatus === 'failed' || current.matchStatus === 'failed'
   const projectLifecycleLabel = current.lifecycle === 'draft'
@@ -3455,6 +3726,10 @@ function ProjectDetail({
   const latestAnalysisLog = agreementAnalysisLogs[0]
   const activeRequirementStatusMeta = requirementStatusFilter ? requirementStatusMeta[requirementStatusFilter] : null
   const relationshipNodeCount = allRequirements.length + assets.length + projectDocuments.length + participants.length + tasks.length + costs.length
+  const assetTraceCounts = useMemo(
+    () => summarizeProjectRequirementTraces(assets.flatMap((asset) => asset.requirements)),
+    [assets]
+  )
 
   return (
     <div className="project-detail-page page-stack">
@@ -3468,7 +3743,7 @@ function ProjectDetail({
           <Button className="project-back-button" icon={<ArrowLeftOutlined />} onClick={onBack}>返回项目列表</Button>
         </div>
         <Space wrap className="project-detail-actions">
-          {current.lifecycle === 'draft' && <Button type="primary" icon={<CheckCircleOutlined />} disabled={isProcessing} onClick={() => void confirmProject()}>确认创建并匹配</Button>}
+          {current.lifecycle === 'draft' && <Button type="primary" icon={<CheckCircleOutlined />} disabled={isProcessing} title="确认项目；后续是否启动匹配由需求审核状态和后端前置条件决定" onClick={() => void confirmProject()}>确认项目</Button>}
           {current.lifecycle === 'active' && (isMatchingProcessing
             ? <Button danger icon={<CloseOutlined />} loading={stoppingMatching} disabled={stoppingMatching} onClick={stopMatching}>{stoppingMatching ? '正在停止' : '停止匹配'}</Button>
             : <Button type="primary" icon={<SyncOutlined />} disabled={isProcessing} onClick={() => void startMatching()}>重新匹配</Button>)}
@@ -3739,6 +4014,14 @@ function ProjectDetail({
             label: `需求清单 (${requirementSet ? requirementsTotal : current.requirementCount})`,
             children: (
               <div className="project-requirements-stack">
+                {requirementActionsDisabled && (
+                  <Alert
+                    type="info"
+                    showIcon
+                    message="技术协议正在分析"
+                    description={requirementCheckpointMessage}
+                  />
+                )}
                 {requirementSet ? (
                   <section className="project-review-gate" aria-label="需求审核门禁">
                     <div className="project-review-gate-main">
@@ -3752,13 +4035,13 @@ function ProjectDetail({
                     {requirementSet.warnings.length > 0 && <Text type="secondary">质量提示：{requirementSet.warnings.length} 项，低置信或证据缺失内容需重点复核</Text>}
                     <div className="project-review-toolbar">
                       <Space wrap>
-                        <Button type="primary" icon={<PlusOutlined />} onClick={() => openRequirementEditor('create')}>补录需求</Button>
-                        <Button icon={<CheckCircleOutlined />} disabled={!selectedRequirementIds.length} onClick={() => void reviewRequirements('approved')}>批量通过</Button>
-                        <Button danger disabled={!selectedRequirementIds.length} onClick={() => void reviewRequirements('rejected')}>批量驳回</Button>
-                        <Button icon={<LinkOutlined />} disabled={selectedRequirementIds.length < 2} onClick={() => openRequirementEditor('merge')}>合并所选</Button>
+                        <Button type="primary" icon={<PlusOutlined />} disabled={requirementActionsDisabled} title={requirementActionsDisabled ? requirementCheckpointMessage : undefined} onClick={() => openRequirementEditor('create')}>补录需求</Button>
+                        <Button icon={<CheckCircleOutlined />} disabled={requirementActionsDisabled || !selectedRequirementIds.length} title={requirementActionsDisabled ? requirementCheckpointMessage : undefined} onClick={() => void reviewRequirements('approved')}>批量通过</Button>
+                        <Button danger disabled={requirementActionsDisabled || !selectedRequirementIds.length} title={requirementActionsDisabled ? requirementCheckpointMessage : undefined} onClick={() => void reviewRequirements('rejected')}>批量驳回</Button>
+                        <Button icon={<LinkOutlined />} disabled={requirementActionsDisabled || selectedRequirementIds.length < 2} title={requirementActionsDisabled ? requirementCheckpointMessage : undefined} onClick={() => openRequirementEditor('merge')}>合并所选</Button>
                       </Space>
-                      <Tooltip title={requirementSet.pendingCount ? `仍有 ${requirementSet.pendingCount} 条需求未审核` : '发布后才会替换当前生效版本并启动匹配'}>
-                        <Button type="primary" icon={<CheckCircleFilled />} disabled={requirementSet.pendingCount > 0 || requirementSet.approvedCount < 1} onClick={() => void publishRequirements()}>发布并开始匹配</Button>
+                      <Tooltip title={requirementSet.pendingCount ? `仍有 ${requirementSet.pendingCount} 条需求未审核` : '发布后将替换当前需求基线，是否启动匹配由后端前置条件决定'}>
+                        <Button type="primary" icon={<CheckCircleFilled />} disabled={requirementActionsDisabled || requirementSet.pendingCount > 0 || requirementSet.approvedCount < 1} title={requirementActionsDisabled ? requirementCheckpointMessage : undefined} onClick={() => void publishRequirements()}>发布需求基线</Button>
                       </Tooltip>
                     </div>
                   </section>
@@ -3837,7 +4120,7 @@ function ProjectDetail({
                       rowKey="id"
                       loading={loading}
                       dataSource={requirements}
-                      rowSelection={requirementSet ? { selectedRowKeys: selectedRequirementIds, onChange: setSelectedRequirementIds } : undefined}
+                      rowSelection={requirementSet ? { selectedRowKeys: selectedRequirementIds, onChange: setSelectedRequirementIds, getCheckboxProps: () => ({ disabled: requirementActionsDisabled }) } : undefined}
                       scroll={{ x: requirementSet ? 1480 : 1380, y: projectDetailTableScrollY }}
                       pagination={{ current: requirementPage, pageSize: requirementPageSize, total: requirementsTotal, showSizeChanger: true, showTotal: (count) => `共 ${count} 条需求` }}
                       onChange={(pagination: TablePaginationConfig) => {
@@ -3889,14 +4172,14 @@ function ProjectDetail({
                           render: (value: number | null, row: ProjectRequirement) => <Button type="link" className="project-score-button" onClick={() => setMatchRequirement(row)}>{Number.isFinite(value) ? `${Number(value).toFixed(2)} / 100` : '待重新匹配'} <EyeOutlined /></Button>
                         }, {
                           title: '状态', dataIndex: 'status', width: 150,
-                          render: (value: ProjectRequirementStatus, row: ProjectRequirement) => <Space direction="vertical" size={2}><Select size="small" value={value} options={Object.entries(requirementStatusMeta).map(([key, item]) => ({ value: key, label: item.label }))} onChange={(next) => void updateRequirementStatus(row.id, next as ProjectRequirementStatus)} /><Text type="secondary" className={row.statusSource === 'legacy_unverified' ? 'project-requirement-status-source is-legacy' : 'project-requirement-status-source'}>{requirementStatusSourceLabel[row.statusSource]}</Text></Space>
+                          render: (value: ProjectRequirementStatus, row: ProjectRequirement) => <Space direction="vertical" size={2}><Select size="small" value={value} disabled={requirementActionsDisabled} title={requirementActionsDisabled ? requirementCheckpointMessage : undefined} options={Object.entries(requirementStatusMeta).map(([key, item]) => ({ value: key, label: item.label }))} onChange={(next) => void updateRequirementStatus(row.id, next as ProjectRequirementStatus)} /><Text type="secondary" className={row.statusSource === 'legacy_unverified' ? 'project-requirement-status-source is-legacy' : 'project-requirement-status-source'}>{requirementStatusSourceLabel[row.statusSource]}</Text></Space>
                         }, { title: '相似候选', dataIndex: 'similarCandidateCount', width: 100, render: (value: number) => `${value} 条` }] : []),
                         {
                           title: '操作', key: 'action', fixed: 'right', width: requirementSet ? 250 : 150,
                           render: (_value, row) => requirementSet ? <Space size={0}>
-                            <Button type="link" size="small" icon={<EditOutlined />} onClick={() => openRequirementEditor('edit', row)}>编辑</Button>
-                            <Button type="link" size="small" onClick={() => { setSplitRequirementTarget(row); splitForm.setFieldsValue({ parts: `${row.content}\n` }) }}>拆分</Button>
-                            <Button type="link" size="small" onClick={() => void reviewRequirements(row.reviewStatus === 'approved' ? 'pending' : 'approved', [row.id])}>{row.reviewStatus === 'approved' ? '撤回' : '通过'}</Button>
+                            <Button type="link" size="small" disabled={requirementActionsDisabled} title={requirementActionsDisabled ? requirementCheckpointMessage : undefined} icon={<EditOutlined />} onClick={() => openRequirementEditor('edit', row)}>编辑</Button>
+                            <Button type="link" size="small" disabled={requirementActionsDisabled} title={requirementActionsDisabled ? requirementCheckpointMessage : undefined} onClick={() => { setSplitRequirementTarget(row); splitForm.setFieldsValue({ parts: `${row.content}\n` }) }}>拆分</Button>
+                            <Button type="link" size="small" disabled={requirementActionsDisabled} title={requirementActionsDisabled ? requirementCheckpointMessage : undefined} onClick={() => void reviewRequirements(row.reviewStatus === 'approved' ? 'pending' : 'approved', [row.id])}>{row.reviewStatus === 'approved' ? '撤回' : '通过'}</Button>
                             <Popconfirm
                               title={`确认删除“${row.title}”？`}
                               description="删除仅影响当前待审核版本。"
@@ -3905,7 +4188,7 @@ function ProjectDetail({
                               okButtonProps={{ danger: true }}
                               onConfirm={() => void deleteRequirement(row.id)}
                             >
-                              <Button type="link" danger size="small" icon={<DeleteOutlined />} aria-label={`删除功能需求：${row.title}`}>删除</Button>
+                              <Button type="link" danger size="small" disabled={requirementActionsDisabled} title={requirementActionsDisabled ? requirementCheckpointMessage : undefined} icon={<DeleteOutlined />} aria-label={`删除功能需求：${row.title}`}>删除</Button>
                             </Popconfirm>
                           </Space> : <Button type="link" size="small" icon={<EyeOutlined />} onClick={() => setMatchRequirement(row)}>查看匹配</Button>
                         }
@@ -3975,7 +4258,11 @@ function ProjectDetail({
             key: 'assets',
             label: `项目资产 (${assets.length})`,
             children: (
-              <Card className="project-table-card" extra={<Button type="primary" icon={<LinkOutlined />} onClick={() => { setAssetModalOpen(true); void loadRecords() }}>关联数据中心记录</Button>}>
+              <Card className="project-table-card" extra={<Space size={8} wrap>
+                <Text type="secondary">有效追溯 {assetTraceCounts.valid} 条</Text>
+                {projectRequirementTraceReviewCount(assetTraceCounts) > 0 && <Tooltip title="需复核和失效关系会继续展示在资产列表中，但不计入有效关联数量。"><Tag color="warning" icon={<WarningOutlined aria-hidden="true" />}>{projectRequirementTraceDisplayLabels.suspect} {projectRequirementTraceReviewCount(assetTraceCounts)}</Tag></Tooltip>}
+                <Button type="primary" icon={<LinkOutlined />} onClick={() => { setRecordPage(1); setAssetModalOpen(true) }}>关联数据中心记录</Button>
+              </Space>}>
                 {assets.length ? <ResizableTable<ProjectAsset>
                   tableKey="project-assets-v2"
                   rowKey="recordUid"
@@ -3993,18 +4280,20 @@ function ProjectDetail({
                       render: (_value, row) => row.requirements.length ? (
                         <div className="project-asset-requirements">
                           {row.requirements.map((requirement) => (
-                            <Button
-                              key={requirement.requirementId}
-                              type="link"
-                              size="small"
-                              className="project-asset-requirement-link"
-                              icon={<FileSearchOutlined />}
-                              title={`打开需求匹配明细：${requirement.title}`}
-                              aria-label={`打开需求匹配明细：${requirement.title}`}
-                              onClick={() => void openRequirementMatch(requirement.requirementId)}
-                            >
-                              <span>{requirement.requirementNo > 0 ? `REQ-${String(requirement.requirementNo).padStart(3, '0')} · ` : ''}{requirement.title}</span>
-                            </Button>
+                            <Space key={requirement.requirementId} size={4} wrap>
+                              <Button
+                                type="link"
+                                size="small"
+                                className="project-asset-requirement-link"
+                                icon={<FileSearchOutlined />}
+                                title={`打开需求匹配明细：${requirement.title}`}
+                                aria-label={`打开需求匹配明细：${requirement.title}`}
+                                onClick={() => void openRequirementMatch(requirement.requirementId)}
+                              >
+                                <span>{formatProjectRequirementOptionLabel(requirement.requirementNo, requirement.title)}</span>
+                              </Button>
+                              <ProjectRequirementTraceTag relation={requirement} impactContext />
+                            </Space>
                           ))}
                         </div>
                       ) : <Text type="secondary">未指定需求</Text>
@@ -4035,7 +4324,7 @@ function ProjectDetail({
                   </Descriptions.Item>
                   <Descriptions.Item label="知识库状态"><ProjectStatus project={current} /></Descriptions.Item>
                   <Descriptions.Item label="分析说明">{current.analysisMessage || '上传技术协议后自动建立索引并识别功能需求'}</Descriptions.Item>
-                  <Descriptions.Item label="匹配说明">{current.matchMessage || '确认项目后开始匹配数据中心记录'}</Descriptions.Item>
+                  <Descriptions.Item label="匹配说明">{current.matchMessage || '发布需求基线后，是否启动匹配由后端前置条件决定'}</Descriptions.Item>
                 </Descriptions>
                 <Space className="project-knowledge-actions" wrap>
                   <Button type="primary" icon={<UploadOutlined />} disabled={isProcessing} onClick={() => void uploadAgreement()}>{isProcessing ? '协议处理中' : '上传技术协议及附件'}</Button>
@@ -4124,7 +4413,7 @@ function ProjectDetail({
         </section>
       </Drawer>
 
-      <MatchDrawer requirement={matchRequirement} open={Boolean(matchRequirement)} assets={assets} progress={projectProgress} onClose={() => setMatchRequirement(null)} onOpenRecord={(uid) => void openRecord(uid)} onLinkAsset={(uid, requirementId) => linkAsset(uid, requirementId)} onUnlinkAssetRequirement={(uid, requirementId) => unlinkAssetRequirement(uid, requirementId)} onSaveKeyInfoTerms={saveRequirementKeyInfoTerms} matchScoreThreshold={matchScoreThreshold} />
+      <MatchDrawer requirement={matchRequirement} open={Boolean(matchRequirement)} readOnly={matchRequirementReadOnly} assets={assets} progress={projectProgress} onClose={() => { setMatchRequirement(null); setMatchRequirementReadOnly(false) }} onOpenRecord={(uid) => void openRecord(uid)} onLinkAsset={(uid, requirementId) => linkAsset(uid, requirementId)} onUnlinkAssetRequirement={(uid, requirementId) => unlinkAssetRequirement(uid, requirementId)} onSaveKeyInfoTerms={saveRequirementKeyInfoTerms} matchScoreThreshold={matchScoreThreshold} />
 
       <Modal title="编辑项目基本信息" open={editModalOpen} onCancel={() => setEditModalOpen(false)} footer={null} destroyOnHidden afterOpenChange={(open) => { if (open) editForm.setFieldsValue(current) }}>
         <ProjectForm form={editForm} onFinish={(values) => void saveProject(values)} organizationPeople={organizationPeople} currentProject={current} />
@@ -4177,6 +4466,7 @@ function ProjectDetail({
         onCancel={() => { setRequirementEditorMode(null); setEditingRequirement(null); requirementForm.resetFields() }}
         onOk={() => void requirementForm.submit()}
         okText={requirementEditorMode === 'merge' ? '合并并待审核' : '保存为待审核'}
+        okButtonProps={{ disabled: requirementActionsDisabled, title: requirementActionsDisabled ? requirementCheckpointMessage : undefined }}
         destroyOnHidden
         width={760}
       >
@@ -4207,6 +4497,7 @@ function ProjectDetail({
         onCancel={() => { setSplitRequirementTarget(null); splitForm.resetFields() }}
         onOk={() => void splitForm.submit()}
         okText="拆分为待审核需求"
+        okButtonProps={{ disabled: requirementActionsDisabled, title: requirementActionsDisabled ? requirementCheckpointMessage : undefined }}
         destroyOnHidden
         width={680}
       >
@@ -4346,8 +4637,8 @@ function ProjectDetail({
       </Modal>
 
       <Modal title="关联数据中心记录" open={assetModalOpen} onCancel={() => setAssetModalOpen(false)} footer={null} width={900}>
-        <div className="project-asset-search"><Input.Search allowClear prefix={<SearchOutlined />} placeholder="搜索数据名称、编号或内容" value={recordSearch} onChange={(event) => setRecordSearch(event.target.value)} onSearch={() => void loadRecords()} enterButton="搜索" /></div>
-        <ResizableTable<RecordRow> tableKey="project-asset-picker" rowKey="uid" dataSource={availableAssetRecords} pagination={{ total: recordTotal, pageSize: 50, showTotal: (count) => `共 ${count} 条数据` }} scroll={{ x: 760, y: projectCompactTableScrollY }} columns={[{ title: '数据名称', dataIndex: 'name', render: (value: string) => value }, { title: '类型', dataIndex: 'nodeType', width: 160 }, { title: '业务编号', dataIndex: 'itemId', width: 180 }, { title: '操作', key: 'action', width: 110, render: (_value, row) => <Button type="link" icon={<LinkOutlined />} onClick={() => void linkAsset(row.uid)}>关联</Button> }]} />
+        <div className="project-asset-search"><Input.Search allowClear prefix={<SearchOutlined />} placeholder="搜索数据名称、编号或内容" value={recordSearch} onChange={(event) => { const nextSearch = event.target.value; setRecordSearch(nextSearch); if (!nextSearch) { setRecordPage(1); setRecordSearchQuery('') } }} onSearch={() => { if (recordPage === 1 && recordSearchQuery === recordSearch) { void loadRecords(1, recordPageSize, recordSearch); return } setRecordPage(1); setRecordSearchQuery(recordSearch) }} enterButton="搜索" /></div>
+        <ResizableTable<RecordRow> tableKey="project-asset-picker" rowKey="uid" loading={recordLoading} dataSource={availableAssetRecords} pagination={{ current: recordPage, pageSize: recordPageSize, total: recordTotal, showSizeChanger: true, pageSizeOptions: [50, 100], showTotal: (count) => `共 ${count} 条数据`, onChange: (nextPage, nextPageSize) => { setRecordPage(nextPage); setRecordPageSize(nextPageSize) } }} scroll={{ x: 760, y: projectCompactTableScrollY }} columns={[{ title: '数据名称', dataIndex: 'name', render: (value: string) => value }, { title: '类型', dataIndex: 'nodeType', width: 160 }, { title: '业务编号', dataIndex: 'itemId', width: 180 }, { title: '操作', key: 'action', width: 110, render: (_value, row) => <Button type="link" icon={<LinkOutlined />} onClick={() => void linkAsset(row.uid)}>关联</Button> }]} />
       </Modal>
     </div>
   )
@@ -4386,10 +4677,12 @@ export function ProjectManagementPage({
       const result = await window.visslm.listManagedProjects({ page, pageSize, search })
       setProjects(result.rows)
       setTotal(result.total)
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '加载项目列表失败')
     } finally {
       setLoading(false)
     }
-  }, [page, pageSize, search])
+  }, [message, page, pageSize, search])
 
   const scheduleProgressRefresh = useCallback((immediate: boolean): void => {
     if (progressRefreshTimerRef.current !== null) {
@@ -4428,43 +4721,53 @@ export function ProjectManagementPage({
 
   useEffect(() => {
     if (!createModalOpen) return
-    void window.visslm.listOrganizationPeople({ page: 1, pageSize: 100 }).then((result) => setOrganizationPeople(result.rows))
-  }, [createModalOpen])
+    void window.visslm.listOrganizationPeople({ page: 1, pageSize: 100 })
+      .then((result) => setOrganizationPeople(result.rows))
+      .catch((error: unknown) => message.error(error instanceof Error ? error.message : '加载组织人员失败'))
+  }, [createModalOpen, message])
 
   const createProject = async (values: ManagedProjectInput): Promise<void> => {
-    const created = await window.visslm.createManagedProject(projectInputFromValues(values as unknown as Record<string, unknown>))
-    setCreateModalOpen(false)
-    createForm.resetFields()
-    setSelectedProjectId(created.id)
-    await loadProjects()
-    onChanged()
-    message.success('项目已创建')
+    try {
+      const created = await window.visslm.createManagedProject(projectInputFromValues(values as unknown as Record<string, unknown>))
+      setCreateModalOpen(false)
+      createForm.resetFields()
+      setSelectedProjectId(created.id)
+      await loadProjects()
+      onChanged()
+      message.success('项目已创建')
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '项目创建失败')
+    }
   }
 
   const uploadAgreement = async (): Promise<void> => {
-    let allowExternalProcessing = modelSettings?.source !== 'online'
-    if (modelSettings?.source === 'online') {
-      allowExternalProcessing = await new Promise<boolean>((resolve) => modal.confirm({
-        title: '确认将协议发送到在线模型？',
-        icon: <WarningOutlined />,
-        content: `本次解析会将所选协议正文发送至 ${modelSettings.provider} 的 ${modelSettings.model}。请确认已获得协议外发授权。`,
-        okText: '已授权，本次继续',
-        cancelText: '取消',
-        onOk: () => resolve(true),
-        onCancel: () => resolve(false)
-      }))
+    try {
+      let allowExternalProcessing = modelSettings?.source !== 'online'
+      if (modelSettings?.source === 'online') {
+        allowExternalProcessing = await new Promise<boolean>((resolve) => modal.confirm({
+          title: '确认将协议发送到在线模型？',
+          icon: <WarningOutlined />,
+          content: `本次解析会将所选协议正文发送至 ${modelSettings.provider} 的 ${modelSettings.model}。请确认已获得协议外发授权。`,
+          okText: '已授权，本次继续',
+          cancelText: '取消',
+          onOk: () => resolve(true),
+          onCancel: () => resolve(false)
+        }))
+      }
+      if (!allowExternalProcessing) return
+      const result = await window.visslm.startProjectTechnicalAgreementUpload(undefined, { allowExternalProcessing })
+      if (result.canceled) return
+      if (!result.ok || !result.projectId) {
+        message.error(result.message)
+        return
+      }
+      setSelectedProjectId(result.projectId)
+      await loadProjects()
+      onChanged()
+      message.success(result.message)
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '技术协议上传失败')
     }
-    if (!allowExternalProcessing) return
-    const result = await window.visslm.startProjectTechnicalAgreementUpload(undefined, { allowExternalProcessing })
-    if (result.canceled) return
-    if (!result.ok || !result.projectId) {
-      message.error(result.message)
-      return
-    }
-    setSelectedProjectId(result.projectId)
-    await loadProjects()
-    onChanged()
-    message.success(result.message)
   }
 
   const importProjectData = async (): Promise<void> => {

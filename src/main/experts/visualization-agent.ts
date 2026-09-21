@@ -16,6 +16,11 @@ import type {
 } from '../../shared/dashboard'
 import { dashboardAiEditMode } from '../../shared/dashboard'
 import {
+  dashboardComponentOptionKeys,
+  dashboardComponentStyleForType,
+  dashboardComponentSupportsOption
+} from '../../shared/dashboard-component-options'
+import {
   arrangeDashboardComponentsByStory,
   findFirstAvailableDashboardLayout
 } from '../../shared/dashboard-layout'
@@ -40,6 +45,31 @@ import { QueryEngine } from '../analytics/query-engine'
 import { adaptDashboardComponentQuery } from '../dashboards/component-repair'
 import { validateDashboardSpec } from '../dashboards/validator'
 import { ModelClient } from '../model-client'
+
+const dashboardComponentOptionJsonSchemaProperties = {
+  decimalPlaces: { type: 'integer', minimum: 0, maximum: 4 },
+  maxItems: { type: 'integer', minimum: 1, maximum: 100 },
+  showLabels: { type: 'boolean' },
+  showValues: { type: 'boolean' },
+  smooth: { type: 'boolean' },
+  showArea: { type: 'boolean' },
+  showSymbols: { type: 'boolean' },
+  showIndex: { type: 'boolean' },
+  showStatus: { type: 'boolean' },
+  showStatusLegend: { type: 'boolean' },
+  targetValue: { type: 'number', minimum: 1, maximum: 10000 },
+  showIcon: { type: 'boolean' },
+  minimumValue: { type: 'number', minimum: -100000, maximum: 100000 },
+  maximumValue: { type: 'number', minimum: -100000, maximum: 100000 },
+  showPointer: { type: 'boolean' },
+  symbolSize: { type: 'number', minimum: 4, maximum: 30 },
+  barWidth: { type: 'number', minimum: 6, maximum: 40 },
+  legendPosition: { type: 'string', enum: ['top', 'right', 'bottom'] },
+  sortOrder: { type: 'string', enum: ['none', 'ascending', 'descending'] },
+  radarShape: { type: 'string', enum: ['polygon', 'circle'] },
+  areaOpacity: { type: 'number', minimum: 0, maximum: 0.8 },
+  itemGap: { type: 'number', minimum: 0, maximum: 12 }
+} as const
 
 const dashboardJsonSchema = {
   type: 'object',
@@ -124,7 +154,7 @@ const dashboardJsonSchema = {
           id: { type: 'string' },
           type: {
             type: 'string',
-            enum: ['kpi', 'bar', 'line', 'pie', 'ranking', 'table', 'progress', 'insight', 'gauge', 'funnel', 'radar', 'scatter', 'treemap', 'combo']
+            enum: ['kpi', 'bar', 'line', 'pie', 'ranking', 'table', 'progress', 'insight', 'gauge', 'funnel', 'radar', 'scatter', 'treemap', 'combo', 'data-matrix', 'description-list', 'comparison-bars']
           },
           title: { type: 'string', minLength: 1 },
           semanticBinding: { type: 'object', additionalProperties: true },
@@ -162,7 +192,8 @@ const dashboardJsonSchema = {
               showGrid: { type: 'boolean' },
               lineWidth: { type: 'number', minimum: 1, maximum: 8 },
               orientation: { type: 'string', enum: ['horizontal', 'vertical'] },
-              donut: { type: 'boolean' }
+              donut: { type: 'boolean' },
+              ...dashboardComponentOptionJsonSchemaProperties
             }
           },
           query: {
@@ -289,16 +320,19 @@ const dashboardPatchJsonSchema = {
               'set-component-limit',
               'set-component-sort',
               'set-component-time-grain',
+              'set-component-style',
+              'set-component-content-settings',
+              'set-component-content-item',
               'add-component'
             ]
           },
           type: {
             type: 'string',
-            enum: ['kpi', 'bar', 'line', 'pie', 'ranking', 'table', 'progress', 'insight', 'gauge', 'funnel', 'radar', 'scatter', 'treemap', 'combo']
+            enum: ['kpi', 'bar', 'line', 'pie', 'ranking', 'table', 'progress', 'insight', 'gauge', 'funnel', 'radar', 'scatter', 'treemap', 'combo', 'data-matrix', 'description-list', 'comparison-bars']
           },
           componentType: {
             type: 'string',
-            enum: ['kpi', 'bar', 'line', 'pie', 'ranking', 'table', 'progress', 'insight', 'gauge', 'funnel', 'radar', 'scatter', 'treemap', 'combo']
+            enum: ['kpi', 'bar', 'line', 'pie', 'ranking', 'table', 'progress', 'insight', 'gauge', 'funnel', 'radar', 'scatter', 'treemap', 'combo', 'data-matrix', 'description-list', 'comparison-bars']
           },
           componentId: { type: 'string' },
           componentTitle: { type: 'string' },
@@ -319,7 +353,38 @@ const dashboardPatchJsonSchema = {
           limit: { type: 'integer', minimum: 1, maximum: 500 },
           sortField: { type: 'string' },
           sortDirection: { type: 'string', enum: ['asc', 'desc'] },
-          timeGrain: { type: 'string', enum: ['day', 'week', 'month', 'quarter'] }
+          timeGrain: { type: 'string', enum: ['day', 'week', 'month', 'quarter'] },
+          accent: { type: 'string' },
+          titleFontSize: { type: 'number', minimum: 9, maximum: 24 },
+          subtitleFontSize: { type: 'number', minimum: 8, maximum: 18 },
+          valueFontSize: { type: 'number', minimum: 14, maximum: 48 },
+          bodyFontSize: { type: 'number', minimum: 9, maximum: 20 },
+          borderRadius: { type: 'number', minimum: 0, maximum: 12 },
+          padding: { type: 'number', minimum: 4, maximum: 20 },
+          lineWidth: { type: 'number', minimum: 1, maximum: 8 },
+          showLegend: { type: 'boolean' },
+          showGrid: { type: 'boolean' },
+          donut: { type: 'boolean' },
+          orientation: { type: 'string', enum: ['horizontal', 'vertical'] },
+          ...dashboardComponentOptionJsonSchemaProperties,
+          leadingLabel: { type: 'string' },
+          columns: { type: 'array', minItems: 1, maxItems: 12, items: { type: 'string' } },
+          pageSize: { type: 'integer', minimum: 3, maximum: 20 },
+          expansionMode: { type: 'string', enum: ['inline', 'linked-detail', 'none'] },
+          selectionChannel: { type: 'string' },
+          selectedRowId: { type: 'string' },
+          heading: { type: 'string' },
+          statusLabel: { type: 'string' },
+          statusTone: { type: 'string', enum: ['success', 'info', 'warning', 'error', 'neutral'] },
+          valueLabel: { type: 'string' },
+          secondaryLabel: { type: 'string' },
+          selectionId: { type: 'string' },
+          itemId: { type: 'string' },
+          label: { type: 'string' },
+          displayValue: { type: 'string' },
+          numericValue: { type: 'number' },
+          secondaryNumericValue: { type: 'number' },
+          tone: { type: 'string', enum: ['success', 'info', 'warning', 'error', 'neutral'] }
         }
       }
     }
@@ -344,6 +409,58 @@ type DashboardPatchOperation = {
   sortDirection?: 'asc' | 'desc'
   timeGrain?: TimeGrain
   dimensionField?: string
+  accent?: string
+  titleFontSize?: number
+  subtitleFontSize?: number
+  valueFontSize?: number
+  bodyFontSize?: number
+  borderRadius?: number
+  padding?: number
+  lineWidth?: number
+  showLegend?: boolean
+  showGrid?: boolean
+  donut?: boolean
+  orientation?: 'horizontal' | 'vertical'
+  decimalPlaces?: number
+  maxItems?: number
+  showLabels?: boolean
+  showValues?: boolean
+  smooth?: boolean
+  showArea?: boolean
+  showSymbols?: boolean
+  showIndex?: boolean
+  showStatus?: boolean
+  showStatusLegend?: boolean
+  targetValue?: number
+  showIcon?: boolean
+  minimumValue?: number
+  maximumValue?: number
+  showPointer?: boolean
+  symbolSize?: number
+  barWidth?: number
+  legendPosition?: 'top' | 'right' | 'bottom'
+  sortOrder?: 'none' | 'ascending' | 'descending'
+  radarShape?: 'polygon' | 'circle'
+  areaOpacity?: number
+  itemGap?: number
+  leadingLabel?: string
+  columns?: string[]
+  pageSize?: number
+  expansionMode?: 'inline' | 'linked-detail' | 'none'
+  selectionChannel?: string
+  selectedRowId?: string
+  heading?: string
+  statusLabel?: string
+  statusTone?: 'success' | 'info' | 'warning' | 'error' | 'neutral'
+  valueLabel?: string
+  secondaryLabel?: string
+  selectionId?: string
+  itemId?: string
+  label?: string
+  displayValue?: string
+  numericValue?: number
+  secondaryNumericValue?: number
+  tone?: 'success' | 'info' | 'warning' | 'error' | 'neutral'
 }
 
 type AppliedDashboardPatch = {
@@ -368,7 +485,10 @@ const componentTypes = new Set<DashboardComponentType>([
   'radar',
   'scatter',
   'treemap',
-  'combo'
+  'combo',
+  'data-matrix',
+  'description-list',
+  'comparison-bars'
 ])
 
 const patchThemes = new Set([
@@ -398,6 +518,9 @@ const patchOperations = new Set([
   'set-component-limit',
   'set-component-sort',
   'set-component-time-grain',
+  'set-component-style',
+  'set-component-content-settings',
+  'set-component-content-item',
   'add-component'
 ])
 
@@ -408,7 +531,10 @@ const componentPatchOperations = new Set([
   'set-component-type',
   'set-component-limit',
   'set-component-sort',
-  'set-component-time-grain'
+  'set-component-time-grain',
+  'set-component-style',
+  'set-component-content-settings',
+  'set-component-content-item'
 ])
 
 const presentationPatchOperations = new Set([
@@ -416,7 +542,10 @@ const presentationPatchOperations = new Set([
   'set-dashboard-subtitle',
   'set-theme',
   'set-component-title',
-  'set-component-subtitle'
+  'set-component-subtitle',
+  'set-component-style',
+  'set-component-content-settings',
+  'set-component-content-item'
 ])
 
 const validatePresentationPatchOperations = (
@@ -425,7 +554,7 @@ const validatePresentationPatchOperations = (
   const unsupported = operations.find((operation) => !presentationPatchOperations.has(operation.op))
   if (unsupported) {
     throw new Error(
-      `展示快照模式不支持 ${unsupported.op}，仅允许修改大屏或组件的标题、副标题与主题`
+      `展示快照模式不支持 ${unsupported.op}，仅允许修改标题、主题、组件样式与结构化展示内容`
     )
   }
 }
@@ -522,7 +651,22 @@ const parsePatchOperations = (input: unknown): DashboardPatchOperation[] => {
       'sortField',
       'dimensionField',
       'measureField',
-      'secondaryMeasureField'
+      'secondaryMeasureField',
+      'accent',
+      'leadingLabel',
+      'selectionChannel',
+      'selectedRowId',
+      'heading',
+      'statusLabel',
+      'valueLabel',
+      'secondaryLabel',
+      'legendPosition',
+      'sortOrder',
+      'radarShape',
+      'selectionId',
+      'itemId',
+      'label',
+      'displayValue'
     ] as const) {
       if (operation[field] !== undefined && typeof operation[field] !== 'string') {
         throw new Error(`淇敼鎿嶄綔 ${index + 1} 鐨?${field} 必须是字符串`)
@@ -530,6 +674,66 @@ const parsePatchOperations = (input: unknown): DashboardPatchOperation[] => {
     }
     if (operation.limit !== undefined && typeof operation.limit !== 'number') {
       throw new Error(`淇敼鎿嶄綔 ${index + 1} 鐨?limit 必须是数字`)
+    }
+    for (const field of [
+      'titleFontSize',
+      'subtitleFontSize',
+      'valueFontSize',
+      'bodyFontSize',
+      'borderRadius',
+      'padding',
+      'lineWidth',
+      'decimalPlaces',
+      'maxItems',
+      'targetValue',
+      'minimumValue',
+      'maximumValue',
+      'symbolSize',
+      'barWidth',
+      'areaOpacity',
+      'itemGap',
+      'pageSize',
+      'numericValue',
+      'secondaryNumericValue'
+    ] as const) {
+      if (operation[field] !== undefined && typeof operation[field] !== 'number') {
+        throw new Error(`修改操作 ${index + 1} 的 ${field} 必须是数字`)
+      }
+    }
+    for (const field of [
+      'showLegend',
+      'showGrid',
+      'donut',
+      'showLabels',
+      'showValues',
+      'smooth',
+      'showArea',
+      'showSymbols',
+      'showIndex',
+      'showStatus',
+      'showStatusLegend',
+      'showIcon',
+      'showPointer'
+    ] as const) {
+      if (operation[field] !== undefined && typeof operation[field] !== 'boolean') {
+        throw new Error(`修改操作 ${index + 1} 的 ${field} 必须是布尔值`)
+      }
+    }
+    if (operation.columns !== undefined &&
+        (!Array.isArray(operation.columns) || operation.columns.some((item) => typeof item !== 'string'))) {
+      throw new Error(`修改操作 ${index + 1} 的 columns 必须是字符串数组`)
+    }
+    if (operation.legendPosition !== undefined &&
+        !['top', 'right', 'bottom'].includes(operation.legendPosition)) {
+      throw new Error(`修改操作 ${index + 1} 的 legendPosition 不受支持`)
+    }
+    if (operation.sortOrder !== undefined &&
+        !['none', 'ascending', 'descending'].includes(operation.sortOrder)) {
+      throw new Error(`修改操作 ${index + 1} 的 sortOrder 不受支持`)
+    }
+    if (operation.radarShape !== undefined &&
+        !['polygon', 'circle'].includes(operation.radarShape)) {
+      throw new Error(`修改操作 ${index + 1} 的 radarShape 不受支持`)
     }
     if (operation.timeGrain !== undefined && !patchTimeGrains.has(operation.timeGrain)) {
       throw new Error(`涓嶆敮鎸佺殑鏃堕棿绮掑害: ${String(operation.timeGrain)}`)
@@ -692,7 +896,7 @@ const compatibleDimensionCandidates = (
   if (type === 'line') {
     return profiles.filter((profile) => profile.inferredType === 'date' && profile.sensitivity !== 'sensitive')
   }
-  if (['bar', 'pie', 'ranking', 'table', 'funnel', 'radar', 'scatter', 'treemap'].includes(type)) {
+  if (['bar', 'pie', 'ranking', 'table', 'funnel', 'radar', 'scatter', 'treemap', 'data-matrix', 'description-list', 'comparison-bars'].includes(type)) {
     return profiles.filter((profile) =>
       profile.sensitivity !== 'sensitive' &&
       profile.role !== 'identifier' &&
@@ -759,7 +963,10 @@ const addComponentLimit = (type: DashboardComponentType): number => ({
   bar: 10,
   line: 60,
   table: 100,
-  insight: 20
+  insight: 20,
+  'data-matrix': 30,
+  'description-list': 30,
+  'comparison-bars': 30
 }[type] ?? 100)
 
 const measureMatchesMetric = (
@@ -1012,7 +1219,7 @@ const buildAddedComponent = (
         ? { timeGrain: operation.timeGrain ?? requestedQuestion?.timeGrain ?? 'month' }
         : {})
     }
-  } else if (!singleValue && ['bar', 'pie', 'ranking', 'table', 'funnel', 'radar', 'scatter', 'treemap', 'combo', 'line'].includes(type)) {
+  } else if (!singleValue && ['bar', 'pie', 'ranking', 'table', 'funnel', 'radar', 'scatter', 'treemap', 'combo', 'line', 'data-matrix', 'description-list', 'comparison-bars'].includes(type)) {
     throw new Error(`${type} 没有可用维度字段，请澄清后再添加组件`)
   }
   if (operation.timeGrain && dimension) {
@@ -1240,6 +1447,7 @@ const applyPatchOperations = (
         throw new Error(`不支持的组件类型: ${type}`)
       }
       component.type = type as DashboardComponentType
+      component.style = dashboardComponentStyleForType(component.type, component.style)
       component.slotRole = dashboardSlotRoleForType(component.type, component.query?.dimensions ?? [])
       typeChangedComponentIds.add(component.id)
       queryAffectedComponentIds.add(component.id)
@@ -1247,6 +1455,212 @@ const applyPatchOperations = (
         next.components[index] = adaptDashboardComponentQuery(next, component.id, queryEngine).component
       }
       needsArrange = true
+      continue
+    }
+    if (operation.op === 'set-component-style') {
+      const supportedOptionFields = [...dashboardComponentOptionKeys].filter((field) =>
+        dashboardComponentSupportsOption(component.type, field)
+      )
+      const allowed = new Set([
+        'accent',
+        'titleFontSize',
+        'subtitleFontSize',
+        'bodyFontSize',
+        'borderRadius',
+        'padding',
+        ...(['kpi', 'progress', 'gauge'].includes(component.type) ? ['valueFontSize'] : []),
+        ...(['bar', 'line', 'pie', 'funnel', 'radar', 'combo'].includes(component.type) ? ['showLegend'] : []),
+        ...(['bar', 'line', 'scatter', 'combo'].includes(component.type) ? ['showGrid'] : []),
+        ...(['line', 'radar', 'combo'].includes(component.type) ? ['lineWidth'] : []),
+        ...(['bar', 'funnel'].includes(component.type) ? ['orientation'] : []),
+        ...(component.type === 'pie' ? ['donut'] : []),
+        ...supportedOptionFields
+      ])
+      const requested = [
+        'accent', 'titleFontSize', 'subtitleFontSize', 'valueFontSize', 'bodyFontSize',
+        'borderRadius', 'padding', 'lineWidth', 'showLegend', 'showGrid', 'donut', 'orientation',
+        ...dashboardComponentOptionKeys
+      ].filter((field) => operation[field as keyof DashboardPatchOperation] !== undefined)
+      if (!requested.length) throw new Error(`组件 ${component.title} 的样式修改没有提供属性`)
+      const unsupported = requested.find((field) => !allowed.has(field))
+      if (unsupported) throw new Error(`组件 ${component.title} 不支持样式属性 ${unsupported}`)
+      if (operation.accent !== undefined) {
+        if (!/^#[0-9a-f]{6}$/i.test(operation.accent)) throw new Error('强调色必须是 6 位十六进制颜色')
+        component.accent = operation.accent
+      }
+      const stylePatch = Object.fromEntries(requested
+        .filter((field) => field !== 'accent')
+        .map((field) => [field, operation[field as keyof DashboardPatchOperation]]))
+      component.style = { ...component.style, ...stylePatch }
+      continue
+    }
+    if (operation.op === 'set-component-content-settings') {
+      const content = component.content
+      if (!content) throw new Error(`组件 ${component.title} 没有结构化内容配置`)
+      if (content.kind === 'data-matrix') {
+        if (operation.columns && operation.columns.length !== content.columns.length) {
+          throw new Error(`组件 ${component.title} 的列标题数量必须保持为 ${content.columns.length}`)
+        }
+        component.content = {
+          ...content,
+          ...(operation.leadingLabel !== undefined ? { leadingLabel: operation.leadingLabel.trim() } : {}),
+          ...(operation.columns !== undefined ? { columns: operation.columns.map((item) => item.trim()) } : {}),
+          ...(operation.pageSize !== undefined ? { pageSize: operation.pageSize } : {}),
+          ...(operation.expansionMode !== undefined ? { expansionMode: operation.expansionMode } : {}),
+          ...(operation.selectionChannel !== undefined ? { selectionChannel: operation.selectionChannel.trim() || undefined } : {}),
+          ...(operation.selectedRowId !== undefined ? { selectedRowId: operation.selectedRowId.trim() } : {})
+        }
+      } else if (content.kind === 'description-list') {
+        const variants = content.variants ?? []
+        const variantIndex = operation.selectionId
+          ? variants.findIndex((variant) => variant.selectionId === operation.selectionId)
+          : -1
+        if (variantIndex >= 0) {
+          const target = variants[variantIndex]
+          const nextVariant = {
+            ...target,
+            ...(operation.heading !== undefined ? { heading: operation.heading.trim() || undefined } : {}),
+            ...(operation.statusLabel !== undefined || operation.statusTone !== undefined
+              ? {
+                  status: {
+                    label: operation.statusLabel ?? target.status?.label ?? '',
+                    tone: operation.statusTone ?? target.status?.tone ?? 'neutral'
+                  }
+                }
+              : {})
+          }
+          component.content = {
+            ...content,
+            ...(operation.selectionChannel !== undefined
+              ? { selectionChannel: operation.selectionChannel.trim() || undefined }
+              : {}),
+            variants: variants.map((variant, index) => index === variantIndex ? nextVariant : variant)
+          }
+        } else {
+          component.content = {
+            ...content,
+            ...(operation.heading !== undefined ? { heading: operation.heading.trim() || undefined } : {}),
+            ...(operation.statusLabel !== undefined || operation.statusTone !== undefined
+              ? {
+                  status: {
+                    label: operation.statusLabel ?? content.status?.label ?? '',
+                    tone: operation.statusTone ?? content.status?.tone ?? 'neutral'
+                  }
+                }
+              : {}),
+            ...(operation.selectionChannel !== undefined
+              ? { selectionChannel: operation.selectionChannel.trim() || undefined }
+              : {})
+          }
+        }
+      } else {
+        component.content = {
+          ...content,
+          ...(operation.valueLabel !== undefined ? { valueLabel: operation.valueLabel.trim() || undefined } : {}),
+          ...(operation.secondaryLabel !== undefined
+            ? { secondaryLabel: operation.secondaryLabel.trim() || undefined }
+            : {})
+        }
+      }
+      continue
+    }
+    if (operation.op === 'set-component-content-item') {
+      const content = component.content
+      const itemId = operation.itemId?.trim()
+      if (!content || !itemId) throw new Error(`组件 ${component.title} 的内容项修改缺少 itemId`)
+      if (content.kind === 'data-matrix') {
+        let found = false
+        const rows = content.rows.map((row) => {
+          if (row.id === itemId) {
+            found = true
+            return {
+              ...row,
+              ...(operation.label !== undefined ? { label: operation.label } : {}),
+              ...(operation.tone !== undefined ? { tone: operation.tone } : {})
+            }
+          }
+          return {
+            ...row,
+            cells: row.cells.map((cell) => {
+              if (cell.id !== itemId) return cell
+              found = true
+              return {
+                ...cell,
+                ...(operation.label !== undefined ? { label: operation.label } : {}),
+                ...(operation.displayValue !== undefined ? { value: operation.displayValue || undefined } : {}),
+                ...(operation.tone !== undefined ? { tone: operation.tone } : {})
+              }
+            })
+          }
+        })
+        if (!found) throw new Error(`组件 ${component.title} 不存在内容项 ${itemId}`)
+        component.content = { ...content, rows }
+      } else if (content.kind === 'description-list') {
+        const variants = content.variants ?? []
+        const variantIndex = operation.selectionId
+          ? variants.findIndex((variant) => variant.selectionId === operation.selectionId)
+          : -1
+        const target = variantIndex >= 0 ? variants[variantIndex] : content
+        let found = false
+        const fields = target.fields.map((field) => {
+          if (field.id !== itemId) return field
+          found = true
+          return {
+            ...field,
+            ...(operation.label !== undefined ? { label: operation.label } : {}),
+            ...(operation.displayValue !== undefined ? { value: operation.displayValue } : {}),
+            ...(operation.tone !== undefined ? { tone: operation.tone } : {})
+          }
+        })
+        const sections = target.sections?.map((section) => {
+          if (section.id !== itemId) return section
+          found = true
+          return {
+            ...section,
+            ...(operation.label !== undefined ? { label: operation.label } : {}),
+            ...(operation.displayValue !== undefined ? { value: operation.displayValue } : {}),
+            ...(operation.tone !== undefined ? { tone: operation.tone } : {})
+          }
+        })
+        const summary = itemId === 'summary' && target.summary
+          ? (() => {
+              found = true
+              return {
+                ...target.summary,
+                ...(operation.label !== undefined ? { label: operation.label } : {}),
+                ...(operation.displayValue !== undefined ? { value: operation.displayValue } : {}),
+                ...(operation.tone !== undefined ? { tone: operation.tone } : {})
+              }
+            })()
+          : target.summary
+        if (!found) throw new Error(`组件 ${component.title} 不存在内容项 ${itemId}`)
+        if (variantIndex >= 0) {
+          const nextVariant = { ...variants[variantIndex], fields, sections, summary }
+          component.content = {
+            ...content,
+            variants: variants.map((variant, index) => index === variantIndex ? nextVariant : variant)
+          }
+        } else {
+          component.content = { ...content, fields, sections, summary }
+        }
+      } else {
+        const index = content.items.findIndex((item) => item.id === itemId)
+        if (index < 0) throw new Error(`组件 ${component.title} 不存在内容项 ${itemId}`)
+        component.content = {
+          ...content,
+          items: content.items.map((item, currentIndex) => currentIndex === index
+            ? {
+                ...item,
+                ...(operation.label !== undefined ? { label: operation.label } : {}),
+                ...(operation.numericValue !== undefined ? { value: operation.numericValue } : {}),
+                ...(operation.secondaryNumericValue !== undefined
+                  ? { secondaryValue: operation.secondaryNumericValue }
+                  : {}),
+                ...(operation.tone !== undefined ? { tone: operation.tone } : {})
+              }
+            : item)
+        }
+      }
       continue
     }
     if (!component.query) throw new Error(`组件 ${component.title} 缺少 QuerySpec，无法修改查询`)
@@ -1326,11 +1740,13 @@ const toDataPoints = (
   const labelField = component.encoding?.label
   const valueField = component.encoding?.value
   const secondaryField = component.encoding?.secondaryValue
+  const valueScale = component.encoding?.valueScale ?? 1
+  const secondaryValueScale = component.encoding?.secondaryValueScale ?? 1
   if (!valueField) return []
   return dataset.rows.map((row, index) => ({
     name: String(labelField ? row[labelField] ?? `数据 ${index + 1}` : row[labelField ?? ''] ?? component.title),
-    value: Number(row[valueField] ?? 0),
-    ...(secondaryField ? { secondaryValue: Number(row[secondaryField] ?? 0) } : {})
+    value: Number(row[valueField] ?? 0) * valueScale,
+    ...(secondaryField ? { secondaryValue: Number(row[secondaryField] ?? 0) * secondaryValueScale } : {})
   }))
 }
 
@@ -1364,7 +1780,10 @@ const componentTypeNames: Record<DashboardComponentType, string> = {
   radar: '多维分析',
   scatter: '相关性分析',
   treemap: '层级构成',
-  combo: '组合趋势'
+  combo: '组合趋势',
+  'data-matrix': '数据矩阵',
+  'description-list': '描述列表',
+  'comparison-bars': '比较条形'
 }
 
 const normalizedText = (...values: unknown[]): string | undefined => {
@@ -1384,6 +1803,8 @@ const dashboardSlotRoleForType = (
     )
     return hasTimeDimension ? 'trend' : 'comparison'
   }
+  if (type === 'data-matrix' || type === 'description-list') return 'detail'
+  if (type === 'comparison-bars') return 'comparison'
   if (['bar', 'ranking'].includes(type)) return 'comparison'
   if (['pie', 'treemap'].includes(type)) return 'breakdown'
   if (type === 'table') return 'detail'
@@ -2245,6 +2666,7 @@ const normalizeGeneratedSpec = (
     ...spec,
     id: normalizedText(spec.id) ?? randomUUID(),
     title: normalizedText(spec.title) ?? 'AI 数据看板',
+    dataScope: JSON.parse(JSON.stringify(scope)) as DataScope,
     ...(globalFilters === undefined ? {} : { globalFilters }),
     components: spec.components.map((value, index) => {
       if (!value || typeof value !== 'object' || Array.isArray(value)) return value
@@ -2831,6 +3253,7 @@ export class VisualizationAgent {
         const dashboard: DashboardSpec = {
           ...patched,
           id: baseDashboard.id,
+          dataScope: JSON.parse(JSON.stringify(scope)) as DataScope,
           updatedAt: new Date().toISOString(),
           components: patched.components.map((component) => {
             if (!component.query || !appliedPatch.queryAffectedComponentIds.has(component.id)) {
@@ -2975,7 +3398,12 @@ export class VisualizationAgent {
             'A patch is applied by the host and then fully validated. Do not invent component IDs or fields.',
             'Supported operations: set-dashboard-title, set-dashboard-subtitle, set-theme, remove-component,',
             'set-component-title, set-component-subtitle, set-component-type, set-component-limit,',
-            'set-component-sort, set-component-time-grain, add-component.',
+            'set-component-sort, set-component-time-grain, set-component-style,',
+            'set-component-content-settings, set-component-content-item, add-component.',
+            'Use set-component-style only for properties supported by that component type.',
+            'Component-specific visual primitives such as labels, values, item limits, targets, line/point/area controls, gauge bounds and chart sorting also use set-component-style.',
+            'Use set-component-content-settings for matrix pagination/linkage, detail heading/status/linkage, or comparison labels.',
+            'Use set-component-content-item with an existing itemId; selectionId chooses a description-list variant.',
             'Supported add component types include treemap and combo. Treemap needs a category dimension and one metric.',
             'Combo needs a time or category dimension and two different metrics; scatter likewise needs two safe numeric metrics.',
             'For add-component provide type, optionally a controlled title override, dimensionField when the type needs a dimension,',
@@ -2986,8 +3414,8 @@ export class VisualizationAgent {
             'Never use add-component when focusComponent is provided.',
             'For set-component-limit use integer limit. For set-component-sort provide sortField and sortDirection.',
             'For set-component-time-grain provide timeGrain and optionally dimensionField.',
-            'When editMode is presentation-only, only use set-dashboard-title, set-dashboard-subtitle, set-theme,',
-            'set-component-title, or set-component-subtitle. Never change type, query, limit, sort, grain, or components.',
+            'When editMode is presentation-only, only change titles, theme, component style, or structured display content.',
+            'Never change type, query, limit, sort, grain, or component membership in presentation-only mode.',
             'When focusComponent is provided, only return component-scoped operations for that component.',
             'Never change dashboard title, subtitle, theme, or another component when focusComponent is provided.',
             'With focusComponent, unqualified title, subtitle, type, chart, limit, or sort refers to that component.',

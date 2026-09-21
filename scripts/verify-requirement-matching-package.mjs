@@ -10,9 +10,11 @@ const argument = (name) => {
   return index >= 0 ? process.argv[index + 1] : undefined
 }
 
-const installer = resolve(argument('--installer') ?? 'release/VISSLM-Agent-Setup-1.5.0.exe')
+const packageJson = JSON.parse(await readFile('package.json', 'utf8'))
+const installerName = `VISSLM-Agent-Setup-${packageJson.version}.exe`
+const installer = resolve(argument('--installer') ?? `release/${installerName}`)
 const unpacked = resolve(argument('--unpacked') ?? 'release/win-unpacked')
-const output = resolve(argument('--output') ?? 'release/requirement-matching-v1.5-package-report.json')
+const output = resolve(argument('--output') ?? `release/requirement-matching-v${packageJson.version}-package-report.json`)
 const smokeTimeoutMs = Math.max(3000, Number(argument('--smoke-timeout-ms') ?? 6000))
 
 const sha256 = async (path) => new Promise((resolveHash, reject) => {
@@ -23,9 +25,7 @@ const sha256 = async (path) => new Promise((resolveHash, reject) => {
   stream.on('end', () => resolveHash(hash.digest('hex')))
 })
 
-const packageJson = JSON.parse(await readFile('package.json', 'utf8'))
-if (packageJson.version !== '1.5.0') throw new Error(`Unexpected source version: ${packageJson.version}`)
-if (basename(installer) !== 'VISSLM-Agent-Setup-1.5.0.exe') throw new Error(`Unexpected installer name: ${basename(installer)}`)
+if (basename(installer) !== installerName) throw new Error(`Unexpected installer name: ${basename(installer)}`)
 
 const installerStat = await stat(installer)
 const resources = join(unpacked, 'resources')

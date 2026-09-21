@@ -39,7 +39,10 @@ export const dashboardLayoutProfiles: Record<DashboardComponentType, LayoutProfi
   radar: { minimumWidth: 7, preferredWidth: 9, minimumHeight: 4, preferredHeight: 5 },
   scatter: { minimumWidth: 8, preferredWidth: 10, minimumHeight: 4, preferredHeight: 5 },
   treemap: { minimumWidth: 7, preferredWidth: 9, minimumHeight: 4, preferredHeight: 5 },
-  combo: { minimumWidth: 9, preferredWidth: 12, minimumHeight: 4, preferredHeight: 5 }
+  combo: { minimumWidth: 9, preferredWidth: 12, minimumHeight: 4, preferredHeight: 5 },
+  'data-matrix': { minimumWidth: 12, preferredWidth: 18, minimumHeight: 7, preferredHeight: 10 },
+  'description-list': { minimumWidth: 5, preferredWidth: 6, minimumHeight: 7, preferredHeight: 10 },
+  'comparison-bars': { minimumWidth: 6, preferredWidth: 8, minimumHeight: 4, preferredHeight: 6 }
 }
 
 const rowCost = (components: DashboardComponentSpec[]): number => {

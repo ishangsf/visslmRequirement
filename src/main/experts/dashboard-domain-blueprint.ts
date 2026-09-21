@@ -20,6 +20,8 @@ export interface DashboardDomainBlueprintInput {
   metricIds: readonly string[]
   processBindingIds: readonly string[]
   generatedAt: string
+  platformAdapterId?: string
+  sourceSystem?: string
 }
 
 export interface DashboardDomainComponentPlan {
@@ -144,7 +146,18 @@ const componentLayout = (
     'configuration-change-baseline-card': { x: 12, y: 0, w: 12, h: 4 },
     'configuration-change-approval-card': { x: 0, y: 4, w: 12, h: 5 },
     'configuration-change-open-trend-card': { x: 12, y: 4, w: 12, h: 5 },
-    'configuration-change-reproducible-build-card': { x: 0, y: 9, w: 24, h: 5 }
+    'configuration-change-reproducible-build-card': { x: 0, y: 9, w: 24, h: 5 },
+    'gjb5000b-compliance-activity-card': { x: 0, y: 0, w: 12, h: 4 },
+    'gjb5000b-compliance-work-product-card': { x: 12, y: 0, w: 12, h: 4 },
+    'gjb5000b-compliance-evidence-card': { x: 0, y: 4, w: 12, h: 5 },
+    'gjb5000b-compliance-deviation-card': { x: 12, y: 4, w: 12, h: 5 },
+    'gjb5000b-compliance-nonconformity-card': { x: 0, y: 9, w: 24, h: 5 },
+    'organization-improvement-quality-dispersion-card': { x: 0, y: 0, w: 12, h: 4 },
+    'organization-improvement-estimation-card': { x: 12, y: 0, w: 12, h: 4 },
+    'organization-improvement-productivity-card': { x: 0, y: 4, w: 12, h: 5 },
+    'organization-improvement-defect-escape-card': { x: 12, y: 4, w: 12, h: 5 },
+    'organization-improvement-completion-card': { x: 0, y: 9, w: 12, h: 5 },
+    'organization-improvement-baseline-card': { x: 12, y: 9, w: 12, h: 5 }
   }
   const layout = layouts[componentId]
   if (!layout) return fail(`场景组件 ${componentId} 没有受控布局`)
@@ -242,13 +255,20 @@ const blueprintFor = (
       organization: '组织',
       configuration: '配置'
     }[line])).join('、')}问题。`,
-    scopeDescription: `受控项目范围（${input.projectIds.length} 个项目）；仅编译语义方案，不读取业务数据。`,
+    scopeDescription: input.platformAdapterId
+      ? `平台项目范围（${input.projectIds.length} 个项目）；数据源 ${input.sourceSystem ?? '未命名平台'}；仅编译语义方案，不读取业务数据。`
+      : `受控项目范围（${input.projectIds.length} 个项目）；仅编译语义方案，不读取业务数据。`,
     metrics,
     questions,
-    assumptions: [
-      '本方案来自受控领域目录，尚未接入真实平台数据适配器。',
-      '指标 field/measureId 是语义占位符，后续必须由受控适配器绑定并保留证据链。'
-    ],
+    assumptions: input.platformAdapterId
+      ? [
+          `本方案使用平台适配器 ${input.platformAdapterId}，字段映射仍需业务负责人复核。`,
+          '指标与过程证据必须保持版本化追溯，当前产物仍为 preview。'
+        ]
+      : [
+          '本方案来自受控领域目录，尚未接入真实平台数据适配器。',
+          '指标 field/measureId 是语义占位符，后续必须由受控适配器绑定并保留证据链。'
+        ],
     unresolvedAmbiguities: [],
     generatedAt: input.generatedAt.trim()
   }
@@ -289,7 +309,8 @@ export const compileDashboardDomainBlueprint = (
     processBindingIds.includes(binding.id)
   )
   const expectedBaselineIds = [...new Set(plannedBindings.map((binding) => binding.tailoringBaselineId))]
-  if (expectedBaselineIds.length !== 1 || expectedBaselineIds[0] !== input.tailoringBaselineId.trim()) {
+  if (!input.platformAdapterId &&
+    (expectedBaselineIds.length !== 1 || expectedBaselineIds[0] !== input.tailoringBaselineId.trim())) {
     return fail(
       `invalid tailoring baseline：期望 ${expectedBaselineIds.join(',') || '未配置'}，实际 ${input.tailoringBaselineId.trim()}`
     )

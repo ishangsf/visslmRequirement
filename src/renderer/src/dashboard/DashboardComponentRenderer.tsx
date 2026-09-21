@@ -1,9 +1,26 @@
-import { ArrowUpOutlined, BulbOutlined } from '@ant-design/icons'
-import { Empty, Progress } from 'antd'
+import {
+  ArrowRightOutlined,
+  ArrowUpOutlined,
+  BulbOutlined,
+  CheckCircleFilled,
+  ExclamationCircleFilled,
+  FileTextOutlined,
+  InfoCircleFilled,
+  WarningFilled
+} from '@ant-design/icons'
+import { Button, Empty, Progress } from 'antd'
 import { TreemapChart } from 'echarts/charts'
 import * as echarts from 'echarts/core'
-import { memo, useMemo } from 'react'
-import type { DashboardComponentSpec, DashboardThemeId } from '../../../shared/dashboard'
+import { memo, useEffect, useMemo, useState } from 'react'
+import type {
+  DashboardComponentSpec,
+  DashboardDescriptionListContent,
+  DashboardComparisonBarsContent,
+  DashboardDataMatrixContent,
+  DashboardStatusTone,
+  DashboardThemeId
+} from '../../../shared/dashboard'
+import { dashboardComponentOptionValue } from '../../../shared/dashboard-component-options'
 import LightweightECharts from '../components/LightweightECharts'
 
 // LightweightECharts owns the common chart registrations.  Treemap is a
@@ -74,18 +91,328 @@ const hexToRgba = (color: string, alpha: number): string => {
   return `rgba(${red}, ${green}, ${blue}, ${alpha})`
 }
 
-const formatNumber = (value: number): string =>
-  new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 1 }).format(value)
+const formatNumber = (value: number, decimalPlaces = 1): string =>
+  new Intl.NumberFormat('zh-CN', {
+    maximumFractionDigits: decimalPlaces
+  }).format(value)
 
-const buildChartOption = (
+const toneIcon = (tone: DashboardStatusTone): React.JSX.Element => {
+  if (tone === 'success') return <CheckCircleFilled />
+  if (tone === 'warning') return <WarningFilled />
+  if (tone === 'error') return <ExclamationCircleFilled />
+  if (tone === 'info') return <InfoCircleFilled />
+  return <FileTextOutlined />
+}
+
+const fallbackDataMatrixContent = (
+  component: DashboardComponentSpec
+): DashboardDataMatrixContent => ({
+  kind: 'data-matrix',
+  leadingLabel: component.encoding?.label ?? '对象',
+  columns: [component.encoding?.value ?? '数值'],
+  rows: component.data.map((item, index) => ({
+    id: `${component.id}-row-${index}`,
+    label: item.name,
+    cells: [{
+      id: `${component.id}-cell-${index}`,
+      label: formatNumber(item.value),
+      tone: 'neutral'
+    }]
+  }))
+})
+
+function DataMatrixPrimitive({
+  component,
+  selectionByChannel,
+  onSelectionChange
+}: {
+  component: DashboardComponentSpec
+  selectionByChannel?: Record<string, string>
+  onSelectionChange?: (channel: string, selectionId: string) => void
+}): React.JSX.Element {
+  const content = component.content?.kind === 'data-matrix'
+    ? component.content
+    : fallbackDataMatrixContent(component)
+  const [localSelectedRowId, setLocalSelectedRowId] = useState(
+    content.selectedRowId ?? content.rows[0]?.id ?? ''
+  )
+  const [page, setPage] = useState(1)
+  const pageSize = Math.max(3, Math.min(20, content.pageSize ?? 8))
+  const pageCount = Math.max(1, Math.ceil(content.rows.length / pageSize))
+  const channelSelection = content.selectionChannel
+    ? selectionByChannel?.[content.selectionChannel]
+    : undefined
+  const selectedRowId = channelSelection ?? localSelectedRowId
+  const visibleRows = content.rows.slice((page - 1) * pageSize, page * pageSize)
+  const expansionMode = content.expansionMode ?? 'inline'
+
+  useEffect(() => {
+    if (content.rows.some((row) => row.id === selectedRowId)) return
+    setLocalSelectedRowId(content.selectedRowId ?? content.rows[0]?.id ?? '')
+  }, [content.rows, content.selectedRowId, selectedRowId])
+
+  useEffect(() => {
+    const selectedIndex = content.rows.findIndex((row) => row.id === selectedRowId)
+    if (selectedIndex >= 0) setPage(Math.floor(selectedIndex / pageSize) + 1)
+  }, [content.rows, pageSize, selectedRowId])
+
+  useEffect(() => {
+    setPage((current) => Math.min(current, pageCount))
+  }, [pageCount])
+
+  const selectRow = (rowId: string): void => {
+    setLocalSelectedRowId(rowId)
+    if (content.selectionChannel) onSelectionChange?.(content.selectionChannel, rowId)
+  }
+
+  return (
+    <div className="viz-data-matrix">
+      {content.legend?.length && dashboardComponentOptionValue(
+        component.type,
+        component.style,
+        'showStatusLegend'
+      ) !== false ? (
+        <div className="viz-status-legend" aria-label="状态图例">
+          {content.legend.map((item) => (
+            <span className={`tone-${item.tone}`} key={`${item.label}-${item.tone}`}>
+              {toneIcon(item.tone)} {item.label}
+            </span>
+          ))}
+        </div>
+      ) : null}
+      <div className="viz-data-matrix-scroll">
+        <table aria-label={`${component.title}矩阵`}>
+          <thead>
+            <tr>
+              <th scope="col">{content.leadingLabel}</th>
+              {content.columns.map((column, index) => (
+                <th scope="col" key={`${column}-${index}`}>
+                  <span>{column}</span>
+                  {index < content.columns.length - 1 ? <ArrowRightOutlined aria-hidden="true" /> : null}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {visibleRows.map((row) => {
+              const selected = row.id === selectedRowId
+              return [
+                <tr className={selected ? 'is-selected' : ''} key={row.id}>
+                  <th scope="row">
+                    <button
+                      type="button"
+                      aria-pressed={selected}
+                      onClick={() => selectRow(row.id)}
+                    >
+                      <span className={`tone-${row.tone ?? 'info'}`}>{toneIcon(row.tone ?? 'info')}</span>
+                      <span><strong>{row.label}</strong>{row.caption ? <small>{row.caption}</small> : null}</span>
+                    </button>
+                  </th>
+                  {content.columns.map((_, index) => {
+                    const cell = row.cells[index]
+                    return (
+                      <td key={cell?.id ?? `${row.id}-empty-${index}`}>
+                        {cell ? (
+                          <span className={`viz-matrix-cell tone-${cell.tone ?? 'neutral'}`}>
+                            {toneIcon(cell.tone ?? 'neutral')}
+                            <span><strong>{cell.label}</strong>{cell.caption ? <small>{cell.caption}</small> : null}</span>
+                            {cell.value ? <em>{cell.value}</em> : null}
+                          </span>
+                        ) : <span className="viz-matrix-cell is-empty">—</span>}
+                      </td>
+                    )
+                  })}
+                </tr>,
+                selected && row.expanded && expansionMode === 'inline' ? (
+                  <tr className="viz-matrix-expanded" key={`${row.id}-expanded`}>
+                    <td colSpan={content.columns.length + 1}>
+                      <div>
+                        <strong>{row.expanded.label}</strong>
+                        <span className="viz-matrix-expanded-nodes">
+                          {row.expanded.nodes.map((node, index) => (
+                            <span className={`viz-matrix-node tone-${node.tone ?? 'neutral'}`} key={node.id}>
+                              {toneIcon(node.tone ?? 'neutral')}
+                              <span><strong>{node.label}</strong>{node.caption ? <small>{node.caption}</small> : null}</span>
+                              {index < row.expanded!.nodes.length - 1 ? <ArrowRightOutlined aria-hidden="true" /> : null}
+                            </span>
+                          ))}
+                        </span>
+                      </div>
+                    </td>
+                  </tr>
+                ) : null
+              ]
+            })}
+          </tbody>
+        </table>
+      </div>
+      {pageCount > 1 ? (
+        <div className="viz-data-matrix-pager" aria-label="矩阵分页">
+          <span>第 {page} / {pageCount} 页 · 共 {content.rows.length} 条</span>
+          <span>
+            <Button
+              type="text"
+              size="small"
+              aria-label="上一页"
+              disabled={page <= 1}
+              onClick={() => setPage((current) => Math.max(1, current - 1))}
+            >
+              上一页
+            </Button>
+            <Button
+              type="text"
+              size="small"
+              aria-label="下一页"
+              disabled={page >= pageCount}
+              onClick={() => setPage((current) => Math.min(pageCount, current + 1))}
+            >
+              下一页
+            </Button>
+          </span>
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+const fallbackDescriptionContent = (
+  component: DashboardComponentSpec
+): DashboardDescriptionListContent => ({
+  kind: 'description-list',
+  heading: component.data[0]?.name,
+  fields: component.data.map((item, index) => ({
+    id: `${component.id}-field-${index}`,
+    label: item.name,
+    value: `${formatNumber(item.value)}${component.unit ?? ''}`
+  }))
+})
+
+function DescriptionListPrimitive({
+  component,
+  selectionByChannel
+}: {
+  component: DashboardComponentSpec
+  selectionByChannel?: Record<string, string>
+}): React.JSX.Element {
+  const baseContent = component.content?.kind === 'description-list'
+    ? component.content
+    : fallbackDescriptionContent(component)
+  const selectedVariant = baseContent.selectionChannel
+    ? baseContent.variants?.find((variant) =>
+      variant.selectionId === selectionByChannel?.[baseContent.selectionChannel!]
+    )
+    : undefined
+  const content = selectedVariant
+    ? { ...baseContent, ...selectedVariant, kind: 'description-list' as const }
+    : baseContent
+  const showStatus = dashboardComponentOptionValue(component.type, component.style, 'showStatus') !== false
+  return (
+    <div className="viz-description-list">
+      {(content.heading || (showStatus && content.status)) && (
+        <div className="viz-description-heading">
+          <strong>{content.heading}</strong>
+          {showStatus && content.status ? (
+            <span className={`tone-${content.status.tone}`}>
+              {toneIcon(content.status.tone)} {content.status.label}
+            </span>
+          ) : null}
+        </div>
+      )}
+      {content.sections?.map((section) => (
+        <section className={`tone-${section.tone ?? 'neutral'}`} key={section.id}>
+          <span>{section.label}</span>
+          <p>{section.value}</p>
+          {section.help ? <small>{section.help}</small> : null}
+        </section>
+      ))}
+      <dl>
+        {content.fields.map((field) => (
+          <div key={field.id}>
+            <dt>{field.label}</dt>
+            <dd className={`tone-${field.tone ?? 'neutral'}`}>{field.value}</dd>
+          </div>
+        ))}
+      </dl>
+      {content.summary ? (
+        <section className={`viz-description-summary tone-${content.summary.tone ?? 'neutral'}`}>
+          <span>{content.summary.label}</span>
+          <p>{content.summary.value}</p>
+        </section>
+      ) : null}
+    </div>
+  )
+}
+
+const fallbackComparisonBarsContent = (
+  component: DashboardComponentSpec
+): DashboardComparisonBarsContent => ({
+  kind: 'comparison-bars',
+  items: component.data.map((item, index) => ({
+    id: `${component.id}-interval-${index}`,
+    label: item.name,
+    value: item.value,
+    secondaryValue: item.secondaryValue,
+    unit: component.unit
+  }))
+})
+
+function ComparisonBarsPrimitive({
+  component
+}: {
+  component: DashboardComponentSpec
+}): React.JSX.Element {
+  const content = component.content?.kind === 'comparison-bars'
+    ? component.content
+    : fallbackComparisonBarsContent(component)
+  const maxItems = Number(dashboardComponentOptionValue(component.type, component.style, 'maxItems'))
+  const showValues = dashboardComponentOptionValue(component.type, component.style, 'showValues') !== false
+  const items = content.items.slice(0, maxItems)
+  const maximum = Math.max(...items.map((item) => item.value), 1)
+  return (
+    <div className="viz-comparison-bars" role="list" aria-label={component.title}>
+      <div className="viz-comparison-bars-legend" aria-label="比较指标名称">
+        <span>{content.valueLabel ?? '当前值'}</span>
+        <span>{content.secondaryLabel ?? '对比值'}</span>
+      </div>
+      {items.map((item) => (
+        <div className={`tone-${item.tone ?? 'info'}`} key={item.id} role="listitem">
+          <span title={item.label}>{item.label}</span>
+          <i aria-hidden="true"><b style={{ width: `${Math.max(4, item.value / maximum * 100)}%` }} /></i>
+          <strong aria-label={`${content.valueLabel ?? '数值'} ${formatNumber(item.value)}${item.unit ?? ''}`}>
+            {showValues ? `${formatNumber(item.value)}${item.unit ?? ''}` : ''}
+          </strong>
+          <em>
+            {!showValues || item.secondaryValue === undefined
+              ? '—'
+              : `${formatNumber(item.secondaryValue)}${item.secondaryUnit ?? ''}`}
+          </em>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+export const buildDashboardChartOption = (
   component: DashboardComponentSpec,
   themeId: DashboardThemeId
 ): Record<string, unknown> => {
   const theme = chartThemeTokens[themeId]
-  const names = component.data.map((item) => item.name)
-  const values = component.data.map((item) => item.value)
-  const secondaryValues = component.data.some((item) => item.secondaryValue !== undefined)
-    ? component.data.map((item) => item.secondaryValue ?? 0)
+  const sortOrder = dashboardComponentOptionValue(component.type, component.style, 'sortOrder')
+  const chartData = sortOrder === 'ascending' || sortOrder === 'descending'
+    ? [...component.data].sort((left, right) => sortOrder === 'ascending'
+      ? left.value - right.value
+      : right.value - left.value)
+    : component.data
+  const names = chartData.map((item) => item.name)
+  const axisNames = (component.type === 'line' || component.type === 'combo')
+    ? names.map((name) => {
+        const isoDate = /^(\d{4})-(\d{2})-(\d{2})T/u.exec(name)
+        return isoDate ? `${isoDate[2]}-${isoDate[3]}` : name
+      })
+    : names
+  const values = chartData.map((item) => item.value)
+  const secondaryValues = chartData.some((item) => item.secondaryValue !== undefined)
+    ? chartData.map((item) => item.secondaryValue ?? 0)
     : undefined
   const accent = component.accent ?? theme.palette[0]
   const componentStyle = component.style ?? {}
@@ -93,6 +420,7 @@ const buildChartOption = (
   const showGrid = componentStyle.showGrid ?? true
   const lineWidth = componentStyle.lineWidth ?? 3
   const horizontalBar = component.type === 'bar' && componentStyle.orientation !== 'vertical'
+  const showLabels = dashboardComponentOptionValue(component.type, component.style, 'showLabels') === true
   const common = {
     animationDuration: 500,
     color: component.accent
@@ -109,15 +437,17 @@ const buildChartOption = (
 
   if (component.type === 'pie') {
     const compact = component.layout.w < 8
+    const legendPosition = dashboardComponentOptionValue(component.type, component.style, 'legendPosition')
+    const legendAtRight = legendPosition === 'right' && !compact
     return {
       ...common,
       tooltip: { ...common.tooltip, trigger: 'item', formatter: '{b}<br/>{c} 条 · {d}%' },
       legend: {
         show: showLegend,
-        orient: compact ? 'horizontal' : 'vertical',
-        right: compact ? 'center' : 4,
-        bottom: compact ? 0 : 'auto',
-        top: compact ? 'auto' : 'middle',
+        orient: legendAtRight ? 'vertical' : 'horizontal',
+        right: legendAtRight ? 4 : 'center',
+        bottom: legendPosition === 'bottom' || compact ? 0 : 'auto',
+        top: legendPosition === 'top' && !compact ? 0 : legendAtRight ? 'middle' : 'auto',
         icon: 'circle',
         itemWidth: 8,
         itemHeight: 8,
@@ -127,9 +457,9 @@ const buildChartOption = (
         {
           type: 'pie',
           radius: componentStyle.donut === false ? ['0%', '72%'] : ['48%', '72%'],
-          center: compact ? ['50%', '43%'] : ['36%', '53%'],
-          data: component.data,
-          label: { show: false },
+          center: compact ? ['50%', '43%'] : legendAtRight ? ['36%', '53%'] : ['50%', '53%'],
+          data: chartData,
+          label: { show: showLabels, color: theme.textColor, fontSize: componentStyle.bodyFontSize ?? 10 },
           itemStyle: {
             borderWidth: 3,
             borderColor: theme.pieBorderColor,
@@ -141,18 +471,22 @@ const buildChartOption = (
   }
 
   if (component.type === 'gauge') {
+    const minimumValue = Number(dashboardComponentOptionValue(component.type, component.style, 'minimumValue'))
+    const maximumValue = Number(dashboardComponentOptionValue(component.type, component.style, 'maximumValue'))
+    const safeMaximumValue = maximumValue > minimumValue ? maximumValue : minimumValue + 1
+    const showPointer = dashboardComponentOptionValue(component.type, component.style, 'showPointer') !== false
     return {
       ...common,
       series: [{
         type: 'gauge',
-        min: 0,
-        max: 100,
+        min: minimumValue,
+        max: safeMaximumValue,
         progress: { show: true, width: 12, itemStyle: { color: accent } },
         axisLine: { lineStyle: { width: 12, color: [[1, theme.gridColor]] } },
         axisTick: { show: false },
         splitLine: { show: false },
         axisLabel: { show: false },
-        pointer: { itemStyle: { color: accent } },
+        pointer: { show: showPointer, itemStyle: { color: accent } },
         detail: {
           valueAnimation: true,
           color: theme.tooltipTextColor,
@@ -160,7 +494,7 @@ const buildChartOption = (
           offsetCenter: [0, '12%']
         },
         data: [{
-          value: Math.max(0, Math.min(100, component.data[0]?.value ?? 0)),
+          value: Math.max(minimumValue, Math.min(safeMaximumValue, component.data[0]?.value ?? 0)),
           name: component.unit ?? '%'
         }]
       }]
@@ -180,11 +514,11 @@ const buildChartOption = (
         bottom: 8,
         minSize: '12%',
         maxSize: '92%',
-        sort: 'descending',
+        sort: sortOrder === 'ascending' ? 'ascending' : sortOrder === 'none' ? 'none' : 'descending',
         gap: 3,
-        label: { color: theme.tooltipTextColor, fontSize: componentStyle.bodyFontSize ?? 10 },
+        label: { show: showLabels, color: theme.tooltipTextColor, fontSize: componentStyle.bodyFontSize ?? 10 },
         itemStyle: { borderColor: theme.tooltipBackground, borderWidth: 1 },
-        data: component.data.map((item) => ({ name: item.name, value: item.value }))
+        data: chartData.map((item) => ({ name: item.name, value: item.value }))
       }]
     }
   }
@@ -194,6 +528,7 @@ const buildChartOption = (
     return {
       ...common,
       radar: {
+        shape: dashboardComponentOptionValue(component.type, component.style, 'radarShape'),
         indicator: component.data.map((item) => ({ name: item.name, max: maxValue })),
         axisName: { color: theme.textColor, fontSize: componentStyle.bodyFontSize ?? 10 },
         splitArea: { areaStyle: { color: ['rgba(255,255,255,0.03)', 'rgba(255,255,255,0.01)'] } },
@@ -204,7 +539,12 @@ const buildChartOption = (
         type: 'radar',
         data: [{ value: component.data.map((item) => item.value), name: component.encoding?.value ?? '指标' }],
         lineStyle: { width: lineWidth, color: accent },
-        areaStyle: { color: hexToRgba(accent, 0.2) },
+        areaStyle: {
+          color: hexToRgba(
+            accent,
+            Number(dashboardComponentOptionValue(component.type, component.style, 'areaOpacity'))
+          )
+        },
         itemStyle: { color: accent }
       }]
     }
@@ -226,7 +566,7 @@ const buildChartOption = (
         squareRatio: 1.15,
         data: component.data.map((item) => ({ name: item.name, value: item.value })),
         label: {
-          show: true,
+          show: showLabels,
           color: theme.tooltipTextColor,
           fontSize: componentStyle.bodyFontSize ?? 10,
           overflow: 'truncate'
@@ -235,7 +575,7 @@ const buildChartOption = (
         itemStyle: {
           borderColor: theme.tooltipBackground,
           borderWidth: 1,
-          gapWidth: 3
+          gapWidth: Number(dashboardComponentOptionValue(component.type, component.style, 'itemGap'))
         },
         emphasis: {
           label: { color: theme.tooltipTextColor },
@@ -289,7 +629,7 @@ const buildChartOption = (
       },
       xAxis: {
         type: 'category',
-        data: names,
+        data: axisNames,
         boundaryGap: true,
         axisLine: { lineStyle: { color: theme.gridColor } },
         axisTick: { show: false },
@@ -310,7 +650,7 @@ const buildChartOption = (
           type: 'bar',
           yAxisIndex: 0,
           data: values,
-          barMaxWidth: compact ? 14 : 20,
+          barMaxWidth: Number(dashboardComponentOptionValue(component.type, component.style, 'barWidth')),
           itemStyle: { color: accent, borderRadius: [4, 4, 0, 0] }
         },
         {
@@ -318,8 +658,8 @@ const buildChartOption = (
           type: 'line',
           yAxisIndex: 1,
           data: comboSecondaryValues,
-          smooth: true,
-          symbol: 'circle',
+          smooth: dashboardComponentOptionValue(component.type, component.style, 'smooth') !== false,
+          symbol: dashboardComponentOptionValue(component.type, component.style, 'showSymbols') === false ? 'none' : 'circle',
           symbolSize: compact ? 5 : 6,
           lineStyle: { width: lineWidth, color: theme.palette[1] },
           itemStyle: { color: theme.palette[1] }
@@ -341,8 +681,14 @@ const buildChartOption = (
       yAxis: axis,
       series: [{
         type: 'scatter',
-        symbolSize: 9,
-        data: component.data.map((item) => [item.value, item.secondaryValue ?? item.value, item.name]),
+        symbolSize: Number(dashboardComponentOptionValue(component.type, component.style, 'symbolSize')),
+        label: {
+          show: showLabels,
+          formatter: (params: { data?: [number, number, string] }) => params.data?.[2] ?? '',
+          color: theme.textColor,
+          fontSize: componentStyle.bodyFontSize ?? 10
+        },
+        data: chartData.map((item) => [item.value, item.secondaryValue ?? item.value, item.name]),
         itemStyle: { color: accent }
       }]
     }
@@ -369,7 +715,7 @@ const buildChartOption = (
         }
       : {
           type: 'category',
-          data: names,
+          data: axisNames,
           boundaryGap: component.type === 'bar',
           axisLine: { lineStyle: { color: theme.gridColor } },
           axisTick: { show: false },
@@ -401,7 +747,8 @@ const buildChartOption = (
             name: component.encoding?.value ?? '指标',
             type: 'bar',
             data: values,
-            barMaxWidth: 16,
+            barMaxWidth: Number(dashboardComponentOptionValue(component.type, component.style, 'barWidth')),
+            label: { show: showLabels, position: 'right', color: theme.textColor },
             itemStyle: {
               color: accent,
               borderRadius: horizontalBar ? [0, 5, 5, 0] : [5, 5, 0, 0]
@@ -411,7 +758,8 @@ const buildChartOption = (
             name: component.encoding?.secondaryValue ?? '对比指标',
             type: 'bar',
             data: secondaryValues,
-            barMaxWidth: 16,
+            barMaxWidth: Number(dashboardComponentOptionValue(component.type, component.style, 'barWidth')),
+            label: { show: showLabels, position: 'right', color: theme.textColor },
             itemStyle: {
               color: theme.palette[1],
               borderRadius: horizontalBar ? [0, 5, 5, 0] : [5, 5, 0, 0]
@@ -423,12 +771,12 @@ const buildChartOption = (
             name: component.encoding?.value ?? '指标',
             type: 'line',
             data: values,
-            smooth: true,
-            symbol: 'circle',
+            smooth: dashboardComponentOptionValue(component.type, component.style, 'smooth') !== false,
+            symbol: dashboardComponentOptionValue(component.type, component.style, 'showSymbols') === false ? 'none' : 'circle',
             symbolSize: 6,
             lineStyle: { width: lineWidth, color: accent },
             itemStyle: { color: accent },
-            areaStyle: {
+            areaStyle: dashboardComponentOptionValue(component.type, component.style, 'showArea') === false ? undefined : {
               color: {
                 type: 'linear',
                 x: 0,
@@ -446,8 +794,8 @@ const buildChartOption = (
             name: component.encoding?.secondaryValue ?? '对比指标',
             type: 'line',
             data: secondaryValues,
-            smooth: true,
-            symbol: 'circle',
+            smooth: dashboardComponentOptionValue(component.type, component.style, 'smooth') !== false,
+            symbol: dashboardComponentOptionValue(component.type, component.style, 'showSymbols') === false ? 'none' : 'circle',
             symbolSize: 5,
             lineStyle: { width: 2, color: theme.palette[1] },
             itemStyle: { color: theme.palette[1] }
@@ -457,16 +805,20 @@ const buildChartOption = (
 
 }
 
-function DashboardComponentRendererView({
+export function DashboardComponentRendererView({
   component,
-  theme = 'technology-dark'
+  theme = 'technology-dark',
+  selectionByChannel,
+  onSelectionChange
 }: {
   component: DashboardComponentSpec
   theme?: DashboardThemeId
+  selectionByChannel?: Record<string, string>
+  onSelectionChange?: (channel: string, selectionId: string) => void
 }): React.JSX.Element {
   const first = component.data[0]
   const chartOption = useMemo(
-    () => buildChartOption(component, theme),
+    () => buildDashboardChartOption(component, theme),
     [component, theme]
   )
 
@@ -479,50 +831,65 @@ function DashboardComponentRendererView({
   }
 
   if (component.type === 'kpi') {
+    const decimalPlaces = Number(dashboardComponentOptionValue(component.type, component.style, 'decimalPlaces'))
+    const showStatus = dashboardComponentOptionValue(component.type, component.style, 'showStatus') !== false
     return (
       <div
         className="viz-kpi"
         role="img"
-        aria-label={`${component.title}：${formatNumber(first.value)}${component.unit ?? ''}`}
+        aria-label={`${component.title}：${formatNumber(first.value, decimalPlaces)}${component.unit ?? ''}`}
       >
         <div className="viz-kpi-value" style={{ color: component.accent, fontSize: component.style?.valueFontSize }}>
-          {formatNumber(first.value)}
+          {formatNumber(first.value, decimalPlaces)}
           <small>{component.unit}</small>
         </div>
-        <div className="viz-kpi-meta">
-          <span><ArrowUpOutlined /> 数据已同步</span>
-          <i style={{ background: component.accent }} />
-        </div>
+        {showStatus ? (
+          <div className="viz-kpi-meta">
+            <span><ArrowUpOutlined /> 数据已同步</span>
+            <i style={{ background: component.accent }} />
+          </div>
+        ) : null}
       </div>
     )
   }
 
   if (component.type === 'progress') {
+    const targetValue = Math.max(
+      1,
+      Number(dashboardComponentOptionValue(component.type, component.style, 'targetValue'))
+    )
+    const currentValue = Math.max(0, first.value)
+    const percent = Math.max(0, Math.min(100, currentValue / targetValue * 100))
+    const showValues = dashboardComponentOptionValue(component.type, component.style, 'showValues') !== false
     return (
       <div
         className="viz-progress"
         role="meter"
-        aria-label={`${component.title}完成率 ${Math.max(0, Math.min(100, first.value))}%`}
+        aria-label={`${component.title}完成率 ${formatNumber(percent)}%`}
         aria-valuemin={0}
         aria-valuemax={100}
-        aria-valuenow={Math.max(0, Math.min(100, first.value))}
+        aria-valuenow={percent}
       >
         <Progress
-          percent={Math.max(0, Math.min(100, first.value))}
+          percent={percent}
           strokeColor={component.accent ?? '#54dfa6'}
           railColor="rgba(126, 151, 185, 0.15)"
           format={() => null}
         />
         <div className="viz-progress-labels">
-          <span>当前覆盖</span>
-          <span>目标 100%</span>
+          <span>{showValues ? `当前 ${formatNumber(currentValue)}${component.unit ?? ''}` : '当前进度'}</span>
+          <span>目标 {formatNumber(targetValue)}{component.unit ?? ''}</span>
         </div>
       </div>
     )
   }
 
   if (component.type === 'ranking') {
-    const max = Math.max(...component.data.map((item) => item.value), 1)
+    const maxItems = Number(dashboardComponentOptionValue(component.type, component.style, 'maxItems'))
+    const showIndex = dashboardComponentOptionValue(component.type, component.style, 'showIndex') !== false
+    const showValues = dashboardComponentOptionValue(component.type, component.style, 'showValues') !== false
+    const items = component.data.slice(0, maxItems)
+    const max = Math.max(...items.map((item) => item.value), 1)
     return (
       <div
         className="viz-ranking"
@@ -530,9 +897,9 @@ function DashboardComponentRendererView({
         role="list"
         aria-label={`${component.title}排行`}
       >
-        {component.data.map((item, index) => (
+        {items.map((item, index) => (
           <div className="viz-ranking-row" key={`${item.name}-${index}`} role="listitem">
-            <span className={`viz-ranking-index rank-${index + 1}`}>{index + 1}</span>
+            {showIndex ? <span className={`viz-ranking-index rank-${index + 1}`}>{index + 1}</span> : null}
             <span className="viz-ranking-name" title={item.name}>{item.name}</span>
             <span className="viz-ranking-track">
             <i
@@ -542,7 +909,7 @@ function DashboardComponentRendererView({
               }}
             />
             </span>
-            <strong>{formatNumber(item.value)}</strong>
+            <strong>{showValues ? formatNumber(item.value) : ''}</strong>
           </div>
         ))}
       </div>
@@ -550,25 +917,48 @@ function DashboardComponentRendererView({
   }
 
   if (component.type === 'insight') {
+    const showIcon = dashboardComponentOptionValue(component.type, component.style, 'showIcon') !== false
     return (
       <div className="viz-insight" role="note" aria-label={`${component.title}洞察`}>
-        <span className="viz-insight-icon"><BulbOutlined /></span>
+        {showIcon ? <span className="viz-insight-icon"><BulbOutlined /></span> : null}
         <p style={{ fontSize: component.style?.bodyFontSize }}>{component.insight}</p>
       </div>
     )
   }
 
   if (component.type === 'table') {
+    const maxItems = Number(dashboardComponentOptionValue(component.type, component.style, 'maxItems'))
+    const showIndex = dashboardComponentOptionValue(component.type, component.style, 'showIndex') === true
+    const showValues = dashboardComponentOptionValue(component.type, component.style, 'showValues') !== false
     return (
       <div className="viz-table" style={{ fontSize: component.style?.bodyFontSize }} role="table" aria-label={`${component.title}明细`}>
-        {component.data.map((item) => (
+        {component.data.slice(0, maxItems).map((item, index) => (
           <div key={item.name} role="row">
+            {showIndex ? <i aria-label={`第 ${index + 1} 行`}>{index + 1}</i> : null}
             <span>{item.name}</span>
-            <strong>{formatNumber(item.value)}</strong>
+            <strong>{showValues ? formatNumber(item.value) : ''}</strong>
           </div>
         ))}
       </div>
     )
+  }
+
+  if (component.type === 'data-matrix') {
+    return (
+      <DataMatrixPrimitive
+        component={component}
+        selectionByChannel={selectionByChannel}
+        onSelectionChange={onSelectionChange}
+      />
+    )
+  }
+
+  if (component.type === 'description-list') {
+    return <DescriptionListPrimitive component={component} selectionByChannel={selectionByChannel} />
+  }
+
+  if (component.type === 'comparison-bars') {
+    return <ComparisonBarsPrimitive component={component} />
   }
 
   return (

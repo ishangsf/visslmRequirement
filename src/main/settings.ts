@@ -1,6 +1,7 @@
 import { safeStorage } from 'electron'
 import type {
   AppSettings,
+  DashboardDomainPlatformAdapterSaveInput,
   FeatureNavigationOrder,
   FeatureModuleKey,
   FeatureModuleSettings,
@@ -20,6 +21,10 @@ import {
   normalizeRequirementMatchingRolloutMode
 } from '../shared/types'
 import { AppDatabase } from './database'
+import {
+  dashboardDomainPlatformAdaptersSettingKey,
+  parseDashboardDomainPlatformAdapters
+} from './experts/dashboard-domain-adapter'
 
 const DEFAULT_PLATFORM_URL = 'http://visionmc.vicp.net:889/alm'
 const DEFAULT_MODEL_URL = 'http://127.0.0.1:11434'
@@ -95,6 +100,7 @@ export class SettingsService {
       online: this.getModelProfile('online', source)
     }
     const activeProfile = modelProfiles[source]
+    const dashboardDomainPlatformAdapters = this.getDashboardDomainPlatformAdapters()
     return {
       platform: {
         baseUrl: this.db.getSetting('platform.baseUrl') ?? DEFAULT_PLATFORM_URL,
@@ -114,8 +120,28 @@ export class SettingsService {
           : normalizeRequirementMatchingRolloutMode(this.db.getSetting(PROJECT_MATCH_ROLLOUT_SETTING))
       },
       features: this.getFeatureSettings(),
-      navigationOrder: this.getNavigationOrder()
+      navigationOrder: this.getNavigationOrder(),
+      dashboardDomainPlatformAdapters: [...dashboardDomainPlatformAdapters.adapters],
+      dashboardDomainPlatformAdapterErrors: [...dashboardDomainPlatformAdapters.errors]
     }
+  }
+
+  getDashboardDomainPlatformAdapters(): ReturnType<typeof parseDashboardDomainPlatformAdapters> {
+    return parseDashboardDomainPlatformAdapters(
+      this.db.getSetting(dashboardDomainPlatformAdaptersSettingKey) ?? undefined
+    )
+  }
+
+  saveDashboardDomainPlatformAdapters(input: DashboardDomainPlatformAdapterSaveInput): AppSettings {
+    const parsed = parseDashboardDomainPlatformAdapters(
+      JSON.stringify(Array.isArray(input?.adapters) ? input.adapters : [])
+    )
+    if (parsed.errors.length) throw new Error(`平台适配器配置无效：${[...new Set(parsed.errors)].join('；')}`)
+    this.db.setSetting(
+      dashboardDomainPlatformAdaptersSettingKey,
+      JSON.stringify({ adapters: parsed.adapters })
+    )
+    return this.getAll()
   }
 
   getFeatureSettings(): FeatureModuleSettings {

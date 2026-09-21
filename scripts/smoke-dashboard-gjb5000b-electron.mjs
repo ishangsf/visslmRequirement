@@ -23,6 +23,7 @@ const electronPath = require('electron')
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const smokeName = 'dashboard-gjb5000b-electron'
 const sampleProjectId = 'sample-project-001'
+const platformProjectId = 'platform-project-alpha'
 const generatedAt = '2026-08-28T00:00:00.000Z'
 const modelEndpoint = 'http://127.0.0.1:1'
 const sleep = (milliseconds) => new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds))
@@ -188,6 +189,68 @@ const configurationChangeSampleRows = [
   { uid: 'sample-reproducible-build-003', itemId: 'SAMPLE-CC-BUILD-003', name: '发布构建 C', updatedAt: '2026-08-15T00:00:00.000Z', values: { reproducibleBuildRate: 0.6 } }
 ]
 
+const gjb5000bComplianceSampleRows = [
+  { uid: 'sample-compliance-summary', itemId: 'SAMPLE-GJB-SUMMARY', name: '最新内部检查摘要', updatedAt: '2026-08-15T00:00:00.000Z', values: { activityExecutionRate: 0.89, workProductCompletenessRate: 0.86 } },
+  { uid: 'sample-evidence-domain-001', itemId: 'SAMPLE-GJB-EVIDENCE-001', name: '项目策划过程域', updatedAt: '2026-08-15T00:00:00.000Z', values: { evidenceSufficiencyRate: 0.92 } },
+  { uid: 'sample-evidence-domain-002', itemId: 'SAMPLE-GJB-EVIDENCE-002', name: '需求开发过程域', updatedAt: '2026-08-15T00:00:00.000Z', values: { evidenceSufficiencyRate: 0.81 } },
+  { uid: 'sample-evidence-domain-003', itemId: 'SAMPLE-GJB-EVIDENCE-003', name: '配置管理过程域', updatedAt: '2026-08-15T00:00:00.000Z', values: { evidenceSufficiencyRate: 0.74 } },
+  { uid: 'sample-deviation-snapshot-001', itemId: 'SAMPLE-GJB-DEV-001', name: '检查快照 1', updatedAt: '2026-08-01T00:00:00.000Z', values: { processDeviationCount: 9 } },
+  { uid: 'sample-deviation-snapshot-002', itemId: 'SAMPLE-GJB-DEV-002', name: '检查快照 2', updatedAt: '2026-08-08T00:00:00.000Z', values: { processDeviationCount: 6 } },
+  { uid: 'sample-deviation-snapshot-003', itemId: 'SAMPLE-GJB-DEV-003', name: '检查快照 3', updatedAt: '2026-08-15T00:00:00.000Z', values: { processDeviationCount: 4 } },
+  { uid: 'sample-nonconformity-domain-001', itemId: 'SAMPLE-GJB-NC-001', name: '项目策划过程域', updatedAt: '2026-08-15T00:00:00.000Z', values: { nonconformityClosureRate: 1 } },
+  { uid: 'sample-nonconformity-domain-002', itemId: 'SAMPLE-GJB-NC-002', name: '需求开发过程域', updatedAt: '2026-08-15T00:00:00.000Z', values: { nonconformityClosureRate: 0.83 } },
+  { uid: 'sample-nonconformity-domain-003', itemId: 'SAMPLE-GJB-NC-003', name: '配置管理过程域', updatedAt: '2026-08-15T00:00:00.000Z', values: { nonconformityClosureRate: 0.67 } }
+]
+
+const organizationImprovementSampleRows = [
+  { uid: 'sample-organization-summary', itemId: 'SAMPLE-OI-SUMMARY', name: '最新组织度量摘要', updatedAt: '2026-08-15T00:00:00.000Z', values: { qualityDispersionScore: 0.42, estimationDeviationRate: 0.21, improvementCompletionRate: 0.78 } },
+  { uid: 'sample-productivity-project-001', itemId: 'SAMPLE-OI-PROD-001', name: '项目 Alpha', updatedAt: '2026-08-15T00:00:00.000Z', values: { productivityIndex: 1.08 } },
+  { uid: 'sample-productivity-project-002', itemId: 'SAMPLE-OI-PROD-002', name: '项目 Beta', updatedAt: '2026-08-15T00:00:00.000Z', values: { productivityIndex: 0.91 } },
+  { uid: 'sample-productivity-project-003', itemId: 'SAMPLE-OI-PROD-003', name: '项目 Gamma', updatedAt: '2026-08-15T00:00:00.000Z', values: { productivityIndex: 0.76 } },
+  { uid: 'sample-defect-escape-001', itemId: 'SAMPLE-OI-ESCAPE-001', name: '质量周期 1', updatedAt: '2026-08-01T00:00:00.000Z', values: { defectEscapeRate: 0.13 } },
+  { uid: 'sample-defect-escape-002', itemId: 'SAMPLE-OI-ESCAPE-002', name: '质量周期 2', updatedAt: '2026-08-08T00:00:00.000Z', values: { defectEscapeRate: 0.09 } },
+  { uid: 'sample-defect-escape-003', itemId: 'SAMPLE-OI-ESCAPE-003', name: '质量周期 3', updatedAt: '2026-08-15T00:00:00.000Z', values: { defectEscapeRate: 0.06 } },
+  { uid: 'sample-baseline-group-001', itemId: 'SAMPLE-OI-BASE-001', name: '研发过程基线组', updatedAt: '2026-08-15T00:00:00.000Z', values: { baselineStabilityRate: 0.94 } },
+  { uid: 'sample-baseline-group-002', itemId: 'SAMPLE-OI-BASE-002', name: '质量度量基线组', updatedAt: '2026-08-15T00:00:00.000Z', values: { baselineStabilityRate: 0.86 } },
+  { uid: 'sample-baseline-group-003', itemId: 'SAMPLE-OI-BASE-003', name: '项目估算基线组', updatedAt: '2026-08-15T00:00:00.000Z', values: { baselineStabilityRate: 0.72 } }
+]
+
+const platformAdapter = {
+  schemaVersion: '1.0',
+  id: 'visslm-project-overview-v1',
+  scenarioId: 'project-overview',
+  sourceSystem: 'VISSLM lifecycle platform',
+  allowedProjectIds: [platformProjectId],
+  permissions: ['project:read', 'process:evidence:read'],
+  nodeTypes: ['ProjectStatusRecord'],
+  tailoringBaselineId: 'BL-PROJECT-2026-V3',
+  metricBindings: [
+    { metricId: 'project-health', field: 'health_indicator', aggregation: 'avg' },
+    { metricId: 'milestone-achievement', field: 'milestone_ratio', aggregation: 'avg' },
+    { metricId: 'requirement-completion', field: 'requirement_ratio', aggregation: 'avg' },
+    { metricId: 'defect-density', field: 'defect_per_size', aggregation: 'avg' },
+    { metricId: 'high-risk-count', field: 'risk_total', aggregation: 'sum' },
+    { metricId: 'process-compliance', field: 'process_rate', aggregation: 'avg' }
+  ],
+  questionBindings: [
+    { questionId: 'project-overview-defect-question', dimensionFields: ['name'] }
+  ],
+  evidenceBindings: [
+    { processBindingId: 'process.project-health', evidenceStatus: 'sufficient', sourceKey: 'visslm.review.project-health' },
+    { processBindingId: 'process.milestone-tracking', evidenceStatus: 'sufficient', sourceKey: 'visslm.plan.milestone' },
+    { processBindingId: 'process.requirement-status', evidenceStatus: 'insufficient', sourceKey: 'visslm.requirement.status' },
+    { processBindingId: 'process.defect-classification', evidenceStatus: 'sufficient', sourceKey: 'visslm.defect.classification' },
+    { processBindingId: 'process.risk-register', evidenceStatus: 'missing', sourceKey: 'visslm.risk.register' },
+    { processBindingId: 'process.baseline-evidence', evidenceStatus: 'insufficient', sourceKey: 'visslm.baseline.evidence' }
+  ],
+  updatedAt: generatedAt
+}
+
+const platformRows = [
+  { uid: 'platform-project-001', itemId: 'PLATFORM-PROJECT-001', name: '平台项目 Alpha', updatedAt: '2026-08-20T00:00:00.000Z', values: { health_indicator: 0.82, milestone_ratio: 0.88, requirement_ratio: 0.79, defect_per_size: 0.12, risk_total: 4, process_rate: 0.86 } },
+  { uid: 'platform-project-002', itemId: 'PLATFORM-PROJECT-002', name: '平台项目 Beta', updatedAt: '2026-08-20T00:00:00.000Z', values: { health_indicator: 0.76, milestone_ratio: 0.81, requirement_ratio: 0.84, defect_per_size: 0.18, risk_total: 6, process_rate: 0.78 } }
+]
+
 const seedDatabase = async (userDataDirectory) => {
   const AppDatabase = await loadAppDatabase()
   const database = new AppDatabase(
@@ -206,7 +269,8 @@ const seedDatabase = async (userDataDirectory) => {
       'model.profile.local.provider': 'ollama',
       'model.profile.local.baseUrl': modelEndpoint,
       'model.profile.local.model': 'smoke-domain-unused',
-      'model.profile.local.thinking': 'false'
+      'model.profile.local.thinking': 'false',
+      'dashboard.domain-platform-adapters:v1': JSON.stringify({ adapters: [platformAdapter] })
     }
     for (const [key, value] of Object.entries(settings)) database.setSetting(key, value)
 
@@ -257,6 +321,24 @@ const seedDatabase = async (userDataDirectory) => {
       title: record.name,
       content: 'controlled configuration and change sample',
       metadata: { projectId: sampleProjectId, recordType: 'ConfigurationChangeSample', sourceId: record.uid, itemId: record.itemId, updatedAt: record.updatedAt },
+      raw: record.values
+    })), gjb5000bComplianceSampleRows.map((record) => ({
+      documentId: `Gjb5000bComplianceSample:${record.uid}`,
+      title: record.name,
+      content: 'controlled internal GJB5000B process evidence sample; not an official compliance conclusion',
+      metadata: { projectId: sampleProjectId, recordType: 'Gjb5000bComplianceSample', sourceId: record.uid, itemId: record.itemId, updatedAt: record.updatedAt },
+      raw: record.values
+    })), organizationImprovementSampleRows.map((record) => ({
+      documentId: `OrganizationImprovementSample:${record.uid}`,
+      title: record.name,
+      content: 'controlled organization measurement and improvement sample',
+      metadata: { projectId: sampleProjectId, recordType: 'OrganizationImprovementSample', sourceId: record.uid, itemId: record.itemId, updatedAt: record.updatedAt },
+      raw: record.values
+    })), platformRows.map((record) => ({
+      documentId: `ProjectStatusRecord:${record.uid}`,
+      title: record.name,
+      content: 'mapped VISSLM lifecycle platform project status record',
+      metadata: { projectId: platformProjectId, recordType: 'ProjectStatusRecord', sourceId: record.uid, itemId: record.itemId, updatedAt: record.updatedAt },
       raw: record.values
     })))
     const imported = database.importRows(rows)
@@ -842,6 +924,255 @@ const runConfigurationChangeContract = async function () {
   }
 }
 
+const runGjb5000bComplianceContract = async function () {
+  const runsBefore = await window.visslm.listVisualizationRuns(100)
+  const response = await window.visslm.askAgent({
+    question: 'QA/EPG 基于受控样例生成 GJB5000B 过程符合度与证据审计大屏',
+    expertId: 'visualization',
+    chatMode: 'expert',
+    entrypoint: 'dashboard',
+    dataScope: { projectIds: ['sample-project-001'] }
+  })
+  const dashboard = response?.dashboard
+  const expectedMetrics = [
+    'process-activity-execution-rate',
+    'work-product-completeness-rate',
+    'evidence-sufficiency-rate',
+    'process-deviation-count',
+    'nonconformity-closure-rate'
+  ]
+  const components = Array.isArray(dashboard?.components) ? dashboard.components : []
+  const evidence = components.find((component) => component.id === 'gjb5000b-compliance-evidence-headline-card')
+  const deviations = components.find((component) => component.id === 'gjb5000b-compliance-deviation-card')
+  const evidenceField = evidence?.query?.measures?.[0]?.field
+  const deviationField = deviations?.query?.measures?.[0]?.field
+  const checks = {
+    complianceResponseHasDashboard: Boolean(dashboard),
+    complianceExpertRouted: response?.expertId === 'visualization',
+    complianceScenarioValid: dashboard?.domainContext?.scenario === 'gjb5000b-compliance',
+    complianceTitleValid: dashboard?.title === 'GJB5000B 过程符合度与证据审计（受控样例）',
+    complianceMetricsValid: JSON.stringify(dashboard?.analysisBlueprint?.metrics?.map((metric) => metric.id)) ===
+      JSON.stringify(expectedMetrics),
+    complianceComponentsValid: components.length === 9 && components.every((component) =>
+      component?.query && component?.semanticBinding?.processBindingIds?.length && component?.data?.length &&
+      JSON.stringify(component?.query?.scope?.nodeTypes) === JSON.stringify(['Gjb5000bComplianceSample'])
+    ),
+    compliancePublicPrimitivesValid: JSON.stringify(components.map((component) => component.type)) === JSON.stringify([
+      'kpi',
+      'kpi',
+      'kpi',
+      'kpi',
+      'data-matrix',
+      'description-list',
+      'line',
+      'ranking',
+      'comparison-bars'
+    ]),
+    complianceSemanticsValid: evidenceField === 'evidenceSufficiencyRate' &&
+      deviationField === 'processDeviationCount' && evidenceField !== deviationField,
+    complianceOfficialBoundaryVisible: dashboard?.domainReceipt?.warnings?.some((warning) =>
+      /不构成正式符合性结论/.test(warning)
+    ) === true,
+    complianceReceiptPersisted: Boolean(dashboard?.domainReceipt?.confidence) &&
+      dashboard.domainReceipt.evidenceMissing?.length > 0 &&
+      dashboard.domainReceipt.evidenceInsufficient?.length > 0,
+    complianceNoModelFallback: (await window.visslm.listVisualizationRuns(100)).length === runsBefore.length
+  }
+  if (!dashboard || !Object.values(checks).every(Boolean)) {
+    return { ok: false, checks, answer: response?.answer, dashboard }
+  }
+  const diagnosis = await window.visslm.diagnoseDashboard(dashboard)
+  checks.complianceDiagnosticUsesControlledFixture =
+    diagnosis.components.length === components.length &&
+    diagnosis.components.every((component) => component.status === 'ok') &&
+    diagnosis.issues.every((issue) => issue.code !== 'query-error')
+  const repaired = await window.visslm.repairDashboardComponent(
+    dashboard,
+    'gjb5000b-compliance-activity-card'
+  )
+  checks.complianceRepairUsesControlledFixture =
+    repaired.componentId === 'gjb5000b-compliance-activity-card' &&
+    repaired.spec.components.length === components.length &&
+    repaired.report.components.every((component) => component.status === 'ok') &&
+    repaired.report.issues.every((issue) => issue.code !== 'query-error')
+  const saved = await window.visslm.saveDashboard({
+    spec: repaired.spec,
+    changeSummary: 'gjb5000b-compliance Electron preview smoke'
+  })
+  const readBack = await window.visslm.getDashboard(saved.dashboardId, saved.version)
+  checks.compliancePreviewSaveReadBack = saved.version === 1 &&
+    readBack?.spec?.domainContext?.scenario === 'gjb5000b-compliance' &&
+    readBack?.spec?.components?.length === 9 &&
+    readBack?.spec?.domainReceipt?.warnings?.some((warning) => /不构成正式符合性结论/.test(warning)) === true
+  return {
+    ok: Object.values(checks).every(Boolean),
+    checks,
+    answer: response?.answer,
+    dashboardId: dashboard.id,
+    version: saved.version,
+    componentTitles: components.map((component) => component.title)
+  }
+}
+
+const runOrganizationImprovementContract = async function () {
+  const runsBefore = await window.visslm.listVisualizationRuns(100)
+  const response = await window.visslm.askAgent({
+    question: '型号组织管理负责人基于受控样例生成组织级度量与过程改进大屏',
+    expertId: 'visualization',
+    chatMode: 'expert',
+    entrypoint: 'dashboard',
+    dataScope: { projectIds: ['sample-project-001'] }
+  })
+  const dashboard = response?.dashboard
+  const expectedMetrics = [
+    'project-quality-dispersion-score',
+    'estimation-deviation-rate',
+    'delivery-productivity-index',
+    'defect-escape-rate',
+    'process-improvement-completion-rate',
+    'organizational-baseline-stability-rate'
+  ]
+  const components = Array.isArray(dashboard?.components) ? dashboard.components : []
+  const dispersion = components.find((component) => component.id === 'organization-improvement-quality-dispersion-card')
+  const productivity = components.find((component) => component.id === 'organization-improvement-productivity-card')
+  const checks = {
+    organizationResponseHasDashboard: Boolean(dashboard),
+    organizationExpertRouted: response?.expertId === 'visualization',
+    organizationScenarioValid: dashboard?.domainContext?.scenario === 'organization-improvement',
+    organizationRoleValid: dashboard?.domainContext?.role === 'model-org-manager',
+    organizationTitleValid: dashboard?.title === '组织级度量与过程改进（受控样例）',
+    organizationMetricsValid: JSON.stringify(dashboard?.analysisBlueprint?.metrics?.map((metric) => metric.id)) ===
+      JSON.stringify(expectedMetrics),
+    organizationComponentsValid: components.length === 6 && components.every((component) =>
+      component?.query && component?.semanticBinding?.processBindingIds?.length && component?.data?.length &&
+      JSON.stringify(component?.query?.scope?.nodeTypes) === JSON.stringify(['OrganizationImprovementSample'])
+    ),
+    organizationSemanticsValid: dispersion?.query?.measures?.[0]?.field === 'qualityDispersionScore' &&
+      productivity?.query?.measures?.[0]?.field === 'productivityIndex',
+    organizationReceiptPersisted: Boolean(dashboard?.domainReceipt?.confidence) &&
+      dashboard.domainReceipt.evidenceMissing?.length > 0 &&
+      dashboard.domainReceipt.evidenceInsufficient?.length > 0,
+    organizationNoModelFallback: (await window.visslm.listVisualizationRuns(100)).length === runsBefore.length
+  }
+  if (!dashboard || !Object.values(checks).every(Boolean)) {
+    return { ok: false, checks, answer: response?.answer, dashboard }
+  }
+  const saved = await window.visslm.saveDashboard({
+    spec: dashboard,
+    changeSummary: 'organization-improvement Electron preview smoke'
+  })
+  const readBack = await window.visslm.getDashboard(saved.dashboardId, saved.version)
+  checks.organizationPreviewSaveReadBack = saved.version === 1 &&
+    readBack?.spec?.domainContext?.scenario === 'organization-improvement' &&
+    readBack?.spec?.domainContext?.role === 'model-org-manager' &&
+    readBack?.spec?.components?.length === 6
+  return {
+    ok: Object.values(checks).every(Boolean),
+    checks,
+    answer: response?.answer,
+    dashboardId: dashboard.id,
+    version: saved.version,
+    componentTitles: components.map((component) => component.title)
+  }
+}
+
+const runPlatformAdapterContract = async function () {
+  const runsBefore = await window.visslm.listVisualizationRuns(100)
+  const response = await window.visslm.askAgent({
+    question: '项目负责人生成项目综合态势大屏',
+    expertId: 'visualization',
+    chatMode: 'expert',
+    entrypoint: 'dashboard',
+    dataScope: { projectIds: ['platform-project-alpha'] }
+  })
+  const dashboard = response?.dashboard
+  const components = Array.isArray(dashboard?.components) ? dashboard.components : []
+  const health = components.find((component) => component.id === 'project-overview-health-card')
+  const checks = {
+    platformResponseHasDashboard: Boolean(dashboard),
+    platformExpertRouted: response?.expertId === 'visualization',
+    platformScenarioValid: dashboard?.domainContext?.scenario === 'project-overview',
+    platformBaselineValid: dashboard?.domainContext?.tailoringBaselineId === 'BL-PROJECT-2026-V3',
+    platformTitleValid: dashboard?.title === '项目综合态势（平台数据预览）',
+    platformSubtitleValid: dashboard?.subtitle === 'VISSLM lifecycle platform · mapped data · preview',
+    platformAnswerValid: /平台数据预览/.test(response?.answer || '') &&
+      /visslm-project-overview-v1/.test(response?.answer || ''),
+    platformComponentsValid: components.length === 6 && components.every((component) =>
+      component?.query && component?.data?.length &&
+      JSON.stringify(component?.query?.scope?.nodeTypes) === JSON.stringify(['ProjectStatusRecord'])
+    ),
+    platformFieldMappingValid: health?.query?.measures?.[0]?.field === 'health_indicator',
+    platformReceiptValid: dashboard?.domainReceipt?.evidenceMissing?.length === 1 &&
+      dashboard?.domainReceipt?.evidenceInsufficient?.length === 2 &&
+      dashboard?.domainReceipt?.warnings?.some((warning) => /VISSLM lifecycle platform/.test(warning)) === true,
+    platformNoModelFallback: (await window.visslm.listVisualizationRuns(100)).length === runsBefore.length
+  }
+  const settings = await window.visslm.getSettings()
+  const configuredAdapter = settings?.dashboardDomainPlatformAdapters?.find((adapter) => adapter.id === 'visslm-project-overview-v1')
+  const scopeRejected = configuredAdapter
+    ? await window.visslm.previewDashboardDomainPlatformAdapter({
+      adapter: { ...configuredAdapter, allowedProjectIds: ['another-project'] },
+      projectId: 'platform-project-alpha'
+    })
+    : undefined
+  const permissionRejected = configuredAdapter
+    ? await window.visslm.previewDashboardDomainPlatformAdapter({
+      adapter: { ...configuredAdapter, permissions: ['project:read'] },
+      projectId: 'platform-project-alpha'
+    })
+    : undefined
+  checks.platformAdapterScopeRejected = scopeRejected?.ok === false && /授权范围|超出/.test(scopeRejected.reason || '')
+  checks.platformAdapterPermissionRejected = permissionRejected?.ok === false && /必要权限|过程证据/.test(permissionRejected.reason || '')
+  if (!dashboard || !Object.values(checks).every(Boolean)) {
+    return { ok: false, checks, answer: response?.answer, dashboard }
+  }
+  const saved = await window.visslm.saveDashboard({
+    spec: dashboard,
+    changeSummary: 'platform adapter Electron preview smoke'
+  })
+  const readBack = await window.visslm.getDashboard(saved.dashboardId, saved.version)
+  checks.platformPreviewSaveReadBack = saved.version === 1 &&
+    readBack?.spec?.title === '项目综合态势（平台数据预览）' &&
+    readBack?.spec?.domainContext?.tailoringBaselineId === 'BL-PROJECT-2026-V3' &&
+    readBack?.spec?.components?.every((component) =>
+      JSON.stringify(component?.query?.scope?.nodeTypes) === JSON.stringify(['ProjectStatusRecord'])
+    )
+  return {
+    ok: Object.values(checks).every(Boolean),
+    checks,
+    answer: response?.answer,
+    dashboardId: dashboard.id,
+    version: saved.version,
+    mappedFields: dashboard.analysisBlueprint?.metrics?.map((metric) => ({ id: metric.id, field: metric.field }))
+  }
+}
+
+const runAdapterSettingsContract = async function () {
+  const initial = await window.visslm.getSettings()
+  const configured = initial?.dashboardDomainPlatformAdapters || []
+  const selected = configured.find((adapter) => adapter.id === 'visslm-project-overview-v1')
+  if (!selected) return { ok: false, checks: { adapterLoadedInSettings: false } }
+  const saved = await window.visslm.saveDashboardDomainPlatformAdapters({ adapters: configured })
+  const readBack = await window.visslm.getSettings()
+  const duplicateError = await window.visslm.saveDashboardDomainPlatformAdapters({
+    adapters: [selected, { ...selected, id: `${selected.id}-duplicate` }]
+  }).then(() => '').catch((error) => String(error))
+  const checks = {
+    adapterLoadedInSettings: selected.id === 'visslm-project-overview-v1',
+    adapterSaveReadBack: saved.dashboardDomainPlatformAdapters.some((adapter) => adapter.id === selected.id) &&
+      readBack.dashboardDomainPlatformAdapters.some((adapter) => adapter.id === selected.id &&
+        JSON.stringify(adapter.allowedProjectIds) === JSON.stringify(selected.allowedProjectIds) &&
+        JSON.stringify(adapter.permissions) === JSON.stringify(selected.permissions)),
+    duplicateAdapterRejected: /同一场景只能配置一个平台适配器|场景已存在平台适配器/.test(duplicateError)
+  }
+  return {
+    ok: Object.values(checks).every(Boolean),
+    checks,
+    adapterCount: readBack.dashboardDomainPlatformAdapters.length,
+    duplicateError
+  }
+}
+
 const stopElectron = async (electron) => {
   if (!electron || electron.exitCode !== null) return
   if (process.platform === 'win32' && electron.pid) {
@@ -870,6 +1201,10 @@ const run = async () => {
   let qualityContract
   let testValidationContract
   let configurationChangeContract
+  let gjb5000bComplianceContract
+  let organizationImprovementContract
+  let platformAdapterContract
+  let adapterSettingsContract
   let failure
   let electronLogs = ''
   try {
@@ -927,6 +1262,30 @@ const run = async () => {
       throw new Error(`配置与变更领域 Electron 合约失败：${JSON.stringify(configurationChangeContract)}`)
     }
     Object.assign(checks, configurationChangeContract.checks)
+    gjb5000bComplianceContract = await evaluateRenderer(cdp, runGjb5000bComplianceContract, 120_000)
+    if (!gjb5000bComplianceContract || gjb5000bComplianceContract.ok !== true ||
+      !Object.values(gjb5000bComplianceContract.checks || {}).every(Boolean)) {
+      throw new Error(`GJB5000B 过程证据领域 Electron 合约失败：${JSON.stringify(gjb5000bComplianceContract)}`)
+    }
+    Object.assign(checks, gjb5000bComplianceContract.checks)
+    organizationImprovementContract = await evaluateRenderer(cdp, runOrganizationImprovementContract, 120_000)
+    if (!organizationImprovementContract || organizationImprovementContract.ok !== true ||
+      !Object.values(organizationImprovementContract.checks || {}).every(Boolean)) {
+      throw new Error(`组织级度量领域 Electron 合约失败：${JSON.stringify(organizationImprovementContract)}`)
+    }
+    Object.assign(checks, organizationImprovementContract.checks)
+    platformAdapterContract = await evaluateRenderer(cdp, runPlatformAdapterContract, 120_000)
+    if (!platformAdapterContract || platformAdapterContract.ok !== true ||
+      !Object.values(platformAdapterContract.checks || {}).every(Boolean)) {
+      throw new Error(`平台适配器 Electron 合约失败：${JSON.stringify(platformAdapterContract)}`)
+    }
+    Object.assign(checks, platformAdapterContract.checks)
+    adapterSettingsContract = await evaluateRenderer(cdp, runAdapterSettingsContract, 120_000)
+    if (!adapterSettingsContract || adapterSettingsContract.ok !== true ||
+      !Object.values(adapterSettingsContract.checks || {}).every(Boolean)) {
+      throw new Error(`平台适配器设置 Electron 合约失败：${JSON.stringify(adapterSettingsContract)}`)
+    }
+    Object.assign(checks, adapterSettingsContract.checks)
   } catch (error) {
     failure = error instanceof Error ? error.message : String(error)
   } finally {
@@ -947,6 +1306,10 @@ const run = async () => {
     qualityContract,
     testValidationContract,
     configurationChangeContract,
+    gjb5000bComplianceContract,
+    organizationImprovementContract,
+    platformAdapterContract,
+    adapterSettingsContract,
     modelNetworkCallsObserved: contract?.rendererModelRequests?.length ?? 0,
     ...(failure ? { failure } : {}),
     ...(electronLogs ? { electronLogs: electronLogs.slice(-8_000) } : {})

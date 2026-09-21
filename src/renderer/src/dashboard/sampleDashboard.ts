@@ -17,6 +17,7 @@ export const buildSampleDashboard = (stats: DashboardStats): DashboardSpec => {
     title: 'VISSLM 数据运营驾驶舱',
     subtitle: '基于本地已采集数据 · 实时概览',
     theme: 'technology-dark',
+    dataScope: {},
     updatedAt: new Date().toISOString(),
     components: [
       {

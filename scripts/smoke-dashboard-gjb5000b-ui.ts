@@ -8,6 +8,22 @@ const dashboardStudioSource = readFileSync(
   new URL('../src/renderer/src/dashboard/DashboardStudio.tsx', import.meta.url),
   'utf8'
 )
+const dashboardAdapterSettingsSource = readFileSync(
+  new URL('../src/renderer/src/dashboard/DashboardAdapterSettings.tsx', import.meta.url),
+  'utf8'
+)
+const componentRegistrySource = readFileSync(
+  new URL('../src/renderer/src/dashboard/componentRegistry.ts', import.meta.url),
+  'utf8'
+)
+const componentRendererSource = readFileSync(
+  new URL('../src/renderer/src/dashboard/DashboardComponentRenderer.tsx', import.meta.url),
+  'utf8'
+)
+const stylesSource = readFileSync(
+  new URL('../src/renderer/src/styles.css', import.meta.url),
+  'utf8'
+)
 
 const escapeRegExp = (value: string): string =>
   value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
@@ -44,8 +60,8 @@ const expectedScenarioLabels = {
   'software-quality': '软件质量与缺陷闭环',
   'test-validation': '测试与验证充分性',
   'configuration-change': '配置管理与变更控制',
-  'gjb5000b-compliance': '过程证据审计',
-  'organization-improvement': '组织改进'
+  'gjb5000b-compliance': 'GJB5000B 过程符合度与证据审计',
+  'organization-improvement': '组织级度量与过程改进'
 } as const
 
 assert.deepEqual(
@@ -95,7 +111,10 @@ assert.ok(
   conditionalStart >= 0,
   'domain-context 必须由 dashboard.domainContext 条件片段生成'
 )
-const selectedComponentCollapseIndex = dashboardStudioSource.indexOf("defaultActiveKey={['basic', 'data', 'layout-query']}", contextKeyIndex)
+const selectedComponentCollapseIndex = dashboardStudioSource.indexOf(
+  "defaultActiveKey={['basic', 'content', 'data', 'layout-query']}",
+  contextKeyIndex
+)
 const conditionalEnd = selectedComponentCollapseIndex > contextKeyIndex
   ? dashboardStudioSource.lastIndexOf('}] : [])', selectedComponentCollapseIndex)
   : -1
@@ -210,6 +229,59 @@ assert.equal(
   'DashboardStudio 必须保持单一属性 inspector'
 )
 assertSourceContains('dashboard-preview-shell', 'DashboardStudio 必须保留画布优先的 preview shell')
+for (const marker of [
+  "type DashboardStudioViewMode = 'edit' | DashboardPresentationMode",
+  'dashboard-studio-mode-switch',
+  "{ label: '编辑', value: 'edit' }",
+  'Gjb5000bComplianceDashboard',
+  'is-presentation-mode'
+] as const) {
+  assert.ok(!dashboardStudioSource.includes(marker), `编辑与预览必须共用组件树，不得保留 ${marker}`)
+}
+for (const marker of [
+  '<DashboardGrid',
+  'const hasDashboardScene =',
+  'immersiveScene',
+  'is-scene-immersive',
+  'presentation.scene.disclaimer',
+  'gjb5000b-scene-background.png'
+] as const) {
+  assertSourceContains(marker, `统一画布与场景皮肤必须包含 ${marker}`)
+}
+for (const type of ['data-matrix', 'description-list', 'comparison-bars'] as const) {
+  assert.ok(componentRegistrySource.includes(`type: '${type}'`), `公共组件库必须注册 ${type}`)
+  assert.ok(componentRendererSource.includes(`component.type === '${type}'`), `公共渲染器必须支持 ${type}`)
+}
+for (const marker of [
+  'selectionByChannel',
+  'onSelectionChange',
+  'content.pageSize ?? 8',
+  "expansionMode === 'inline'",
+  'viz-data-matrix-pager'
+] as const) {
+  assert.ok(componentRendererSource.includes(marker), `公共组件渲染器必须支持 ${marker}`)
+}
+for (const marker of [
+  '组件专属配置',
+  '矩阵配置',
+  '详情配置',
+  '比较条配置',
+  '联动通道',
+  '每页行数'
+] as const) {
+  assertSourceContains(marker, `属性面板必须包含 ${marker}`)
+}
+for (const marker of [
+  '.dashboard-library-tabs .ant-tabs-body',
+  '.dashboard-component-library-list',
+  'overflow-y: auto',
+  'scrollbar-width: thin'
+] as const) {
+  assert.ok(stylesSource.includes(marker), `组件库内部滚动必须包含 ${marker}`)
+}
+for (const businessMarker of ['gjb5000b', 'GJB5000B', '过程域', '证据'] as const) {
+  assert.ok(!componentRendererSource.includes(businessMarker), `公共组件渲染器不得硬编码业务词 ${businessMarker}`)
+}
 assertSourceContains("const dashboardInspectorWidthStorageKey = 'visslm:dashboard-inspector-width:v1'",
   '属性面板宽度缓存 key 不得改变')
 for (const [constant, value] of [
@@ -224,6 +296,24 @@ for (const [constant, value] of [
   )
 }
 
+for (const marker of [
+  '数据适配器与指标映射',
+  '保存适配器',
+  '试运行预览',
+  'settings.dashboardDomainPlatformAdapterErrors',
+  'window.visslm.saveDashboardDomainPlatformAdapters',
+  'window.visslm.previewDashboardDomainPlatformAdapter',
+  'window.visslm.listFieldProfiles',
+  '刷新字段目录',
+  'inferredType',
+  'sensitivity',
+  'showSearch',
+  'fail-closed 校验',
+  'GJB5000B 过程符合度与证据审计'
+] as const) {
+  assert.ok(dashboardAdapterSettingsSource.includes(marker), `适配器设置页必须包含 ${marker}`)
+}
+
 console.log(JSON.stringify({
   ok: true,
   checked: {
@@ -234,6 +324,7 @@ console.log(JSON.stringify({
     semanticBindingFields: ['confidence', 'processBindingIds'],
     inspectorSidebars: sidebars,
     inspectorWidth: { default: 320, minimum: 280, maximum: 480 },
-    fixtureComponents: fixtureSpec.components.length
+    fixtureComponents: fixtureSpec.components.length,
+    adapterSettings: true
   }
 }, null, 2))

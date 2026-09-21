@@ -156,9 +156,10 @@ assertClarification({
 
 assertClarification({
   ...completeInput,
-  request: 'QA/EPG 生成 GJB5000B 过程证据符合度大屏',
-  scenario: 'gjb5000b-compliance'
-}, 'scenario-not-active', 'gjb5000b-compliance')
+  request: '型号组织管理负责人生成未来扩展大屏',
+  role: 'model-org-manager',
+  scenario: 'future-scenario'
+}, 'scenario-not-active', 'future-scenario')
 
 const generalizedPlan = assertReady(resolve({
   ...completeInput,

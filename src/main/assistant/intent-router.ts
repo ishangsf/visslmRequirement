@@ -12,6 +12,7 @@ import { ModelClient } from '../model-client'
 import type { ModelChatInput, ModelResponse } from '../model-client'
 import { sanitizeContextText, selectHistoryMessages } from '../context-budget'
 import { resolveNaturalLanguageDeliveryIntent } from '../../shared/assistant-natural-language'
+import { parseRegionalRequirementRequest } from './regional-requirements'
 
 /** Narrow adapter used by tests and by alternative model transports. */
 export interface AssistantIntentModelClient {
@@ -507,6 +508,23 @@ export class AssistantIntentRouter {
         reason: naturalDelivery.referencesPriorResult
           ? 'natural-delivery-prior-result-missing'
           : 'natural-delivery-query-target-missing'
+      }
+    }
+
+    // A user-supplied region-to-code mapping is already an actionable record
+    // query. Keep the complete original mapping instead of asking a classifier
+    // to rewrite it or confusing its identifiers with similarity matching.
+    const regionalRequirements = parseRegionalRequirementRequest(routingQuestion)
+    if (regionalRequirements) {
+      return {
+        taskType: 'record_query',
+        skillId: 'general',
+        sourceMode: 'records',
+        resolvedQuestion: routingQuestion,
+        resultMode: 'answer',
+        groupEntities: regionalRequirements.groups.map((group) => group.name),
+        needsClarification: false,
+        reason: 'explicit-regional-requirement-codes'
       }
     }
 

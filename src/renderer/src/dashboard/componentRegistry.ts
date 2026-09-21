@@ -191,6 +191,45 @@ export const dashboardComponentRegistry: DashboardComponentDefinition[] = [
     compatibleSlotRoles: ['trend', 'comparison'],
     supportsManualAdd: true,
     requiresQuery: true
+  },
+  {
+    manifestVersion: '1.0',
+    type: 'data-matrix',
+    name: '数据矩阵',
+    description: '按对象与可配置列呈现状态、数量和可展开的关联内容',
+    category: '明细',
+    minimumSize: { w: dashboardLayoutProfiles['data-matrix'].minimumWidth, h: dashboardLayoutProfiles['data-matrix'].minimumHeight },
+    preferredSize: { w: dashboardLayoutProfiles['data-matrix'].preferredWidth, h: dashboardLayoutProfiles['data-matrix'].preferredHeight },
+    supportedDataShapes: ['detail', 'category-value'],
+    compatibleSlotRoles: ['detail', 'breakdown'],
+    supportsManualAdd: true,
+    requiresQuery: true
+  },
+  {
+    manifestVersion: '1.0',
+    type: 'description-list',
+    name: '描述列表',
+    description: '分组展示所选对象的状态、字段、规则和说明',
+    category: '明细',
+    minimumSize: { w: dashboardLayoutProfiles['description-list'].minimumWidth, h: dashboardLayoutProfiles['description-list'].minimumHeight },
+    preferredSize: { w: dashboardLayoutProfiles['description-list'].preferredWidth, h: dashboardLayoutProfiles['description-list'].preferredHeight },
+    supportedDataShapes: ['detail', 'text'],
+    compatibleSlotRoles: ['detail', 'diagnosis'],
+    supportsManualAdd: true,
+    requiresQuery: true
+  },
+  {
+    manifestVersion: '1.0',
+    type: 'comparison-bars',
+    name: '比较条形',
+    description: '比较分组的主值、参考值或差异值',
+    category: '比较',
+    minimumSize: { w: dashboardLayoutProfiles['comparison-bars'].minimumWidth, h: dashboardLayoutProfiles['comparison-bars'].minimumHeight },
+    preferredSize: { w: dashboardLayoutProfiles['comparison-bars'].preferredWidth, h: dashboardLayoutProfiles['comparison-bars'].preferredHeight },
+    supportedDataShapes: ['category-value', 'dual-measure'],
+    compatibleSlotRoles: ['comparison', 'breakdown', 'diagnosis'],
+    supportsManualAdd: true,
+    requiresQuery: true
   }
 ]
 

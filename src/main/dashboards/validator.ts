@@ -1,12 +1,19 @@
 import type { DashboardComponentSpec, DashboardSpec } from '../../shared/dashboard'
 import { validateDashboardSemanticConsistency } from '../../shared/dashboard-semantics'
 import { dashboardLayoutProfiles } from '../../shared/dashboard-layout'
+import {
+  dashboardComponentOptionDefinitions,
+  dashboardComponentOptionKeys,
+  dashboardComponentSupportsOption
+} from '../../shared/dashboard-component-options'
 import type { QueryEngine } from '../analytics/query-engine'
 
 const componentTypes = new Set([
   'kpi', 'bar', 'line', 'pie', 'ranking', 'table', 'progress', 'insight',
-  'gauge', 'funnel', 'radar', 'scatter', 'treemap', 'combo'
+  'gauge', 'funnel', 'radar', 'scatter', 'treemap', 'combo',
+  'data-matrix', 'description-list', 'comparison-bars'
 ])
+const statusTones = new Set(['success', 'info', 'warning', 'error', 'neutral'])
 const themes = new Set([
   'technology-dark',
   'business-light',
@@ -56,6 +63,27 @@ export const validateDashboardSpec = (
   if (!spec.id?.trim()) errors.push('id 不能为空')
   if (!spec.title?.trim()) errors.push('title 不能为空')
   if (!themes.has(String(spec.theme))) errors.push(`不支持的主题: ${String(spec.theme)}`)
+  if (spec.dataScope !== undefined) {
+    if (!spec.dataScope || typeof spec.dataScope !== 'object' || Array.isArray(spec.dataScope)) {
+      errors.push('dataScope 必须是对象')
+    } else {
+      for (const field of ['projectIds', 'nodeTypes', 'recordUids'] as const) {
+        const values = spec.dataScope[field]
+        if (values !== undefined && (!Array.isArray(values) || values.some((value) =>
+          typeof value !== 'string' || !value.trim()
+        ))) {
+          errors.push(`dataScope.${field} 必须是非空字符串数组`)
+        }
+      }
+      if (spec.dataScope.baseFilters !== undefined && !Array.isArray(spec.dataScope.baseFilters)) {
+        errors.push('dataScope.baseFilters 必须是数组')
+      }
+      if (spec.dataScope.snapshotAt !== undefined &&
+          (typeof spec.dataScope.snapshotAt !== 'string' || !spec.dataScope.snapshotAt.trim())) {
+        errors.push('dataScope.snapshotAt 必须是非空字符串')
+      }
+    }
+  }
   if (spec.globalFilters !== undefined) {
     if (!Array.isArray(spec.globalFilters)) {
       errors.push('globalFilters 必须是数组')
@@ -126,6 +154,70 @@ export const validateDashboardSpec = (
     }
   }
 
+  const presentation = spec.presentation
+  if (presentation !== undefined) {
+    if (!presentation || typeof presentation !== 'object' || Array.isArray(presentation)) {
+      errors.push('presentation 必须是对象')
+    } else if (presentation.kind !== 'gjb5000b-compliance') {
+      errors.push(`不支持的 presentation.kind: ${String((presentation as { kind?: unknown }).kind)}`)
+    } else {
+      if (domainContext?.scenario !== 'gjb5000b-compliance') {
+        errors.push('GJB5000B presentation 只能用于 gjb5000b-compliance 场景')
+      }
+      if (!['standard', 'immersive'].includes(presentation.defaultMode)) {
+        errors.push('GJB5000B presentation.defaultMode 不受支持')
+      }
+      if (!presentation.projectLabel?.trim() || !presentation.baselineLabel?.trim() ||
+          !presentation.auditPeriodLabel?.trim() || !presentation.dataModeLabel?.trim()) {
+        errors.push('GJB5000B presentation 缺少项目、基线、审计周期或数据模式')
+      }
+      if (!Array.isArray(presentation.processDomains) || !presentation.processDomains.length) {
+        errors.push('GJB5000B presentation.processDomains 不能为空')
+      } else {
+        const domainIds = new Set<string>()
+        for (const domain of presentation.processDomains) {
+          if (!domain.id?.trim() || !domain.label?.trim()) {
+            errors.push('GJB5000B 过程域必须包含 id 和 label')
+            continue
+          }
+          if (domainIds.has(domain.id)) errors.push(`GJB5000B 过程域 id 重复: ${domain.id}`)
+          domainIds.add(domain.id)
+          if (!Number.isFinite(domain.evidenceSufficiencyRate) ||
+              domain.evidenceSufficiencyRate < 0 || domain.evidenceSufficiencyRate > 100) {
+            errors.push(`GJB5000B 过程域 ${domain.id} 的证据充分率必须位于 0-100`)
+          }
+        }
+        if (!domainIds.has(presentation.selectedDomainId)) {
+          errors.push('GJB5000B presentation.selectedDomainId 必须引用有效过程域')
+        }
+      }
+      if (!Array.isArray(presentation.trace) || presentation.trace.length !== 5) {
+        errors.push('GJB5000B presentation.trace 必须完整覆盖五个证据阶段')
+      }
+      const trendLengths = [
+        presentation.trend?.labels?.length,
+        presentation.trend?.overall?.length,
+        presentation.trend?.selectedDomain?.length
+      ]
+      if (!trendLengths[0] || new Set(trendLengths).size !== 1) {
+        errors.push('GJB5000B presentation.trend 的标签和序列长度必须一致')
+      }
+      if (!Array.isArray(presentation.aging) || presentation.aging.some((bucket) =>
+        !bucket.id?.trim() || !bucket.label?.trim() || !Number.isInteger(bucket.count) || bucket.count < 0
+      )) {
+        errors.push('GJB5000B presentation.aging 必须包含非负整数桶')
+      }
+      if (presentation.scene?.kind !== 'aerospace-situational' ||
+          presentation.scene?.source !== 'approved-generated-visual' ||
+          presentation.scene?.classification !== 'visual-theme' ||
+          presentation.scene?.decorativeOnly !== true ||
+          !presentation.scene?.assetId?.trim() || !presentation.scene?.assetVersion?.trim() ||
+          !presentation.scene?.disclaimer?.trim()) {
+        errors.push('GJB5000B scene 必须声明可治理的视觉主题资产和免责声明')
+      }
+    }
+  }
+
   if (spec.components.length > 10) errors.push('首屏组件不能超过 10 个')
   const ids = new Set<string>()
   const occupied = new Set<string>()
@@ -148,6 +240,104 @@ export const validateDashboardSpec = (
       if (component.style.orientation !== undefined &&
           !['horizontal', 'vertical'].includes(component.style.orientation)) {
         errors.push(`组件 ${component.id} 的 style.orientation 不受支持`)
+      }
+      for (const key of dashboardComponentOptionKeys) {
+        if (component.style[key] !== undefined && !dashboardComponentSupportsOption(component.type, key)) {
+          errors.push(`组件 ${component.id} 不支持专属配置 style.${key}`)
+        }
+      }
+      for (const definition of dashboardComponentOptionDefinitions[component.type]) {
+        const value = component.style[definition.key]
+        if (value === undefined) continue
+        if (definition.control === 'boolean' && typeof value !== 'boolean') {
+          errors.push(`组件 ${component.id} 的 style.${definition.key} 必须是布尔值`)
+        }
+        if (definition.control === 'number' && (
+          typeof value !== 'number' || !Number.isFinite(value) ||
+          (definition.min !== undefined && value < definition.min) ||
+          (definition.max !== undefined && value > definition.max)
+        )) {
+          errors.push(
+            `组件 ${component.id} 的 style.${definition.key} 必须位于 ${definition.min}-${definition.max}`
+          )
+        }
+        if (definition.control === 'select' &&
+            (typeof value !== 'string' || !definition.options?.some((option) => option.value === value))) {
+          errors.push(`组件 ${component.id} 的 style.${definition.key} 不受支持`)
+        }
+      }
+      if (component.type === 'gauge' &&
+          component.style.minimumValue !== undefined &&
+          component.style.maximumValue !== undefined &&
+          component.style.maximumValue <= component.style.minimumValue) {
+        errors.push(`组件 ${component.id} 的仪表最大值必须大于最小值`)
+      }
+    }
+    if (component.content) {
+      if (component.content.kind !== component.type) {
+        errors.push(`组件 ${component.id} 的 content.kind 必须与组件类型一致`)
+      } else if (component.content.kind === 'data-matrix') {
+        const matrixContent = component.content
+        if (!matrixContent.leadingLabel?.trim() || !matrixContent.columns.length || !matrixContent.rows.length) {
+          errors.push(`组件 ${component.id} 的数据矩阵必须包含表头、列和行`)
+        }
+        if (matrixContent.rows.some((row) =>
+          !row.id?.trim() || !row.label?.trim() || row.cells.length !== matrixContent.columns.length
+        )) {
+          errors.push(`组件 ${component.id} 的数据矩阵行必须完整覆盖全部列`)
+        }
+        if (new Set(matrixContent.rows.map((row) => row.id)).size !== matrixContent.rows.length) {
+          errors.push(`组件 ${component.id} 的数据矩阵行 id 不能重复`)
+        }
+        if (matrixContent.selectedRowId &&
+            !matrixContent.rows.some((row) => row.id === matrixContent.selectedRowId)) {
+          errors.push(`组件 ${component.id} 的默认选中行不存在`)
+        }
+        if (matrixContent.pageSize !== undefined &&
+            (!Number.isInteger(matrixContent.pageSize) || matrixContent.pageSize < 3 || matrixContent.pageSize > 20)) {
+          errors.push(`组件 ${component.id} 的 pageSize 必须是 3-20 的整数`)
+        }
+        if (matrixContent.expansionMode !== undefined &&
+            !['inline', 'linked-detail', 'none'].includes(matrixContent.expansionMode)) {
+          errors.push(`组件 ${component.id} 的 expansionMode 不受支持`)
+        }
+        if (matrixContent.expansionMode === 'linked-detail' && !matrixContent.selectionChannel?.trim()) {
+          errors.push(`组件 ${component.id} 使用联动详情时必须配置 selectionChannel`)
+        }
+        const tones = [
+          ...(matrixContent.legend ?? []).map((item) => item.tone),
+          ...matrixContent.rows.flatMap((row) => [
+            row.tone,
+            ...row.cells.map((cell) => cell.tone),
+            ...(row.expanded?.nodes.map((node) => node.tone) ?? [])
+          ])
+        ].filter(Boolean)
+        if (tones.some((tone) => !statusTones.has(String(tone)))) {
+          errors.push(`组件 ${component.id} 的阶段矩阵包含不支持的状态色`)
+        }
+      } else if (component.content.kind === 'description-list') {
+        if (!Array.isArray(component.content.fields) || !component.content.fields.length ||
+            component.content.fields.some((field) => !field.id?.trim() || !field.label?.trim())) {
+          errors.push(`组件 ${component.id} 的描述列表必须包含有效字段`)
+        }
+        const variants = component.content.variants ?? []
+        if (new Set(variants.map((variant) => variant.selectionId)).size !== variants.length ||
+            variants.some((variant) =>
+              !variant.selectionId?.trim() || !variant.fields.length ||
+              variant.fields.some((field) => !field.id?.trim() || !field.label?.trim())
+            )) {
+          errors.push(`组件 ${component.id} 的联动详情变体必须包含唯一选择 id 和有效字段`)
+        }
+        if (variants.length && !component.content.selectionChannel?.trim()) {
+          errors.push(`组件 ${component.id} 包含联动详情变体时必须配置 selectionChannel`)
+        }
+      } else if (component.content.kind === 'comparison-bars') {
+        if (!component.content.items.length || component.content.items.some((item) =>
+          !item.id?.trim() || !item.label?.trim() || !Number.isFinite(item.value) ||
+          (item.secondaryValue !== undefined && !Number.isFinite(item.secondaryValue))
+        )) {
+          errors.push(`组件 ${component.id} 的比较条形必须包含有效数值项`)
+        }
       }
     }
     const { x, y, w, h } = component.layout ?? {}
@@ -182,6 +372,12 @@ export const validateDashboardSpec = (
     if (!component.encoding?.value && (Boolean(component.query) || !allowInlineData)) {
       errors.push(`组件 ${component.id} 缺少 encoding.value`)
     }
+    for (const scaleField of ['valueScale', 'secondaryValueScale'] as const) {
+      const scale = component.encoding?.[scaleField]
+      if (scale !== undefined && (!Number.isFinite(scale) || scale <= 0 || scale > 1_000_000)) {
+        errors.push(`组件 ${component.id} 的 encoding.${scaleField} 必须是 0-1000000 范围内的有限正数`)
+      }
+    }
     if (component.query && component.encoding?.value) {
       const measureIds = new Set(component.query.measures.map((measure) => measure.id))
       const dimensionFields = new Set(
@@ -196,7 +392,7 @@ export const validateDashboardSpec = (
       if (['kpi', 'progress', 'gauge'].includes(component.type) && dimensionFields.size > 0) {
         errors.push(`组件 ${component.id} 是单值组件，不能包含维度`)
       }
-      if (['bar', 'line', 'pie', 'ranking', 'funnel', 'radar', 'scatter', 'treemap', 'combo'].includes(component.type) &&
+      if (['bar', 'line', 'pie', 'ranking', 'funnel', 'radar', 'scatter', 'treemap', 'combo', 'data-matrix', 'description-list', 'comparison-bars'].includes(component.type) &&
           dimensionFields.size === 0) {
         errors.push(`组件 ${component.id} 至少需要一个维度`)
       }
@@ -233,8 +429,26 @@ export const validateDashboardSpec = (
       }
     }
   }
+  for (const component of spec.components as DashboardComponentSpec[]) {
+    const content = component.content
+    if (content?.kind !== 'data-matrix' || content.expansionMode !== 'linked-detail') continue
+    const target = spec.components.find((candidate) =>
+      candidate.content?.kind === 'description-list' &&
+      candidate.content.selectionChannel === content.selectionChannel
+    )
+    if (!target || target.content?.kind !== 'description-list') {
+      errors.push(`组件 ${component.id} 的联动通道 ${content.selectionChannel} 缺少详情组件`)
+      continue
+    }
+    const variantIds = new Set((target.content.variants ?? []).map((variant) => variant.selectionId))
+    const missing = content.rows.filter((row) => !variantIds.has(row.id)).map((row) => row.label)
+    if (missing.length) {
+      errors.push(`组件 ${component.id} 的联动详情缺少：${missing.join('、')}`)
+    }
+  }
   if (queryEngine && spec.globalFilters?.length) {
-    const scope = spec.components.find((component) => component.query)?.query?.scope
+    const scope = spec.dataScope
+      ?? spec.components.find((component) => component.query)?.query?.scope
     if (scope) {
       const catalog = new Set(queryEngine.profile(scope).map((profile) => profile.field.toLocaleLowerCase()))
       for (const filter of spec.globalFilters) {

@@ -172,6 +172,61 @@ const matchRows = (matches: ProjectRequirementMatch[]): ExcelCell[][] => matches
   match.requirementLinked ? '是' : '否'
 ].map(cell))
 
+const traceRelationKey = (
+  entityType: 'task' | 'asset',
+  taskId: string | null,
+  recordUid: string | null,
+  requirementId: string
+): string => entityType === 'task'
+  ? `task:${taskId ?? ''}:${requirementId}`
+  : `asset:${recordUid ?? ''}:${requirementId}`
+
+const traceMetadataValue = (
+  metadata: ProjectDataSnapshot['tasks'][number]['requirements'][number]['traceMetadata'] | undefined,
+  field: 'validatedBy' | 'validatedAt' | 'validationReason'
+): string => String(metadata?.[field] ?? '')
+
+const traceMatrixRows = (snapshot: ProjectDataSnapshot): ExcelCell[][] => {
+  const rows: ExcelCell[][] = []
+  for (const task of snapshot.tasks ?? []) {
+    for (const requirement of task.requirements ?? []) {
+      const requirementId = String(requirement.requirementId ?? '')
+      const key = traceRelationKey('task', task.id, null, requirementId)
+      const metadata = requirement.traceMetadata
+      rows.push([
+        '任务', task.id, task.title, '', key,
+        requirementId, requirement.requirementNo, requirement.title,
+        requirement.logicalRequirementId || requirement.logicalId,
+        requirement.sourceBaselineId, requirement.sourceBaselineVersion,
+        requirement.sourceRequirementVersion, requirement.targetVersion,
+        requirement.traceStatus,
+        requirement.validatedBy || traceMetadataValue(metadata, 'validatedBy'),
+        requirement.validatedAt || traceMetadataValue(metadata, 'validatedAt'),
+        traceMetadataValue(metadata, 'validationReason'), '', ''
+      ].map(cell))
+    }
+  }
+  for (const asset of snapshot.assets ?? []) {
+    for (const requirement of asset.requirements ?? []) {
+      const requirementId = String(requirement.requirementId ?? '')
+      const key = traceRelationKey('asset', null, asset.recordUid, requirementId)
+      const metadata = requirement.traceMetadata
+      rows.push([
+        '资产', asset.recordUid, asset.name, asset.recordUid, key,
+        requirementId, requirement.requirementNo, requirement.title,
+        requirement.logicalRequirementId || requirement.logicalId,
+        requirement.sourceBaselineId, requirement.sourceBaselineVersion,
+        requirement.sourceRequirementVersion, requirement.targetVersion,
+        requirement.traceStatus,
+        requirement.validatedBy || traceMetadataValue(metadata, 'validatedBy'),
+        requirement.validatedAt || traceMetadataValue(metadata, 'validatedAt'),
+        traceMetadataValue(metadata, 'validationReason'), requirement.matchRunId ?? '', requirement.matchScore ?? ''
+      ].map(cell))
+    }
+  }
+  return rows
+}
+
 export const createProjectWorkbook = (snapshot: ProjectDataSnapshot): XLSX.WorkBook => {
   const workbook = XLSX.utils.book_new()
 
@@ -223,6 +278,11 @@ export const createProjectWorkbook = (snapshot: ProjectDataSnapshot): XLSX.WorkB
     '需求 ID', '记录 UID', '记录名称', '节点类型', '项目编号', '记录描述', '向量分数', 'AI 分数', '最终分数',
     '分数来源', '匹配原因', '最佳分块 ID', '已关联项目资产', '已关联当前需求'
   ], matchRows(snapshot.matches), [38, 38, 30, 20, 20, 70, 14, 14, 14, 14, 60, 38, 18, 18])
+  appendSheet(workbook, '需求追溯矩阵', [
+    '对象类型', '对象 ID', '对象名称', '记录 UID', '关系 Key', '需求 ID', '需求编号', '需求标题', 'logicalId',
+    '源基线 ID', '源基线版本', '源需求版本', '目标版本', '追溯状态', '验证人', '验证时间', '验证原因',
+    '匹配运行 ID', '匹配评分'
+  ], traceMatrixRows(snapshot), [12, 38, 32, 38, 54, 38, 12, 36, 38, 38, 14, 14, 14, 12, 18, 24, 42, 38, 14])
 
   return workbook
 }

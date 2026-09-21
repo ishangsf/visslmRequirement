@@ -187,15 +187,6 @@ try {
   const followUp = await runChat(chatInput(recommendedBaselineOptions[0].prompt), controlledEngine)
   assert.equal(followUp.status, 'ready', '点击推荐选项后 prompt 必须可解析为下一轮 ready 请求')
 
-  const planned = await runChat(
-    chatInput('QA/EPG 生成 GJB5000B 过程证据符合度大屏'),
-    controlledEngine
-  )
-  assertClarification(planned, 'scenario-not-active')
-  assert.equal(planned.scenario, 'gjb5000b-compliance')
-  assert.notEqual(planned.scenario, 'project-overview',
-    'planned 场景不得静默回退到 project-overview')
-
   let genericScans = 0
   const generic = await runChat(
     chatInput('生成销售大屏，关注销售额和客户转化率'),
@@ -227,7 +218,7 @@ try {
       componentCount: dashboard.components.length,
       receiptPersisted: true
     },
-    clarifications: ['missing-role', 'missing-tailoring-baseline', 'scenario-not-active', 'missing-metric-source'],
+    clarifications: ['missing-role', 'missing-tailoring-baseline', 'missing-metric-source'],
     generic: { recognized: generic.recognized, queryEngineScans: genericScans },
     modelCalls
   }, null, 2))

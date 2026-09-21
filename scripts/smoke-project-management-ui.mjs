@@ -7,8 +7,11 @@ const projectPageSource = readFileSync(join(process.cwd(), 'src/renderer/src/pro
 const relationshipGraphSource = readFileSync(join(process.cwd(), 'src/renderer/src/project-management/ProjectRelationshipGraph.tsx'), 'utf8')
 const projectStylesSource = readFileSync(join(process.cwd(), 'src/renderer/src/styles.css'), 'utf8')
 const appSource = readFileSync(join(process.cwd(), 'src/renderer/src/App.tsx'), 'utf8')
-const matchRecordColumnStart = projectPageSource.indexOf("title: '数据中心数据'")
-const matchRecordColumnEnd = projectPageSource.indexOf("title: '综合匹配分'", matchRecordColumnStart)
+const projectManagementSource = readFileSync(join(process.cwd(), 'src/main/project-management.ts'), 'utf8')
+const preloadSource = readFileSync(join(process.cwd(), 'src/preload/index.ts'), 'utf8')
+const mainSource = readFileSync(join(process.cwd(), 'src/main/index.ts'), 'utf8')
+const matchRecordColumnStart = projectPageSource.indexOf("title: '候选数据'")
+const matchRecordColumnEnd = projectPageSource.indexOf("title: '相似度评分'", matchRecordColumnStart)
 const matchRecordColumnSource = matchRecordColumnStart >= 0 && matchRecordColumnEnd > matchRecordColumnStart
   ? projectPageSource.slice(matchRecordColumnStart, matchRecordColumnEnd)
   : ''
@@ -89,11 +92,96 @@ const linkedAssetListContract = projectPageSource.includes('project-linked-asset
   && projectPageSource.includes('matchScore.toFixed(1)')
   && projectPageSource.includes('excludeProjectAssetProjectId')
   && projectStylesSource.includes('.project-linked-assets-list')
+const unlinkAssetRequirementContract = projectPageSource.includes(
+  'result = await window.visslm.unlinkProjectAssetRequirement(current.id, recordUid, requirementId)'
+)
+const requirementPaginationContract = projectPageSource.includes('tableKey="project-requirements-v3"')
+  && projectPageSource.includes('page: requirementPage')
+  && projectPageSource.includes('pageSize: requirementPageSize')
+  && projectPageSource.includes('setRequirementPage(pagination.current ?? 1)')
+  && projectPageSource.includes('setRequirementPageSize(pagination.pageSize ?? 20)')
+  && projectPageSource.includes('y: projectDetailTableScrollY')
+const analysisRequirementLockContract = projectPageSource.includes("const requirementActionsDisabled = current.analysisStatus === 'processing'")
+  && projectPageSource.includes('const ensureRequirementActionsEnabled')
+  && projectPageSource.includes('if (!ensureRequirementActionsEnabled()) return')
+  && projectPageSource.includes('disabled={requirementActionsDisabled}')
 const taskRequirementContract = projectPageSource.includes("type ProjectTaskColumnKey = 'type' | 'title' | 'requirements'")
   && projectPageSource.includes('allRequirements={allRequirements}')
   && projectPageSource.includes('onOpenRequirement={(requirementId) => void openRequirementMatch(requirementId)}')
   && projectPageSource.includes('requirementIds: task.requirements.map')
   && projectStylesSource.includes('.project-task-requirement-link')
+const requirementTraceabilityContract = projectPageSource.includes('type ProjectRequirementTraceStatus = ProjectTraceStatus')
+  && projectPageSource.includes("valid: { label: '有效'")
+  && projectPageSource.includes("suspect: { label: '需复核'")
+  && projectPageSource.includes("invalid: { label: '失效'")
+  && projectPageSource.includes('logicalId')
+  && projectPageSource.includes('sourceBaselineVersion')
+  && projectPageSource.includes('sourceRequirementVersion')
+  && projectPageSource.includes('targetCurrentVersion')
+  && projectPageSource.includes('traceMetadata?.validationReason')
+  && projectPageSource.includes('function ProjectRequirementTraceTag')
+  && projectPageSource.includes('Tooltip title={trace.tooltip}')
+  && projectPageSource.includes('aria-label={`需求追溯状态：${meta.label}`}')
+  && projectPageSource.includes("whiteSpace: 'nowrap'")
+  && projectPageSource.includes('需复核和失效关系会继续展示')
+  && projectPageSource.includes('仅保留历史关系')
+  && projectPageSource.includes('preservedHistoricalRequirementIds')
+  && projectPageSource.includes('else await onUpdate(inlineEditingId, inlineDraft)')
+  && !projectPageSource.includes('...preservedHistoricalRequirementIds')
+  && projectPageSource.includes('ProjectRequirementTraceTag relation={requirement}')
+  && projectPageSource.includes('源基线 ${sourceBaselineVersion}')
+  && projectPageSource.includes('目标当前版本 ${targetCurrentVersion}')
+const sharedProjectTypesSource = readFileSync(join(process.cwd(), 'src/shared/project-types.ts'), 'utf8')
+const sharedTypesSource = readFileSync(join(process.cwd(), 'src/shared/types.ts'), 'utf8')
+const retiredProjectSources = [
+  projectPageSource,
+  preloadSource,
+  mainSource,
+  projectManagementSource,
+  sharedProjectTypesSource,
+  sharedTypesSource
+]
+const retiredProjectApiTokens = [
+  'ProjectRequirementImpact',
+  'getProjectRequirementImpactReport',
+  'applyProjectTraceDecisions',
+  'ProjectTraceDecision',
+  'assignProjectTraceReviews',
+  'listProjectTraceDecisionAudits',
+  'ProjectTraceAiReview',
+  'startProjectTraceAiReview',
+  'cancelProjectTraceAiReview',
+  'listProjectTraceAiReviewRuns',
+  'getProjectTraceAiReviewRun',
+  'ProjectGovernance',
+  'getProjectGovernanceReport',
+  'acknowledgeProjectGovernanceAlerts'
+]
+const retiredProjectIpcTokens = [
+  'projects:requirement-impact',
+  'projects:trace-decisions',
+  'projects:trace-review-assignments',
+  'projects:trace-decision-audits',
+  'projects:trace-ai-review-',
+  'projects:governance-'
+]
+const retiredProjectUiTokens = [
+  "key: 'impact'",
+  '变更影响',
+  'ProjectImpactWorkbench',
+  "key: 'audits'",
+  '决策审计',
+  '分配复核',
+  'AI 辅助复核',
+  'AI辅助复核',
+  "key: 'governance'",
+  '项目治理',
+  '确认知悉治理提醒'
+]
+const retiredProjectNegativeContract = retiredProjectSources.every((source) => (
+  [...retiredProjectApiTokens, ...retiredProjectIpcTokens, ...retiredProjectUiTokens]
+    .every((token) => !source.includes(token))
+))
 const themedAppIconContract = appSource.includes("import appIconLight from './assets/visslm-icon-light.png'")
   && appSource.includes("themeMode === 'light' ? appIconLight : appIconDark")
   && appSource.includes('<ThemedAppIcon alt="VISSLM Agent" />')
@@ -139,10 +227,15 @@ if (process.env.VISSLM_UI_STATIC_ONLY === '1') {
   assert.equal(projectMatchingSettingsContract, true)
   assert.equal(requirementStatusFilterContract, true)
   assert.equal(linkedAssetListContract, true)
+  assert.equal(unlinkAssetRequirementContract, true)
+  assert.equal(requirementPaginationContract, true)
+  assert.equal(analysisRequirementLockContract, true)
   assert.equal(taskRequirementContract, true)
+  assert.equal(requirementTraceabilityContract, true)
+  assert.equal(retiredProjectNegativeContract, true, 'renderer/preload/main/service/shared 不得保留 Phase2–5 退役合同')
   assert.equal(themedAppIconContract, true)
   assert.equal(relationshipGraphContract, true)
-  console.log(JSON.stringify({ ok: true, mode: 'static', checks: ['stable data-center match-record display', 'project requirement status provenance', 'responsive analysis progress layout', 'project-scoped live matching progress', 'controlled matching cancellation'] }))
+  console.log(JSON.stringify({ ok: true, mode: 'static', checks: ['stable data-center match-record display', 'project requirement status provenance', 'responsive analysis progress layout', 'project-scoped live matching progress', 'controlled project matching cancellation', 'requirement-scoped asset unlink', 'requirement pagination', 'analysis write lock', 'requirement trace status and version tooltip', 'historical relation preservation', 'retired Phase2–5 contracts absent', 'theme and relationship graph contracts'] }))
   process.exit(0)
 }
 
@@ -283,7 +376,12 @@ const checks = await evaluate(`(async () => {
     projectMatchingSettings: ${projectMatchingSettingsContract},
     requirementStatusFilter: ${requirementStatusFilterContract},
     linkedAssetList: ${linkedAssetListContract},
+    unlinkAssetRequirement: ${unlinkAssetRequirementContract},
+    requirementPagination: ${requirementPaginationContract},
+    analysisRequirementLock: ${analysisRequirementLockContract},
     taskRequirement: ${taskRequirementContract},
+    requirementTraceability: ${requirementTraceabilityContract},
+    retiredProjectContracts: ${retiredProjectNegativeContract},
     relationshipGraph: ${relationshipGraphContract},
     projectExport: true,
     projectDelete: true
@@ -424,7 +522,12 @@ const checks = await evaluate(`(async () => {
        projectMatchingSettings: taskListFeatures.projectMatchingSettings,
        requirementStatusFilter: taskListFeatures.requirementStatusFilter,
        linkedAssetList: taskListFeatures.linkedAssetList,
+       unlinkAssetRequirement: taskListFeatures.unlinkAssetRequirement,
+       requirementPagination: taskListFeatures.requirementPagination,
+       analysisRequirementLock: taskListFeatures.analysisRequirementLock,
        relationshipGraph: taskListFeatures.relationshipGraph,
+       requirementTraceability: taskListFeatures.requirementTraceability,
+       retiredProjectContracts: taskListFeatures.retiredProjectContracts,
        projectExport: taskListFeatures.projectExport,
       projectDelete: taskListFeatures.projectDelete
     }
@@ -486,7 +589,7 @@ const checks = await evaluate(`(async () => {
   }
 })()`)
 
-  if (!checks.pageReady || !checks.themedAppIcon || !checks.listTable || !checks.organizationPeoplePage || !checks.createButton || !checks.importProjectButton || !checks.formReady || !checks.projectNameField || !checks.contractAmountField || !checks.projectOwnerSelects || !checks.matchRecordDisplay || !checks.taskPlanReady || !checks.taskGanttReady || !checks.resourceGanttReady || !checks.inlineEdit || !checks.subtaskEntry || !checks.inlineCreate || !checks.parentColumnRemoved || !checks.dragReady || !checks.costResponsibleField || !checks.requirementReviewPolicy || !checks.requirementModuleColumn || !checks.technicalIndicatorMatch || !checks.agreementStatus || !checks.matchStatus || !checks.analysisLogAlwaysVisible || !checks.projectMatchingSettings || !checks.requirementStatusFilter || !checks.linkedAssetList || !checks.taskRequirement || !checks.relationshipGraph || !checks.projectExport || !checks.projectDelete) {
+  if (!checks.pageReady || !checks.themedAppIcon || !checks.listTable || !checks.organizationPeoplePage || !checks.createButton || !checks.importProjectButton || !checks.formReady || !checks.projectNameField || !checks.contractAmountField || !checks.projectOwnerSelects || !checks.matchRecordDisplay || !checks.taskPlanReady || !checks.taskGanttReady || !checks.resourceGanttReady || !checks.inlineEdit || !checks.subtaskEntry || !checks.inlineCreate || !checks.parentColumnRemoved || !checks.dragReady || !checks.costResponsibleField || !checks.requirementReviewPolicy || !checks.requirementModuleColumn || !checks.technicalIndicatorMatch || !checks.agreementStatus || !checks.matchStatus || !checks.analysisLogAlwaysVisible || !checks.projectMatchingSettings || !checks.requirementStatusFilter || !checks.linkedAssetList || !checks.unlinkAssetRequirement || !checks.requirementPagination || !checks.analysisRequirementLock || !checks.taskRequirement || !checks.requirementTraceability || !checks.retiredProjectContracts || !checks.relationshipGraph || !checks.projectExport || !checks.projectDelete) {
   throw new Error(`Project management UI smoke failed: ${JSON.stringify(checks)}`)
 }
 

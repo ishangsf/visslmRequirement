@@ -4,6 +4,8 @@ export type ProjectMatchStatus = 'idle' | 'processing' | 'ready' | 'stale' | 'fa
 export type ProjectRequirementStatus = 'unmarked' | 'satisfied' | 'to_develop' | 'to_negotiate'
 export type ProjectRequirementStatusSource = 'ai' | 'manual' | 'system_rule' | 'legacy_unverified'
 export type ProjectAssetLinkSource = 'manual' | 'exact_business_hash' | 'legacy_unknown'
+/** The state of a requirement link when the source baseline is compared with the current one. */
+export type ProjectTraceStatus = 'valid' | 'suspect' | 'invalid'
 export type ProjectRequirementKeyInfoTermsSource = 'ai' | 'manual'
 export type ProjectRequirementCategory =
   | 'functional'
@@ -175,10 +177,25 @@ export interface ProjectParticipantInput {
 
 export interface ProjectPlanTaskRequirement {
   requirementId: string
+  /** Stable identity shared by requirement versions. */
+  logicalId: string
+  /** Phase 2 compatibility alias for consumers that use trace terminology. */
+  logicalRequirementId: string
   requirementNo: number
   title: string
   status: ProjectRequirementStatus
   linkedAt: string
+  sourceBaselineVersion: number
+  /** Stable source baseline/set identifier (empty for legacy links). */
+  sourceBaselineId: string
+  sourceRequirementVersion: number
+  targetCurrentVersion: number | null
+  /** Phase 2 compatibility alias for the current target requirement version. */
+  targetVersion: number | null
+  traceStatus: ProjectTraceStatus
+  validatedBy: string
+  validatedAt: string
+  traceMetadata: ProjectRequirementTraceMetadata
 }
 
 export interface ProjectPlanTask {
@@ -223,6 +240,10 @@ export interface ProjectPlanTaskMoveInput {
 
 export interface ProjectAssetRequirement {
   requirementId: string
+  /** Stable identity shared by requirement versions. */
+  logicalId: string
+  /** Phase 2 compatibility alias for consumers that use trace terminology. */
+  logicalRequirementId: string
   requirementNo: number
   title: string
   linkedAt: string
@@ -231,6 +252,31 @@ export interface ProjectAssetRequirement {
   confirmedAt: string
   matchRunId: string | null
   matchScore?: number
+  sourceBaselineVersion: number
+  /** Stable source baseline/set identifier (empty for legacy links). */
+  sourceBaselineId: string
+  sourceRequirementVersion: number
+  targetCurrentVersion: number | null
+  /** Phase 2 compatibility alias for the current target requirement version. */
+  targetVersion: number | null
+  traceStatus: ProjectTraceStatus
+  validatedBy: string
+  validatedAt: string
+  traceMetadata: ProjectRequirementTraceMetadata
+}
+
+/** Audit metadata retained with task/asset links across requirement releases. */
+export interface ProjectRequirementTraceMetadata {
+  sourceRequirementId: string
+  sourceSetId: string
+  sourceBaselineVersion: number
+  sourceRequirementVersion: number
+  targetRequirementId: string | null
+  targetCurrentVersion: number | null
+  validatedAt: string
+  validationReason: string
+  /** Actor that last validated the link; legacy rows may not have one. */
+  validatedBy?: string
 }
 
 export interface ProjectAsset {
@@ -272,7 +318,8 @@ export interface ProjectDocumentSnapshot {
 
 export interface ProjectDataSnapshot {
   format: 'visslm-project'
-  version: 1
+  /** v1 is retained for import/export compatibility; v2 carries immutable run/set history. */
+  version: 1 | 2
   exportedAt: string
   project: ManagedProject & { baseEstimatedCost: number }
   documents: ProjectDocumentSnapshot[]
@@ -283,6 +330,94 @@ export interface ProjectDataSnapshot {
   tasks: ProjectPlanTask[]
   requirements: ProjectRequirement[]
   matches: LegacyProjectRequirementMatch[]
+  /** v2: all requirement-set versions, including superseded/reviewing sets. */
+  requirementSets?: ProjectRequirementSetSnapshot[]
+  /** v2: immutable match-run metadata for every requirement version. */
+  matchRuns?: ProjectRequirementMatchRunSnapshot[]
+  /** v2: persisted candidates, including evidence and ranking provenance. */
+  matchCandidates?: ProjectRequirementMatchCandidateSnapshot[]
+  /** v2: normalized link trace records for consumers that do not traverse task/assets. */
+  traceMetadata?: ProjectRequirementTraceSnapshot[]
+}
+
+export interface ProjectRequirementSetSnapshot {
+  id: string
+  projectId: string
+  documentId: string
+  version: number
+  status: ProjectRequirementSetStatus
+  totalChunks: number
+  analyzedChunks: number
+  warnings: string[]
+  requirementCount: number
+  pendingCount: number
+  approvedCount: number
+  rejectedCount: number
+  createdAt: string
+  publishedAt: string
+  fingerprint: string
+  externalProcessing?: boolean
+  modelName?: string
+}
+
+export interface ProjectRequirementMatchRunSnapshot {
+  id: string
+  requirementId: string
+  requirementLogicalId: string
+  requirementVersion: number
+  baselineVersion: number
+  requirementSnapshotHash: string
+  requirementBusinessHash: string
+  normalizationVersion: string
+  indexVersion: string
+  pipelineVersion: string
+  rankingVersion: string
+  configHash: string
+  modelVersion: string | null
+  status: 'running' | 'succeeded' | 'failed' | 'stale'
+  degradationCodes: string[]
+  failureCode: string | null
+  startedAt: string
+  createdAt: string
+  completedAt: string | null
+}
+
+/** JSON-safe candidate snapshot; score/evidence fields intentionally remain opaque for forward compatibility. */
+export interface ProjectRequirementMatchCandidateSnapshot {
+  runId: string
+  requirementId: string
+  recordUid: string
+  finalRank: number
+  rankingScore: number
+  similarityScore: number | null
+  rankingVersion: string
+  relation: string | null
+  decisionStatus: string
+  confidenceStatus: string
+  confidenceReasons: string[]
+  evidenceLevel: string
+  reasonCodes: string[]
+  degradationCodes: string[]
+  stageScores: unknown
+  scoreBreakdown: unknown
+  evidenceJson: unknown
+  explanationStatus: string
+  explanation: string | null
+  recordSnapshotHash: string
+}
+
+export interface ProjectRequirementTraceSnapshot extends ProjectRequirementTraceMetadata {
+  entityType: 'task' | 'asset'
+  taskId?: string
+  recordUid?: string
+  projectId: string
+  requirementId: string
+  logicalId: string
+  traceStatus: ProjectTraceStatus
+  linkSource?: ProjectAssetLinkSource
+  confirmedBy?: string
+  confirmedAt?: string
+  linkedAt: string
 }
 
 export interface ProjectDataTransferResult {
@@ -300,6 +435,8 @@ export interface ProjectRequirement {
   projectId: string
   documentId: string
   setId: string
+  /** Stable identity shared by versions unless a split/merge creates a new logical item. */
+  logicalId: string
   version: number
   requirementNo: number
   category: ProjectRequirementCategory
@@ -355,6 +492,7 @@ export interface ProjectRequirementSetSummary {
   rejectedCount: number
   createdAt: string
   publishedAt: string
+  fingerprint: string
 }
 
 export interface ProjectRequirementInput {
@@ -416,6 +554,9 @@ export interface ProjectRequirementMatchQuery {
 export interface ProjectRequirementMatchRunSummary {
   id: string
   requirementId: string
+  requirementLogicalId: string
+  requirementVersion: number
+  baselineVersion: number
   requirementBusinessHash: string
   indexVersion: string
   normalizationVersion: string
@@ -424,6 +565,8 @@ export interface ProjectRequirementMatchRunSummary {
   configHash: string
   modelVersion: string | null
   degradationCodes: string[]
+  status: 'running' | 'succeeded' | 'failed' | 'stale'
+  failureCode: string | null
   startedAt: string
   completedAt: string
 }

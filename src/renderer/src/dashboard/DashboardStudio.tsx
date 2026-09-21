@@ -60,6 +60,7 @@ import type {
   DashboardComponentType,
   DashboardFilter,
   DashboardLayout,
+  DashboardPresentationMode,
   DashboardQualityReport,
   DashboardSpec,
   DashboardSummary,
@@ -70,6 +71,10 @@ import type {
   VisualizationRun
 } from '../../../shared/dashboard'
 import { compareDashboardSpecs } from '../../../shared/dashboard'
+import {
+  dashboardComponentOptionDefinitions,
+  dashboardComponentOptionValue
+} from '../../../shared/dashboard-component-options'
 import { automaticDashboardComponentTitle } from '../../../shared/dashboard-semantics'
 import type { DashboardStats } from '../../../shared/types'
 import type {
@@ -105,6 +110,8 @@ import {
 } from './componentTypeAdapter'
 import { DashboardGrid } from './DashboardGrid'
 import { DashboardAiDrawer } from './DashboardAiDrawer'
+import { DashboardScenarioWizard } from './DashboardScenarioWizard'
+import aerospaceSceneBackground from '../assets/dashboard/gjb5000b-scene-background.png'
 import {
   dashboardDraftStorageKey,
   parseDashboardDraft,
@@ -128,7 +135,10 @@ const componentTypeIcons: Record<DashboardComponentType, string> = {
   radar: '10',
   scatter: '11',
   treemap: '12',
-  combo: '13'
+  combo: '13',
+  'data-matrix': '14',
+  'description-list': '15',
+  'comparison-bars': '16'
 }
 
 const repairableQualityIssueCodes = new Set(['spec-validation', 'query-error'])
@@ -158,8 +168,8 @@ const dashboardDomainScenarioLabels: Record<string, string> = {
   'software-quality': '软件质量与缺陷闭环',
   'test-validation': '测试与验证充分性',
   'configuration-change': '配置管理与变更控制',
-  'gjb5000b-compliance': '过程证据审计',
-  'organization-improvement': '组织改进'
+  'gjb5000b-compliance': 'GJB5000B 过程符合度与证据审计',
+  'organization-improvement': '组织级度量与过程改进'
 }
 
 const dashboardDomainArtifactStatusLabels: Record<string, string> = {
@@ -346,11 +356,13 @@ const queryDataPoints = (
   const labelField = component.encoding?.label
   const valueField = component.encoding?.value
   const secondaryField = component.encoding?.secondaryValue
+  const valueScale = component.encoding?.valueScale ?? 1
+  const secondaryValueScale = component.encoding?.secondaryValueScale ?? 1
   if (!valueField) return []
   return dataset.rows.map((row, index) => ({
     name: String(labelField ? row[labelField] ?? `Data ${index + 1}` : component.title),
-    value: Number(row[valueField] ?? 0),
-    ...(secondaryField ? { secondaryValue: Number(row[secondaryField] ?? 0) } : {})
+    value: Number(row[valueField] ?? 0) * valueScale,
+    ...(secondaryField ? { secondaryValue: Number(row[secondaryField] ?? 0) * secondaryValueScale } : {})
   }))
 }
 
@@ -423,6 +435,7 @@ export function DashboardStudio({
   const [repairingComponentId, setRepairingComponentId] = useState<string | null>(null)
   const [repairError, setRepairError] = useState('')
   const [previewOpen, setPreviewOpen] = useState(false)
+  const [previewPresentationMode, setPreviewPresentationMode] = useState<DashboardPresentationMode>('standard')
   const [saving, setSaving] = useState(false)
   const [restoringVersion, setRestoringVersion] = useState<number | null>(null)
   const [exporting, setExporting] = useState(false)
@@ -445,9 +458,11 @@ export function DashboardStudio({
   const [libraryPanelOpen, setLibraryPanelOpen] = useState(false)
   const [inspectorOpen, setInspectorOpen] = useState(false)
   const [focusMode, setFocusMode] = useState(false)
+  const [scenarioWizardOpen, setScenarioWizardOpen] = useState(false)
   const [librarySearch, setLibrarySearch] = useState('')
   const [libraryCategory, setLibraryCategory] = useState<string>('全部')
   const [addingComponentType, setAddingComponentType] = useState<DashboardComponentType | null>(null)
+  const [contentVariantId, setContentVariantId] = useState<string | undefined>()
 
   useEffect(() => () => {
     inspectorResizeCleanupRef.current?.()
@@ -549,7 +564,10 @@ export function DashboardStudio({
       spec.id
     )
     setDraftSavedAt(draft?.savedAt ?? null)
-    return draft?.spec ?? spec
+    const restored = draft?.spec ?? spec
+    return restored.dataScope === undefined && spec.dataScope !== undefined
+      ? { ...restored, dataScope: cloneValue(spec.dataScope) }
+      : restored
   }
 
   const refreshDashboards = async (): Promise<void> => {
@@ -612,6 +630,13 @@ export function DashboardStudio({
     [dashboard, selectedId]
   )
 
+  useEffect(() => {
+    const content = selectedComponent?.content
+    setContentVariantId(content?.kind === 'description-list'
+      ? content.variants?.[0]?.selectionId
+      : undefined)
+  }, [selectedComponent?.id])
+
   const libraryDefinitions = useMemo(() => {
     const normalizedSearch = librarySearch.trim().toLocaleLowerCase()
     return dashboardComponentRegistry.filter((definition) => {
@@ -653,6 +678,7 @@ export function DashboardStudio({
     return true
   }
   const fieldProfileScope = selectedComponent?.query?.scope
+    ?? dashboard?.dataScope
     ?? dashboard?.components.find((component) => component.query)?.query?.scope
   const fieldProfileScopeKey = JSON.stringify(fieldProfileScope ?? null)
 
@@ -969,9 +995,31 @@ export function DashboardStudio({
       message.warning(plan.error)
       return
     }
+    const commitComponent = (component: DashboardComponentSpec): void => {
+      mutateDashboard((draft) => {
+        if (draft.components.length >= 10) return
+        if (draft.components.some((candidate) => candidate.id === component.id)) return
+        draft.components = plan.components
+          ? plan.components.map((candidate) => candidate.id === component.id
+              ? component
+              : cloneValue(candidate))
+          : [...draft.components, component]
+        if (plan.dataScope) draft.dataScope = cloneValue(plan.dataScope)
+        if (plan.analysisBlueprint) {
+          draft.analysisBlueprint = cloneValue(plan.analysisBlueprint)
+        }
+      })
+    }
+    if (!plan.component.query) {
+      commitComponent(plan.component)
+      setSelectedId(plan.component.id)
+      setAddingComponentType(null)
+      message.success(`已添加${dashboardComponentRegistry.find((item) => item.type === type)?.name ?? '组件'}，请配置手动数据`)
+      return
+    }
     setQueryLoading(true)
     try {
-      const dataset = await window.visslm.executeQuery(plan.component.query!)
+      const dataset = await window.visslm.executeQuery(plan.component.query)
       const hydratedComponent: DashboardComponentSpec = {
         ...plan.component,
         data: queryDataPoints(plan.component, dataset),
@@ -979,18 +1027,7 @@ export function DashboardStudio({
           ? { insight: `当前数据范围匹配 ${dataset.matchedRows} 条记录。` }
           : {})
       }
-      mutateDashboard((draft) => {
-        if (draft.components.length >= 10) return
-        if (draft.components.some((component) => component.id === hydratedComponent.id)) return
-        draft.components = plan.components
-          ? plan.components.map((component) => component.id === hydratedComponent.id
-              ? hydratedComponent
-              : cloneValue(component))
-          : [...draft.components, hydratedComponent]
-        if (plan.analysisBlueprint) {
-          draft.analysisBlueprint = cloneValue(plan.analysisBlueprint)
-        }
-      })
+      commitComponent(hydratedComponent)
       setSelectedId(hydratedComponent.id)
       message.success(`已添加${dashboardComponentRegistry.find((item) => item.type === type)?.name ?? '组件'}`)
     } catch (error) {
@@ -1056,6 +1093,7 @@ export function DashboardStudio({
       ?? null
     mutateDashboard((draft) => {
       draft.components = removal.components.map((component) => cloneValue(component))
+      if (removal.dataScope) draft.dataScope = cloneValue(removal.dataScope)
       if (removal.analysisBlueprint) {
         draft.analysisBlueprint = cloneValue(removal.analysisBlueprint)
       }
@@ -1127,6 +1165,403 @@ export function DashboardStudio({
   ): void => {
     if (!selectedComponent) return
     updateComponent({ style: { ...selectedComponent.style, ...patch } })
+  }
+
+  const renderComponentOptionEditor = (component: DashboardComponentSpec): React.JSX.Element => {
+    const definitions = dashboardComponentOptionDefinitions[component.type]
+    const updateOption = (
+      key: (typeof definitions)[number]['key'],
+      value: boolean | number | string
+    ): void => {
+      updateComponentStyle({ [key]: value } as NonNullable<DashboardComponentSpec['style']>)
+    }
+    return (
+      <section
+        className="dashboard-component-option-editor"
+        data-component-type={component.type}
+        aria-label={`${dashboardComponentRegistry.find((item) => item.type === component.type)?.name ?? component.type}专属配置`}
+      >
+        <div className="dashboard-query-section-header">
+          <strong>显示控制</strong>
+          <Tag>{definitions.length} 项</Tag>
+        </div>
+        <div className="dashboard-style-grid dashboard-component-option-grid">
+          {definitions.map((definition) => {
+            const value = dashboardComponentOptionValue(component.type, component.style, definition.key)
+            if (definition.control === 'boolean') {
+              return (
+                <label className="dashboard-style-switch-control" key={definition.key}>
+                  <span>{definition.label}</span>
+                  <Switch
+                    size="small"
+                    aria-label={definition.label}
+                    data-component-option={definition.key}
+                    checked={value !== false}
+                    onChange={(checked) => updateOption(definition.key, checked)}
+                  />
+                </label>
+              )
+            }
+            if (definition.control === 'number') {
+              return (
+                <label key={definition.key}>
+                  <span>{definition.label}</span>
+                  <InputNumber
+                    aria-label={definition.label}
+                    data-component-option={definition.key}
+                    min={definition.min}
+                    max={definition.max}
+                    step={definition.step}
+                    value={Number(value)}
+                    onChange={(nextValue) => updateOption(
+                      definition.key,
+                      nextValue ?? Number(definition.defaultValue)
+                    )}
+                  />
+                </label>
+              )
+            }
+            return (
+              <label className="dashboard-style-wide-control" key={definition.key}>
+                <span>{definition.label}</span>
+                <Select
+                  aria-label={definition.label}
+                  data-component-option={definition.key}
+                  value={String(value)}
+                  options={definition.options}
+                  onChange={(nextValue) => updateOption(definition.key, nextValue)}
+                />
+              </label>
+            )
+          })}
+        </div>
+      </section>
+    )
+  }
+
+  const renderComponentContentEditor = (component: DashboardComponentSpec): React.JSX.Element => {
+    const content = component.content
+    if (content?.kind === 'data-matrix') {
+      const updateContent = (patch: Partial<typeof content>): void => {
+        updateComponent({ content: { ...content, ...patch } })
+      }
+      return (
+        <div className="dashboard-component-content-stack">
+          {renderComponentOptionEditor(component)}
+          <section className="dashboard-component-content-editor">
+          <div className="dashboard-query-section-header">
+            <strong>矩阵配置</strong>
+            <Tag>{content.rows.length} 行 × {content.columns.length} 列</Tag>
+          </div>
+          <div className="dashboard-inspector-form">
+            <label>首列标题</label>
+            <Input
+              value={content.leadingLabel}
+              onChange={(event) => updateContent({ leadingLabel: event.target.value })}
+            />
+            <label>每页行数</label>
+            <InputNumber
+              min={3}
+              max={20}
+              value={content.pageSize ?? 8}
+              onChange={(value) => updateContent({ pageSize: value ?? 8 })}
+            />
+            <label>展开方式</label>
+            <Select
+              value={content.expansionMode ?? 'inline'}
+              options={[
+                { value: 'linked-detail', label: '联动详情面板' },
+                { value: 'inline', label: '行内展开（受控高度）' },
+                { value: 'none', label: '不展开' }
+              ]}
+              onChange={(expansionMode) => updateContent({ expansionMode })}
+            />
+            <label>联动通道</label>
+            <Input
+              value={content.selectionChannel}
+              placeholder="例如 process-domain"
+              onChange={(event) => updateContent({ selectionChannel: event.target.value || undefined })}
+            />
+            <label>默认选中行</label>
+            <Select
+              value={content.selectedRowId}
+              options={content.rows.map((row) => ({ value: row.id, label: row.label }))}
+              onChange={(selectedRowId) => updateContent({ selectedRowId })}
+            />
+            <div className="dashboard-structured-editor-wide">
+              <span>列标题</span>
+              <div className="dashboard-structured-editor-list">
+                {content.columns.map((column, columnIndex) => (
+                  <Input
+                    key={`${component.id}-column-${columnIndex}`}
+                    aria-label={`第 ${columnIndex + 1} 列标题`}
+                    value={column}
+                    onChange={(event) => updateContent({
+                      columns: content.columns.map((item, index) =>
+                        index === columnIndex ? event.target.value : item
+                      )
+                    })}
+                  />
+                ))}
+              </div>
+            </div>
+            <div className="dashboard-structured-editor-wide">
+              <span>行与单元格</span>
+              <Collapse
+                size="small"
+                items={content.rows.map((row, rowIndex) => ({
+                  key: row.id,
+                  label: row.label,
+                  children: (
+                    <div className="dashboard-structured-editor-list">
+                      <Input
+                        aria-label={`${row.label}行名称`}
+                        value={row.label}
+                        onChange={(event) => updateContent({
+                          rows: content.rows.map((item, index) =>
+                            index === rowIndex ? { ...item, label: event.target.value } : item
+                          )
+                        })}
+                      />
+                      {row.cells.map((cell, cellIndex) => (
+                        <div className="dashboard-structured-editor-pair" key={cell.id}>
+                          <Input
+                            aria-label={`${row.label}第 ${cellIndex + 1} 列主值`}
+                            value={cell.label}
+                            onChange={(event) => updateContent({
+                              rows: content.rows.map((item, index) => index === rowIndex
+                                ? {
+                                    ...item,
+                                    cells: item.cells.map((candidate, currentIndex) =>
+                                      currentIndex === cellIndex
+                                        ? { ...candidate, label: event.target.value }
+                                        : candidate
+                                    )
+                                  }
+                                : item)
+                            })}
+                          />
+                          <Input
+                            aria-label={`${row.label}第 ${cellIndex + 1} 列补充值`}
+                            value={cell.value}
+                            placeholder="补充值"
+                            onChange={(event) => updateContent({
+                              rows: content.rows.map((item, index) => index === rowIndex
+                                ? {
+                                    ...item,
+                                    cells: item.cells.map((candidate, currentIndex) =>
+                                      currentIndex === cellIndex
+                                        ? { ...candidate, value: event.target.value || undefined }
+                                        : candidate
+                                    )
+                                  }
+                                : item)
+                            })}
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  )
+                }))}
+              />
+            </div>
+          </div>
+          </section>
+        </div>
+      )
+    }
+
+    if (content?.kind === 'description-list') {
+      const variants = content.variants ?? []
+      const activeVariantId = variants.some((variant) => variant.selectionId === contentVariantId)
+        ? contentVariantId
+        : variants[0]?.selectionId
+      const variantIndex = variants.findIndex((variant) => variant.selectionId === activeVariantId)
+      const activeContent = variantIndex >= 0 ? variants[variantIndex] : content
+      const updateActiveContent = (patch: Partial<typeof activeContent>): void => {
+        if (variantIndex < 0) {
+          updateComponent({ content: { ...content, ...patch } })
+          return
+        }
+        updateComponent({
+          content: {
+            ...content,
+            variants: variants.map((variant, index) =>
+              index === variantIndex ? { ...variant, ...patch } : variant
+            )
+          }
+        })
+      }
+      return (
+        <div className="dashboard-component-content-stack">
+          {renderComponentOptionEditor(component)}
+          <section className="dashboard-component-content-editor">
+          <div className="dashboard-query-section-header">
+            <strong>详情配置</strong>
+            <Tag>{variants.length ? `${variants.length} 个联动状态` : '静态详情'}</Tag>
+          </div>
+          <div className="dashboard-inspector-form">
+            <label>联动通道</label>
+            <Input
+              value={content.selectionChannel}
+              placeholder="与矩阵通道保持一致"
+              onChange={(event) => updateComponent({
+                content: { ...content, selectionChannel: event.target.value || undefined }
+              })}
+            />
+            {variants.length ? (
+              <>
+                <label>编辑联动状态</label>
+                <Select
+                  value={activeVariantId}
+                  options={variants.map((variant) => ({
+                    value: variant.selectionId,
+                    label: variant.heading ?? variant.selectionId
+                  }))}
+                  onChange={setContentVariantId}
+                />
+              </>
+            ) : null}
+            <label>详情标题</label>
+            <Input
+              value={activeContent.heading}
+              onChange={(event) => updateActiveContent({ heading: event.target.value || undefined })}
+            />
+            <label>状态文字</label>
+            <Input
+              value={activeContent.status?.label}
+              onChange={(event) => updateActiveContent({
+                status: {
+                  label: event.target.value,
+                  tone: activeContent.status?.tone ?? 'neutral'
+                }
+              })}
+            />
+            <label>状态色</label>
+            <Select
+              value={activeContent.status?.tone ?? 'neutral'}
+              options={['success', 'info', 'warning', 'error', 'neutral'].map((tone) => ({
+                value: tone,
+                label: tone
+              }))}
+              onChange={(tone) => updateActiveContent({
+                status: { label: activeContent.status?.label ?? '', tone }
+              })}
+            />
+            <div className="dashboard-structured-editor-wide">
+              <span>详情字段</span>
+              <div className="dashboard-structured-editor-list">
+                {activeContent.fields.map((field, fieldIndex) => (
+                  <div className="dashboard-structured-editor-pair" key={field.id}>
+                    <Input
+                      aria-label={`详情字段 ${fieldIndex + 1} 名称`}
+                      value={field.label}
+                      onChange={(event) => updateActiveContent({
+                        fields: activeContent.fields.map((item, index) =>
+                          index === fieldIndex ? { ...item, label: event.target.value } : item
+                        )
+                      })}
+                    />
+                    <Input
+                      aria-label={`详情字段 ${fieldIndex + 1} 内容`}
+                      value={field.value}
+                      onChange={(event) => updateActiveContent({
+                        fields: activeContent.fields.map((item, index) =>
+                          index === fieldIndex ? { ...item, value: event.target.value } : item
+                        )
+                      })}
+                    />
+                  </div>
+                ))}
+              </div>
+            </div>
+            {activeContent.summary ? (
+              <div className="dashboard-structured-editor-wide">
+                <span>摘要</span>
+                <Input.TextArea
+                  value={activeContent.summary.value}
+                  autoSize={{ minRows: 2, maxRows: 5 }}
+                  onChange={(event) => updateActiveContent({
+                    summary: { ...activeContent.summary!, value: event.target.value }
+                  })}
+                />
+              </div>
+            ) : null}
+          </div>
+          </section>
+        </div>
+      )
+    }
+
+    if (content?.kind === 'comparison-bars') {
+      const updateContent = (patch: Partial<typeof content>): void => {
+        updateComponent({ content: { ...content, ...patch } })
+      }
+      return (
+        <div className="dashboard-component-content-stack">
+          {renderComponentOptionEditor(component)}
+          <section className="dashboard-component-content-editor">
+          <div className="dashboard-query-section-header">
+            <strong>比较条配置</strong>
+            <Tag>{content.items.length} 项</Tag>
+          </div>
+          <div className="dashboard-inspector-form">
+            <label>主值名称</label>
+            <Input
+              value={content.valueLabel}
+              onChange={(event) => updateContent({ valueLabel: event.target.value || undefined })}
+            />
+            <label>对比值名称</label>
+            <Input
+              value={content.secondaryLabel}
+              onChange={(event) => updateContent({ secondaryLabel: event.target.value || undefined })}
+            />
+            <div className="dashboard-structured-editor-wide">
+              <span>比较项</span>
+              <div className="dashboard-structured-editor-list">
+                {content.items.map((item, itemIndex) => (
+                  <div className="dashboard-structured-editor-triplet" key={item.id}>
+                    <Input
+                      aria-label={`比较项 ${itemIndex + 1} 名称`}
+                      value={item.label}
+                      onChange={(event) => updateContent({
+                        items: content.items.map((candidate, index) =>
+                          index === itemIndex ? { ...candidate, label: event.target.value } : candidate
+                        )
+                      })}
+                    />
+                    <InputNumber
+                      aria-label={`比较项 ${itemIndex + 1} 主值`}
+                      value={item.value}
+                      onChange={(value) => updateContent({
+                        items: content.items.map((candidate, index) =>
+                          index === itemIndex ? { ...candidate, value: value ?? 0 } : candidate
+                        )
+                      })}
+                    />
+                    <InputNumber
+                      aria-label={`比较项 ${itemIndex + 1} 对比值`}
+                      value={item.secondaryValue}
+                      placeholder="对比值"
+                      onChange={(secondaryValue) => updateContent({
+                        items: content.items.map((candidate, index) =>
+                          index === itemIndex
+                            ? { ...candidate, secondaryValue: secondaryValue ?? undefined }
+                            : candidate
+                        )
+                      })}
+                    />
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+          </section>
+        </div>
+      )
+    }
+
+    return renderComponentOptionEditor(component)
   }
 
   const updateInlineDataPoint = (
@@ -2421,42 +2856,68 @@ export function DashboardStudio({
     )
   }
 
-  const renderCanvas = (preview = false): React.JSX.Element => (
-    <div
-      className={`dashboard-preview ${preview ? 'is-full-preview' : ''}`}
-      ref={preview ? undefined : canvasRef}
-      title={!preview && interactionError ? interactionError : undefined}
-      onPointerDown={(event) => {
-        if (preview || !(event.target instanceof HTMLElement)) return
-        if (event.target.closest('.dashboard-widget, .dashboard-filter-bar')) return
-        setSelectedId(null)
-      }}
-    >
-      <header className="dashboard-preview-header">
-        <div className="dashboard-title-mark" />
-        <div>
-          <h2>{dashboard?.title}</h2>
-          <p>{dashboard?.subtitle}</p>
-        </div>
-        <div className="dashboard-preview-meta">
-          <span className="live-dot" />
-          本地数据
-          <time>{dashboard ? new Date(dashboard.updatedAt).toLocaleTimeString('zh-CN') : ''}</time>
-        </div>
-      </header>
-      {renderDashboardFilters(preview)}
-      <DashboardGrid
-        components={dashboard?.components ?? []}
-        theme={dashboard?.theme ?? 'technology-dark'}
-        preview={preview}
-        selectedId={selectedId}
-        onSelect={selectCanvasComponent}
-        onProvenance={setProvenanceComponent}
-        onLayoutCommit={commitCanvasLayout}
-        onInteractionError={setInteractionError}
-      />
-    </div>
-  )
+  const hasDashboardScene = dashboard?.presentation?.scene?.kind === 'aerospace-situational'
+
+  const renderCanvas = (
+    preview = false,
+    previewMode: DashboardPresentationMode = previewPresentationMode
+  ): React.JSX.Element => {
+    const immersiveScene = Boolean(preview && hasDashboardScene && previewMode === 'immersive')
+    return (
+      <div
+        className={[
+          'dashboard-preview',
+          preview ? 'is-full-preview' : '',
+          hasDashboardScene ? 'has-dashboard-scene' : '',
+          immersiveScene ? 'is-scene-immersive' : ''
+        ].filter(Boolean).join(' ')}
+        ref={preview ? undefined : canvasRef}
+        title={!preview && interactionError ? interactionError : undefined}
+        onPointerDown={(event) => {
+          if (preview || !(event.target instanceof HTMLElement)) return
+          if (event.target.closest('.dashboard-widget, .dashboard-filter-bar')) return
+          setSelectedId(null)
+        }}
+      >
+        {immersiveScene ? (
+          <img
+            className="dashboard-scene-background"
+            src={aerospaceSceneBackground}
+            alt=""
+            aria-hidden="true"
+          />
+        ) : null}
+        <header className="dashboard-preview-header">
+          <div className="dashboard-title-mark" />
+          <div>
+            <h2>{dashboard?.title}</h2>
+            <p>{dashboard?.subtitle}</p>
+          </div>
+          <div className="dashboard-preview-meta">
+            <span className="live-dot" />
+            本地数据
+            <time>{dashboard ? new Date(dashboard.updatedAt).toLocaleTimeString('zh-CN') : ''}</time>
+          </div>
+        </header>
+        {renderDashboardFilters(preview)}
+        <DashboardGrid
+          components={dashboard?.components ?? []}
+          theme={dashboard?.theme ?? 'technology-dark'}
+          preview={preview}
+          selectedId={selectedId}
+          onSelect={selectCanvasComponent}
+          onProvenance={setProvenanceComponent}
+          onLayoutCommit={commitCanvasLayout}
+          onInteractionError={setInteractionError}
+        />
+        {immersiveScene && dashboard?.presentation?.scene?.disclaimer ? (
+          <span className="dashboard-scene-disclaimer">
+            {dashboard.presentation.scene.disclaimer}
+          </span>
+        ) : null}
+      </div>
+    )
+  }
 
   const domainReceipt = dashboard?.domainReceipt
   const domainReceiptWarnings = dashboardDomainReceiptItemsOf(domainReceipt?.warnings)
@@ -2517,6 +2978,13 @@ export function DashboardStudio({
               { label: '明亮简洁', value: 'minimal-light' }
             ]}
           />
+          <Button
+            icon={<AppstoreOutlined />}
+            aria-label="从黄金场景创建大屏"
+            onClick={() => setScenarioWizardOpen(true)}
+          >
+            黄金场景
+          </Button>
           <Tooltip title="撤销本次编辑">
             <Button aria-label="撤销本次编辑" icon={<UndoOutlined />} disabled={!history.length} onClick={undo} />
           </Tooltip>
@@ -2548,7 +3016,15 @@ export function DashboardStudio({
             <SafetyCertificateOutlined />
             检查
           </Dropdown.Button>
-          <Button icon={<FullscreenOutlined />} onClick={() => setPreviewOpen(true)}>预览</Button>
+          <Button
+            icon={<FullscreenOutlined />}
+            onClick={() => {
+              setPreviewPresentationMode(dashboard?.presentation?.defaultMode ?? 'standard')
+              setPreviewOpen(true)
+            }}
+          >
+            预览
+          </Button>
           <Dropdown
             trigger={['click']}
             open={exportMenuOpen && !pendingExport}
@@ -2710,7 +3186,7 @@ export function DashboardStudio({
                     </div>
                     <div className="dashboard-component-help">
                       <strong>安全添加</strong>
-                      <p>点击卡片或按 Enter / Space 执行查询，成功后才会写入画布。</p>
+                      <p>有数据范围时自动绑定查询；纯手动大屏会创建可在属性面板编辑的数据模板。</p>
                       <span>{dashboard?.components.length ?? 0} / 10 个组件</span>
                     </div>
                   </div>
@@ -3012,7 +3488,7 @@ export function DashboardStudio({
               <Collapse
                 className="dashboard-inspector-groups"
                 bordered={false}
-                defaultActiveKey={['basic', 'data', 'layout-query']}
+                defaultActiveKey={['basic', 'content', 'data', 'layout-query']}
                 items={[
                   {
                     key: 'basic',
@@ -3145,6 +3621,16 @@ export function DashboardStudio({
                     children: renderComponentDataEditor(selectedComponent)
                   },
                   {
+                    key: 'content',
+                    label: (
+                      <span className="dashboard-inspector-group-label">
+                        <strong>组件专属配置</strong>
+                        <small>{selectedComponent.content ? '结构化内容' : '按类型控制'}</small>
+                      </span>
+                    ),
+                    children: renderComponentContentEditor(selectedComponent)
+                  },
+                  {
                     key: 'style',
                     label: (
                       <span className="dashboard-inspector-group-label">
@@ -3194,6 +3680,15 @@ export function DashboardStudio({
           </div>
         </aside>
       </div>
+
+      <DashboardScenarioWizard
+        open={scenarioWizardOpen}
+        onClose={() => setScenarioWizardOpen(false)}
+        onGenerated={(nextDashboard) => {
+          setScenarioWizardOpen(false)
+          applyAgentDashboard(nextDashboard)
+        }}
+      />
 
       <DashboardAiDrawer
         open={aiOpen}
@@ -3596,15 +4091,28 @@ export function DashboardStudio({
       </Drawer>
 
       <Modal
-        className="dashboard-preview-modal"
-        title={dashboard?.title}
+        className={`dashboard-preview-modal${hasDashboardScene ? ' has-dashboard-scene' : ''}`}
+        title={hasDashboardScene ? (
+          <div className="dashboard-preview-modal-title">
+            <span>{dashboard?.title}</span>
+            <Segmented
+              aria-label="预览显示模式"
+              value={previewPresentationMode}
+              options={[
+                { label: '标准分析', value: 'standard' },
+                { label: '沉浸展示', value: 'immersive' }
+              ]}
+              onChange={(value) => setPreviewPresentationMode(value as DashboardPresentationMode)}
+            />
+          </div>
+        ) : dashboard?.title}
         open={previewOpen}
         footer={null}
-        width="96vw"
+        width={hasDashboardScene ? 'calc(100vw - 24px)' : '96vw'}
         onCancel={() => setPreviewOpen(false)}
       >
         <div className={`dashboard-modal-canvas theme-${dashboard?.theme ?? 'technology-dark'}`}>
-          {dashboard && renderCanvas(true)}
+          {dashboard && renderCanvas(true, previewPresentationMode)}
         </div>
       </Modal>
 

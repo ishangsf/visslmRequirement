@@ -50,7 +50,10 @@ import {
 } from '../shared/types'
 import type { KnowledgeIndexProgress, ModelSettings, ProjectMatchingSettings } from '../shared/types'
 import { normalizeProjectRequirementText } from '../shared/project-requirement-utils'
-import { AppDatabase, REQUIREMENT_BUSINESS_INDEX_VERSION } from './database'
+import {
+  AppDatabase,
+  REQUIREMENT_BUSINESS_INDEX_VERSION,
+} from './database'
 import { KnowledgeService, type KnowledgeRecordMatch } from './knowledge'
 import { ModelClient } from './model-client'
 import { buildProjectRequirementMatchCard } from './requirements/requirement-match-card'
@@ -446,7 +449,7 @@ export class ProjectManagementService {
     private readonly modelSettings: () => ModelSettings,
     private readonly progress?: (progress: ProjectAnalysisProgress) => void,
     private readonly projectMatchingSettings: () => ProjectMatchingSettings = () => DEFAULT_PROJECT_MATCHING_SETTINGS,
-    matchingCore?: RequirementMatchingCore
+    matchingCore?: RequirementMatchingCore,
   ) {
     this.matchingCore = matchingCore ?? createRequirementMatchingCore(db, knowledge, modelSettings)
     this.requirementMatchRuns = new RequirementMatchRunService(db, this.matchingCore)
@@ -495,7 +498,9 @@ export class ProjectManagementService {
   }
 
   exportProjectData(id: string): ProjectDataSnapshot | null {
-    return this.db.exportManagedProjectSnapshot(id)
+    // v2 keeps the v1 entity payload while adding all requirement-set/run/
+    // candidate history and normalized trace metadata.
+    return this.db.exportManagedProjectSnapshot(id, 2)
   }
 
   importProjectData(payload: unknown): ProjectDataTransferResult {
@@ -517,9 +522,12 @@ export class ProjectManagementService {
   }
 
   confirmProject(id: string): ManagedProject | null {
+    const current = this.db.getManagedProject(id)
+    if (!current) return null
+    if (current.analysisStatus === 'processing' || current.matchStatus === 'processing') return null
     const project = this.db.confirmManagedProject(id)
     if (!project) return null
-    if (project.requirementCount > 0 && ['idle', 'stale', 'failed'].includes(project.matchStatus)) {
+    if (!project.reviewSetId && project.requirementCount > 0 && ['idle', 'stale', 'failed'].includes(project.matchStatus)) {
       this.startMatching(id)
     }
     return this.db.getManagedProject(id)
@@ -553,6 +561,14 @@ export class ProjectManagementService {
         projectName: fileName
       }, 'technical_agreement', 'draft')
     }
+    const replaceFailedReviewSet = this.canReplaceFailedReviewSet(targetProject)
+    if (targetProject.reviewSetId && !replaceFailedReviewSet) {
+      return {
+        ok: false,
+        projectId: targetProject.id,
+        message: '项目已有待审核需求版本，请先完成审核并发布后再分析新协议'
+      }
+    }
     if (this.runningProjectIds.has(targetProject.id) || targetProject.analysisStatus === 'processing') {
       return { ok: false, projectId: targetProject.id, message: '该项目已有协议解析任务正在运行' }
     }
@@ -565,7 +581,13 @@ export class ProjectManagementService {
       matchStatus: 'idle',
       matchMessage: ''
     })
-    void this.runTechnicalAgreement(taskId, targetProject.id, paths, settings.source === 'online')
+    void this.runTechnicalAgreement(
+      taskId,
+      targetProject.id,
+      paths,
+      settings.source === 'online',
+      replaceFailedReviewSet
+    )
     return {
       ok: true,
       projectId: targetProject.id,
@@ -581,6 +603,10 @@ export class ProjectManagementService {
     }
     if (project.analysisStatus !== 'failed') {
       return { ok: false, message: '当前没有失败的技术协议识别任务' }
+    }
+    const replaceFailedReviewSet = this.canReplaceFailedReviewSet(project)
+    if (project.reviewSetId && !replaceFailedReviewSet) {
+      return { ok: false, projectId: id, message: '项目已有待审核需求版本，请先完成审核并发布后再重试分析' }
     }
     const document = this.db.getKnowledgeDocument(project.currentDocumentId)
     if (!document) return { ok: false, message: '技术协议索引不存在' }
@@ -600,18 +626,27 @@ export class ProjectManagementService {
     })
     this.runningProjectIds.add(id)
     void (document.status === 'ready'
-      ? this.runDocumentAnalysis(taskId, id, [document.id], false)
-      : this.runDocumentRetry(taskId, id, document.id))
+      ? this.runDocumentAnalysis(taskId, id, [document.id], false, replaceFailedReviewSet)
+      : this.runDocumentRetry(taskId, id, document.id, replaceFailedReviewSet))
     return { ok: true, projectId: id, taskId, message: '技术协议已重新加入分析队列' }
   }
 
   startMatching(id: string): ProjectAnalysisStartResult {
     const project = this.db.getManagedProject(id)
     if (!project) return { ok: false, message: '项目不存在' }
+    if (project.lifecycle !== 'active') {
+      return { ok: false, projectId: id, message: '项目尚未确认，不能启动匹配' }
+    }
+    if (project.analysisStatus === 'processing') {
+      return { ok: false, projectId: id, message: '技术协议正在分析，请完成后再启动匹配' }
+    }
     if (!project.requirementCount) return { ok: false, message: '当前项目没有可匹配的需求条目' }
     if (project.reviewSetId) return { ok: false, message: '存在未发布的需求审核版本，请先完成审核并发布' }
     if (resolveRequirementMatchingRollout(this.projectMatchingSettings().rolloutMode).mode === 'legacy_safe') {
       return { ok: false, projectId: id, message: '安全旧链路仅提供历史结果只读查看，请切换到影子验证或 v1.1 后重新匹配' }
+    }
+    if (project.matchStatus === 'processing') {
+      return { ok: false, projectId: id, message: '该项目已有匹配任务正在运行' }
     }
     if (this.runningProjectIds.has(id)) return { ok: false, projectId: id, message: '该项目已有任务正在运行' }
     const taskId = randomUUID()
@@ -658,7 +693,7 @@ export class ProjectManagementService {
 
   listAllRequirements(projectId: string): ProjectRequirement[] {
     this.assertProject(projectId)
-    return this.db.listAllProjectRequirements(projectId, 'active')
+    return this.db.listAllProjectRequirements(projectId, 'published')
   }
 
   getRequirement(id: string): ProjectRequirement | null {
@@ -671,21 +706,31 @@ export class ProjectManagementService {
 
   createRequirement(projectId: string, input: ProjectRequirementInput): ProjectRequirement {
     this.assertProject(projectId)
+    this.assertRequirementReviewWritable(projectId)
     return this.db.createReviewProjectRequirement(projectId, this.normalizeRequirementInput(input))
   }
 
   updateRequirement(id: string, input: ProjectRequirementInput): ProjectRequirement | null {
+    const current = this.db.getProjectRequirement(id)
+    if (current) this.assertRequirementReviewWritable(current.projectId)
     return this.db.updateReviewProjectRequirement(id, this.normalizeRequirementInput(input))
   }
 
   splitRequirement(id: string, input: ProjectRequirementSplitInput): ProjectRequirement[] {
     if (!Array.isArray(input.parts) || input.parts.length < 2) throw new Error('拆分后至少需要两条需求')
+    const current = this.db.getProjectRequirement(id)
+    if (current) this.assertRequirementReviewWritable(current.projectId)
     return this.db.splitReviewProjectRequirement(id, {
       parts: input.parts.map((part) => this.normalizeRequirementInput(part))
     })
   }
 
   mergeRequirements(input: ProjectRequirementMergeInput): ProjectRequirement | null {
+    const requirementIds = Array.isArray(input.requirementIds) ? input.requirementIds : []
+    const projectIds = new Set(requirementIds
+      .map((id) => this.db.getProjectRequirement(id)?.projectId)
+      .filter((projectId): projectId is string => Boolean(projectId)))
+    projectIds.forEach((projectId) => this.assertRequirementReviewWritable(projectId))
     return this.db.mergeReviewProjectRequirements({
       ...this.normalizeRequirementInput(input),
       requirementIds: input.requirementIds
@@ -694,36 +739,48 @@ export class ProjectManagementService {
 
   reviewRequirements(ids: string[], status: ProjectRequirementReviewStatus): { ok: boolean; message: string } {
     if (!['pending', 'approved', 'rejected'].includes(status)) return { ok: false, message: '审核状态无效' }
-    const projectIds = [...new Set(ids
-      .map((id) => this.db.getProjectRequirement(id)?.projectId)
-      .filter((projectId): projectId is string => Boolean(projectId)))]
-    const count = this.db.reviewProjectRequirements(ids, status)
-    if (!count) return { ok: false, message: '没有可更新的待审核需求' }
-
-    if (status === 'approved') {
-      for (const projectId of projectIds) {
-        const set = this.db.getReviewProjectRequirementSet(projectId)
-        if (!set) continue
-        const allApproved = set.requirementCount > 0 && set.pendingCount === 0 &&
-          set.rejectedCount === 0 && set.approvedCount === set.requirementCount
-        if (!allApproved) continue
-        const published = this.publishRequirements(projectId)
-        return {
-          ok: published.ok,
-          message: published.ok
-            ? `全部 ${set.approvedCount} 条需求已通过，${published.message}`
-            : published.message
-        }
-      }
+    const normalizedIds = [...new Set((Array.isArray(ids) ? ids : [])
+      .map((id) => String(id).trim())
+      .filter(Boolean))]
+    if (!normalizedIds.length) return { ok: false, message: '请选择待审核需求' }
+    const fetchedRequirements = normalizedIds.map((id) => this.db.getProjectRequirement(id))
+    if (fetchedRequirements.some((requirement) => !requirement)) {
+      return { ok: false, message: '审核需求必须全部存在并属于同一项目' }
     }
+    const requirements = fetchedRequirements as ProjectRequirement[]
+    const projectIds = new Set(requirements.map((requirement) => requirement.projectId))
+    if (projectIds.size !== 1) return { ok: false, message: '一次审核只能处理同一项目的需求' }
+    const projectId = [...projectIds][0]
+    const reviewSet = this.db.getReviewProjectRequirementSet(projectId)
+    if (!reviewSet || requirements.some((requirement) => requirement.setId !== reviewSet.id)) {
+      return { ok: false, message: '只能审核当前待审核版本的需求' }
+    }
+    try {
+      this.assertRequirementReviewWritable(projectId)
+    } catch (error) {
+      return { ok: false, message: error instanceof Error ? error.message : String(error) }
+    }
+    const count = this.db.reviewProjectRequirements(normalizedIds, status)
+    if (!count) return { ok: false, message: '没有可更新的待审核需求' }
     return { ok: true, message: `已更新 ${count} 条需求的审核状态` }
   }
 
   publishRequirements(projectId: string): ProjectAnalysisStartResult {
+    const project = this.db.getManagedProject(projectId)
+    if (!project) return { ok: false, projectId, message: '项目不存在' }
+    if (project.analysisStatus === 'processing') {
+      return { ok: false, projectId, message: '技术协议正在分析，请完成后再发布需求' }
+    }
+    if (project.matchStatus === 'processing') {
+      return { ok: false, projectId, message: '项目匹配正在运行，请完成后再发布需求' }
+    }
     const set = this.db.publishReviewProjectRequirementSet(projectId)
+    if (project.lifecycle !== 'active') {
+      return { ok: true, projectId, message: `需求 V${set.version} 已发布；项目尚未确认，未启动匹配` }
+    }
     const matching = this.startMatching(projectId)
     return matching.ok
-      ? { ...matching, message: `需求 V${set.version} 已自动发布，语义匹配任务已启动` }
+      ? { ...matching, message: `需求 V${set.version} 已发布，语义匹配任务已启动` }
       : { ok: true, projectId, message: `需求 V${set.version} 已发布；${matching.message}` }
   }
 
@@ -733,14 +790,23 @@ export class ProjectManagementService {
     if (!requirement || !reviewSet || requirement.setId !== reviewSet.id) {
       return { ok: false, message: '已发布需求不能直接删除，请通过新协议版本变更' }
     }
+    try {
+      this.assertRequirementReviewWritable(requirement.projectId)
+    } catch (error) {
+      return { ok: false, message: error instanceof Error ? error.message : String(error) }
+    }
     return this.db.deleteProjectRequirement(id)
   }
 
   updateRequirementStatus(id: string, status: ProjectRequirementStatus): ProjectRequirement | null {
+    const requirement = this.db.getProjectRequirement(id)
+    if (requirement) this.assertRequirementReviewWritable(requirement.projectId)
     return this.db.updateProjectRequirementStatus(id, status)
   }
 
   updateRequirementKeyInfoTerms(id: string, terms: string[]): ProjectRequirement | null {
+    const requirement = this.db.getProjectRequirement(id)
+    if (requirement) this.assertRequirementReviewWritable(requirement.projectId)
     return this.db.updateProjectRequirementKeyInfoTerms(id, this.normalizeKeyInfoTerms(terms))
   }
 
@@ -748,9 +814,20 @@ export class ProjectManagementService {
     const requirement = this.db.getProjectRequirement(id)
     if (!requirement) return { ok: false, message: '功能需求不存在' }
     const project = this.db.getManagedProject(requirement.projectId)
-    if (project?.reviewSetId) return { ok: false, message: '待审核需求不能启动匹配' }
+    if (!project) return { ok: false, message: '项目不存在' }
+    if (project.lifecycle !== 'active') return { ok: false, projectId: project.id, message: '项目尚未确认，不能启动匹配' }
+    if (project.analysisStatus === 'processing') {
+      return { ok: false, projectId: project.id, message: '技术协议正在分析，请完成后再启动匹配' }
+    }
+    if (project.reviewSetId) return { ok: false, message: '待审核需求不能启动匹配' }
+    if (!this.db.listAllProjectRequirements(project.id).some((item) => item.id === requirement.id)) {
+      return { ok: false, projectId: project.id, message: '只能匹配当前已发布版本的需求' }
+    }
     if (resolveRequirementMatchingRollout(this.projectMatchingSettings().rolloutMode).mode === 'legacy_safe') {
       return { ok: false, message: '安全旧链路仅提供历史结果只读查看，请切换到影子验证或 v1.1 后重新匹配' }
+    }
+    if (project.matchStatus === 'processing') {
+      return { ok: false, projectId: project.id, message: '该项目已有匹配任务正在运行' }
     }
     if (this.runningProjectIds.has(requirement.projectId)) return { ok: false, message: '该项目已有任务正在运行' }
     const taskId = randomUUID()
@@ -792,6 +869,9 @@ export class ProjectManagementService {
       run: {
         id: run.id,
         requirementId: run.requirementId,
+        requirementLogicalId: requirement.logicalId,
+        requirementVersion: requirement.version,
+        baselineVersion: requirement.version,
         requirementBusinessHash: run.requirementBusinessHash,
         indexVersion: run.indexVersion,
         normalizationVersion: run.normalizationVersion,
@@ -800,6 +880,8 @@ export class ProjectManagementService {
         configHash: run.configHash,
         modelVersion: run.modelVersion,
         degradationCodes: run.degradationCodes,
+        status: run.status,
+        failureCode: run.failureCode,
         startedAt: run.startedAt,
         completedAt: run.completedAt ?? ''
       },
@@ -892,7 +974,11 @@ export class ProjectManagementService {
     if (!current) return null
     if (normalized.parentTaskId) this.assertProjectTaskParent(current.projectId, normalized.parentTaskId, id)
     if (normalized.ownerPersonId) this.assertPerson(normalized.ownerPersonId)
-    this.assertProjectTaskRequirements(current.projectId, normalized.requirementIds ?? [])
+    this.assertProjectTaskRequirements(
+      current.projectId,
+      normalized.requirementIds ?? [],
+      new Set(current.requirements.map((requirement) => requirement.requirementId))
+    )
     return this.db.updateProjectTask(id, normalized)
   }
 
@@ -921,6 +1007,9 @@ export class ProjectManagementService {
       if (!requirement || requirement.projectId !== projectId) {
         throw new Error('需求条目不存在或不属于当前项目')
       }
+      if (!this.db.listAllProjectRequirements(projectId).some((item) => item.id === normalizedRequirementId)) {
+        throw new Error('只能关联当前已发布且审核通过的需求')
+      }
     }
     return this.db.linkProjectAsset(projectId, recordUid, normalizedRequirementId, {
       linkSource: 'manual',
@@ -948,7 +1037,9 @@ export class ProjectManagementService {
       salesOwner: input.salesOwner?.trim() ?? '',
       technicalOwner: input.technicalOwner?.trim() ?? '',
       developmentOwner: input.developmentOwner?.trim() ?? '',
-      estimatedCost: Math.max(0, Number(input.estimatedCost ?? 0)),
+      estimatedCost: input.estimatedCost === undefined
+        ? undefined
+        : Math.max(0, Number(input.estimatedCost)),
       estimatedDurationDays: Math.max(0, Math.trunc(Number(input.estimatedDurationDays ?? 0)))
     }
   }
@@ -977,15 +1068,43 @@ export class ProjectManagementService {
     if (!this.db.getManagedProject(id)) throw new Error('项目不存在')
   }
 
+  private assertRequirementReviewWritable(projectId: string): void {
+    const project = this.db.getManagedProject(projectId)
+    if (!project) throw new Error('项目不存在')
+    if (project.analysisStatus === 'processing') {
+      throw new Error('技术协议分析进行中，暂不允许人工审核或编辑需求')
+    }
+  }
+
+  private canReplaceFailedReviewSet(project: ManagedProject): boolean {
+    if (!project.reviewSetId) return false
+    if (project.analysisStatus !== 'failed') return false
+    const reviewSet = this.db.getReviewProjectRequirementSet(project.id)
+    if (!reviewSet || reviewSet.approvedCount > 0 || reviewSet.rejectedCount > 0) return false
+    return this.db.listAllProjectRequirements(project.id, 'active').every((requirement) => (
+      requirement.reviewStatus === 'pending' &&
+      requirement.keyInfoTermsSource === 'ai' &&
+      requirement.statusSource === 'ai'
+    ))
+  }
+
   private assertPerson(id: string): void {
     if (!this.db.getOrganizationPerson(id)) throw new Error('组织人员不存在')
   }
 
-  private assertProjectTaskRequirements(projectId: string, requirementIds: string[]): void {
+  private assertProjectTaskRequirements(
+    projectId: string,
+    requirementIds: string[],
+    existingRequirementIds: Set<string> = new Set()
+  ): void {
+    const currentPublishedIds = new Set(this.db.listAllProjectRequirements(projectId).map((requirement) => requirement.id))
     for (const requirementId of requirementIds) {
       const requirement = this.db.getProjectRequirement(requirementId)
       if (!requirement || requirement.projectId !== projectId) {
         throw new Error('计划任务关联的需求不存在或不属于当前项目')
+      }
+      if (!currentPublishedIds.has(requirementId) && !existingRequirementIds.has(requirementId)) {
+        throw new Error('计划任务只能新增当前已发布且审核通过的需求关联')
       }
     }
   }
@@ -1091,7 +1210,8 @@ export class ProjectManagementService {
     taskId: string,
     projectId: string,
     filePaths: string[],
-    externalProcessing: boolean
+    externalProcessing: boolean,
+    replaceFailedReviewSet = false
   ): Promise<void> {
     const totalFiles = filePaths.length
     const fileNames = filePaths.map((filePath) => basename(filePath))
@@ -1170,7 +1290,7 @@ export class ProjectManagementService {
         throw new Error(failed?.errorMessage || result.skipped[0]?.reason || '部分技术协议未完成索引')
       }
       const documentIds = [...new Set(readyDocuments.map((document) => document.id))]
-      await this.runDocumentAnalysis(taskId, projectId, documentIds, externalProcessing)
+      await this.runDocumentAnalysis(taskId, projectId, documentIds, externalProcessing, replaceFailedReviewSet)
     } catch (error) {
       this.failProject(taskId, projectId, error, {
         current: currentFile,
@@ -1182,7 +1302,12 @@ export class ProjectManagementService {
     }
   }
 
-  private async runDocumentRetry(taskId: string, projectId: string, documentId: string): Promise<void> {
+  private async runDocumentRetry(
+    taskId: string,
+    projectId: string,
+    documentId: string,
+    replaceFailedReviewSet = false
+  ): Promise<void> {
     try {
       const document = this.db.getKnowledgeDocument(documentId)
       if (!document) throw new Error('技术协议索引记录不存在')
@@ -1215,7 +1340,7 @@ export class ProjectManagementService {
         total: 1,
         status: 'running'
       })
-      await this.runDocumentAnalysis(taskId, projectId, [retried.id], false)
+      await this.runDocumentAnalysis(taskId, projectId, [retried.id], false, replaceFailedReviewSet)
     } catch (error) {
       this.failProject(taskId, projectId, error, {
         detail: '协议附件仍保留在项目中，可查看日志定位索引失败原因'
@@ -1229,7 +1354,8 @@ export class ProjectManagementService {
     taskId: string,
     projectId: string,
     documentIds: string[],
-    externalProcessing: boolean
+    externalProcessing: boolean,
+    replaceFailedReviewSet = false
   ): Promise<void> {
     let analyzedCurrent = 0
     let analyzedTotal = 0
@@ -1248,6 +1374,9 @@ export class ProjectManagementService {
       if (!chunks.length) throw new Error('协议没有可分析的正文分块')
       const primaryDocumentId = documentIds[documentIds.length - 1]
       const settings = this.modelSettings()
+      if (this.db.getReviewProjectRequirementSet(projectId) && !replaceFailedReviewSet) {
+        throw new Error('项目已有待审核需求版本，请先完成审核并发布后再分析新协议')
+      }
       const set = this.db.createProjectRequirementSet({
         projectId,
         documentId: primaryDocumentId,
@@ -1583,6 +1712,10 @@ export class ProjectManagementService {
         { role: 'user', content: source }
       ],
       format: 'json',
+      // Agreement extraction is a structured, bounded-output workflow.  Keep
+      // it deterministic even when the online model profile enables thinking;
+      // `reasoningEffort` takes precedence over the persisted online switch.
+      reasoningEffort: 'none',
       think: false,
       temperature: 0,
       numPredict: mode === 'compact'
@@ -2147,7 +2280,7 @@ export class ProjectManagementService {
       throw new Error('项目数据文件内容无效')
     }
     const value = payload as Record<string, unknown>
-    if (value.format !== 'visslm-project' || value.version !== 1) {
+    if (value.format !== 'visslm-project' || (value.version !== 1 && value.version !== 2)) {
       throw new Error('项目数据文件格式或版本不受支持')
     }
     const project = value.project
@@ -2160,6 +2293,18 @@ export class ProjectManagementService {
     }
     for (const field of ['documents', 'people', 'participants', 'costs', 'assets', 'tasks', 'requirements', 'matches']) {
       if (!Array.isArray(value[field])) throw new Error(`项目数据文件缺少有效的 ${field} 数据`)
+    }
+    if (value.version === 2) {
+      for (const field of [
+        'requirementSets',
+        'matchRuns',
+        'matchCandidates',
+        'traceMetadata'
+      ]) {
+        if (value[field] !== undefined && !Array.isArray(value[field])) {
+          throw new Error(`项目数据文件的 ${field} 数据无效`)
+        }
+      }
     }
     return value as unknown as ProjectDataSnapshot
   }

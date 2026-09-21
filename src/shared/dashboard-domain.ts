@@ -1,7 +1,10 @@
 import type {
+  DashboardDomainReceipt,
+  DashboardSpec,
   DashboardComponentType,
   DashboardSlotRole
 } from './dashboard'
+import type { DataScope } from './query-spec'
 
 /**
  * Stable domain vocabulary used by the first dashboard slice.
@@ -133,6 +136,95 @@ export interface DashboardGoldenScenario {
   clarificationKeys?: readonly string[]
 }
 
+/** Entry point used by the guided scenario flow. */
+export type DashboardScenarioEntry = 'gallery' | 'assistant' | 'blank'
+
+/** Data source selected for a scenario draft. */
+export type DashboardScenarioDataMode = 'controlled-sample' | 'platform-adapter'
+
+/** Coarse readiness state shown before the generator is invoked. */
+export type DashboardReadinessLevel = 'ready' | 'partial' | 'blocked'
+
+export type DashboardReadinessBlockerCode =
+  | 'scenario-not-found'
+  | 'scenario-not-active'
+  | 'role-not-supported'
+  | 'adapter-required'
+  | 'adapter-invalid'
+  | 'adapter-scope-violation'
+  | 'insufficient-permission'
+  | 'profile-failed'
+  | 'metric-field-missing'
+  | 'metric-field-invalid'
+  | 'evidence-unavailable'
+
+export interface DashboardScenarioMetricReadiness {
+  metricId: string
+  availability: DashboardMetricAvailability
+  /** Resolved only after a non-sensitive numeric platform field is verified. */
+  resolvedField?: string
+  reason?: string
+}
+
+/**
+ * Explainable, non-sensitive readiness result used by the scenario gallery and
+ * wizard. It is intentionally separate from DashboardDomainGenerationResult:
+ * readiness must be available before a query or model generation is attempted.
+ */
+export interface DashboardScenarioReadiness {
+  scenarioId: string
+  role: DashboardDomainRole
+  dataMode: DashboardScenarioDataMode
+  level: DashboardReadinessLevel
+  metricStatuses: DashboardScenarioMetricReadiness[]
+  projectIds: string[]
+  nodeTypes: string[]
+  missingPermissions: string[]
+  missingEvidence: string[]
+  warnings: string[]
+  blockers: Array<{ code: DashboardReadinessBlockerCode; message: string }>
+  checkedAt: string
+  adapterId?: string
+  tailoringBaselineId?: string
+  /** Number of profiled fields; never contains field values or record payloads. */
+  profiledFieldCount: number
+}
+
+/** Result returned by the structured scenario entry; mirrors the chat path. */
+export interface DashboardScenarioGenerationResult {
+  status: 'ready' | 'clarification' | 'rejected'
+  dashboard?: DashboardSpec
+  scenario?: string
+  dataMode?: DashboardScenarioDataMode
+  adapterId?: string
+  sourceSystem?: string
+  receipt?: DashboardDomainReceipt
+  reason?: string
+  answer?: string
+  clarification?: {
+    reason?: string
+    options?: readonly { id: string; label: string; recommended: boolean }[]
+  }
+}
+
+/**
+ * Draft exchanged between the gallery/wizard and the main process. It carries
+ * no credentials; the adapter is revalidated in the main process on every
+ * readiness or generation request.
+ */
+export interface DashboardScenarioDraft {
+  entry: DashboardScenarioEntry
+  scenarioId: string
+  role: DashboardDomainRole
+  dataMode: DashboardScenarioDataMode
+  scope: DataScope
+  adapter?: DashboardDomainPlatformAdapter
+  requestedPermissions?: readonly string[]
+  metricOverrides?: Record<string, unknown>
+  componentOverrides?: Record<string, unknown>
+  generatedAt: string
+}
+
 export interface DashboardQualityWeights {
   businessMetric: 30
   processCompliance: 20
@@ -166,4 +258,43 @@ export interface DashboardDomainCatalog {
   components: readonly DashboardDomainComponent[]
   processBindings: readonly ProcessBinding[]
   qualityPolicy: DashboardQualityPolicy
+}
+
+export interface DashboardDomainAdapterMetricBinding {
+  metricId: string
+  field: string
+  aggregation: 'count' | 'countDistinct' | 'sum' | 'avg' | 'min' | 'max'
+}
+
+export interface DashboardDomainAdapterQuestionBinding {
+  questionId: string
+  dimensionFields: readonly string[]
+}
+
+export interface DashboardDomainAdapterEvidenceBinding {
+  processBindingId: string
+  evidenceStatus: DashboardEvidenceStatus
+  /** Stable reference to the verified platform evidence source. */
+  sourceKey: string
+}
+
+/**
+ * Explicit, fail-closed mapping from one golden scenario to synchronized
+ * platform records. Adapter configuration never contains credentials.
+ */
+export interface DashboardDomainPlatformAdapter {
+  schemaVersion: '1.0'
+  id: string
+  scenarioId: string
+  sourceSystem: string
+  /** Explicit project boundary for this adapter; an empty list is invalid and fails closed. */
+  allowedProjectIds: readonly string[]
+  /** Capabilities granted to the adapter runtime (never credentials). */
+  permissions: readonly string[]
+  nodeTypes: readonly string[]
+  tailoringBaselineId: string
+  metricBindings: readonly DashboardDomainAdapterMetricBinding[]
+  questionBindings: readonly DashboardDomainAdapterQuestionBinding[]
+  evidenceBindings: readonly DashboardDomainAdapterEvidenceBinding[]
+  updatedAt: string
 }

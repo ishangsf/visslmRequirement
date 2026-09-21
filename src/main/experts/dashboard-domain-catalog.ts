@@ -680,6 +680,193 @@ const metrics: readonly MetricCatalogEntry[] = [
     processRequirementIds: ['process.build-reproducibility-verification'],
     availability: 'missing',
     format: 'percent'
+  },
+  {
+    id: 'process-activity-execution-rate',
+    label: '过程活动执行率',
+    definition: '当前适用裁剪基线内已按要求执行并形成可核验记录的过程活动数量占应执行活动总数的比例。',
+    formulaVersion: 'sample-process-activity-execution-rate-v1',
+    sourceFields: [sourceField('sample.compliance.activity_execution', 'Gjb5000bComplianceSample', 'activityExecutionRate', 'record.processDomainId -> processActivity.domainId', 'insufficient', '真实适配器需关联适用裁剪基线、活动状态和执行记录。')],
+    timeSemantics: '过程检查快照；适用活动集合必须由同一有效裁剪基线确定。',
+    applicableScopes: ['managed-project', 'process-domain', 'tailoring-baseline'],
+    thresholds: [
+      sampleThreshold('sample-activity-execution-low', '受控样例：执行不足', 'lt', 0.9, '仅为样例分段'),
+      sampleThreshold('sample-activity-execution-good', '受控样例：执行较充分', 'gte', 0.9, '不代表官方符合性结论')
+    ],
+    ownerRoles: ['qa-epg', 'model-org-manager'],
+    processRequirementIds: ['process.activity-execution-evidence'],
+    availability: 'insufficient',
+    format: 'percent'
+  },
+  {
+    id: 'work-product-completeness-rate',
+    label: '工作产品完整率',
+    definition: '当前适用过程范围内已形成、标识并通过完整性检查的工作产品数量占应形成工作产品总数的比例。',
+    formulaVersion: 'sample-work-product-completeness-rate-v1',
+    sourceFields: [sourceField('sample.compliance.work_product_completeness', 'Gjb5000bComplianceSample', 'workProductCompletenessRate', 'record.processDomainId -> workProduct.domainId', 'insufficient', '真实适配器需提供应交付清单、版本和检查记录。')],
+    timeSemantics: '工作产品审计快照；应交付清单和检查状态必须绑定同一阶段。',
+    applicableScopes: ['managed-project', 'process-domain', 'lifecycle-stage'],
+    thresholds: [
+      sampleThreshold('sample-work-product-incomplete', '受控样例：不完整', 'lt', 1, '需下钻缺失或未确认工作产品'),
+      sampleThreshold('sample-work-product-complete', '受控样例：完整', 'eq', 1, '不代表官方符合性结论')
+    ],
+    ownerRoles: ['qa-epg', 'model-org-manager'],
+    processRequirementIds: ['process.work-product-completeness-audit'],
+    availability: 'insufficient',
+    format: 'percent'
+  },
+  {
+    id: 'evidence-sufficiency-rate',
+    label: '证据充分率',
+    definition: '经内部检查达到完整、有效、可追溯要求的过程证据项数量占应提供证据项总数的比例。',
+    formulaVersion: 'sample-evidence-sufficiency-rate-v1',
+    sourceFields: [sourceField('sample.compliance.evidence_sufficiency', 'Gjb5000bComplianceSample', 'evidenceSufficiencyRate', 'record.processDomainId -> processEvidence.domainId', 'missing', '真实适配器需提供证据规则、检查结论和追溯关系。')],
+    timeSemantics: '内部证据检查快照；证据规则版本、检查人和检查时间必须留痕。',
+    applicableScopes: ['managed-project', 'process-domain', 'tailoring-baseline'],
+    thresholds: [
+      sampleThreshold('sample-evidence-insufficient', '受控样例：证据不足', 'lt', 0.9, '需下钻缺失和不足证据'),
+      sampleThreshold('sample-evidence-sufficient', '受控样例：内部检查较充分', 'gte', 0.9, '不构成官方审核结论')
+    ],
+    ownerRoles: ['qa-epg', 'model-org-manager'],
+    processRequirementIds: ['process.evidence-sufficiency-review'],
+    availability: 'missing',
+    format: 'percent'
+  },
+  {
+    id: 'process-deviation-count',
+    label: '过程偏差数',
+    definition: '当前检查快照中已识别且尚未完成批准处置或关闭验证的过程偏差数量。',
+    formulaVersion: 'sample-process-deviation-count-v1',
+    sourceFields: [sourceField('sample.compliance.process_deviations', 'Gjb5000bComplianceSample', 'processDeviationCount', 'record.snapshotId -> processDeviation.snapshotId', 'partial')],
+    timeSemantics: '过程检查快照趋势；偏差识别和关闭判定必须使用一致规则。',
+    applicableScopes: ['managed-project', 'process-domain'],
+    thresholds: [
+      sampleThreshold('sample-process-deviation-none', '受控样例：无开放偏差', 'eq', 0, '仅为样例分段'),
+      sampleThreshold('sample-process-deviation-existing', '受控样例：存在开放偏差', 'gt', 0, '需要结合影响和批准状态判断')
+    ],
+    ownerRoles: ['qa-epg', 'model-org-manager'],
+    processRequirementIds: ['process.deviation-control'],
+    availability: 'partial',
+    format: 'number'
+  },
+  {
+    id: 'nonconformity-closure-rate',
+    label: '不符合项关闭率',
+    definition: '统计周期内完成原因分析、整改、验证并被确认关闭的不符合项数量占同期应关闭不符合项总数的比例。',
+    formulaVersion: 'sample-nonconformity-closure-rate-v1',
+    sourceFields: [sourceField('sample.compliance.nonconformity_closure', 'Gjb5000bComplianceSample', 'nonconformityClosureRate', 'record.processDomainId -> nonconformity.domainId', 'insufficient', '真实适配器需提供整改、验证和关闭历史。')],
+    timeSemantics: '整改统计周期；关闭必须包含独立验证结果，不得仅以状态字段替代。',
+    applicableScopes: ['managed-project', 'process-domain', 'audit-cycle'],
+    thresholds: [
+      sampleThreshold('sample-nonconformity-closure-low', '受控样例：闭环不足', 'lt', 0.9, '需下钻逾期和验证未通过项'),
+      sampleThreshold('sample-nonconformity-closure-good', '受控样例：闭环较好', 'gte', 0.9, '不代表官方符合性结论')
+    ],
+    ownerRoles: ['qa-epg', 'model-org-manager'],
+    processRequirementIds: ['process.nonconformity-closure-verification'],
+    availability: 'insufficient',
+    format: 'percent'
+  },
+  {
+    id: 'project-quality-dispersion-score',
+    label: '项目间质量差异评分',
+    definition: '按固定质量指标集合、标准化规则和权重预计算的项目间质量离散程度评分；不得由普通平均值冒充方差计算。',
+    formulaVersion: 'sample-project-quality-dispersion-score-v1',
+    sourceFields: [sourceField('sample.organization.quality_dispersion', 'OrganizationImprovementSample', 'qualityDispersionScore', 'record.organizationId -> measurementBaseline.organizationId', 'insufficient', '真实适配器需提供同口径项目质量指标和离散度计算明细。')],
+    timeSemantics: '组织度量周期快照；参与项目集合、标准化规则和权重必须随公式版本固定。',
+    applicableScopes: ['organization', 'project-portfolio', 'measurement-cycle'],
+    thresholds: [
+      sampleThreshold('sample-quality-dispersion-low', '受控样例：差异较小', 'lt', 0.3, '仅为样例分段'),
+      sampleThreshold('sample-quality-dispersion-high', '受控样例：差异较大', 'gte', 0.6, '需下钻项目和指标构成')
+    ],
+    ownerRoles: ['model-org-manager', 'qa-epg'],
+    processRequirementIds: ['process.organization-measurement-analysis'],
+    availability: 'insufficient',
+    format: 'number'
+  },
+  {
+    id: 'estimation-deviation-rate',
+    label: '估算偏差率',
+    definition: '已完成工作项实际工作量与批准估算工作量之差的绝对值占批准估算工作量的比例。',
+    formulaVersion: 'sample-estimation-deviation-rate-v1',
+    sourceFields: [sourceField('sample.organization.estimation_deviation', 'OrganizationImprovementSample', 'estimationDeviationRate', 'record.projectId -> estimateBaseline.projectId', 'partial')],
+    timeSemantics: '项目完工或阶段关闭快照；估算基线、实际工作量和排除规则必须一致。',
+    applicableScopes: ['organization', 'managed-project', 'lifecycle-stage'],
+    thresholds: [
+      sampleThreshold('sample-estimation-deviation-low', '受控样例：偏差较小', 'lte', 0.15, '仅为样例分段'),
+      sampleThreshold('sample-estimation-deviation-high', '受控样例：偏差较大', 'gt', 0.3, '需下钻估算假设和范围变更')
+    ],
+    ownerRoles: ['model-org-manager', 'qa-epg'],
+    processRequirementIds: ['process.estimation-baseline-review'],
+    availability: 'partial',
+    format: 'percent'
+  },
+  {
+    id: 'delivery-productivity-index',
+    label: '交付生产率指数',
+    definition: '按组织统一规模、工作量和复杂度校正规则形成的版本化归一生产率指数；不同计量单位不得直接混合比较。',
+    formulaVersion: 'sample-delivery-productivity-index-v1',
+    sourceFields: [sourceField('sample.organization.productivity_index', 'OrganizationImprovementSample', 'productivityIndex', 'record.projectId -> productivityBaseline.projectId', 'insufficient', '真实适配器需提供规模、工作量、复杂度和归一规则。')],
+    timeSemantics: '组织度量周期；仅比较同一公式版本和可比项目类型。',
+    applicableScopes: ['organization', 'managed-project', 'measurement-cycle'],
+    thresholds: [
+      sampleThreshold('sample-productivity-index-low', '受控样例：相对偏低', 'lt', 0.8, '仅能在同口径项目间比较'),
+      sampleThreshold('sample-productivity-index-good', '受控样例：相对较好', 'gte', 1, '不等同于人员绩效评价')
+    ],
+    ownerRoles: ['model-org-manager', 'qa-epg'],
+    processRequirementIds: ['process.productivity-baseline-analysis'],
+    availability: 'insufficient',
+    format: 'number'
+  },
+  {
+    id: 'defect-escape-rate',
+    label: '缺陷逃逸率',
+    definition: '在后续阶段或交付后发现、且按规则归属于前序阶段应发现的缺陷数量占同期确认缺陷总数的比例。',
+    formulaVersion: 'sample-defect-escape-rate-v1',
+    sourceFields: [sourceField('sample.organization.defect_escape_rate', 'OrganizationImprovementSample', 'defectEscapeRate', 'record.snapshotId -> defectOrigin.snapshotId', 'missing', '真实适配器需提供缺陷注入阶段、发现阶段和归因审核。')],
+    timeSemantics: '组织质量周期趋势；缺陷归因规则和观察窗口必须固定。',
+    applicableScopes: ['organization', 'project-portfolio', 'quality-cycle'],
+    thresholds: [
+      sampleThreshold('sample-defect-escape-low', '受控样例：逃逸较低', 'lte', 0.05, '仅为样例分段'),
+      sampleThreshold('sample-defect-escape-high', '受控样例：逃逸偏高', 'gt', 0.1, '需下钻注入与发现阶段')
+    ],
+    ownerRoles: ['model-org-manager', 'qa-epg'],
+    processRequirementIds: ['process.defect-causal-analysis'],
+    availability: 'missing',
+    format: 'percent'
+  },
+  {
+    id: 'process-improvement-completion-rate',
+    label: '过程改进完成率',
+    definition: '统计周期内完成实施、效果验证并通过关闭评审的过程改进项数量占同期计划关闭改进项总数的比例。',
+    formulaVersion: 'sample-process-improvement-completion-rate-v1',
+    sourceFields: [sourceField('sample.organization.improvement_completion', 'OrganizationImprovementSample', 'improvementCompletionRate', 'record.cycleId -> improvementAction.cycleId', 'partial')],
+    timeSemantics: '组织改进周期；仅实施未验证的改进项不得计为完成。',
+    applicableScopes: ['organization', 'improvement-cycle'],
+    thresholds: [
+      sampleThreshold('sample-improvement-completion-low', '受控样例：推进不足', 'lt', 0.8, '需下钻逾期和验证未完成项'),
+      sampleThreshold('sample-improvement-completion-good', '受控样例：推进较好', 'gte', 0.8, '仅为样例分段')
+    ],
+    ownerRoles: ['model-org-manager', 'qa-epg'],
+    processRequirementIds: ['process.improvement-action-closure'],
+    availability: 'partial',
+    format: 'percent'
+  },
+  {
+    id: 'organizational-baseline-stability-rate',
+    label: '组织基线稳定率',
+    definition: '当前组织过程与度量基线中在观察周期内未发生未批准或高频变更的基线项数量占有效基线项总数的比例。',
+    formulaVersion: 'sample-organizational-baseline-stability-rate-v1',
+    sourceFields: [sourceField('sample.organization.baseline_stability', 'OrganizationImprovementSample', 'baselineStabilityRate', 'record.baselineGroupId -> organizationalBaseline.groupId', 'missing', '真实适配器需提供基线版本、变更审批和生效历史。')],
+    timeSemantics: '组织基线观察周期；稳定性窗口和高频变更阈值必须版本化。',
+    applicableScopes: ['organization', 'organizational-baseline', 'measurement-cycle'],
+    thresholds: [
+      sampleThreshold('sample-org-baseline-unstable', '受控样例：稳定性不足', 'lt', 0.85, '需下钻频繁或未批准变更'),
+      sampleThreshold('sample-org-baseline-stable', '受控样例：相对稳定', 'gte', 0.85, '仅为样例分段')
+    ],
+    ownerRoles: ['model-org-manager', 'qa-epg'],
+    processRequirementIds: ['process.organizational-baseline-governance'],
+    availability: 'missing',
+    format: 'percent'
   }
 ]
 
@@ -1057,6 +1244,127 @@ const questions: readonly DashboardDomainQuestion[] = [
     required: true,
     priority: 90,
     clarificationKeys: ['build-version', 'toolchain-version', 'artifact-checksum']
+  },
+  {
+    id: 'gjb5000b-compliance-activity-question',
+    question: '适用裁剪基线中的过程活动是否真实执行并留下可核验记录？',
+    metricIds: ['process-activity-execution-rate'],
+    line: 'process',
+    slotRole: 'headline',
+    preferredComponentTypes: ['progress', 'gauge'],
+    required: true,
+    priority: 100,
+    clarificationKeys: ['tailoring-baseline', 'process-domain']
+  },
+  {
+    id: 'gjb5000b-compliance-work-product-question',
+    question: '适用过程要求的工作产品是否完整形成并通过内部检查？',
+    metricIds: ['work-product-completeness-rate'],
+    line: 'process',
+    slotRole: 'headline',
+    preferredComponentTypes: ['gauge', 'progress'],
+    required: true,
+    priority: 95,
+    clarificationKeys: ['lifecycle-stage', 'work-product-list']
+  },
+  {
+    id: 'gjb5000b-compliance-evidence-question',
+    question: '各过程域的证据是否完整、有效且可追溯？',
+    metricIds: ['evidence-sufficiency-rate'],
+    line: 'process',
+    slotRole: 'breakdown',
+    preferredComponentTypes: ['bar', 'ranking'],
+    required: true,
+    priority: 95,
+    clarificationKeys: ['process-domain', 'evidence-rule-version']
+  },
+  {
+    id: 'gjb5000b-compliance-deviation-question',
+    question: '开放过程偏差数量如何变化，是否形成受控处置？',
+    metricIds: ['process-deviation-count'],
+    line: 'process',
+    slotRole: 'trend',
+    preferredComponentTypes: ['line', 'bar'],
+    required: true,
+    priority: 90,
+    clarificationKeys: ['audit-cycle', 'deviation-rule']
+  },
+  {
+    id: 'gjb5000b-compliance-nonconformity-question',
+    question: '各过程域不符合项是否完成原因分析、整改、验证和关闭？',
+    metricIds: ['nonconformity-closure-rate'],
+    line: 'quality',
+    slotRole: 'diagnosis',
+    preferredComponentTypes: ['ranking', 'bar'],
+    required: true,
+    priority: 90,
+    clarificationKeys: ['audit-cycle', 'closure-verification-rule']
+  },
+  {
+    id: 'organization-improvement-quality-dispersion-question',
+    question: '项目群质量表现差异是否扩大并需要组织干预？',
+    metricIds: ['project-quality-dispersion-score'],
+    line: 'organization',
+    slotRole: 'headline',
+    preferredComponentTypes: ['kpi', 'gauge'],
+    required: true,
+    priority: 100,
+    clarificationKeys: ['project-portfolio', 'measurement-baseline']
+  },
+  {
+    id: 'organization-improvement-estimation-question',
+    question: '项目群估算偏差是否处于组织可接受范围？',
+    metricIds: ['estimation-deviation-rate'],
+    line: 'execution',
+    slotRole: 'headline',
+    preferredComponentTypes: ['gauge', 'progress'],
+    required: true,
+    priority: 95,
+    clarificationKeys: ['project-portfolio', 'estimate-baseline']
+  },
+  {
+    id: 'organization-improvement-productivity-question',
+    question: '在统一归一口径下，各项目交付生产率指数如何分布？',
+    metricIds: ['delivery-productivity-index'],
+    line: 'organization',
+    slotRole: 'breakdown',
+    preferredComponentTypes: ['bar', 'ranking'],
+    required: true,
+    priority: 95,
+    clarificationKeys: ['project-type', 'productivity-formula-version']
+  },
+  {
+    id: 'organization-improvement-defect-escape-question',
+    question: '缺陷逃逸率随组织质量周期如何变化？',
+    metricIds: ['defect-escape-rate'],
+    line: 'quality',
+    slotRole: 'trend',
+    preferredComponentTypes: ['line', 'bar'],
+    required: true,
+    priority: 90,
+    clarificationKeys: ['quality-cycle', 'defect-attribution-rule']
+  },
+  {
+    id: 'organization-improvement-completion-question',
+    question: '计划改进项是否完成实施、效果验证和关闭评审？',
+    metricIds: ['process-improvement-completion-rate'],
+    line: 'process',
+    slotRole: 'diagnosis',
+    preferredComponentTypes: ['progress', 'gauge'],
+    required: true,
+    priority: 90,
+    clarificationKeys: ['improvement-cycle', 'effectiveness-rule']
+  },
+  {
+    id: 'organization-improvement-baseline-question',
+    question: '哪些组织基线组存在频繁或未批准变更，稳定性不足？',
+    metricIds: ['organizational-baseline-stability-rate'],
+    line: 'process',
+    slotRole: 'detail',
+    preferredComponentTypes: ['ranking', 'bar'],
+    required: true,
+    priority: 85,
+    clarificationKeys: ['organizational-baseline', 'stability-window']
   }
 ]
 
@@ -1366,6 +1674,105 @@ const components: readonly DashboardDomainComponent[] = [
     questionIds: ['configuration-change-reproducible-build-question'],
     line: 'quality',
     slotRole: 'diagnosis'
+  },
+  {
+    id: 'gjb5000b-compliance-activity-card',
+    label: '过程活动执行率',
+    type: 'progress',
+    metricIds: ['process-activity-execution-rate'],
+    questionIds: ['gjb5000b-compliance-activity-question'],
+    line: 'process',
+    slotRole: 'headline'
+  },
+  {
+    id: 'gjb5000b-compliance-work-product-card',
+    label: '工作产品完整率',
+    type: 'gauge',
+    metricIds: ['work-product-completeness-rate'],
+    questionIds: ['gjb5000b-compliance-work-product-question'],
+    line: 'process',
+    slotRole: 'headline'
+  },
+  {
+    id: 'gjb5000b-compliance-evidence-card',
+    label: '过程域证据充分率',
+    type: 'bar',
+    metricIds: ['evidence-sufficiency-rate'],
+    questionIds: ['gjb5000b-compliance-evidence-question'],
+    line: 'process',
+    slotRole: 'breakdown'
+  },
+  {
+    id: 'gjb5000b-compliance-deviation-card',
+    label: '过程偏差趋势',
+    type: 'line',
+    metricIds: ['process-deviation-count'],
+    questionIds: ['gjb5000b-compliance-deviation-question'],
+    line: 'process',
+    slotRole: 'trend'
+  },
+  {
+    id: 'gjb5000b-compliance-nonconformity-card',
+    label: '不符合项关闭率排行',
+    type: 'ranking',
+    metricIds: ['nonconformity-closure-rate'],
+    questionIds: ['gjb5000b-compliance-nonconformity-question'],
+    line: 'quality',
+    slotRole: 'diagnosis'
+  },
+  {
+    id: 'organization-improvement-quality-dispersion-card',
+    label: '项目间质量差异评分',
+    type: 'kpi',
+    metricIds: ['project-quality-dispersion-score'],
+    questionIds: ['organization-improvement-quality-dispersion-question'],
+    line: 'organization',
+    slotRole: 'headline'
+  },
+  {
+    id: 'organization-improvement-estimation-card',
+    label: '估算偏差率',
+    type: 'gauge',
+    metricIds: ['estimation-deviation-rate'],
+    questionIds: ['organization-improvement-estimation-question'],
+    line: 'execution',
+    slotRole: 'headline'
+  },
+  {
+    id: 'organization-improvement-productivity-card',
+    label: '项目生产率指数对比',
+    type: 'bar',
+    metricIds: ['delivery-productivity-index'],
+    questionIds: ['organization-improvement-productivity-question'],
+    line: 'organization',
+    slotRole: 'breakdown'
+  },
+  {
+    id: 'organization-improvement-defect-escape-card',
+    label: '缺陷逃逸率趋势',
+    type: 'line',
+    metricIds: ['defect-escape-rate'],
+    questionIds: ['organization-improvement-defect-escape-question'],
+    line: 'quality',
+    slotRole: 'trend'
+  },
+  {
+    id: 'organization-improvement-completion-card',
+    label: '过程改进完成率',
+    type: 'progress',
+    metricIds: ['process-improvement-completion-rate'],
+    questionIds: ['organization-improvement-completion-question'],
+    line: 'process',
+    slotRole: 'diagnosis'
+  },
+  {
+    id: 'organization-improvement-baseline-card',
+    label: '组织基线稳定率排行',
+    type: 'ranking',
+    metricIds: ['organizational-baseline-stability-rate'],
+    questionIds: ['organization-improvement-baseline-question'],
+    line: 'process',
+    slotRole: 'detail'
   }
 ]
 
@@ -1754,6 +2161,138 @@ const processBindings: readonly ProcessBinding[] = [
     evidenceStatus: 'missing',
     sourceKey: 'sample.process.build-reproducibility-verification',
     evidenceRule: '源码、依赖、工具链、参数、环境和制品校验值必须完整留痕。'
+  },
+  {
+    id: 'process.activity-execution-evidence',
+    metricIds: ['process-activity-execution-rate'],
+    requirementId: 'sample-process-activity-execution-evidence',
+    tailoringBaselineId: sampleBaselineId,
+    activityId: 'sample-activity-process-execution-review',
+    workProductId: 'sample-work-product-activity-execution-record',
+    evidenceId: 'sample-evidence-activity-execution',
+    evidenceStatus: 'insufficient',
+    sourceKey: 'sample.process.activity-execution-evidence',
+    evidenceRule: '适用活动、责任人、执行时间、输入输出和执行记录必须完整关联。'
+  },
+  {
+    id: 'process.work-product-completeness-audit',
+    metricIds: ['work-product-completeness-rate'],
+    requirementId: 'sample-process-work-product-completeness-audit',
+    tailoringBaselineId: sampleBaselineId,
+    activityId: 'sample-activity-work-product-audit',
+    workProductId: 'sample-work-product-completeness-checklist',
+    evidenceId: 'sample-evidence-work-product-audit',
+    evidenceStatus: 'insufficient',
+    sourceKey: 'sample.process.work-product-completeness-audit',
+    evidenceRule: '应形成工作产品、实际版本、检查结论和批准状态必须可追溯。'
+  },
+  {
+    id: 'process.evidence-sufficiency-review',
+    metricIds: ['evidence-sufficiency-rate'],
+    requirementId: 'sample-process-evidence-sufficiency-review',
+    tailoringBaselineId: sampleBaselineId,
+    activityId: 'sample-activity-evidence-sufficiency-review',
+    workProductId: 'sample-work-product-evidence-review-record',
+    evidenceId: 'sample-evidence-evidence-traceability',
+    evidenceStatus: 'missing',
+    sourceKey: 'sample.process.evidence-sufficiency-review',
+    evidenceRule: '证据规则、证据项、关联活动和工作产品、检查结论必须完整关联。'
+  },
+  {
+    id: 'process.deviation-control',
+    metricIds: ['process-deviation-count'],
+    requirementId: 'sample-process-deviation-control',
+    tailoringBaselineId: sampleBaselineId,
+    activityId: 'sample-activity-deviation-control',
+    workProductId: 'sample-work-product-deviation-register',
+    evidenceId: 'sample-evidence-deviation-disposition',
+    evidenceStatus: 'missing',
+    sourceKey: 'sample.process.deviation-control',
+    evidenceRule: '偏差原因、影响分析、批准处置、责任人和关闭验证必须形成闭环。'
+  },
+  {
+    id: 'process.nonconformity-closure-verification',
+    metricIds: ['nonconformity-closure-rate'],
+    requirementId: 'sample-process-nonconformity-closure-verification',
+    tailoringBaselineId: sampleBaselineId,
+    activityId: 'sample-activity-nonconformity-closure-verification',
+    workProductId: 'sample-work-product-corrective-action-record',
+    evidenceId: 'sample-evidence-nonconformity-verification',
+    evidenceStatus: 'insufficient',
+    sourceKey: 'sample.process.nonconformity-closure-verification',
+    evidenceRule: '原因分析、整改措施、实施结果、独立验证和关闭决定必须完整关联。'
+  },
+  {
+    id: 'process.organization-measurement-analysis',
+    metricIds: ['project-quality-dispersion-score'],
+    requirementId: 'sample-process-organization-measurement-analysis',
+    tailoringBaselineId: sampleBaselineId,
+    activityId: 'sample-activity-organization-measurement-analysis',
+    workProductId: 'sample-work-product-quality-dispersion-analysis',
+    evidenceId: 'sample-evidence-quality-dispersion-calculation',
+    evidenceStatus: 'insufficient',
+    sourceKey: 'sample.process.organization-measurement-analysis',
+    evidenceRule: '项目集合、指标口径、标准化规则、权重和离散度计算明细必须可复核。'
+  },
+  {
+    id: 'process.estimation-baseline-review',
+    metricIds: ['estimation-deviation-rate'],
+    requirementId: 'sample-process-estimation-baseline-review',
+    tailoringBaselineId: sampleBaselineId,
+    activityId: 'sample-activity-estimation-baseline-review',
+    workProductId: 'sample-work-product-estimation-deviation-analysis',
+    evidenceId: 'sample-evidence-estimation-baseline',
+    evidenceStatus: 'insufficient',
+    sourceKey: 'sample.process.estimation-baseline-review',
+    evidenceRule: '批准估算、实际工作量、范围变更和偏差原因必须完整关联。'
+  },
+  {
+    id: 'process.productivity-baseline-analysis',
+    metricIds: ['delivery-productivity-index'],
+    requirementId: 'sample-process-productivity-baseline-analysis',
+    tailoringBaselineId: sampleBaselineId,
+    activityId: 'sample-activity-productivity-baseline-analysis',
+    workProductId: 'sample-work-product-productivity-baseline',
+    evidenceId: 'sample-evidence-productivity-normalization',
+    evidenceStatus: 'missing',
+    sourceKey: 'sample.process.productivity-baseline-analysis',
+    evidenceRule: '规模、工作量、复杂度、项目类型和归一公式版本必须可复核。'
+  },
+  {
+    id: 'process.defect-causal-analysis',
+    metricIds: ['defect-escape-rate'],
+    requirementId: 'sample-process-defect-causal-analysis',
+    tailoringBaselineId: sampleBaselineId,
+    activityId: 'sample-activity-defect-causal-analysis',
+    workProductId: 'sample-work-product-defect-causal-analysis',
+    evidenceId: 'sample-evidence-defect-attribution',
+    evidenceStatus: 'missing',
+    sourceKey: 'sample.process.defect-causal-analysis',
+    evidenceRule: '缺陷注入阶段、发现阶段、归因审核和改进动作必须完整关联。'
+  },
+  {
+    id: 'process.improvement-action-closure',
+    metricIds: ['process-improvement-completion-rate'],
+    requirementId: 'sample-process-improvement-action-closure',
+    tailoringBaselineId: sampleBaselineId,
+    activityId: 'sample-activity-improvement-action-closure',
+    workProductId: 'sample-work-product-improvement-action-report',
+    evidenceId: 'sample-evidence-improvement-effectiveness',
+    evidenceStatus: 'insufficient',
+    sourceKey: 'sample.process.improvement-action-closure',
+    evidenceRule: '改进目标、实施记录、效果度量、验证结论和关闭评审必须完整关联。'
+  },
+  {
+    id: 'process.organizational-baseline-governance',
+    metricIds: ['organizational-baseline-stability-rate'],
+    requirementId: 'sample-process-organizational-baseline-governance',
+    tailoringBaselineId: sampleBaselineId,
+    activityId: 'sample-activity-organizational-baseline-governance',
+    workProductId: 'sample-work-product-organizational-baseline-history',
+    evidenceId: 'sample-evidence-baseline-change-approval',
+    evidenceStatus: 'missing',
+    sourceKey: 'sample.process.organizational-baseline-governance',
+    evidenceRule: '基线版本、变更原因、审批、生效时间和稳定性观察窗口必须完整留痕。'
   }
 ]
 
@@ -1792,6 +2331,18 @@ const configurationChangeQuestionIds = questions
   .map((question) => question.id)
 const configurationChangeComponentIds = components
   .filter((component) => component.id.startsWith('configuration-change-'))
+  .map((component) => component.id)
+const gjb5000bComplianceQuestionIds = questions
+  .filter((question) => question.id.startsWith('gjb5000b-compliance-'))
+  .map((question) => question.id)
+const gjb5000bComplianceComponentIds = components
+  .filter((component) => component.id.startsWith('gjb5000b-compliance-'))
+  .map((component) => component.id)
+const organizationImprovementQuestionIds = questions
+  .filter((question) => question.id.startsWith('organization-improvement-'))
+  .map((question) => question.id)
+const organizationImprovementComponentIds = components
+  .filter((component) => component.id.startsWith('organization-improvement-'))
   .map((component) => component.id)
 
 const scenarios: readonly DashboardGoldenScenario[] = [
@@ -1909,33 +2460,40 @@ const scenarios: readonly DashboardGoldenScenario[] = [
   },
   {
     id: 'gjb5000b-compliance',
-    name: '过程证据审计',
-    description: '裁剪基线、过程活动和证据链的受控样例；不代表官方符合性结论。',
-    status: 'planned',
+    name: 'GJB5000B 过程符合度与证据审计',
+    description: '围绕裁剪基线、过程活动、工作产品、证据、偏差和整改闭环的内部受控样例；不代表官方符合性结论。',
+    status: 'active',
     roleIds: ['qa-epg', 'model-org-manager'],
-    metricIds: ['process-compliance'],
-    questionIds: ['project-overview-process-question'],
-    componentIds: ['project-overview-process-card'],
-    lines: ['process']
+    metricIds: [
+      'process-activity-execution-rate',
+      'work-product-completeness-rate',
+      'evidence-sufficiency-rate',
+      'process-deviation-count',
+      'nonconformity-closure-rate'
+    ],
+    questionIds: gjb5000bComplianceQuestionIds,
+    componentIds: gjb5000bComplianceComponentIds,
+    lines: ['process', 'quality'],
+    clarificationKeys: ['project-key', 'tailoring-baseline', 'process-domain', 'audit-cycle']
   },
   {
     id: 'organization-improvement',
-    name: '组织改进',
-    description: '组织级项目风险和健康信号的受控样例。',
-    status: 'planned',
+    name: '组织级度量与过程改进',
+    description: '以项目群质量差异、估算、生产率、缺陷逃逸、改进闭环和组织基线稳定为主线的受控样例。',
+    status: 'active',
     roleIds: ['model-org-manager', 'qa-epg'],
-    metricIds: ['project-health', 'high-risk-count', 'process-compliance'],
-    questionIds: [
-      'project-overview-health-question',
-      'project-overview-risk-question',
-      'project-overview-process-question'
+    metricIds: [
+      'project-quality-dispersion-score',
+      'estimation-deviation-rate',
+      'delivery-productivity-index',
+      'defect-escape-rate',
+      'process-improvement-completion-rate',
+      'organizational-baseline-stability-rate'
     ],
-    componentIds: [
-      'project-overview-health-card',
-      'project-overview-risk-card',
-      'project-overview-process-card'
-    ],
-    lines: ['organization', 'process']
+    questionIds: organizationImprovementQuestionIds,
+    componentIds: organizationImprovementComponentIds,
+    lines: ['organization', 'execution', 'quality', 'process'],
+    clarificationKeys: ['organization-scope', 'project-portfolio', 'measurement-cycle', 'measurement-baseline']
   }
 ]
 

@@ -83,6 +83,7 @@ import appIconDark from './assets/visslm-icon.png'
 import appIconLight from './assets/visslm-icon-light.png'
 import { RichDescription } from './RichDescription'
 import { ResizableTable } from './ResizableTable'
+import DashboardAdapterSettings from './dashboard/DashboardAdapterSettings'
 import {
   ArtifactExportPanel,
   assistantSkillPresentation
@@ -291,7 +292,7 @@ function ThemedAppIcon({ alt }: { alt: string }): React.JSX.Element {
   return <img src={themeMode === 'light' ? appIconLight : appIconDark} alt={alt} />
 }
 
-type SystemSettingsTabKey = 'platform' | 'model' | 'general' | 'features'
+type SystemSettingsTabKey = 'platform' | 'model' | 'general' | 'features' | 'dashboard-adapters'
 type FeatureDropPosition = 'before' | 'after'
 type FeatureDropTarget = {
   key: FeatureModuleKey
@@ -302,7 +303,8 @@ const systemSettingsTabKeys: readonly SystemSettingsTabKey[] = [
   'platform',
   'model',
   'general',
-  'features'
+  'features',
+  'dashboard-adapters'
 ]
 
 const isSystemSettingsTabKey = (key: string): key is SystemSettingsTabKey =>
@@ -4808,7 +4810,7 @@ function KnowledgeBasePage({ refreshKey }: { refreshKey: number }): React.JSX.El
       onOk: async () => {
         const result = await window.visslm.deleteKnowledgeDocument(document.id)
         result.ok ? message.success(result.message) : message.error(result.message)
-        if (detail?.id === document.id) closeDetail()
+        if (result.ok && detail?.id === document.id) closeDetail()
         await load()
       }
     })
@@ -8067,7 +8069,14 @@ function ChatPage({
                     {activeRecordDetail.name}
                   </Descriptions.Item>
                   <Descriptions.Item label="UID">
-                    {activeRecordDetail.uid}
+                    <a
+                      href={`http://visionmc.vicp.net:889/alm/Home/Jump?id=${encodeURIComponent(activeRecordDetail.uid)}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      aria-label={`在平台打开记录 ${activeRecordDetail.uid}`}
+                    >
+                      {activeRecordDetail.uid}
+                    </a>
                   </Descriptions.Item>
                   <Descriptions.Item label="类型">
                     {activeRecordDetail.nodeType}
@@ -8082,6 +8091,11 @@ function ChatPage({
                     {formatDate(activeRecordDetail.lastModifyTime)}
                   </Descriptions.Item>
                 </Descriptions>
+                <Divider titlePlacement="start">描述信息</Divider>
+                <RichDescription
+                  html={activeRecordDetail.description}
+                  images={recordImagePage?.images ?? activeRecordDetail.images}
+                />
                 {activeRecordDetail.imageCount > 0 && (
                   <>
                     <Divider titlePlacement="start">图片资源</Divider>
@@ -11064,6 +11078,11 @@ function SettingsPage({
                   </section>
                 </div>
               )
+            },
+            {
+              key: 'dashboard-adapters',
+              label: '数据适配器',
+              children: <DashboardAdapterSettings settings={settings} onChanged={onChanged} />
             },
             {
               key: 'features',

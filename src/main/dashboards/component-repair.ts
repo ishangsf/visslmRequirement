@@ -68,7 +68,10 @@ const numericProfiles = (profiles: FieldProfile[]): FieldProfile[] =>
   )
 
 const uniqueId = (preferred: string, used: Set<string>): string => {
-  const base = preferred.trim().replace(/[^A-Za-z0-9_]/g, '_') || 'metric'
+  // QuerySpec accepts any non-empty measure id. Preserve stable domain ids
+  // (which commonly contain dots and hyphens) because analysisBlueprint and
+  // semanticBinding refer to the exact id. Repair only emptiness/duplicates.
+  const base = preferred.trim() || 'metric'
   let candidate = base
   let suffix = 2
   while (used.has(candidate)) candidate = `${base}_${suffix++}`
@@ -92,7 +95,7 @@ const repairMeasures = (
     const originalId = measure.id?.trim() || `metric${index + 1}`
     const id = uniqueId(originalId, used)
     if (!idMap.has(originalId)) idMap.set(originalId, id)
-    if (id !== originalId) actions.push(`将重复或无效指标标识调整为 ${id}`)
+    if (id !== originalId) actions.push(`将重复或空指标标识调整为 ${id}`)
     return { measure, id }
   })
 
@@ -386,11 +389,13 @@ const toDataPoints = (
   const labelField = component.encoding?.label
   const valueField = component.encoding?.value
   const secondaryField = component.encoding?.secondaryValue
+  const valueScale = component.encoding?.valueScale ?? 1
+  const secondaryValueScale = component.encoding?.secondaryValueScale ?? 1
   if (!valueField) return []
   return dataset.rows.map((row, index) => ({
     name: String(labelField ? row[labelField] ?? `数据 ${index + 1}` : component.title),
-    value: Number(row[valueField] ?? 0),
-    ...(secondaryField ? { secondaryValue: Number(row[secondaryField] ?? 0) } : {})
+    value: Number(row[valueField] ?? 0) * valueScale,
+    ...(secondaryField ? { secondaryValue: Number(row[secondaryField] ?? 0) * secondaryValueScale } : {})
   }))
 }
 

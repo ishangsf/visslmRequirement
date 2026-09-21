@@ -5,6 +5,7 @@ import type {
   DashboardLayout
 } from '../../../shared/dashboard'
 import type { FieldProfile, QueryDimension, QueryMeasure, QuerySpec } from '../../../shared/query-spec'
+import { dashboardComponentStyleForType } from '../../../shared/dashboard-component-options'
 import {
   dashboardGridColumns,
   dashboardGridRows,
@@ -20,7 +21,8 @@ const categoryTypes = new Set<DashboardComponentType>([
   'ranking',
   'funnel',
   'radar',
-  'treemap'
+  'treemap',
+  'comparison-bars'
 ])
 
 export const dashboardComponentDataShape = (
@@ -30,7 +32,7 @@ export const dashboardComponentDataShape = (
   if (categoryTypes.has(type)) return 'category-value'
   if (type === 'line') return 'time-series'
   if (type === 'scatter' || type === 'combo') return 'dual-measure'
-  if (type === 'table') return 'detail'
+  if (type === 'table' || type === 'data-matrix' || type === 'description-list') return 'detail'
   return 'text'
 }
 
@@ -305,6 +307,8 @@ export const planDashboardComponentTypeChange = (
     ...component,
     type: targetType,
     layout,
+    style: dashboardComponentStyleForType(targetType, component.style),
+    content: component.content?.kind === targetType ? component.content : undefined,
     ...(queryAdaptation ? {
       query: queryAdaptation.query,
       encoding: queryAdaptation.encoding

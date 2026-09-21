@@ -14,6 +14,8 @@ import {
   sanitizeContextText
 } from '../../context-budget'
 import { assertAssistantAgentToolAllowed } from '../agent-registry'
+import { executeRegionalRequirements, renderRegionalRequirements } from '../regional-requirements'
+import type { RegionalRequirementRequest, RegionalRequirementResult } from '../regional-requirements'
 
 const MODEL_TOOL_TEXT_LIMIT = 4_096
 const MODEL_TOOL_FIELD_LIMIT = 512
@@ -30,6 +32,7 @@ export type DataCenterPlanIntent =
   | 'search_content'
 
 export interface DataCenterQueryPlan {
+  regionalRequirements?: RegionalRequirementRequest
   sourceMode: 'conversation' | 'records' | 'knowledge' | 'mixed'
   needsClarification: boolean
   clarificationQuestion?: string
@@ -266,6 +269,14 @@ export class DataCenterAgent {
   }
 
   executePlan(projectId: string | undefined, plan: DataCenterQueryPlan): DataCenterExecution {
+    if (plan.regionalRequirements) {
+      assertAssistantAgentToolAllowed('data-center', 'query_records_by_fields')
+      return {
+        toolName: 'query_records_by_fields',
+        args: { result_mode: 'grouped_list', group_entities: plan.regionalRequirements.groups.map((group) => group.name) },
+        result: executeRegionalRequirements(this.db, plan.regionalRequirements, projectId, plan.scope, plan.scope?.baseFilters?.map(scopeFilterToDatabaseFilter))
+      }
+    }
     // Keep direct/legacy callers safe even when a planner has mistaken the
     // collection noun for a full-text term. The returned aggregate result is
     // still rendered against the original plan by renderVerifiedAnswer, which
@@ -872,6 +883,7 @@ export class DataCenterAgent {
     result: unknown,
     modelAnswer: string
   ): string {
+    if (plan.regionalRequirements) return renderRegionalRequirements(result as RegionalRequirementResult, modelAnswer)
     if (plan.intent === 'count_matching' && result && typeof result === 'object') {
       const aggregateValue = Number((result as { value?: unknown }).value)
       if (isUnconstrainedRecordCountPlan(plan) && Number.isFinite(aggregateValue)) {
