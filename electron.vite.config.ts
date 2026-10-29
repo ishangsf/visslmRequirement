@@ -37,7 +37,8 @@ export default defineConfig({
         input: {
           index: resolve(__dirname, 'src/main/index.ts'),
           'database-bootstrap-worker': resolve(__dirname, 'src/main/database-bootstrap-worker.ts'),
-          'embedding-worker': resolve(__dirname, 'src/main/embedding-worker.ts')
+          'embedding-worker': resolve(__dirname, 'src/main/embedding-worker.ts'),
+          'dashboard-mcp-worker': resolve(__dirname, 'src/main/dashboards/mcp-stdio.ts')
         },
         output: {
           entryFileNames: '[name].js',
@@ -63,6 +64,10 @@ export default defineConfig({
     plugins: [stripSvarRemoteFontFaces(), react()],
     build: {
       rollupOptions: {
+        input: {
+          index: resolve(__dirname, 'src/renderer/index.html'),
+          'dashboard-preview': resolve(__dirname, 'src/renderer/dashboard-preview.html')
+        },
         output: {
           manualChunks(id) {
             const normalizedId = id.replaceAll('\\', '/')

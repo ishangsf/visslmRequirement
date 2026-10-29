@@ -732,9 +732,9 @@ for (const [name, draft] of [
   assert.doesNotMatch(draft.summary, new RegExp(rawPlanStatusMessage), `${name} 摘要不得回显原始状态消息`)
 }
 const completedPlanStatuses = [
-  workLogForStatus('route', '执行准备已完成。'),
-  workLogForStatus('plan', '已确定处理方式。'),
-  workLogForStatus('generate', '准备已完成。')
+  workLogForStatus('route', '执行准备已完成。', 'completed'),
+  workLogForStatus('plan', '已确定处理方式。', 'completed'),
+  workLogForStatus('generate', '准备已完成。', 'completed')
 ]
 for (const draft of completedPlanStatuses) {
   assert.equal(draft.stage, 'execution-preparation', '准备完成状态必须保持 execution-preparation 生命周期')

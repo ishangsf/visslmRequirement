@@ -39,7 +39,7 @@ React 页面 -> window.visslm -> preload/index.ts -> ipcRenderer.invoke(channel)
 | API-IPC-003 | `window:close` / `closeWindow` | 无 | `Promise<void>` | `WindowTitleBar`；`index.ts:129` / BrowserWindow；无表 |
 | API-IPC-004 | `window:is-maximized` / `isWindowMaximized` | 无 | `Promise<boolean>` | `WindowTitleBar`；`index.ts:130` / BrowserWindow；无表 |
 | API-IPC-005 | `settings:get` / `getSettings` | 无 | `AppSettings`；配置损坏时导航/同步配置回退默认值 | `AppShell`、`SettingsPage`：`App.tsx:3910,3371-3855`；`index.ts:132` / `SettingsService.getAll`；`settings` |
-| API-IPC-006 | `settings:save-platform` / `savePlatformSettings` | `PlatformSettingsInput {baseUrl, username, token?, uploadPassword?}` | `AppSettings`；返回仅含 `hasToken/hasUploadPassword`，safeStorage 不可用时 rejection | `SettingsPage`；`index.ts:133-135` / `SettingsService.savePlatform`；`settings` |
+| API-IPC-006 | `settings:save-platform` / `savePlatformSettings` | `PlatformSettingsInput {baseUrl, username, token?, uploadPassword?, mcpServerPath?}` | `AppSettings`；凭据仅返回 `hasToken/hasUploadPassword`，safeStorage 不可用时 rejection；MCP 路径留空使用内置版本，否则必须为 JS 文件绝对路径 | `SettingsPage`；`SettingsService.savePlatform`；`settings` |
 | API-IPC-007 | `settings:save-model` / `saveModelSettings` | `ModelSettings`；online 时 apiKey 可选且仅非空时更新 | `AppSettings`；未保存 API Key 不会被清空是当前实现行为 | `SettingsPage`；`index.ts:136-138` / `SettingsService.saveModel`；`settings` |
 | API-IPC-008 | `settings:save-features` / `saveFeatureSettings` | `FeatureModuleSettings` | `AppSettings`；键由固定 feature key 集合写入 | `SettingsPage`；`index.ts:139-141` / `SettingsService.saveFeatures`；`settings` |
 | API-IPC-009 | `settings:save-navigation-order` / `saveNavigationOrder` | `FeatureNavigationOrder` | `AppSettings`；未知/重复键被归一化，版本不匹配回默认 | `SettingsPage`；`index.ts:142-144` / `SettingsService.saveNavigationOrder`；`settings` |
@@ -76,7 +76,7 @@ React 页面 -> window.visslm -> preload/index.ts -> ipcRenderer.invoke(channel)
 | API-IPC-028 | `chat:save-session` / `saveChatSession` | `ChatSessionSaveInput {id,title?,messages}` | `ChatSession`；消息结构会被清洗/截断 | `ChatPage`；`index.ts:184-186` / DB；`chat_sessions` |
 | API-IPC-029 | `chat:delete-session` / `deleteChatSession` | `id: string` | `ChatSessionDeleteResult` | `ChatPage`；`index.ts:187-189` / DB；`chat_sessions` |
 | API-IPC-030 | `analytics:field-profiles` / `listFieldProfiles` | `DataScope?` | `FieldProfile[]`；无记录返回空数组 | `DashboardStudio`：`DashboardStudio.tsx:345,907`；`index.ts:266-268` / `QueryEngine.profile`；`records`,`field_profiles` |
-| API-IPC-031 | `analytics:field-profile-semantics` / `saveFieldProfileSemantics` | `scope,field,patch {displayName?,role?,synonyms?,sensitivity?}` | `FieldProfile|null`；非法 role/sensitivity 或字段不存在时 rejection/null | **renderer 当前未找到调用，可能未使用**；preload `index.ts:104-107`，handler `index.ts:269-273` / DB；`field_profiles` |
+| API-IPC-031 | `analytics:field-profile-semantics` / `saveFieldProfileSemantics` | `scope,field,patch {displayName?,role?,synonyms?,sensitivity?,businessMeaning?,unit?,valueLabels?}` | `FieldProfile|null`；定义截断至 1000 字符、单位截断至 40 字符、最多 100 个编码释义；非法类型或枚举超限 rejection | 资产中心字段语义词典；`QueryEngine.updateFieldProfileSemantics` / DB；`field_profiles` |
 | API-IPC-032 | `analytics:execute-query` / `executeQuery` | `QuerySpec`：最多 8 指标、2 维度、12 filters、limit 1-500 | `QueryDataset {columns,rows,scannedRows,matchedRows,truncated,elapsedMs}`；validator rejection | `DashboardStudio`：`DashboardStudio.tsx:373,413`；`index.ts:274-275` / `QueryEngine.execute`；`records`,`field_profiles`,`query_cache` |
 
 ### 2.4 Dashboard 与可视化专家工作台

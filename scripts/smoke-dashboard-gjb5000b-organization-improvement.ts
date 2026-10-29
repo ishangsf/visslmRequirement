@@ -33,6 +33,7 @@ globalThis.fetch = (async () => {
 
 try {
   const result = await runDashboardDomainChatRequest({
+    domainSelection: { scenario: organizationImprovementGoldenFixture.scenario, role: organizationImprovementGoldenFixture.role, tailoringBaselineId: 'sample-tailoring-baseline-v1' },
     question: organizationImprovementGoldenFixture.request,
     scope: { projectIds: [organizationImprovementGoldenFixture.projectId] },
     generatedAt: organizationImprovementGoldenFixture.generatedAt
@@ -78,6 +79,7 @@ try {
     raw: Object.fromEntries(Object.entries(record.raw).filter(([field]) => field !== 'defectEscapeRate'))
   }))
   const missingEscapeEvidence = await runDashboardDomainChatRequest({
+    domainSelection: { scenario: organizationImprovementGoldenFixture.scenario, role: organizationImprovementGoldenFixture.role, tailoringBaselineId: 'sample-tailoring-baseline-v1' },
     question: organizationImprovementGoldenFixture.request,
     scope: { projectIds: [organizationImprovementGoldenFixture.projectId] },
     generatedAt: organizationImprovementGoldenFixture.generatedAt
@@ -86,6 +88,7 @@ try {
   assert.equal(missingEscapeEvidence.reason, 'missing-metric-source')
 
   const roleMismatch = await runDashboardDomainChatRequest({
+    domainSelection: { scenario: scenario!.id, role: 'rd-lead', tailoringBaselineId: 'sample-tailoring-baseline-v1' },
     question: '研发负责人基于受控样例生成组织级度量与过程改进大屏',
     scope: { projectIds: [organizationImprovementGoldenFixture.projectId] },
     generatedAt: organizationImprovementGoldenFixture.generatedAt

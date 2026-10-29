@@ -1,4 +1,5 @@
 import { safeStorage } from 'electron'
+import { isAbsolute } from 'node:path'
 import type {
   AppSettings,
   DashboardDomainPlatformAdapterSaveInput,
@@ -106,7 +107,8 @@ export class SettingsService {
         baseUrl: this.db.getSetting('platform.baseUrl') ?? DEFAULT_PLATFORM_URL,
         username: this.db.getSetting('platform.username') ?? '',
         hasToken: Boolean(this.db.getSetting('platform.token')),
-        hasUploadPassword: Boolean(this.db.getSetting('platform.uploadPassword'))
+        hasUploadPassword: Boolean(this.db.getSetting('platform.uploadPassword')),
+        mcpServerPath: this.db.getSetting('platform.mcpServerPath') ?? ''
       },
       system: {
         userPropertyKeys: this.getUserPropertyKeys()
@@ -174,10 +176,13 @@ export class SettingsService {
   }
 
   savePlatform(input: PlatformSettingsInput): AppSettings {
+    const mcpPath = input.mcpServerPath?.trim()
+    if (mcpPath && (!isAbsolute(mcpPath) || !/\.[cm]?js$/i.test(mcpPath))) throw new Error('MCP 服务入口必须是 JavaScript 文件的绝对路径。')
     this.db.setSetting('platform.baseUrl', input.baseUrl.trim().replace(/\/+$/, ''))
     this.db.setSetting('platform.username', input.username.trim())
     if (input.token?.trim()) this.writeSecret('platform.token', input.token.trim())
     if (input.uploadPassword?.length) this.writeSecret('platform.uploadPassword', input.uploadPassword)
+    if (mcpPath !== undefined) this.db.setSetting('platform.mcpServerPath', mcpPath)
     return this.getAll()
   }
 

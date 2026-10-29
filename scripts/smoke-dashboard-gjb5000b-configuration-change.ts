@@ -35,6 +35,7 @@ globalThis.fetch = (async () => {
 
 try {
   const result = await runDashboardDomainChatRequest({
+    domainSelection: { scenario: configurationChangeGoldenFixture.scenario, role: configurationChangeGoldenFixture.role, tailoringBaselineId: 'sample-tailoring-baseline-v1' },
     question: configurationChangeGoldenFixture.request,
     scope: { projectIds: [configurationChangeGoldenFixture.projectId] },
     generatedAt: configurationChangeGoldenFixture.generatedAt
@@ -82,6 +83,7 @@ try {
     raw: Object.fromEntries(Object.entries(record.raw).filter(([field]) => field !== 'reproducibleBuildRate'))
   }))
   const missingBuildEvidence = await runDashboardDomainChatRequest({
+    domainSelection: { scenario: configurationChangeGoldenFixture.scenario, role: configurationChangeGoldenFixture.role, tailoringBaselineId: 'sample-tailoring-baseline-v1' },
     question: configurationChangeGoldenFixture.request,
     scope: { projectIds: [configurationChangeGoldenFixture.projectId] },
     generatedAt: configurationChangeGoldenFixture.generatedAt
@@ -91,6 +93,7 @@ try {
   assert.equal(missingBuildEvidence.dashboard, undefined)
 
   const roleMismatch = await runDashboardDomainChatRequest({
+    domainSelection: { scenario: scenario!.id, role: 'model-org-manager', tailoringBaselineId: 'sample-tailoring-baseline-v1' },
     question: '型号组织管理负责人基于受控样例生成配置管理与变更控制大屏',
     scope: { projectIds: [configurationChangeGoldenFixture.projectId] },
     generatedAt: configurationChangeGoldenFixture.generatedAt

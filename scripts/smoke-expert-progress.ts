@@ -1,3 +1,4 @@
+import '../tests/helpers/visualization-discovery-fixture'
 import { strict as assert } from 'node:assert'
 import { QueryEngine } from '../src/main/analytics/query-engine'
 import type { AnalyticsRecord, AppDatabase } from '../src/main/database'
@@ -79,6 +80,8 @@ try {
     'intent',
     'profile',
     'plan',
+    'profile',
+    'plan',
     'query',
     'execute',
     'compose',
@@ -90,7 +93,7 @@ try {
   assert.equal(runs[0].status, 'success')
   assert.deepEqual(
     [...new Set(runs[0].toolCalls.map((call) => call.tool))],
-    ['profile-fields', 'model-compose', 'validate-dashboard', 'execute-query']
+    ['profile-fields', 'mcp-call', 'discover-analysis', 'model-compose', 'plan-analysis', 'validate-semantics', 'validate-dashboard', 'execute-query', 'quality-check', 'goal-coverage', 'render-preview']
   )
   assert.equal(runs[0].toolCalls.filter((call) => call.tool === 'execute-query').length, 4)
   assert.ok(runs[0].toolCalls.every((call, index) => call.sequence === index + 1))

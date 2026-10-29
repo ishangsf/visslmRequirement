@@ -1,3 +1,4 @@
+import '../tests/helpers/visualization-discovery-fixture'
 import { strict as assert } from 'node:assert'
 import { QueryEngine } from '../src/main/analytics/query-engine'
 import type { AnalyticsRecord, AppDatabase } from '../src/main/database'
@@ -132,7 +133,7 @@ const runCanonicalMetadataLabelContract = (): void => {
     { ...dateProfile, field: '_valm_LastModifyTime', displayName: undefined },
     ...profiled.filter((profile) => profile.field !== 'lastModifyTime')
   ]
-  const blueprint = planAnalysisBlueprint('按最后修改时间生成趋势', scope, profiles)
+  const blueprint = planAnalysisBlueprint('按最后修改时间生成趋势', scope, profiles, { fields: ['lastModifyTime'] })
   const trendQuestions = blueprint.questions.filter((question) =>
     question.dimensionFields.includes('lastModifyTime')
   )
@@ -171,11 +172,11 @@ const settings = {
   thinking: false
 }
 
-assert.equal(resolveVisualizationRequestMode('生成项目管理大屏看板', true), 'generate')
+assert.equal(resolveVisualizationRequestMode('生成项目管理大屏看板', true, undefined, 'generate'), 'generate')
 assert.equal(
   resolveVisualizationRequestMode(
     '生成项目管理看板，最低不少于8个组件，需要统计开发负责人排行、测试负责人排行、发布数排行。',
-    true
+    true, undefined, 'generate'
   ),
   'generate'
 )
@@ -201,7 +202,7 @@ assert.equal(expertRouter.route({
 const modelResponses = [
   [{ op: 'set-dashboard-title', value: 'Operations overview' }],
   [{ op: 'set-theme', value: 'light-business' }],
-  [{ op: 'set-dashboard-title', value: 'Issue count' }],
+  [{ op: 'set-component-title', componentId: 'kpi-total', value: 'Issue count' }],
   [{ op: 'set-component-limit', componentId: 'kpi-total', limit: 25 }],
   [{
     op: 'set-component-sort',
@@ -210,6 +211,7 @@ const modelResponses = [
     sortDirection: 'desc'
   }],
   [
+    { op: 'set-component-type', componentId: 'kpi-total', value: 'line' },
     { op: 'set-component-time-grain', componentId: 'kpi-total', timeGrain: 'month' }
   ],
   [{ op: 'set-component-subtitle', componentId: 'kpi-total', value: 'Monthly tracked issues' }],
@@ -701,7 +703,7 @@ const runSemanticPatchContract = async (): Promise<void> => {
 
 await runSemanticPatchContract()
 
-const runBlueprintFirstContract = async (): Promise<void> => {
+const runSemanticCompositionContract = async (): Promise<void> => {
   const previousFetch = globalThis.fetch
   const ambiguousRequest = '生成研发质量大屏；负责人可能指开发负责人或测试负责人，请保留歧义并说明假设。'
   const ambiguousBlueprint: DashboardAnalysisBlueprint = {
@@ -739,59 +741,19 @@ const runBlueprintFirstContract = async (): Promise<void> => {
     const firstPrompt = firstMessages
       .map((message) => typeof message.content === 'string' ? message.content : '')
       .join('\n')
-    const promptBlueprintPayload = firstMessages
-      .map((message) => {
-        if (typeof message.content !== 'string') return undefined
-        try {
-          return JSON.parse(message.content) as Record<string, unknown>
-        } catch {
-          return undefined
-        }
-      })
-      .find((payload) => payload && payload.analysisBlueprint && typeof payload.analysisBlueprint === 'object')
-    const promptBlueprint = promptBlueprintPayload?.analysisBlueprint as {
-      request?: unknown
-      metrics?: Array<{ id?: unknown; measureId?: unknown }>
-      questions?: Array<{ id?: unknown; metricIds?: unknown }>
-    } | undefined
-    assert.ok(modelBodies.length > 0, 'Blueprint-first 生成必须发起模型请求')
-    assert.match(firstPrompt, /analysisBlueprint/, '模型 prompt 必须包含主机先生成的 AnalysisBlueprint')
-    assert.ok(promptBlueprint, '模型 prompt 必须携带 concrete AnalysisBlueprint，而不是仅写审计标签')
-    assert.equal(promptBlueprint?.request, ambiguousRequest)
-    assert.ok((promptBlueprint?.metrics?.length ?? 0) > 0, 'prompt Blueprint 必须包含 concrete metric ids')
-    assert.ok((promptBlueprint?.questions?.length ?? 0) > 0, 'prompt Blueprint 必须包含 concrete question ids')
-    const promptMetricIds = new Set(
-      (promptBlueprint?.metrics ?? []).map((metric) => metric.id).filter((id): id is string => typeof id === 'string' && id.length > 0)
-    )
-    assert.equal(promptMetricIds.size, promptBlueprint?.metrics?.length,
-      'prompt Blueprint metric ids 必须非空且唯一')
-    for (const question of promptBlueprint?.questions ?? []) {
-      assert.ok(typeof question.id === 'string' && question.id.length > 0,
-        'prompt Blueprint question id 必须为非空字符串')
-      assert.ok(Array.isArray(question.metricIds), 'prompt Blueprint question 必须绑定 metric ids')
-      for (const metricId of question.metricIds as unknown[]) {
-        assert.ok(typeof metricId === 'string' && promptMetricIds.has(metricId),
-          `prompt Blueprint question ${String(question.id)} 引用了不存在的 metric id`)
-      }
-    }
-    const run = auditRuns.find((item) => item.mode === 'generate' && item.status === 'success')
-    assert.ok(run, 'Blueprint-first 生成必须写入成功审计记录')
-    const planCall = run.toolCalls.find((call) => call.tool === 'plan-analysis')
-    const composeCall = run.toolCalls.find((call) => call.tool === 'model-compose')
-    assert.ok(planCall && composeCall, '生成审计必须同时包含 plan-analysis 与 model-compose')
-    assert.ok(planCall.sequence < composeCall.sequence,
-      'plan-analysis 必须在 model-compose 之前完成')
-    assert.ok(generated.analysisBlueprint, '生成结果必须携带 AnalysisBlueprint')
-    assert.deepEqual(
-      generated.analysisBlueprint.metrics.map((metric) => metric.id),
-      [...promptMetricIds],
-      '最终 Blueprint 必须延续 prompt 中主机先生成的 metric ids'
-    )
-    assert.deepEqual(
-      generated.analysisBlueprint.questions.map((question) => question.id),
-      (promptBlueprint?.questions ?? []).map((question) => question.id),
-      '最终 Blueprint 必须延续 prompt 中主机先生成的 question ids'
-    )
+
+    const payload = JSON.parse(String(firstMessages.at(-1)?.content))
+    assert.equal(payload.request, ambiguousRequest, 'original objective reaches the model')
+    assert.ok(Array.isArray(payload.fieldCatalog), 'the model receives real field metadata')
+    assert.equal(payload.analysisBlueprint, undefined, 'keyword-derived blueprint must not constrain the model')
+    const run = auditRuns.find(item => item.mode === 'generate' && item.status === 'success')
+    assert.ok(run)
+    const composeCall = run.toolCalls.find(call => call.tool === 'model-compose')
+    const planCall = run.toolCalls.find(call => call.tool === 'plan-analysis')
+    assert.ok(composeCall && planCall)
+    assert.ok(composeCall.sequence < planCall.sequence, 'host contract derives from the model query plan')
+    assert.ok(generated.analysisBlueprint)
+    assert.deepEqual(validateDashboardSemanticConsistency(generated), [])
     assert.ok(generated.analysisBlueprint.assumptions.length > 0,
       '歧义请求必须记录 assumptions')
     assert.ok(generated.analysisBlueprint.unresolvedAmbiguities.length > 0,
@@ -916,7 +878,8 @@ const runAiScatterContract = async (): Promise<void> => {
   const scatterBlueprint = planAnalysisBlueprint(
     '生成投入工时与评分的双指标散点图',
     scatterScope,
-    new QueryEngine(fakeDb).profile(scatterScope)
+    new QueryEngine(fakeDb).profile(scatterScope),
+    { componentType: 'scatter' }
   )
   const scatterQuestion = scatterBlueprint.questions.find((question) =>
     question.preferredComponentTypes.includes('scatter')
@@ -1037,6 +1000,6 @@ const runAiScatterContract = async (): Promise<void> => {
 }
 
 runCanonicalMetadataLabelContract()
-await runBlueprintFirstContract()
+await runSemanticCompositionContract()
 await runLegacyUpgradeContract()
 await runAiScatterContract()

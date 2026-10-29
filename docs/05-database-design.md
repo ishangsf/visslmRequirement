@@ -271,6 +271,7 @@
 | `display_name` | `TEXT NOT NULL DEFAULT ''` | 用户设置的显示名 |
 | `role` | `TEXT NOT NULL DEFAULT ''` | `dimension`、`measure`、`time`、`identifier` |
 | `synonyms_json` | `TEXT NOT NULL DEFAULT '[]'` | 字段别名，最多 12 个 |
+| `business_semantics_json` | `TEXT NOT NULL DEFAULT '{}'` | 人工业务定义 `businessMeaning`、单位 `unit`、编码释义 `valueLabels`；刷新画像时保留 |
 | `sensitivity` | `TEXT NOT NULL DEFAULT 'normal'` | `normal`、`internal`、`sensitive` |
 | `profiled_at` | `TEXT NOT NULL` | 画像时间 |
 | `data_revision` | `INTEGER NOT NULL` | 与 `settings` 中的 `analytics:data-revision` 对应 |

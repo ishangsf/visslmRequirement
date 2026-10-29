@@ -1,4 +1,4 @@
-import type { PushConfig, PushFieldMapping } from '../../shared/types'
+import type { PushConfig, PushFieldMapping, PushValueOptions } from '../../shared/types'
 import {
   defaultPushTargetField,
   pushForbiddenSourceFields,
@@ -12,12 +12,13 @@ export {
   pushMappingIdentifierPattern
 } from '../../shared/push-field-mapping'
 
-export type PushFormValues = Omit<PushConfig, 'recordUids' | 'fieldMappings'>
+export type PushFormValues = Omit<PushConfig, 'recordUids' | 'fieldMappings' | keyof PushValueOptions>
 
 export type PushConfigDraft = {
   version: 3
   formValues: Partial<PushFormValues>
   fieldMappings: PushFieldMapping[]
+  valueOptions?: PushValueOptions
   mappingInitialized: boolean
   /**
    * Legacy generated mappings need a first record before they can be rebuilt
@@ -66,6 +67,7 @@ export const parsePushConfigDraft = (parsed: unknown): PushConfigDraft | null =>
   if ((parsed.version === 2 || parsed.version === 3) && ![
     'formValues',
     'fieldMappings',
+    'valueOptions',
     'mappingInitialized',
     'selectedRowKeys',
     'search',
@@ -83,6 +85,26 @@ export const parsePushConfigDraft = (parsed: unknown): PushConfigDraft | null =>
   }
 
   const usedMappingIds = new Set<string>()
+  const valueOptions: PushValueOptions | undefined = isRecordObject(parsed.valueOptions)
+    ? {
+        userMappingFields: Array.isArray(parsed.valueOptions.userMappingFields)
+          ? parsed.valueOptions.userMappingFields.filter((value): value is string => typeof value === 'string') : [],
+        unmappedUserPolicy: parsed.valueOptions.unmappedUserPolicy === 'keep' ? 'keep' : 'error',
+        userMappings: Array.isArray(parsed.valueOptions.userMappings)
+          ? parsed.valueOptions.userMappings.map((value, index) => ({
+              id: `restored-user-${index}`,
+              sourceLogin: isRecordObject(value) && typeof value.sourceLogin === 'string' ? value.sourceLogin : '',
+              targetLogin: isRecordObject(value) && typeof value.targetLogin === 'string' ? value.targetLogin : ''
+            })) : [],
+        fixedParameters: Array.isArray(parsed.valueOptions.fixedParameters)
+          ? parsed.valueOptions.fixedParameters.map((value, index) => ({
+              id: `restored-fixed-${index}`,
+              location: isRecordObject(value) && value.location === 'query' ? 'query' : 'body',
+              key: isRecordObject(value) && typeof value.key === 'string' ? value.key : '',
+              valueType: isRecordObject(value) && value.valueType === 'json' ? 'json' : 'text',
+              value: isRecordObject(value) && typeof value.value === 'string' ? value.value : ''
+            })) : []
+      } : undefined
   const fieldMappings = Array.isArray(parsed.fieldMappings)
     ? parsed.fieldMappings.flatMap((value, index) => {
         if (!isRecordObject(value)) return []
@@ -125,6 +147,7 @@ export const parsePushConfigDraft = (parsed: unknown): PushConfigDraft | null =>
     version: 3,
     formValues,
     fieldMappings,
+    ...(valueOptions ? { valueOptions } : {}),
     // Keep an explicit initialization marker even when every old mapping row
     // was forbidden, otherwise navigation would silently repopulate the table.
     mappingInitialized,

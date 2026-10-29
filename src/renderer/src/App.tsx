@@ -102,6 +102,9 @@ import {
   writePushConfigDraft
 } from './push-config-draft'
 import type { PushConfigDraft, PushFormValues } from './push-config-draft'
+import type { PushValueOptions } from '../../shared/types'
+import { compilePushValueTransforms } from '../../shared/push-value-transforms'
+import { PushValueOptionsEditor } from './PushValueOptionsEditor'
 import type { AppThemeMode } from './theme'
 import type { DashboardSpec } from '../../shared/dashboard'
 import type {
@@ -115,6 +118,7 @@ import {
   stripRedundantAssistantCitationSections
 } from '../../shared/chat-message-format'
 import { deriveAssistantWorkspaceReadiness } from '../../shared/assistant-readiness'
+import { PlatformEvidenceModal } from './PlatformEvidenceModal'
 import type { AgentEvent, AgentMatchProgress, AgentProgress, ExpertId } from '../../shared/expert-types'
 import {
   DEFAULT_PROJECT_MATCHING_SETTINGS,
@@ -195,7 +199,7 @@ import type {
   SyncScopeConfig,
   UpdateStatus
 } from '../../shared/types'
-import { resolveNaturalLanguageDeliveryIntent } from '../../shared/assistant-natural-language'
+
 
 const { Content, Sider } = Layout
 const { Title, Text, Paragraph } = Typography
@@ -1686,25 +1690,6 @@ const explicitAgentSkillOf = (question: string): string | undefined => {
   if (/@交付物专家(?:\s|$)/.test(question)) return 'artifact'
   if (/@通用数据助手(?:\s|$)/.test(question)) return 'general'
   return undefined
-}
-
-const followUpQuestionOf = (question: string): boolean => (
-  /(?:刚才|上一轮|前面|上述|以上|前述|继续(?:查|分析|看|说)?|这些(?:记录|数据|文档|结果)?|它们|这个结果|那个结果)/.test(question)
-)
-
-/**
- * Natural-language delivery requests may refer to the answer immediately
- * before them instead of naming a new query target.  Such a request can be
- * fulfilled from the local evidence ledger without sending a meaningless
- * "上一轮" query back through the data agents.
- */
-const isNaturalLanguageDeliveryReference = (queryText: string): boolean => {
-  const normalized = queryText
-    .trim()
-    .replace(/[\s，。！？；：,.!?;:、]+$/gu, '')
-    .replace(/[\s]+/gu, '')
-  if (!normalized || normalized.length > 32) return false
-  return /^(?:(?:请|麻烦|帮我|把|将|对|基于|依据|根据)*(?:(?:上一轮|上轮|上一条|最近一条|前一条)(?:的)?(?:回答|结果|数据|记录|内容|查询结果)?|(?:刚才|刚刚|前面|上述|以上|前述)(?:的)?(?:回答|结果|数据|记录|内容|查询结果)?|这些(?:回答|结果|数据|记录|内容)?|这个(?:回答|结果|数据|记录|内容)|那个(?:回答|结果|数据|记录|内容))(?:进行)?(?:整理|汇总|梳理|导出|生成)?)$/u.test(normalized)
 }
 
 const assistantArtifactInputFromMessage = ({
@@ -3273,6 +3258,9 @@ function DataPage({
   const [semanticDisplayName, setSemanticDisplayName] = useState('')
   const [semanticRole, setSemanticRole] = useState<FieldProfileRole>('dimension')
   const [semanticSynonyms, setSemanticSynonyms] = useState('')
+  const [semanticMeaning, setSemanticMeaning] = useState('')
+  const [semanticUnit, setSemanticUnit] = useState('')
+  const [semanticValueLabels, setSemanticValueLabels] = useState('')
   const [semanticSensitivity, setSemanticSensitivity] = useState<FieldSensitivity>('normal')
   const [semanticSaving, setSemanticSaving] = useState(false)
 
@@ -3302,6 +3290,9 @@ function DataPage({
     setSemanticDisplayName(profile.displayName ?? '')
     setSemanticRole(profile.role ?? 'dimension')
     setSemanticSynonyms((profile.synonyms ?? []).join('、'))
+    setSemanticMeaning(profile.businessMeaning ?? '')
+    setSemanticUnit(profile.unit ?? '')
+    setSemanticValueLabels(Object.entries(profile.valueLabels ?? {}).map(([code, label]) => `${code}=${label}`).join('\n'))
     setSemanticSensitivity(profile.sensitivity)
   }
 
@@ -3320,6 +3311,13 @@ function DataPage({
           displayName: semanticDisplayName.trim(),
           role: semanticRole,
           synonyms,
+          businessMeaning: semanticMeaning,
+          unit: semanticUnit,
+          valueLabels: Object.fromEntries(semanticValueLabels.split('\n').filter((line) => line.trim()).map((line) => {
+            const separator = line.indexOf('=')
+            if (separator < 1) throw new Error('枚举释义每行使用“编码=含义”格式')
+            return [line.slice(0, separator).trim(), line.slice(separator + 1).trim()]
+          })),
           sensitivity: semanticSensitivity
         }
       )
@@ -4179,10 +4177,20 @@ function DataPage({
         cancelText="取消"
         confirmLoading={semanticSaving}
         width="min(640px, calc(100vw - 32px))"
+        styles={{ body: { maxHeight: 'calc(100vh - 240px)', minHeight: 0, overflowY: 'auto', overflowX: 'hidden' } }}
         onOk={() => void saveSemanticProfile()}
         onCancel={() => setSemanticEditing(null)}
       >
-        <Form layout="vertical" className="semantic-dictionary-form">
+        <Form layout="vertical" className="semantic-dictionary-form" style={{ paddingInline: 8 }}>
+          <Form.Item label="业务定义与统计口径" extra="填写经业务确认的含义、计算口径和适用范围。">
+            <Input.TextArea aria-label="业务定义与统计口径" value={semanticMeaning} maxLength={1000} autoSize={{ minRows: 2, maxRows: 4 }} onChange={(event) => setSemanticMeaning(event.target.value)} />
+          </Form.Item>
+          <Form.Item label="单位">
+            <Input aria-label="单位" value={semanticUnit} maxLength={40} placeholder="例如：元、小时、百分比" onChange={(event) => setSemanticUnit(event.target.value)} />
+          </Form.Item>
+          <Form.Item label="枚举值释义" extra="每行一个“编码=含义”，例如 1=进行中。查询使用原始编码。">
+            <Input.TextArea aria-label="枚举值释义" value={semanticValueLabels} autoSize={{ minRows: 2, maxRows: 4 }} onChange={(event) => setSemanticValueLabels(event.target.value)} />
+          </Form.Item>
           <Form.Item label="业务显示名" extra="留空可清除人工显示名，Agent 仍使用原始字段名。">
             <Input
               value={semanticDisplayName}
@@ -5221,6 +5229,7 @@ function ChatPage({
   const [dataViewPageLoading, setDataViewPageLoading] = useState(false)
   const dataViewPageRequestRef = useRef(0)
   const [activeRecordDetail, setActiveRecordDetail] = useState<RecordDetail | null>(null)
+  const [platformEvidenceSource, setPlatformEvidenceSource] = useState<ChatSource | null>(null)
   const [recordDetailModalOpen, setRecordDetailModalOpen] = useState(false)
   const [activeKnowledgeDetail, setActiveKnowledgeDetail] = useState<KnowledgeDocumentDetail | null>(null)
   const [activeKnowledgePreview, setActiveKnowledgePreview] = useState<KnowledgeDocumentPreview | null>(null)
@@ -6150,12 +6159,7 @@ function ChatPage({
       message.warning('模型未连接，请先完成系统配置')
       return
     }
-    // Resolve the delivery part locally so a natural-language request can
-    // remain a normal read-only query while the renderer prepares a
-    // confirmation preview after evidence is returned.  Explicit specialist
-    // mentions retain their existing route and are intentionally excluded
-    // from this opt-in path below.
-    const naturalLanguageDeliveryIntent = resolveNaturalLanguageDeliveryIntent(text)
+    // Submit the original question; semantic intent is resolved in the main process.
     const sessionId = conversationId
     const runId = crypto.randomUUID()
     const startedAt = new Date().toISOString()
@@ -6168,11 +6172,7 @@ function ChatPage({
     }
     const next = [...messages, userMessage]
     const explicitSkill = explicitAgentSkillOf(text)
-    const isFollowUp = followUpQuestionOf(text) && messages.some((item) => item.role === 'assistant')
-    const initialRunMetadata = mergeAgentRunMetadata(
-      explicitSkill ? { skill: explicitSkill } : {},
-      isFollowUp ? { followUp: true } : {}
-    )
+    const initialRunMetadata = mergeAgentRunMetadata(explicitSkill ? { skill: explicitSkill } : {})
     activeRunRef.current = {
       runId,
       sessionId,
@@ -6199,7 +6199,7 @@ function ChatPage({
       const hasExplicitExpertMention = /@(?:数据可视化专家|通用数据助手|需求分析专家|知识库专家|交付物专家)(?:\s|$)/.test(text)
       const requestsVisualization = /@数据可视化专家(?:\s|$)/.test(text)
       const requestsArtifactExport = /@交付物专家(?:\s|$)/.test(text)
-      const requestsNaturalLanguageArtifact = Boolean(naturalLanguageDeliveryIntent) && !requestsArtifactExport
+
       const requestArtifact = requestsVisualization && artifactAttached ? activeArtifact : null
       const artifactSourceMessage = requestsArtifactExport
         ? [...messages].reverse().find((item) => (
@@ -6213,86 +6213,8 @@ function ChatPage({
       const artifactSourceQuestion = artifactSourceIndex > 0
         ? [...messages.slice(0, artifactSourceIndex)].reverse().find((item) => item.role === 'user')?.content
         : undefined
-      const requestedArtifactFormat: AssistantArtifactOutputFormat = requestsNaturalLanguageArtifact && naturalLanguageDeliveryIntent
-        ? naturalLanguageDeliveryIntent.format
-        : /(?:xlsx|excel|表格)/i.test(text)
-          ? 'xlsx'
-          : /(?:pptx|ppt|演示|汇报)/i.test(text)
-            ? 'pptx'
-            : /(?:zip|导出包|打包)/i.test(text)
-              ? 'zip'
-              : 'docx'
-      const queryQuestion = requestsNaturalLanguageArtifact
-        ? naturalLanguageDeliveryIntent?.queryText?.trim() || text
-        : text
-      const naturalLanguageDeliveryReference = naturalLanguageDeliveryIntent && (
-        naturalLanguageDeliveryIntent.referencesPriorResult === true ||
-        isNaturalLanguageDeliveryReference(naturalLanguageDeliveryIntent.queryText)
-      )
-
-      // A reference-only request such as “把上一轮整理成 Excel” already
-      // has a verified source in the current conversation.  Reuse it locally
-      // instead of asking a data agent to search for the literal reference.
-      const naturalArtifactSourceMessage = requestsNaturalLanguageArtifact &&
-        naturalLanguageDeliveryReference
-        ? [...messages].reverse().find((item) => (
-            item.role === 'assistant' && item.contextOutcome !== 'failed' &&
-            item.contextOutcome !== 'undone' && item.evidenceBlocks?.length
-          ))
-        : undefined
-      if (naturalArtifactSourceMessage && naturalLanguageDeliveryIntent) {
-        const sourceIndex = messages.findIndex((item) => item.id === naturalArtifactSourceMessage.id)
-        const sourceQuestion = sourceIndex > 0
-          ? [...messages.slice(0, sourceIndex)].reverse().find((item) => item.role === 'user')?.content
-          : undefined
-        const assistantMessageId = crypto.randomUUID()
-        const completedAt = new Date().toISOString()
-        const directAssistantMessage: ChatMessage = {
-          id: assistantMessageId,
-          role: 'assistant',
-          content: '已基于当前会话中最近一条有核验证据的回答准备交付物预览，请确认后生成文件。',
-          ...(dataScope ? { dataScope, dataScopeSummary } : {}),
-          executionLog: assistantExecutionLogForEntries(
-            settleAgentWorkLog('completed'),
-            startedAt,
-            completedAt
-          ),
-          createdAt: completedAt,
-          contextOutcome: 'success'
-        }
-        const directMessages: ChatMessage[] = [
-          ...messages,
-          { ...userMessage, contextOutcome: 'success' },
-          directAssistantMessage
-        ]
-        const directArtifactInput = assistantArtifactInputFromMessage({
-          conversationId: sessionId,
-          // The evidence belongs to the previous assistant turn.  Keep that
-          // source id in the artifact payload; the newly created message is
-          // only the visible delivery status in the current conversation.
-          messageId: naturalArtifactSourceMessage.id,
-          title: `交付物 · ${text}`,
-          question: sourceQuestion ?? text,
-          source: naturalArtifactSourceMessage,
-          outputFormat: requestedArtifactFormat,
-          instructions: naturalLanguageDeliveryIntent.instructions
-        })
-        setMessages(directMessages)
-        setMessageRunMetadata((current) => ({ ...current, [assistantMessageId]: initialRunMetadata }))
-        setAgentRunStatus('idle')
-        void persistSession(sessionId, directMessages)
-        try {
-          const preview = await window.visslm.previewAssistantArtifact(directArtifactInput)
-          if (!isCurrentRun(runId)) return
-          setArtifactExportFormat(preview.input.outputFormat ?? requestedArtifactFormat)
-          setArtifactGenerationStatus('idle')
-          setArtifactGenerationMessage('')
-          setArtifactPreview(preview)
-        } catch (error) {
-          message.warning(`交付物预览创建失败，查询结果已保留：${error instanceof Error ? error.message : String(error)}`)
-        }
-        return
-      }
+      const requestedArtifactFormat: AssistantArtifactOutputFormat = artifactExportFormat
+      const queryQuestion = text
       const contextMessages = messages
         .filter((message) => message.contextOutcome !== 'failed' && message.contextOutcome !== 'undone')
         .map(({ role, content, contextOutcome, contextRefs }) => ({
@@ -6364,7 +6286,7 @@ function ChatPage({
       clearAnswerStream(runId)
       const responseError = response.events?.find((event) => event.type === 'error')
       const responseArtifactPreviewAllowed = Boolean(response.artifactPreview) && (
-        !requestsNaturalLanguageArtifact ||
+        !response.assistantIntent?.delivery ||
         (!responseError && !response.needsClarification && Boolean(response.evidenceBlocks?.length))
       )
       if (responseArtifactPreviewAllowed && response.artifactPreview) {
@@ -6461,24 +6383,24 @@ function ChatPage({
       setAgentRunStatus(response.needsClarification ? 'clarification' : responseError ? 'failed' : 'idle')
       void persistSession(sessionId, completedMessages)
 
-      // Natural-language delivery is a two-phase operation: the query above
-      // remains read-only, then the verified answer is shown in the existing
-      // confirmation panel.  Keep preview errors outside the query failure
-      // path so a usable answer is never relabeled as failed.
+      const naturalLanguageDeliveryIntent = response.assistantIntent?.delivery
+      const naturalDeliverySource = naturalLanguageDeliveryIntent?.referencesPriorResult
+        ? [...messages].reverse().find((item) => item.role === 'assistant' && item.contextOutcome !== 'failed' && item.contextOutcome !== 'undone' && item.evidenceBlocks?.length)
+        : completedAssistantMessage
       if (
-        requestsNaturalLanguageArtifact &&
+
         naturalLanguageDeliveryIntent &&
         !response.artifactPreview &&
         !responseError &&
         !response.needsClarification &&
-        response.evidenceBlocks?.length
+        naturalDeliverySource?.evidenceBlocks?.length
       ) {
         const naturalArtifactInput = assistantArtifactInputFromMessage({
           conversationId: sessionId,
-          messageId: assistantMessageId,
+          messageId: naturalDeliverySource.id,
           title: `交付物 · ${text}`,
           question: text,
-          source: completedAssistantMessage,
+          source: naturalDeliverySource,
           outputFormat: naturalLanguageDeliveryIntent.format,
           instructions: naturalLanguageDeliveryIntent.instructions
         })
@@ -6690,7 +6612,7 @@ function ChatPage({
       case 'unavailable':
         return { title: '状态读取失败', detail: '暂时无法确认数据与索引状态，请刷新后再试。' }
       case 'no_data':
-        return { title: '还没有可查询的数据', detail: '先同步或导入数据，也可以上传知识库文档。' }
+        return { title: '本地数据尚未准备', detail: '可同步或导入数据、上传文档，也可用 @平台 查询已配置的平台。' }
       case 'indexing': {
         const progress = workspaceReadiness.progress
         const count = progress?.total ? `（${progress.current}/${progress.total}）` : ''
@@ -7423,7 +7345,7 @@ function ChatPage({
                           <section className="source-chips source-group-list" aria-label="回答依据来源分组" role="list">
                             {sourceGroups.map((group) => {
                               const sourceIsDocument = group.sourceType === 'document'
-                              const sourceTypeLabel = sourceIsDocument ? '知识文档' : '数据记录'
+                              const sourceTypeLabel = sourceIsDocument ? '知识文档' : group.source.platformSnapshot ? '平台实时记录' : '数据记录'
                               const recordDescription = sourceIsDocument ? '' : chatRecordDescriptionOf(group.source)
                               return (
                                 <article
@@ -7469,6 +7391,7 @@ function ChatPage({
                                             title={canOpen ? `打开${group.name}：${reference.label}` : unavailableLabel}
                                             disabled={!canOpen}
                                             onClick={() => {
+                                              if (source.platformSnapshot) { setPlatformEvidenceSource(source); return }
                                               if (sourceIsDocument) {
                                                 if (documentId) void openKnowledgeDetail(documentId, normalizedChatSourceValueOf(source.chunkId) || undefined)
                                                 return
@@ -8057,6 +7980,7 @@ function ChatPage({
           />
         </Suspense>
       </Drawer>
+      <PlatformEvidenceModal source={platformEvidenceSource} onClose={() => setPlatformEvidenceSource(null)} />
       <Modal
         className="chat-data-modal"
         width="min(1120px, calc(100vw - 48px))"
@@ -9220,6 +9144,7 @@ function PushPage({
     ...(storedDraft?.formValues ?? {})
   }))
   const [fieldMappings, setFieldMappings] = useState<PushFieldMapping[]>(() => storedDraft?.fieldMappings ?? [])
+  const [valueOptions, setValueOptions] = useState<PushValueOptions>(() => storedDraft?.valueOptions ?? {})
   const mappingInitializedRef = useRef(storedDraft?.mappingInitialized ?? false)
   const mappingMigrationPendingRef = useRef(storedDraft?.mappingMigrationPending ?? false)
   const [records, setRecords] = useState<RecordRow[]>([])
@@ -9246,6 +9171,7 @@ function PushPage({
       version: 3,
       formValues,
       fieldMappings,
+      valueOptions,
       mappingInitialized: mappingInitializedRef.current,
       ...(mappingMigrationPendingRef.current ? { mappingMigrationPending: true } : {}),
       selectedRowKeys,
@@ -9256,7 +9182,7 @@ function PushPage({
     }
     writePushConfigDraft(draft)
     return () => writePushConfigDraft(draft)
-  }, [fieldMappings, formValues, page, pageSize, releaseText, search, selectedRowKeys])
+  }, [fieldMappings, formValues, page, pageSize, releaseText, search, selectedRowKeys, valueOptions])
 
   const load = useCallback(async (): Promise<void> => {
     setLoading(true)
@@ -9407,7 +9333,9 @@ function PushPage({
     if (new Set(targetKeys).size !== targetKeys.length) {
       throw new Error('字段映射中存在重复的目标属性 Key')
     }
+    compilePushValueTransforms(valueOptions)
     return {
+      ...valueOptions,
       recordUids: selectedRowKeys,
       nodeType: values.nodeType.trim(),
       projectId: values.projectId.trim(),
@@ -9723,12 +9651,18 @@ function PushPage({
           )}
         </div>
 
+        <PushValueOptionsEditor
+          value={valueOptions}
+          targetFields={fieldMappings.map((mapping) => mapping.targetField)}
+          onChange={(next) => { setValueOptions(next); setResult(null) }}
+        />
+
         <Alert
           showIcon
           type="warning"
           className="compact-push-alert"
           title="图片缺失或上传失败不会阻止记录创建"
-          description="请求消息体仅保留字段映射表中的属性；测试预览不上传图片也不发送请求；真实推送会尝试处理图片，缺失或上传失败的图片将跳过，仍会调用 /alm/rest/items，并强制移除 _valm_Uid、_valm_NodeType 和 _valm_ItemID。最终是否创建成功以每条请求的错误信息为准。"
+          description="请求消息体保留字段映射表中的属性，并应用用户映射和固定参数；测试预览不上传图片也不发送请求；真实推送会尝试处理图片，缺失或上传失败的图片将跳过，仍会调用 /alm/rest/items，并禁止写入 _valm_Uid、_valm_NodeType 和 _valm_ItemID。最终是否创建成功以每条请求的错误信息为准。"
         />
       </Card>}
 
@@ -10484,7 +10418,8 @@ function SettingsPage({
         baseUrl: settings.platform.baseUrl,
         username: settings.platform.username,
         token: '',
-        uploadPassword: ''
+        uploadPassword: '',
+        mcpServerPath: settings.platform.mcpServerPath ?? ''
       })
     }
     if (settingsTab === 'model') {
@@ -10890,6 +10825,10 @@ function SettingsPage({
                       }]}
                     >
                       <Input.Password autoComplete="new-password" placeholder={settings?.platform.hasToken ? '••••••••' : '输入平台 Token'} />
+                    </Form.Item>
+                    <Form.Item label="平台 MCP 服务入口（可选）" name="mcpServerPath"
+                      extra="留空使用内置服务。复用上方平台地址、用户名、登录密码和 API Token；在 AI 助手中以 @平台 开头即可实时查询分析。">
+                      <Input placeholder="使用内置 VISSLM MCP，或填写 server.js 的绝对路径" />
                     </Form.Item>
                     <Space>
                       <Button type="primary" htmlType="submit">保存平台配置</Button>
@@ -11491,7 +11430,7 @@ function AppShell({ themeMode, onThemeModeChange }: AppProps): React.JSX.Element
     visualization: { title: '可视化大屏', description: '编辑可追溯的数据大屏并输出运营视图' },
     projects: { title: '项目管理', description: '管理项目进度、需求匹配与交付风险' },
     data: { title: '资产中心', description: '浏览、筛选和复用已同步的数据资产' },
-    chat: { title: 'AI 助手', description: '用自然语言检索、统计和解释本地数据' },
+    chat: { title: 'AI 助手', description: '用自然语言分析本地数据，或用 @平台 查询平台实时信息' },
     sync: { title: '数据采集', description: '定义采集范围、预览请求并执行同步' },
     push: { title: '数据推送', description: '配置字段映射并将数据安全推送回平台' },
     settings: { title: '系统配置', description: '配置平台连接、模型服务、通用参数与功能模块' }

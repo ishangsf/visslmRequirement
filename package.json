@@ -1,6 +1,6 @@
 {
   "name": "visslm-agent-desktop",
-  "version": "1.5.2",
+  "version": "1.5.7",
   "private": true,
   "author": "VISSLM Agent Team",
   "description": "VISSLM data collection, knowledge search and local AI agent desktop app",
@@ -30,7 +30,13 @@
     "smoke:plain-chat": "npx tsx ./scripts/smoke-plain-chat.ts",
     "test:ai-assistant-global": "npx tsx ./tests/ai-assistant-global-orchestration-regression.ts",
     "test:ai-assistant-intent": "npx tsx ./tests/ai-assistant-agent-intent-regression.ts",
+    "test:assistant-query-contract": "npx tsx ./tests/assistant-query-contract-regression.ts",
+    "test:assistant-semantic": "node ./scripts/verify-assistant-semantic-refactor.mjs",
+    "test:dashboard-generation": "npx tsx ./tests/dashboard-generation-workflow-regression.ts",
+    "eval:assistant-semantic-live": "npx tsx ./scripts/evaluate-semantic-assistant-live.ts",
     "test:assistant-orchestrator": "npx tsx ./tests/assistant-orchestrator-regression.ts",
+    "test:assistant-record-analysis": "npx tsx ./tests/assistant-record-analysis-regression.ts",
+    "test:platform-mcp-analysis": "npx tsx ./tests/platform-mcp-analysis-regression.ts",
     "test:assistant-clarification-choice": "npx tsx ./tests/assistant-clarification-choice-regression.ts",
     "test:assistant-intelligence-live-contract": "npx tsx ./tests/assistant-intelligence-live-contract-regression.ts",
     "smoke:assistant-intelligence-live": "node ./scripts/smoke-assistant-intelligence-live.mjs",
@@ -174,6 +180,17 @@
       "node_modules/sharp/**"
     ],
     "extraResources": [
+      {
+        "from": "resources/visslm-mcp",
+        "to": "mcp/visslm-mcp",
+        "filter": [
+          "server.js",
+          "package.json",
+          "README.md",
+          "lib/**/*",
+          "data/api.json"
+        ]
+      },
       {
         "from": "buildResources/models",
         "to": "models",

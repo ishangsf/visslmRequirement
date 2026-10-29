@@ -77,6 +77,7 @@ import {
   sanitizeContextText
 } from './context-budget'
 import { sanitizeChatMessageContent } from '../shared/chat-message-format'
+import { normalizeFieldBusinessSemantics } from '../shared/field-business-semantics'
 import { buildProjectRequirementMatchCard, buildRequirementBusinessText, buildRequirementSourceView } from './requirements/requirement-match-card'
 import { buildDeterministicRequirementMatchAnalysis } from './requirements/requirement-match-analysis'
 import { hashRequirementBusiness, hashRequirementBusinessText } from './requirements/requirement-business-normalization'
@@ -719,6 +720,11 @@ const parseProjectTraceMetadata = (
   }
 }
 
+const readBusinessSemantics = (value: unknown): FieldProfileSemanticPatch => {
+  try { return normalizeFieldBusinessSemantics(parseJsonValue(value, {}) as FieldProfileSemanticPatch) }
+  catch { return {} }
+}
+
 const mapFieldProfileRow = (row: SqlRow): FieldProfile => {
   const role = String(row.role ?? '')
   const sensitivity = String(row.sensitivity ?? 'normal')
@@ -738,6 +744,7 @@ const mapFieldProfileRow = (row: SqlRow): FieldProfile => {
       ? { role: role as FieldProfileRole }
       : {}),
     synonyms: parseJsonArray(row.synonyms_json),
+    ...readBusinessSemantics(row.business_semantics_json),
     ...(profiledAt ? { profiledAt } : {})
   }
 }
@@ -815,6 +822,8 @@ const mapFieldDefinitionRow = (row: SqlRow): FieldDefinition => {
 }
 
 export interface FieldAggregateOptions {
+  searchTerms?: string[]
+  searchMode?: 'any' | 'all'
   field: string
   projectId?: string
   projectIds?: string[]
@@ -903,6 +912,8 @@ export interface FieldQueryOptions {
   baseFilters?: FieldQueryFilter[]
   filters?: FieldQueryFilter[]
   fields?: string[]
+  /** Group by actual field values over the full filtered set, before preview limits. */
+  groupByField?: string
   sort?: { field: string; direction: 'asc' | 'desc' }
   limit?: number
 }
@@ -921,6 +932,10 @@ export interface FieldQueryResult {
    * queries always provide it.
    */
   recordUidsByTerm?: Record<string, string[]>
+  grouping?: {
+    field: string
+    groups: Array<{ name: string; count: number; recordUids: string[]; isEmpty: boolean }>
+  }
   fields: string[]
   fieldLabels?: Record<string, string>
   records: Array<{
@@ -2120,6 +2135,7 @@ export class AppDatabase {
       "ALTER TABLE records ADD COLUMN pushed_uid TEXT NOT NULL DEFAULT ''",
       "ALTER TABLE records ADD COLUMN semantic_hash TEXT NOT NULL DEFAULT ''",
       "ALTER TABLE field_profiles ADD COLUMN sensitivity TEXT NOT NULL DEFAULT 'normal'",
+      "ALTER TABLE field_profiles ADD COLUMN business_semantics_json TEXT NOT NULL DEFAULT '{}'",
       "ALTER TABLE field_definitions ADD COLUMN source_type TEXT NOT NULL DEFAULT ''",
       "ALTER TABLE field_definitions ADD COLUMN normalized_type TEXT NOT NULL DEFAULT 'unknown'",
       "ALTER TABLE field_definitions ADD COLUMN attr_type TEXT NOT NULL DEFAULT ''",
@@ -8543,7 +8559,7 @@ export class AppDatabase {
   getFieldProfiles(scopeKey: string, dataRevision: number): FieldProfile[] | null {
     const rows = this.db.prepare(`
       SELECT field, inferred_type, non_null_rate, distinct_count, samples_json,
-             display_name, role, synonyms_json, sensitivity, profiled_at
+             display_name, role, synonyms_json, sensitivity, business_semantics_json, profiled_at
       FROM field_profiles
       WHERE scope_key = ? AND data_revision = ?
       ORDER BY non_null_rate DESC, field ASC
@@ -8622,7 +8638,7 @@ export class AppDatabase {
     const normalizedField = field.trim()
     const row = this.db.prepare(`
       SELECT field, inferred_type, non_null_rate, distinct_count, samples_json,
-             display_name, role, synonyms_json, sensitivity, profiled_at
+             display_name, role, synonyms_json, sensitivity, business_semantics_json, profiled_at
       FROM field_profiles
       WHERE scope_key = ? AND field = ?
     `).get(scopeKey, normalizedField) as SqlRow | undefined
@@ -8630,6 +8646,11 @@ export class AppDatabase {
 
     const updates: string[] = []
     const params: Array<string | number> = []
+    const business = normalizeFieldBusinessSemantics(patch)
+    if (Object.keys(business).length) {
+      updates.push('business_semantics_json = ?')
+      params.push(JSON.stringify({ ...readBusinessSemantics(row.business_semantics_json), ...business }))
+    }
     if (patch.displayName !== undefined) {
       if (typeof patch.displayName !== 'string') throw new Error('字段显示名必须是文本')
       updates.push('display_name = ?')
@@ -8664,7 +8685,7 @@ export class AppDatabase {
     }
     const updated = this.db.prepare(`
       SELECT field, inferred_type, non_null_rate, distinct_count, samples_json,
-             display_name, role, synonyms_json, sensitivity, profiled_at
+             display_name, role, synonyms_json, sensitivity, business_semantics_json, profiled_at
       FROM field_profiles
       WHERE scope_key = ? AND field = ?
     `).get(scopeKey, normalizedField) as SqlRow | undefined
@@ -9114,7 +9135,7 @@ export class AppDatabase {
       this.recordWriteStatements = {
         conflict: this.db.prepare('SELECT uid FROM records WHERE item_id = ? AND uid <> ? LIMIT 1'),
         previous: this.db.prepare('SELECT raw_json FROM records WHERE uid = ?'),
-        deleteImageRefs: this.db.prepare('DELETE FROM record_image_refs WHERE record_uid = ?'),
+        deleteImageRefs: this.db.prepare('DELETE FROM record_image_refs WHERE record_uid = ? AND id = ?'),
         upsert: this.db.prepare(`
           INSERT INTO records(
              uid, project_id, node_type, item_id, parent_id, name,
@@ -9244,18 +9265,14 @@ export class AppDatabase {
     }
     const rawJson = JSON.stringify(input.raw)
     const previous = statements.previous.get(input.uid) as SqlRow | undefined
-    if (previous) {
-      let previousRaw: Record<string, unknown> = {}
-      try {
-        const parsed = JSON.parse(String(previous.raw_json ?? '{}')) as unknown
-        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-          previousRaw = parsed as Record<string, unknown>
+    if (previous && String(previous.raw_json) !== rawJson) {
+      // ReturnProperty may omit fields whose local asset tokens must survive.
+      // Remove only references no longer used, regardless of which field changed.
+      const retainedTokens = new Set(rawJson.match(/visslm-asset:\/\/[a-f0-9]{64}\/[A-Za-z0-9_-]{1,128}/gi) ?? [])
+      for (const reference of this.listRecordImageReferences(input.uid)) {
+        if (!retainedTokens.has(`visslm-asset://${reference.assetSha256}/${reference.id}`)) {
+          statements.deleteImageRefs.run(input.uid, reference.id)
         }
-      } catch {
-        previousRaw = {}
-      }
-      if (JSON.stringify(previousRaw._valm_Description) !== JSON.stringify(input.raw._valm_Description)) {
-        statements.deleteImageRefs.run(input.uid)
       }
     }
     const contentHash = createHash('sha256').update(rawJson).digest('hex')
@@ -11065,7 +11082,7 @@ export class AppDatabase {
     const where = clauses.length ? ` WHERE ${clauses.join(' AND ')}` : ''
     const rows = this.db
       .prepare(
-        `SELECT uid, name, node_type, item_id, raw_json
+        `SELECT uid, name, node_type, item_id, raw_json, normalized_text
          FROM records${where}`
       )
        .all(...params) as SqlRow[]
@@ -11078,6 +11095,8 @@ export class AppDatabase {
     }>()
     let matchedRecords = 0
     let valueOccurrences = 0
+    let eligibleRecords = 0
+    const searchTerms = (options.searchTerms ?? []).map((term) => term.normalize('NFKC').trim().toLocaleLowerCase()).filter(Boolean)
 
     for (const row of rows) {
       let raw: Record<string, unknown>
@@ -11091,6 +11110,11 @@ export class AppDatabase {
         normalizedFieldValues(fieldValuesAtPath(raw, filter.field.trim()), false),
         filter
       ))) continue
+      const text = [row.name, row.item_id, row.normalized_text].join('\n').normalize('NFKC').toLocaleLowerCase()
+      if (searchTerms.length && !(options.searchMode === 'all'
+        ? searchTerms.every((term) => text.includes(term))
+        : searchTerms.some((term) => text.includes(term)))) continue
+      eligibleRecords++
       const values = normalizedFieldValues(fieldValuesAtPath(raw, field), splitMultiValue)
       if (!values.length) continue
       matchedRecords += 1
@@ -11125,9 +11149,9 @@ export class AppDatabase {
 
     return {
       field,
-      totalRecords: rows.length,
+      totalRecords: eligibleRecords,
       matchedRecords,
-      emptyRecords: rows.length - matchedRecords,
+      emptyRecords: eligibleRecords - matchedRecords,
       valueOccurrences,
       splitMultiValue,
       items
@@ -11304,7 +11328,8 @@ export class AppDatabase {
          FROM records${where}`
       )
       .all(...params) as SqlRow[]
-    const fields = [...new Set((options.fields ?? []).map((field) => field.trim()).filter(Boolean))]
+    const groupByField = options.groupByField?.trim()
+    const fields = [...new Set([...(groupByField ? [groupByField] : []), ...(options.fields ?? [])].map((field) => field.trim()).filter(Boolean))]
       .slice(0, 20)
     const filters = [...(options.baseFilters ?? []), ...(options.filters ?? [])]
       .filter((filter) => filter.field?.trim())
@@ -11389,7 +11414,39 @@ export class AppDatabase {
     }
 
     const limit = Math.min(50, Math.max(1, Math.trunc(options.limit ?? 10)))
-    const records = matched.slice(0, limit).map(({ source, values, matchedTerms }) => ({
+    // Membership is derived from typed field values, never a substring in the
+    // record title/body. Multi-value members are deduplicated per record.
+    const grouped = new Map<string | null, typeof matched>()
+    if (groupByField) {
+      for (const row of matched) {
+        const members = normalizedFieldValues(fieldValuesAtPath(row.raw, groupByField), true)
+        for (const member of members.length ? members : [null]) {
+          const bucket = grouped.get(member) ?? []
+          bucket.push(row)
+          grouped.set(member, bucket)
+        }
+      }
+    }
+    const preview = groupByField ? [] as typeof matched : matched.slice(0, limit)
+    if (groupByField) {
+      const seen = new Set<string>()
+      const buckets = [...grouped.values()]
+      for (let offset = 0; preview.length < limit; offset++) {
+        let available = false
+        for (const bucket of buckets) {
+          const row = bucket[offset]
+          if (!row) continue
+          available = true
+          if (!seen.has(row.source.uid)) {
+            seen.add(row.source.uid)
+            preview.push(row)
+          }
+          if (preview.length >= limit) break
+        }
+        if (!available) break
+      }
+    }
+    const records = preview.map(({ source, values, matchedTerms }) => ({
       source,
       values,
       ...(matchedTerms?.length ? { matchedTerms } : {})
@@ -11421,6 +11478,10 @@ export class AppDatabase {
       returnedCount: records.length,
       recordUids,
       recordUidsByTerm,
+      ...(groupByField ? { grouping: { field: groupByField, groups: [...grouped].map(([name, rows]) => ({
+        name: name ?? '未填写', isEmpty: name === null, count: rows.length,
+        recordUids: compactRecordUids(rows.map((row) => row.source.uid), FIELD_QUERY_UID_LIMIT)
+      })) } } : {}),
       fields,
       ...(Object.keys(fieldLabels).length ? { fieldLabels } : {}),
       records

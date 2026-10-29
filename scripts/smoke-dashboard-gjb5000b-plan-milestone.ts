@@ -35,6 +35,7 @@ globalThis.fetch = (async () => {
 
 try {
   const result = await runDashboardDomainChatRequest({
+    domainSelection: { scenario: planMilestoneGoldenFixture.scenario, role: planMilestoneGoldenFixture.role, tailoringBaselineId: 'sample-tailoring-baseline-v1' },
     question: planMilestoneGoldenFixture.request,
     scope: { projectIds: [planMilestoneGoldenFixture.projectId] },
     generatedAt: planMilestoneGoldenFixture.generatedAt
@@ -96,6 +97,7 @@ try {
     )
   }))
   const incomplete = await runDashboardDomainChatRequest({
+    domainSelection: { scenario: planMilestoneGoldenFixture.scenario, role: planMilestoneGoldenFixture.role, tailoringBaselineId: 'sample-tailoring-baseline-v1' },
     question: planMilestoneGoldenFixture.request,
     scope: { projectIds: [planMilestoneGoldenFixture.projectId] },
     generatedAt: planMilestoneGoldenFixture.generatedAt
@@ -105,6 +107,7 @@ try {
   assert.equal(incomplete.dashboard, undefined)
 
   const roleMismatch = await runDashboardDomainChatRequest({
+    domainSelection: { scenario: scenario!.id, role: 'qa-epg', tailoringBaselineId: 'sample-tailoring-baseline-v1' },
     question: 'QA/EPG 基于受控样例生成计划与里程碑执行大屏',
     scope: { projectIds: [planMilestoneGoldenFixture.projectId] },
     generatedAt: planMilestoneGoldenFixture.generatedAt

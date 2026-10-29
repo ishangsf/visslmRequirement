@@ -19,6 +19,7 @@ import {
   pushForbiddenTargetFields
 } from '../shared/push-field-mapping'
 import { AppDatabase, type RecordInput } from './database'
+import { compilePushValueTransforms } from '../shared/push-value-transforms'
 import {
   findRichTextImageSources,
   parseAssetToken,
@@ -156,6 +157,20 @@ export const normalizeText = (
 }
 
 const imageExtension = /\.(png|jpe?g|gif|webp|bmp|svg)(?:$|[?#])/i
+
+const isStandaloneImageSource = (input: string): boolean =>
+  !parseAssetToken(input) && (/^data:image\//i.test(input) ||
+    (input.includes('/') && !/[\s<>"']/.test(input) && imageExtension.test(input)))
+
+const hasUnconvertedImages = (input: unknown): boolean => {
+  if (typeof input === 'string') {
+    return isStandaloneImageSource(input) ||
+      findRichTextImageSources(input).some((source) => !parseAssetToken(source.source))
+  }
+  if (Array.isArray(input)) return input.some(hasUnconvertedImages)
+  if (input && typeof input === 'object') return Object.values(input).some(hasUnconvertedImages)
+  return false
+}
 const MAX_JPEG_TRAILING_BYTES = 64 * 1024
 
 const richImageMimeExtensions: Readonly<Record<string, string>> = {
@@ -238,6 +253,26 @@ const imageBytesMatchMime = (mimeType: string, bytes: Buffer): boolean => {
     return /^\s*(?:<\?xml[^>]*>\s*)?<svg\b/i.test(text) && /<\/svg\s*>/i.test(text)
   }
   return true
+}
+
+const resolveCollectedImageMime = (declaredMime: string, bytes: Buffer): string | null => {
+  // FileCenterImg can serve PNG bytes from a .jpg URL with image/jpeg headers.
+  // Detect raster formats from their signature, then retain the structural
+  // checks above (including PNG IEND and JPEG EOI) before storing the MIME.
+  // Do not infer active SVG content from an unrelated HTTP content type.
+  let mime = normalizeRichImageMimeType(declaredMime)
+  if (bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+    mime = 'image/png'
+  } else if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    mime = 'image/jpeg'
+  } else if (['GIF87a', 'GIF89a'].includes(bytes.subarray(0, 6).toString('ascii'))) {
+    mime = 'image/gif'
+  } else if (bytes.subarray(0, 4).toString('ascii') === 'RIFF' && bytes.subarray(8, 12).toString('ascii') === 'WEBP') {
+    mime = 'image/webp'
+  } else if (bytes.subarray(0, 2).toString('ascii') === 'BM') {
+    mime = 'image/bmp'
+  }
+  return imageBytesMatchMime(mime, bytes) ? mime : null
 }
 
 const redactUrlForError = (input: string | URL): string => {
@@ -2270,7 +2305,8 @@ export class VisslmClient {
         throw lastError
       }
 
-      if (!imageBytesMatchMime(contentType, bytes)) {
+      const mimeType = resolveCollectedImageMime(contentType, bytes)
+      if (!mimeType) {
         lastError = new Error(imagePayloadDiagnostic({
           reason: '图片响应 MIME/文件签名校验失败',
           httpStatus: response.status,
@@ -2287,7 +2323,7 @@ export class VisslmClient {
 
       return {
         bytes,
-        mimeType: contentType,
+        mimeType,
         sourceUrl
       }
     }
@@ -2351,6 +2387,16 @@ export class PushService {
       sourceFields.add(mapping.sourceField)
       targetFields.add(mapping.targetField)
     }
+    const transformValues = compilePushValueTransforms(config)
+    if (Array.isArray(config.fieldMappings)) {
+      const fixedBodyFields = new Set((config.fixedParameters ?? [])
+        .filter((parameter) => parameter.location === 'body').map((parameter) => parameter.key.trim()))
+      for (const field of config.userMappingFields ?? []) {
+        if (!targetFields.has(field.trim()) && !fixedBodyFields.has(field.trim())) {
+          throw new Error(`用户映射字段 ${field.trim()} 不在推送目标字段中，请先配置字段映射`)
+        }
+      }
+    }
     const client = this.clientFactory()
     const requests = recordUids.map((uid, index) => {
       const detail = this.db.getRecord(uid, false)
@@ -2382,7 +2428,13 @@ export class PushService {
         for (const field of pushForbiddenTargetFields) delete body[field]
         if (!body._valm_Name) body._valm_Name = detail.name
       }
-      const preparedBody = this.bindBodyImageSources(detail.uid, body)
+      let transformed: ReturnType<typeof transformValues>
+      try {
+        transformed = transformValues(body, params)
+      } catch (error) {
+        throw new Error(`记录“${detail.name}”（${uid}）：${error instanceof Error ? error.message : String(error)}`)
+      }
+      const preparedBody = this.bindBodyImageSources(detail.uid, transformed.body)
       const previewAssets = this.inspectBodyAssets(preparedBody)
       return {
         id: index + 1,
@@ -2390,7 +2442,7 @@ export class PushService {
         recordName: detail.name,
         method: 'POST' as const,
         endpoint: client.createItemEndpoint(),
-        params: client.createItemTraceParams(params),
+        params: client.createItemTraceParams(transformed.params),
         body: preparedBody,
         ...(previewAssets.imageTotal || previewAssets.imageFailed ? previewAssets : {})
       }
@@ -2999,7 +3051,7 @@ export class SyncService {
               })
             }
             context = { stage: '同步图片', nodeType: mergedNodeType, recordUid: existing.uid, itemId, recordName: mergedName }
-            const imageSync = recordChanged || record.uid !== existing.uid
+            const imageSync = recordChanged || record.uid !== existing.uid || hasUnconvertedImages(mergedRaw)
               ? await this.syncImages(client, existing.uid, mergedRaw, record.uid)
               : { count: 0, raw: mergedRaw }
             counts.images += imageSync.count
@@ -3245,29 +3297,27 @@ export class SyncService {
     attachmentUid = recordUid
   ): Promise<{ count: number; raw: JsonObject }> {
     const candidates = new Map<string, string>()
-    const description = typeof raw._valm_Description === 'string' ? raw._valm_Description : ''
-    for (const source of findRichTextImageSources(description)) {
-      if (!parseAssetToken(source.source)) candidates.set(source.source, '富文本图片')
-    }
-    const visitNonDescription = (input: unknown): void => {
+    const visit = (input: unknown): void => {
       if (typeof input === 'string') {
-        if (/^data:image\//i.test(input)) candidates.set(input, '内嵌图片')
-        else if (imageExtension.test(input)) candidates.set(input, '图片字段')
+        for (const source of findRichTextImageSources(input)) {
+          if (!parseAssetToken(source.source)) candidates.set(source.source, '富文本图片')
+        }
+        if (isStandaloneImageSource(input) && !candidates.has(input)) {
+          candidates.set(input, /^data:image\//i.test(input) ? '内嵌图片' : '图片字段')
+        }
       } else if (Array.isArray(input)) {
-        input.forEach(visitNonDescription)
+        input.forEach(visit)
       } else if (input && typeof input === 'object') {
-        Object.values(input as JsonObject).forEach(visitNonDescription)
+        Object.values(input as JsonObject).forEach(visit)
       }
     }
-    for (const [key, valueInput] of Object.entries(raw)) {
-      if (key !== '_valm_Description') visitNonDescription(valueInput)
-    }
+    visit(raw)
 
     const attachments = await client.getAttachments(attachmentUid)
     for (const attachment of attachments) {
       const name = value(attachment, 'Name') || value(attachment, 'FileName')
       const resource = value(attachment, 'resource') || value(attachment, 'Resource')
-      if (resource && imageExtension.test(name || resource)) candidates.set(resource, name)
+      if (resource && imageExtension.test(name || resource) && !candidates.has(resource)) candidates.set(resource, name)
     }
 
     let saved = 0
@@ -3275,7 +3325,7 @@ export class SyncService {
     for (const [source, name] of candidates) {
       let mimeType = 'application/octet-stream'
       const markUnresolved = (message: string): void => {
-        if (name !== '富文本图片' || typeof this.db.saveUnresolvedImage !== 'function') return
+        if (typeof this.db.saveUnresolvedImage !== 'function') return
         try {
           this.db.saveUnresolvedImage({
             recordUid,
@@ -3285,8 +3335,7 @@ export class SyncService {
             errorMessage: sanitizeImageErrorMessage(message)
           })
         } catch {
-          // The unresolved marker is best-effort; the original HTML remains
-          // un-tokenized and therefore still blocks export and push.
+          // Diagnostics are best-effort; missing images must not block records.
         }
       }
       try {
@@ -3313,7 +3362,8 @@ export class SyncService {
           mimeType = downloaded.mimeType
           sourceUrl = downloaded.sourceUrl
         }
-        if (!imageBytesMatchMime(mimeType, bytes)) {
+        const resolvedMime = resolveCollectedImageMime(mimeType, bytes)
+        if (!resolvedMime) {
           markUnresolved(imagePayloadDiagnostic({
             reason: '图片 MIME/文件签名校验失败',
             httpStatus: 0,
@@ -3323,6 +3373,7 @@ export class SyncService {
           }))
           continue
         }
+        mimeType = resolvedMime
         const savedImage = this.db.saveImage({
           recordUid,
           name,
@@ -3342,28 +3393,33 @@ export class SyncService {
         markUnresolved(error instanceof Error ? error.message : '图片下载失败')
       }
     }
-    if (typeof description !== 'string') return { count: saved, raw }
-    const tokenized = replaceRichTextImageSources(description, (source) => {
-      const savedImage = savedBySource.get(source.source)
+    const tokenForSource = (source: string, fieldPath: string, ordinal: number): string | undefined => {
+      const savedImage = savedBySource.get(source)
       if (!savedImage) return undefined
       const reference = this.db.saveRecordImageReference({
         recordUid,
-        fieldPath: '_valm_Description',
-        ordinal: source.occurrence,
+        fieldPath,
+        ordinal,
         assetSha256: savedImage.sha256,
         sourceType: 'rich-text',
         sourceName: savedImage.name,
-        originalSource: source.source
+        originalSource: source
       })
       return `visslm-asset://${savedImage.sha256}/${reference.id}`
-    })
-    if (!tokenized.replacements.length) return { count: saved, raw }
-    return {
-      count: saved,
-      raw: {
-        ...raw,
-        _valm_Description: tokenized.html
-      }
     }
+    const tokenize = (input: unknown, fieldPath: string): unknown => {
+      if (typeof input === 'string') {
+        if (isStandaloneImageSource(input)) return tokenForSource(input, fieldPath, 0) ?? input
+        return replaceRichTextImageSources(input, (source) =>
+          tokenForSource(source.source, fieldPath, source.occurrence)).html
+      }
+      if (Array.isArray(input)) return input.map((entry, index) => tokenize(entry, `${fieldPath}[${index}]`))
+      if (input && typeof input === 'object') {
+        return Object.fromEntries(Object.entries(input).map(([key, entry]) =>
+          [key, tokenize(entry, fieldPath ? `${fieldPath}.${key}` : key)]))
+      }
+      return input
+    }
+    return { count: saved, raw: tokenize(raw, '') as JsonObject }
   }
 }

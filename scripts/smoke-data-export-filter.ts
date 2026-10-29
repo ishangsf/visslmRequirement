@@ -176,7 +176,7 @@ try {
   assert.equal(filtered.ok, true)
   assert.equal(filtered.recordCount, 48)
   assert.equal(filtered.assetCount, 1)
-  assert.match(filtered.message, /跳过 1 张无法恢复的图片/)
+  assert.match(filtered.message, /跳过 1 张图片（本地尚无可用图片文件，请重新采集后再导出）/)
   const filteredPack = readPack(filteredPath)
   assert.equal(filteredPack.manifest.recordCount, 48)
   assert.equal(filteredPack.manifest.assetCount, 1)

@@ -18,6 +18,7 @@ import {
 export interface ModelMessage {
   role: 'system' | 'user' | 'assistant' | 'tool'
   content: string
+  images?: Array<{ mimeType: 'image/png' | 'image/jpeg' | 'image/webp'; data: string }>
   tool_call_id?: string
   reasoningContent?: string
   providerContent?: Array<Record<string, unknown>>
@@ -520,12 +521,12 @@ const responseInputForMessage = (message: ModelMessage): Array<Record<string, un
     return items
   }
 
-  if (!message.content.trim()) return []
+  if (!message.content.trim() && !message.images?.length) return []
   return [{
     role: message.role,
     // All messages in `input` are inputs. `output_text` is reserved for
     // response output items returned by the model.
-    content: [{ type: 'input_text', text: message.content }]
+    content: [{ type: 'input_text', text: message.content }, ...(message.images ?? []).map(image => ({ type: 'input_image', image_url: `data:${image.mimeType};base64,${image.data}` }))]
   }]
 }
 
@@ -1519,7 +1520,7 @@ export class ModelClient {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model: this.settings.model,
-          messages: input.messages,
+          messages: input.messages.map(({ images, ...message }) => ({ ...message, ...(images?.length ? { images: images.map(image => image.data) } : {}) })),
           tools: input.tools,
           think: this.resolveThinking(input),
           stream: input.stream === true,
@@ -1657,7 +1658,7 @@ export class ModelClient {
     const reasoningModel = this.settings.provider === 'openai' && this.isOpenAiReasoningModel()
     const messages = input.messages.map((message) => ({
       role: message.role,
-      content: message.content,
+      content: message.images?.length ? [{ type: 'text', text: message.content }, ...message.images.map(image => ({ type: 'image_url', image_url: { url: `data:${image.mimeType};base64,${image.data}` } }))] : message.content,
       ...(message.reasoningContent !== undefined ? { reasoning_content: message.reasoningContent } : {}),
       ...(message.tool_call_id ? { tool_call_id: message.tool_call_id } : {}),
       ...(message.tool_calls?.length
@@ -1913,7 +1914,7 @@ export class ModelClient {
             ]
           }
         }
-        return { role: message.role, content: message.content }
+        return { role: message.role, content: message.images?.length ? [{ type: 'text', text: message.content }, ...message.images.map(image => ({ type: 'image', source: { type: 'base64', media_type: image.mimeType, data: image.data } }))] : message.content }
       })
     const anthropicTools = (input.tools as Array<{ function?: Record<string, unknown> }> | undefined)
       ?.flatMap((tool) => tool.function

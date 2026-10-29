@@ -117,6 +117,13 @@ const installAnswerModel = (
     writable: true,
     value: async (input: ModelChatInput): Promise<ModelResponse> => {
       calls.push(input)
+      if (input.format) {
+        const context = JSON.parse(input.messages.at(-1)?.content ?? '{}')
+        return answerResponse(JSON.stringify({ sourceMode: context.routingHint?.sourceMode ?? 'records', needsClarification: false,
+          intent: 'filter_records', resultMode: context.routingHint?.resultMode ?? 'list',
+          groupEntities: context.routingHint?.groupEntities ?? [], searchTerms: [], searchMode: 'any',
+          filters: [], fields: [], limit: 50 }))
+      }
       return answerResponse(response)
     }
   })
@@ -486,7 +493,7 @@ const testRecordsInvokeDataCenterOnly = async (): Promise<void> => {
     assert.ok(result.dataViews.length > 0)
     assert.deepEqual(result.dataViews[0]?.recordUids, ['orchestrator-record-001'])
     assert.ok(result.sources.every((source) => source.sourceType === 'record'))
-    assert.equal(calls.length, 0, 'records-only grouped answers use deterministic verified rendering')
+    assert.equal(calls.length, 1, 'grouped queries require catalog-aware semantic planning, then verified rendering')
     assert.ok(result.taskTrace)
     assert.equal(result.taskTrace?.status, 'completed')
     assert.equal(result.taskTrace?.primaryAgent, 'data-center')
@@ -640,8 +647,8 @@ const testKnowledgePlanningAndEvidenceAnswerThinkingContract = async (): Promise
       const evidenceAnswerCall = evidenceAnswerCalls[0]
       assert.ok(planningCall)
       assert.ok(evidenceAnswerCall)
-      assert.equal(planningCall.think, true, `${thinkingCase.label} planning may use model thinking`)
-      assert.equal(planningCall.forceThinking, true, `${thinkingCase.label} planning must preserve its thinking opt-in`)
+      assert.equal(planningCall.think, false, `${thinkingCase.label} source routing has bounded thinking disabled`)
+      assert.equal(planningCall.forceThinking, false, `${thinkingCase.label} source routing does not force thinking`)
       assert.equal(
         evidenceAnswerCall.think,
         thinkingCase.expectedFinalThinking,

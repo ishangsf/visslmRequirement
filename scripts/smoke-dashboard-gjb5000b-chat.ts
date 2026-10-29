@@ -6,9 +6,11 @@ import { validateDashboardSpec } from '../src/main/dashboards/validator'
 import type { DashboardSpec } from '../src/shared/dashboard'
 import type { DataScope } from '../src/shared/query-spec'
 import { projectOverviewGoldenFixture } from '../src/main/experts/dashboard-project-overview'
+import type { DashboardDomainSelection } from '../src/main/experts/dashboard-domain-request'
 import { runDashboardDomainChatRequest } from '../src/main/experts/dashboard-domain-chat'
 
 type ChatInput = {
+  domainSelection?: DashboardDomainSelection
   question: string
   scope: DataScope
   generatedAt: string
@@ -77,8 +79,9 @@ const makeEngine = (
   onScan: () => void = () => undefined
 ): QueryEngine => new QueryEngine(makeDb(records, onScan))
 
-const chatInput = (question: string): ChatInput => ({
+const chatInput = (question: string, domainSelection: DashboardDomainSelection | null = { scenario: 'project-overview', role: 'project-owner', tailoringBaselineId: 'sample-tailoring-baseline-v1' }): ChatInput => ({
   question,
+  domainSelection: domainSelection ?? undefined,
   scope: { ...sampleScope },
   generatedAt
 })
@@ -171,11 +174,11 @@ try {
     'ready dashboard 必须通过现有 DashboardSpec 校验')
   assertReceipt(controlled, dashboard)
 
-  const roleAmbiguous = await runChat(chatInput('生成项目综合态势大屏'), controlledEngine)
+  const roleAmbiguous = await runChat(chatInput('生成项目综合态势大屏', { scenario: 'project-overview' }), controlledEngine)
   assertClarification(roleAmbiguous, 'missing-role')
 
   const baselineAmbiguous = await runChat(
-    chatInput('项目负责人生成项目综合态势大屏'),
+    chatInput('项目负责人生成项目综合态势大屏', { scenario: 'project-overview', role: 'project-owner' }),
     controlledEngine
   )
   const baselineOptions = assertClarification(baselineAmbiguous, 'missing-tailoring-baseline')
@@ -189,7 +192,7 @@ try {
 
   let genericScans = 0
   const generic = await runChat(
-    chatInput('生成销售大屏，关注销售额和客户转化率'),
+    chatInput('生成销售大屏，关注销售额和客户转化率', null),
     makeEngine(projectOverviewGoldenFixture.records, () => { genericScans += 1 })
   )
   assert.equal(generic.recognized, false, '泛经营请求必须交给通用可视化链路')

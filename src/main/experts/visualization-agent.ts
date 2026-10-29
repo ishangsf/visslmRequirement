@@ -45,6 +45,11 @@ import { QueryEngine } from '../analytics/query-engine'
 import { adaptDashboardComponentQuery } from '../dashboards/component-repair'
 import { validateDashboardSpec } from '../dashboards/validator'
 import { ModelClient } from '../model-client'
+import { DashboardGenerationSession, fieldForGeneration, type DashboardGenerationOptions } from '../dashboards/generation-tools'
+import { discoverDashboardAnalysis } from './dashboard-discovery'
+import { getAssistantRunContext } from '../assistant/run-controller'
+import type { DashboardRenderPreview } from '../../shared/dashboard-generation'
+import { reviewDashboardPreview } from './dashboard-preview-review'
 
 const dashboardComponentOptionJsonSchemaProperties = {
   decimalPlaces: { type: 'integer', minimum: 0, maximum: 4 },
@@ -130,6 +135,13 @@ const dashboardJsonSchema = {
           options: { type: 'array', maxItems: 50 },
           value: { type: ['string', 'number', 'boolean', 'array', 'null'] }
         }
+      }
+    },
+    analysisNotes: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        assumptions: { type: 'array', maxItems: 12, items: { type: 'string', maxLength: 240 } },
+        unresolvedAmbiguities: { type: 'array', maxItems: 12, items: { type: 'string', maxLength: 240 } }
       }
     },
     // The host derives this sidecar from the validated QuerySpecs.  It is
@@ -234,6 +246,8 @@ const dashboardJsonSchema = {
                       type: 'string',
                       enum: ['count', 'countDistinct', 'sum', 'avg', 'min', 'max']
                     },
+                    formula: { type: 'string', maxLength: 300 },
+                    comparison: { type: 'object', required: ['offset', 'mode'], additionalProperties: false, properties: { offset: { type: 'integer', minimum: 1, maximum: 52 }, mode: { type: 'string', enum: ['percent', 'difference'] } } },
                     calculation: {
                       type: 'string',
                       enum: ['yoy', 'mom', 'share', 'cumulative']
@@ -796,53 +810,6 @@ const normalizePatchOperationAliases = (
     const theme = themeAliases.get(operation.value.trim().toLocaleLowerCase())
     return theme ? { ...operation, value: theme } : operation
   })
-}
-
-const normalizeFocusedPatchOperations = (
-  operations: DashboardPatchOperation[],
-  focusComponentId: string | undefined,
-  question: string
-): DashboardPatchOperation[] => {
-  if (!focusComponentId) return operations
-  const normalizedQuestion = question.replace(/大屏组件/g, '组件')
-  const explicitlyTargetsDashboard = /大屏|看板|驾驶舱|\bdashboard\b|\bwhole screen\b|\bcanvas\b/i
-    .test(normalizedQuestion)
-  if (explicitlyTargetsDashboard) return operations
-  const componentTypeIntents: Array<[RegExp, DashboardComponentType]> = [
-    [/(?:改成|切换为|换成|调整为|变成|展示为|使用)[^，。]{0,16}(?:折线图|趋势图)|\b(?:change|switch|convert)[^.!?]{0,48}\bline chart\b/i, 'line'],
-    [/(?:改成|切换为|换成|调整为|变成|展示为|使用)[^，。]{0,16}(?:柱状图|条形图)|\b(?:change|switch|convert)[^.!?]{0,48}\bbar chart\b/i, 'bar'],
-    [/(?:改成|切换为|换成|调整为|变成|展示为|使用)[^，。]{0,16}(?:饼图|环图)|\b(?:change|switch|convert)[^.!?]{0,48}\b(?:pie|donut) chart\b/i, 'pie'],
-    [/(?:改成|切换为|换成|调整为|变成|展示为|使用)[^，。]{0,16}排行榜/i, 'ranking'],
-    [/(?:改成|切换为|换成|调整为|变成|展示为|使用)[^，。]{0,16}(?:表格|明细表)/i, 'table'],
-    [/(?:改成|切换为|换成|调整为|变成|展示为|使用)[^，。]{0,16}(?:指标卡|KPI)/i, 'kpi'],
-    [/(?:改成|切换为|换成|调整为|变成|展示为|使用)[^，。]{0,16}进度条/i, 'progress'],
-    [/(?:改成|切换为|换成|调整为|变成|展示为|使用)[^，。]{0,16}仪表图/i, 'gauge'],
-    [/(?:改成|切换为|换成|调整为|变成|展示为|使用)[^，。]{0,16}漏斗图/i, 'funnel'],
-    [/(?:改成|切换为|换成|调整为|变成|展示为|使用)[^，。]{0,16}雷达图/i, 'radar'],
-    [/(?:改成|切换为|换成|调整为|变成|展示为|使用)[^，。]{0,16}散点图/i, 'scatter']
-  ]
-  const explicitType = componentTypeIntents.find(([pattern]) => pattern.test(normalizedQuestion))?.[1]
-  const normalizedOperations = operations.map((operation) => {
-    if (operation.op !== 'set-dashboard-title' && operation.op !== 'set-dashboard-subtitle') {
-      return operation
-    }
-    const { componentTitle: _componentTitle, ...rest } = operation
-    return {
-      ...rest,
-      op: operation.op === 'set-dashboard-title'
-        ? 'set-component-title'
-        : 'set-component-subtitle',
-      componentId: focusComponentId
-    }
-  })
-  if (!explicitType) return normalizedOperations
-  const typeOperation: DashboardPatchOperation = {
-    op: 'set-component-type',
-    componentId: focusComponentId,
-    value: explicitType
-  }
-  const withoutType = normalizedOperations.filter((operation) => operation.op !== 'set-component-type')
-  return [typeOperation, ...withoutType]
 }
 
 const resolveComponentIndex = (
@@ -1452,7 +1419,7 @@ const applyPatchOperations = (
       typeChangedComponentIds.add(component.id)
       queryAffectedComponentIds.add(component.id)
       if (queryEngine) {
-        next.components[index] = adaptDashboardComponentQuery(next, component.id, queryEngine).component
+        next.components[index] = adaptDashboardComponentQuery(next, component.id, queryEngine, { allowDimensionInference: true }).component
       }
       needsArrange = true
       continue
@@ -1750,21 +1717,7 @@ const toDataPoints = (
   }))
 }
 
-const catalogForPrompt = (profiles: FieldProfile[]): object[] =>
-  planSafeProfiles(profiles).slice(0, 100).map((profile) => ({
-    field: profile.field,
-    displayName: profile.displayName ?? profile.field,
-    role: profile.role,
-    synonyms: profile.synonyms ?? [],
-    type: profile.declaredType ?? profile.inferredType,
-    observedType: profile.inferredType,
-    sourceType: profile.sourceType,
-    attrType: profile.attrType,
-    sensitivity: profile.sensitivity,
-    coverage: profile.nonNullRate,
-    distinct: profile.distinctCount,
-    samples: profile.samples.slice(0, 3)
-  }))
+const catalogForPrompt = (profiles: FieldProfile[]): object[] => planSafeProfiles(profiles).map(fieldForGeneration)
 
 const componentTypeNames: Record<DashboardComponentType, string> = {
   kpi: '核心指标',
@@ -1865,26 +1818,6 @@ const isBusinessContext = (
     .every((field) => typeof candidate[field] === 'string')
 }
 
-const normalizeAnalysisTerm = (value: string): string =>
-  value.toLocaleLowerCase().replace(/[\s，。；：、·_\-—（）()\[\]【】]/g, '')
-
-const analysisProfileCandidates = (profile: FieldProfile): string[] => [
-  profile.field,
-  profile.displayName ?? '',
-  ...(profile.synonyms ?? [])
-].map(normalizeAnalysisTerm).filter((value) => value.length >= 2)
-
-const analysisProfileRelevance = (request: string, profile: FieldProfile): number => {
-  const normalizedRequest = normalizeAnalysisTerm(request)
-  return analysisProfileCandidates(profile).reduce((best, candidate) => {
-    if (normalizedRequest.includes(candidate)) return Math.max(best, candidate.length * 10)
-    const requestTokens = normalizedRequest.split(/[^a-z0-9\u4e00-\u9fff]+/i).filter(Boolean)
-    const candidateTokens = candidate.split(/[^a-z0-9\u4e00-\u9fff]+/i).filter(Boolean)
-    const overlap = candidateTokens.filter((token) => requestTokens.includes(token)).length
-    return Math.max(best, overlap * 5)
-  }, 0)
-}
-
 const canonicalMetadataForTransportAlias: Record<string, string> = {
   '_valm_uid': 'uid',
   '_valm_nodetype': 'nodeType',
@@ -1919,35 +1852,23 @@ const analysisMeasureId = (field: string): string => {
   return `measure-${suffix || 'value'}`
 }
 
-const requestedComponentType = (request: string): DashboardComponentType | undefined => {
-  const normalized = request.toLocaleLowerCase()
-  if (/treemap|矩形树图|树图/.test(normalized)) return 'treemap'
-  if (/\bcombo\b|组合图|组合趋势/.test(normalized)) return 'combo'
-  if (/scatter|散点|相关性|相关关系/.test(normalized)) return 'scatter'
-  if (/line|折线|趋势/.test(normalized)) return 'line'
-  if (/pie|donut|饼|环图/.test(normalized)) return 'pie'
-  if (/ranking|排行|排名/.test(normalized)) return 'ranking'
-  if (/table|明细|表格/.test(normalized)) return 'table'
-  if (/bar|柱|条形/.test(normalized)) return 'bar'
-  return undefined
-}
-
 /**
- * Build the business-analysis contract before asking the model to compose a
- * DashboardSpec.  It only uses safe field-profile metadata and never carries
+ * Build optional offline candidates from an explicit structured selection.
+ * The live model plans its own QuerySpecs; this helper never parses the request.  It only uses safe field-profile metadata and never carries
  * row values, SQL, or executable content.
  */
 export const planAnalysisBlueprint = (
   request: string,
   scope: DataScope,
-  profiles: FieldProfile[]
+  profiles: FieldProfile[],
+  selection?: { componentType?: DashboardComponentType; fields?: string[] }
 ): DashboardAnalysisBlueprint => {
   const safeProfiles = planSafeProfiles(profiles)
   const categoryProfiles = safeProfiles.filter(profileIsCategory)
   const dateProfiles = safeProfiles.filter((profile) => profile.inferredType === 'date')
   const numericProfiles = safeProfiles.filter(profileIsNumeric)
   const sortProfiles = (items: FieldProfile[]): FieldProfile[] => [...items].sort((left, right) =>
-    analysisProfileRelevance(request, right) - analysisProfileRelevance(request, left) ||
+    (selection?.fields?.includes(right.field) ? 1 : 0) - (selection?.fields?.includes(left.field) ? 1 : 0) ||
     right.nonNullRate - left.nonNullRate ||
     right.distinctCount - left.distinctCount ||
     left.field.localeCompare(right.field)
@@ -1962,35 +1883,6 @@ export const planAnalysisBlueprint = (
     '指标、维度和组件候选均由当前安全字段画像确定性推导',
     '未识别的字段语义不会被静默替换'
   ]
-  if (/可能|或|或者|未明确|歧义|不确定|待确认|maybe|either|uncertain|ambiguous/i.test(request)) {
-    unresolvedAmbiguities.push('用户请求包含未明确的选择条件，需要确认目标字段或组件类型')
-    assumptions.push('存在未决选择时仅采用安全字段画像作为候选，不将候选当作用户确认')
-  }
-  const recordTopTie = (label: string, items: FieldProfile[]): void => {
-    const ranked = sortProfiles(items)
-    const top = ranked[0]
-    if (!top || analysisProfileRelevance(request, top) <= 0) return
-    const tied = ranked.filter((profile) =>
-      analysisProfileRelevance(request, profile) === analysisProfileRelevance(request, top)
-    )
-    const normalizedRequest = normalizeAnalysisTerm(request)
-    const explicitlyNamed = tied.filter((profile) =>
-      analysisProfileCandidates(profile).some((candidate) => normalizedRequest.includes(candidate))
-    )
-    // A request that names both tied fields (for example, “金额和工时的
-    // 相关性”) is intentional dual-metric selection, not an unresolved
-    // ambiguity.  Keep the ambiguity marker for implicit equal candidates.
-    if (explicitlyNamed.length >= 2) return
-    if (tied.length > 1) {
-      unresolvedAmbiguities.push(
-        `${label}匹配到多个字段：${tied.slice(0, 4).map((profile) => profileLabel(profile, profile.field)).join('、')}`
-      )
-      assumptions.push(`${label}存在多个同等候选，需用户确认后才能改变指标口径`)
-    }
-  }
-  recordTopTie('分类维度', categoryProfiles)
-  recordTopTie('时间维度', dateProfiles)
-  recordTopTie('数值指标', numericProfiles)
   const metrics: DashboardMetricDefinition[] = [{
     id: 'metric-record-count',
     label: '记录数',
@@ -2021,7 +1913,7 @@ export const planAnalysisBlueprint = (
     field: profile.field,
     aggregation: 'sum',
     source: 'inferred',
-    confidence: analysisProfileRelevance(request, profile) ? 1 : 0.8
+    confidence: selection?.fields?.includes(profile.field) ? 1 : 0.8
     }
   }
   if (selectedNumeric) metrics.push(metricForNumeric(selectedNumeric, 0))
@@ -2032,7 +1924,7 @@ export const planAnalysisBlueprint = (
   const secondaryMetric = secondaryNumeric
     ? metrics.find((metric) => metric.field === secondaryNumeric.field)
     : undefined
-  const preferredType = requestedComponentType(request)
+  const preferredType = selection?.componentType
   const questions: DashboardAnalysisQuestion[] = []
   const addQuestion = (
     question: Omit<DashboardAnalysisQuestion, 'id' | 'priority'>
@@ -2113,7 +2005,7 @@ export const planAnalysisBlueprint = (
     slotRole: 'detail',
     required: false
   })
-  const requiredType = requestedComponentType(request)
+  const requiredType = selection?.componentType
   if (requiredType === 'line') {
     const trendQuestion = questions.find((candidate) =>
       candidate.slotRole === 'trend' && candidate.preferredComponentTypes.includes('line')
@@ -2816,6 +2708,13 @@ const normalizeGeneratedSpec = (
       profiles,
       businessContext
     )
+  const notes = (normalizedSpec.analysisNotes ?? normalizedSpec.analysisBlueprint) as Record<string, unknown> | undefined
+  for (const key of ['assumptions', 'unresolvedAmbiguities'] as const) {
+    if (Array.isArray(notes?.[key])) {
+      const values = notes[key].filter((value): value is string => typeof value === 'string').slice(0, 12).map((value) => value.trim().slice(0, 240)).filter(Boolean)
+      semanticPlan.blueprint[key] = [...new Set([...semanticPlan.blueprint[key], ...values])]
+    }
+  }
   return {
     ...normalizedSpec,
     businessContext: businessContext ?? {
@@ -2899,18 +2798,24 @@ class VisualizationToolAuditTrail {
 }
 
 export class VisualizationAgent {
-  private readonly queryEngine: QueryEngine
+  private queryEngine: QueryEngine
+  private readonly sourceQueryEngine: QueryEngine
 
   constructor(
     queryEngine: QueryEngine,
     private readonly settings: ModelSettings,
     private readonly onRun?: (run: VisualizationRunInput) => void,
-    private readonly onProgress?: (event: Extract<AgentEvent, { type: 'status' }>) => void
+    private readonly onProgress?: (event: Extract<AgentEvent, { type: 'status' }>) => void,
+    private readonly generationOptions: DashboardGenerationOptions = {}
   ) {
     this.queryEngine = queryEngine
+    this.sourceQueryEngine = queryEngine
   }
 
   async generate(question: string, scope: DataScope): Promise<DashboardSpec> {
+    const session = new DashboardGenerationSession(this.sourceQueryEngine, scope, { ...this.generationOptions, signal: this.generationOptions.signal ?? getAssistantRunContext()?.signal })
+    this.queryEngine = session.engine
+    scope = session.scope
     const startedAt = performance.now()
     const audit = new VisualizationToolAuditTrail()
     let attemptCount = 0
@@ -2953,45 +2858,34 @@ export class VisualizationAgent {
       throw finalError
     }
     progress('plan', '正在依据字段画像形成业务分析蓝图')
-    const plannedBlueprint = audit.run(
-      'plan-analysis',
-      0,
-      () => planAnalysisBlueprint(question, scope, profiles),
-      (result) => ({
-        metricCount: result.metrics.length,
-        questionCount: result.questions.length
-      })
-    )
+    // Choose semantics with the model; derive the receipt from validated QuerySpecs.
+    const plannedBlueprint = undefined
+    try {
+      await audit.runAsync('discover-analysis', 0, () => discoverDashboardAnalysis(question, this.settings, session, (_name, ok) => { audit.mark('mcp-call', ok ? 'success' : 'failed', 0); progress('profile', ok ? '已取得分析依据，正在核对指标与数据口径' : '分析工具返回校验问题，正在修正规划') }))
+    } catch (error) { finalError = error; record('failed'); throw error }
+    const selectedProfiles = profiles.filter(profile => session.exposedFields.has(profile.field))
+    let previousCandidate: DashboardSpec | undefined
+    let lastPreview: DashboardRenderPreview | undefined
     let validationFeedback = ''
     let lastError: unknown
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
       attemptCount = attempt + 1
       try {
-        progress('plan', attempt ? '正在根据校验结果修复组件编排' : '正在依据业务分析蓝图编排组件')
-        const raw = await audit.runAsync(
-          'model-compose',
-          attemptCount,
-          () => this.generateSpec(
-            question,
-            scope,
-            profiles,
-            validationFeedback,
-            plannedBlueprint
-          )
-        )
-        progress('query', '正在校验受控查询和字段引用')
-        const normalized = normalizeGeneratedSpec(
-          raw,
-          question,
-          scope,
-          profiles,
-          plannedBlueprint
-        ) as DashboardSpec
-        const spec: DashboardSpec = {
-          ...normalized,
-          viewport: { width: 1920, height: 1080, columns: 24, rowHeight: 56 },
-          components: arrangeDashboardComponentsByStory(normalized.components)
+        progress('plan', attempt ? '正在根据校验结果修复组件编排' : '正在根据完整业务目标规划字段、指标和组件')
+        session.check()
+        let normalized: DashboardSpec
+        if (attempt && previousCandidate) {
+          const raw = await audit.runAsync('model-compose', attemptCount, () => this.generatePatchOperations(question, previousCandidate!, scope, selectedProfiles, validationFeedback))
+          const operations = normalizePatchOperationAliases(parsePatchOperations(raw))
+          normalized = audit.run('apply-patch', attemptCount, () => applyPatchOperations(previousCandidate!, operations, undefined, this.queryEngine, scope, profiles).dashboard)
+        } else {
+          const raw = await audit.runAsync('model-compose', attemptCount, () => this.generateSpec(question, scope, selectedProfiles, validationFeedback, plannedBlueprint, { contract: session.contract, trials: session.trials }))
+          normalized = audit.run('plan-analysis', attemptCount, () => normalizeGeneratedSpec(raw, question, scope, profiles, plannedBlueprint) as DashboardSpec)
         }
+        const spec: DashboardSpec = { ...normalized, viewport: { width: 1920, height: 1080, columns: 24, rowHeight: 56 }, components: arrangeDashboardComponentsByStory(normalized.components) }
+        progress('query', '正在校验受控查询和字段引用')
+        previousCandidate = spec
+        for (const component of spec.components) if (component.query) session.bindQuery(component.query)
         const semanticErrors = audit.run(
           'validate-semantics',
           attemptCount,
@@ -3049,15 +2943,37 @@ export class VisualizationAgent {
           validationFeedback = finalErrors.join('\n')
           throw new Error(validationFeedback)
         }
+        previousCandidate = dashboard
+        const draft = session.stage(dashboard)
+        const validation = await audit.runAsync('quality-check', attemptCount, async () => {
+          const response = await session.handle({ id: 1, method: 'tools/call', params: { name: 'validate_dashboard', arguments: draft } })
+          const result = (response as any)?.result
+          if (!result || result.isError) throw new Error(result?.content?.[0]?.text ?? '大屏工具校验失败')
+          return result.structuredContent as { errors: string[]; quality: import('../../shared/dashboard').DashboardQualityReport }
+        })
+        const qualityProblems = validation.quality.issues.filter(issue => issue.severity === 'error' || ['pie-too-many-categories', 'long-title'].includes(issue.code))
+        const coverageErrors = audit.run('goal-coverage', attemptCount, () => session.coverage(dashboard!))
+        lastPreview = await audit.runAsync('render-preview', attemptCount, async () => {
+          const response = await session.handle({ id: 2, method: 'tools/call', params: { name: 'render_preview', arguments: draft } })
+          const result = (response as any)?.result
+          if (!result || result.isError) throw new Error(result?.content?.[0]?.text ?? '预览工具失败')
+          const image = result.content?.find((block: any) => block.type === 'image')
+          return { ...result.structuredContent, ...(image ? { screenshot: { mimeType: image.mimeType, data: image.data } } : {}) } as DashboardRenderPreview
+        })
+        session.check()
+        if (lastPreview.rendered) lastPreview.issues.push(...await reviewDashboardPreview(this.settings, dashboard, lastPreview, session.contract, this.generationOptions.signal ?? getAssistantRunContext()?.signal))
+        const problems = [...validation.errors, ...coverageErrors, ...qualityProblems.map(issue => JSON.stringify(issue)), ...(lastPreview.issues ?? []).map(issue => JSON.stringify(issue))]
+        if (problems.length) { validationFeedback = JSON.stringify({ issues: [...new Set(problems)], draft, instruction: '只修改有问题的组件；保留独立指标契约、筛选、公式、字段与数据范围。不要删除目标来通过校验。' }); throw new Error(validationFeedback) }
+        dashboard.generationEvidence = { snapshotId: session.snapshotId, capturedAt: session.capturedAt, snapshotRetention: 'generation-only', contract: session.contract!, qualityScore: validation.quality.score, rendered: lastPreview.rendered, checkedAt: new Date().toISOString(), warnings: validation.quality.issues.filter(issue => issue.severity !== 'error').map(issue => issue.code) }
+        if (this.generationOptions.dataSource) dashboard.dataSource = this.generationOptions.dataSource
         record('success')
         progress('persist', '生成完成，等待保存为正式版本')
         return dashboard
       } catch (error) {
+        if ((this.generationOptions.signal ?? getAssistantRunContext()?.signal)?.aborted) { finalError = error; record('failed'); throw (this.generationOptions.signal ?? getAssistantRunContext()?.signal)!.reason }
         lastError = error
-        if (!validationFeedback) {
-          validationFeedback = error instanceof Error ? error.message : String(error)
-        }
-        if (attempt === 0) {
+        validationFeedback = validationFeedback && error instanceof Error && error.message !== validationFeedback ? JSON.stringify({ previousFeedback: validationFeedback.slice(0, 12000), lastAttemptError: error.message }) : error instanceof Error ? error.message : String(error)
+        if (attempt < 2) {
           audit.mark('repair-attempt', 'success', attemptCount, {
             nextAttempt: attemptCount + 1,
             validationIssueCount: validationFeedback.split('\n').filter(Boolean).length
@@ -3180,11 +3096,7 @@ export class VisualizationAgent {
             editMode
           )
         )
-        const operations = normalizeFocusedPatchOperations(
-          normalizePatchOperationAliases(parsePatchOperations(raw)),
-          targetComponentId,
-          question
-        )
+        const operations = normalizePatchOperationAliases(parsePatchOperations(raw))
         if (editMode === 'full' && !patchBaseDashboard.analysisBlueprint &&
             operations.some((operation) => semanticUpgradeOperations.has(operation.op))) {
           patchBaseDashboard = audit.run(
@@ -3293,6 +3205,17 @@ export class VisualizationAgent {
           validationFeedback = finalBlockingErrors.join('\n')
           throw new Error(validationFeedback)
         }
+        if (this.generationOptions.renderPreview) {
+          progress('validate', '正在检查修改后的桌面渲染')
+          const preview = await this.generationOptions.renderPreview(dashboard)
+          const issues = preview.issues.filter(issue => !issue.componentId || appliedPatch.affectedComponentIds.has(issue.componentId))
+          if (issues.length) {
+            validationFeedback = JSON.stringify(issues)
+            throw new Error(validationFeedback)
+          }
+          if (dashboard.generationEvidence) dashboard.generationEvidence = { ...dashboard.generationEvidence, rendered: preview.rendered, checkedAt: new Date().toISOString() }
+        }
+        if (appliedPatch.queryAffectedComponentIds.size || dashboard.components.length !== baseDashboard.components.length) delete dashboard.generationEvidence
         record('success', dashboard)
         progress('persist', '修改完成，等待用户保存为新版本')
         return dashboard
@@ -3322,7 +3245,8 @@ export class VisualizationAgent {
     scope: DataScope,
     profiles: FieldProfile[],
     validationFeedback: string,
-    plannedBlueprint: DashboardAnalysisBlueprint
+    plannedBlueprint?: DashboardAnalysisBlueprint,
+    exploration?: { contract: unknown; trials: unknown[] }
   ): Promise<unknown> {
     const payload = await new ModelClient(this.settings).chat({
       format: dashboardJsonSchema,
@@ -3341,7 +3265,8 @@ export class VisualizationAgent {
               '每个组件必须包含 id,type,title,layout,data:[],query,encoding。',
               'query 必须符合 QuerySpec：source=records、scope 使用给定值、1-2 个 dimensions、至少一个 measures，limit<=500。',
               '注意字段名必须精确写成 measures（不能写 metrics、measure 或 metric）。示例：{"measures":[{"id":"recordCount","aggregation":"count"}]}。',
-              'aggregation 只能是 count/countDistinct/sum/avg/min/max；非 count 聚合必须有 field。',
+              'aggregation 只能是 count/countDistinct/sum/avg/min/max；非 count 聚合必须有 field 或受控 formula。formula 仅引用同查询 measure.id 的算术表达式，不能执行代码。comparison 可指定 offset 和 percent/difference。',
+              '必须完整覆盖独立 analysisContract；沿用已试算的字段、单位、分母、公式和筛选，不得改成相近指标。',
               'measure 可选 calculation=yoy/mom/share/cumulative；yoy 和 mom 输出相对上期的百分比，share 输出占比百分比，cumulative 输出按时间累计值；使用这些计算时必须给时间维度设置 timeGrain。',
               'encoding.value 必须引用 measure.id；有维度时 encoding.label 引用第一个 dimension.field。',
               'scatter 和 combo 必须包含两个不同的 measures，并分别设置 encoding.value 与 encoding.secondaryValue；scatter 两个指标都必须是不同的安全数值字段。',
@@ -3350,9 +3275,9 @@ export class VisualizationAgent {
               '优先生成记录总量 KPI、一个分类分布、一个时间趋势（存在日期字段时）和一个排行榜。',
               'insight 也必须有 query 和 encoding，insight 文本只能概括查询含义，不能编造数字。',
               '可选的 globalFilters 只能引用字段目录中的低基数字段，options 只能使用字段样例，不能编造值。',
-              '返回字段：schemaVersion,id,title,subtitle,businessContext,viewport,theme,globalFilters,updatedAt,components。',
-              '主机已先生成 AnalysisBlueprint；必须优先回答其中 required=true 的业务问题，并只使用蓝图指标的 measureId、field、aggregation 和 dimensionFields。',
-              '不要擅自替换蓝图字段或聚合；每个组件都必须实现蓝图中的一个业务问题，不能在 compose 阶段新增指标或业务问题。',
+            '返回字段：schemaVersion,id,title,subtitle,businessContext,analysisNotes,viewport,theme,globalFilters,updatedAt,components。analysisNotes 用 assumptions 和 unresolvedAmbiguities 记录假设与未确定口径，不得凭空替用户消除歧义。',
+              '根据完整业务目的选择字段、指标和组件类型，不能因为出现某个词就忽略否定或切换图表。字段与范围必须通过查询校验。',
+              '没有 AnalysisBlueprint 时输出符合用户目的的 QuerySpec，主机从校验后的查询派生语义回执；不得将候选当作用户确认口径。',
               '主机将重新绑定 semanticBinding、slotRole 并生成自动标题；不要依赖或伪造脱离查询语义的标题或指标。',
               '每个组件必须明确 measures；缺少指标时不要自行补 recordCount。'
             ].join('\n')
@@ -3364,6 +3289,7 @@ export class VisualizationAgent {
               scope,
               analysisBlueprint: plannedBlueprint,
               fieldCatalog: catalogForPrompt(profiles),
+              analysisContract: exploration?.contract, trialResults: exploration?.trials,
               previousValidationErrors: validationFeedback || undefined
             })
           }
@@ -3402,7 +3328,7 @@ export class VisualizationAgent {
             'set-component-content-settings, set-component-content-item, add-component.',
             'Use set-component-style only for properties supported by that component type.',
             'Component-specific visual primitives such as labels, values, item limits, targets, line/point/area controls, gauge bounds and chart sorting also use set-component-style.',
-            'Use set-component-content-settings for matrix pagination/linkage, detail heading/status/linkage, or comparison labels.',
+            'Use set-component-content-settings only when the target actually has content.kind (data-matrix, description-list, comparison-bars). Ordinary charts, KPI, table and ranking without content do not support set-component-content-* operations.',
             'Use set-component-content-item with an existing itemId; selectionId chooses a description-list variant.',
             'Supported add component types include treemap and combo. Treemap needs a category dimension and one metric.',
             'Combo needs a time or category dimension and two different metrics; scatter likewise needs two safe numeric metrics.',

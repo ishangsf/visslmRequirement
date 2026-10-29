@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import { performance } from 'node:perf_hooks'
+import { normalizeFieldBusinessSemantics } from '../../shared/field-business-semantics'
 import type {
   DataScope,
   FieldProfile,
@@ -259,7 +260,7 @@ const inferRole = (field: string, inferredType: QueryFieldType): FieldProfileRol
 }
 
 const normalizeSemanticPatch = (patch: FieldProfileSemanticPatch): FieldProfileSemanticPatch => {
-  const normalized: FieldProfileSemanticPatch = {}
+  const normalized: FieldProfileSemanticPatch = normalizeFieldBusinessSemantics(patch)
   if (patch.displayName !== undefined) {
     if (typeof patch.displayName !== 'string') throw new Error('字段显示名必须是文本')
     normalized.displayName = patch.displayName.trim().slice(0, 80)
@@ -592,6 +593,32 @@ const aggregate = (records: AnalyticsRecord[], measure: QueryMeasure): number =>
 export class QueryEngine {
   constructor(private readonly db: AnalyticsDatabase) {}
 
+  /** One generation uses one immutable set of rows and field semantics. */
+  snapshot(scope: DataScope): { engine: QueryEngine; scope: DataScope; snapshotId: string; capturedAt: string; recordCount: number } {
+    const authorizedUids = scope.recordUids === undefined ? undefined : new Set(scope.recordUids)
+    const records = structuredClone(scanRecords(this.db, scope).filter(record =>
+      (!authorizedUids || authorizedUids.has(record.uid)) && (scope.baseFilters ?? []).every(filter => matchesFilter(record, filter))
+    ))
+    const originalProfiles = this.profile(scope)
+    const profiles = scope.baseFilters?.length || authorizedUids
+      ? new QueryEngine({ scanAnalyticsRecords: () => records }).profile({}).map(profile => {
+        const original = originalProfiles.find(field => field.field === profile.field)
+        return { ...original, ...profile,
+          ...(original ? { displayName: original.displayName, role: original.role, synonyms: original.synonyms, sensitivity: original.sensitivity,
+            businessMeaning: original.businessMeaning, unit: original.unit, valueLabels: original.valueLabels, declaredType: original.declaredType,
+            sourceType: original.sourceType, attrType: original.attrType } : {}) }
+      })
+      : structuredClone(originalProfiles)
+    const capturedAt = new Date().toISOString()
+    const snapshotId = hashValue({ scope, revision: safeRevision(this.db), at: capturedAt })
+    const fixedScope = structuredClone(scope)
+    const engine = new QueryEngine({
+      scanAnalyticsRecords: () => records,
+      getFieldProfiles: () => structuredClone(profiles)
+    })
+    return { engine, scope: fixedScope, snapshotId, capturedAt, recordCount: records.length }
+  }
+
   profile(scope: DataScope): FieldProfile[] {
     const dataRevision = safeRevision(this.db)
     const cacheKey = scopeCacheKey(scope)
@@ -665,7 +692,7 @@ export class QueryEngine {
       })
       .sort((left, right) => right.nonNullRate - left.nonNullRate || left.field.localeCompare(right.field))
     this.db.saveFieldProfiles?.(cacheKey, dataRevision, profiles)
-    return applyFieldMetadata(profiles)
+    return applyFieldMetadata(this.db.getFieldProfiles?.(cacheKey, dataRevision) ?? profiles)
   }
 
   updateFieldProfileSemantics(

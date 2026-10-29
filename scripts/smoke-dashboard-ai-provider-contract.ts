@@ -1,3 +1,4 @@
+import '../tests/helpers/visualization-discovery-fixture'
 import { strict as assert } from 'node:assert'
 import { createServer, type IncomingMessage } from 'node:http'
 import { QueryEngine } from '../src/main/analytics/query-engine'

@@ -18,7 +18,8 @@ type DomainRequestResult = {
 
 const resolve = resolveDashboardDomainRequest as unknown as (
   question: string,
-  scope: RequestScope
+  scope: RequestScope,
+  selection?: { scenario: string; role?: string; tailoringBaselineId?: string }
 ) => DomainRequestResult
 
 const scope: RequestScope = { projectIds: ['sample-project-001'] }
@@ -28,7 +29,8 @@ const preserveInput = (question: string, result: DomainRequestResult): void => {
 }
 
 const controlledQuestion = '项目负责人基于受控样例生成项目综合态势大屏'
-const controlled = resolve(controlledQuestion, scope)
+assert.equal(resolve(controlledQuestion, scope).recognized, false, '关键词不能自动选择业务场景')
+const controlled = resolve(controlledQuestion, scope, { scenario: 'project-overview', role: 'project-owner', tailoringBaselineId: 'sample-tailoring-baseline-v1' })
 preserveInput(controlledQuestion, controlled)
 assert.equal(controlled.recognized, true)
 assert.equal(controlled.role, 'project-owner')
@@ -42,14 +44,14 @@ assert.equal(controlled.provenance?.source, 'local-single-user-policy',
 assert.ok(!JSON.stringify(controlled).toLocaleLowerCase().includes('rbac'))
 
 const roleAmbiguousQuestion = '生成项目综合态势大屏'
-const roleAmbiguous = resolve(roleAmbiguousQuestion, scope)
+const roleAmbiguous = resolve(roleAmbiguousQuestion, scope, { scenario: 'project-overview' })
 preserveInput(roleAmbiguousQuestion, roleAmbiguous)
 assert.equal(roleAmbiguous.recognized, true)
 assert.equal(roleAmbiguous.role, undefined,
   '未明确项目负责人时不得暗猜角色，应交由 planner 追问')
 
 const baselineAmbiguousQuestion = '项目负责人生成项目综合态势大屏'
-const baselineAmbiguous = resolve(baselineAmbiguousQuestion, scope)
+const baselineAmbiguous = resolve(baselineAmbiguousQuestion, scope, { scenario: 'project-overview', role: 'project-owner' })
 preserveInput(baselineAmbiguousQuestion, baselineAmbiguous)
 assert.equal(baselineAmbiguous.recognized, true)
 assert.equal(baselineAmbiguous.role, 'project-owner')
@@ -65,11 +67,11 @@ assert.equal(generic.role, undefined)
 assert.equal(generic.scenario, undefined)
 assert.equal(generic.tailoringBaselineId, undefined)
 
-const scenarioKeywordCases: Array<{ question: string; scenario: string; status: 'active' }> = [
+const structuredScenarioCases: Array<{ question: string; scenario: string; status: 'active' }> = [
   { question: '型号组织管理负责人生成组织级度量与过程改进大屏', scenario: 'organization-improvement', status: 'active' }
 ]
-for (const item of scenarioKeywordCases) {
-  const result = resolve(item.question, scope)
+for (const item of structuredScenarioCases) {
+  const result = resolve(item.question, scope, { scenario: item.scenario })
   preserveInput(item.question, result)
   assert.equal(result.recognized, true, `${item.question} 必须识别为领域请求`)
   assert.equal(result.scenario, item.scenario)
@@ -94,9 +96,9 @@ console.log(JSON.stringify({
     tailoringBaselineId: baselineAmbiguous.tailoringBaselineId
   },
   generic: { recognized: generic.recognized },
-  scenarios: scenarioKeywordCases.map(({ question, scenario }) => ({
+  scenarios: structuredScenarioCases.map(({ question, scenario }) => ({
     question,
     scenario,
-    status: resolve(question, scope).scenarioStatus
+    status: resolve(question, scope, { scenario }).scenarioStatus
   }))
 }, null, 2))

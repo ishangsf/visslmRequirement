@@ -37,17 +37,6 @@ const skillLabel = (skillId: AssistantIntentDecision['skillId']): string => ({
   artifact: '交付物专家'
 }[skillId])
 
-/**
- * Status messages are treated only as control signals.  Never copy the
- * message into a work-log summary: an Agent implementation may put provider
- * details or other untrusted text in it.
- */
-const isExecutionPreparationCompleteMessage = (statusMessage: string): boolean => {
-  const normalizedMessage = statusMessage.trim().replace(/\s+/gu, '')
-  if (!normalizedMessage || /(?:失败|未能|错误|中止|取消|尚未|未完成|未生成|未形成|未成功)/u.test(normalizedMessage)) return false
-  return /(?:计划|规划|准备).*(?:已(?:经)?|完成|成功)|(?:已(?:经)?|完成|成功).*(?:形成|生成|确定|准备)|(?:已(?:经)?\s*(?:形成|生成|确定))|(?:生成|形成|准备).*(?:完成|成功)/u.test(normalizedMessage)
-}
-
 /** Create the safe narrative emitted when the trusted intent is available. */
 export const workLogForIntent = (decision: AssistantIntentDecision): AssistantWorkLogDraft => ({
   kind: 'narrative',
@@ -72,7 +61,7 @@ export const workLogForSkill = (decision: AssistantIntentDecision): AssistantWor
  * implementation and must never become a channel for raw tool arguments,
  * prompts, or provider reasoning.
  */
-export const workLogForStatus = (stage: string, message = ''): AssistantWorkLogDraft => {
+export const workLogForStatus = (stage: string, _message = '', status: AssistantActivityStatus = 'running'): AssistantWorkLogDraft => {
   const normalizedStage = stage.trim().toLocaleLowerCase()
   if (normalizedStage === 'classify') {
     return {
@@ -93,7 +82,7 @@ export const workLogForStatus = (stage: string, message = ''): AssistantWorkLogD
     }
   }
   if (normalizedStage === 'scope') {
-    const confirmed = /已确认|确认完成/u.test(message)
+    const confirmed = status === 'completed'
     return {
       kind: 'checkpoint',
       stage: 'scope-confirmation',
@@ -173,7 +162,7 @@ export const workLogForStatus = (stage: string, message = ''): AssistantWorkLogD
     }
   }
   if (normalizedStage === 'route' || normalizedStage === 'plan' || normalizedStage === 'generate') {
-    const completed = isExecutionPreparationCompleteMessage(message)
+    const completed = status === 'completed'
     return {
       kind: 'narrative',
       stage: 'execution-preparation',

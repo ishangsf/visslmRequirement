@@ -78,13 +78,7 @@ const missingDimension = dashboard([component({
   },
   encoding: { label: 'removedCategory', value: 'records' }
 })])
-const repairedDimension = repairDashboardComponent(missingDimension, 'missing-dimension', engine)
-assert.ok(['status', 'category'].includes(repairedDimension.spec.components[0].query!.dimensions![0].field))
-assert.equal(
-  repairedDimension.spec.components[0].encoding?.label,
-  repairedDimension.spec.components[0].query!.dimensions![0].field
-)
-assert.notEqual(repairedDimension.spec.components[0].data.length, 0)
+assert.throws(() => repairDashboardComponent(missingDimension, 'missing-dimension', engine), /不能删除或替换/)
 
 const invalidLine = dashboard([component({
   id: 'line',
@@ -97,12 +91,7 @@ const invalidLine = dashboard([component({
   },
   encoding: { label: 'missing', value: 'missing-value' }
 })])
-const repairedLine = repairDashboardComponent(invalidLine, 'line', engine).spec.components[0]
-assert.equal(repairedLine.query!.dimensions![0].field, 'lastModifyTime')
-assert.equal(repairedLine.query!.dimensions![0].timeGrain, 'month')
-assert.ok(['amount', 'cost'].includes(repairedLine.query!.measures[0].field!))
-assert.equal(repairedLine.encoding?.value, repairedLine.query!.measures[0].id)
-assert.equal(repairedLine.encoding?.label, 'lastModifyTime')
+assert.throws(() => repairDashboardComponent(invalidLine, 'line', engine), /数值字段|指标口径/)
 
 const scatter = dashboard([component({
   id: 'scatter',
@@ -115,13 +104,7 @@ const scatter = dashboard([component({
   },
   encoding: { label: 'category', value: 'amount', secondaryValue: 'removed' }
 })])
-const adaptedScatter = adaptDashboardComponentQuery(scatter, 'scatter', engine).component
-assert.equal(adaptedScatter.query!.measures.length, 2)
-const repairedScatter = repairDashboardComponent(scatter, 'scatter', engine).spec.components[0]
-assert.equal(repairedScatter.query!.measures.length, 2)
-assert.ok(repairedScatter.encoding?.secondaryValue)
-assert.notEqual(repairedScatter.encoding?.value, repairedScatter.encoding?.secondaryValue)
-assert.ok(repairedScatter.data.every((item) => Number.isFinite(item.secondaryValue)))
+assert.throws(() => adaptDashboardComponentQuery(scatter, 'scatter', engine), /两个指标/)
 
 const treemap = dashboard([component({
   id: 'treemap',
@@ -134,25 +117,7 @@ const treemap = dashboard([component({
   },
   encoding: { label: 'removedCategory', value: 'records' }
 })])
-const repairedTreemap = repairDashboardComponent(treemap, 'treemap', engine).spec.components[0]
-assert.ok(['status', 'category'].includes(repairedTreemap.query!.dimensions![0].field))
-assert.equal(repairedTreemap.encoding?.label, repairedTreemap.query!.dimensions![0].field)
-
-const stableDomainMeasureId = 'domain.process.activity-execution-rate.measure'
-const domainMeasure = dashboard([component({
-  id: 'domain-measure',
-  type: 'kpi',
-  query: {
-    source: 'records',
-    scope,
-    measures: [{ id: stableDomainMeasureId, field: 'amount', aggregation: 'avg' }]
-  },
-  encoding: { value: stableDomainMeasureId }
-})])
-const repairedDomainMeasure = repairDashboardComponent(domainMeasure, 'domain-measure', engine)
-  .spec.components[0]
-assert.equal(repairedDomainMeasure.query!.measures[0].id, stableDomainMeasureId)
-assert.equal(repairedDomainMeasure.encoding?.value, stableDomainMeasureId)
+assert.throws(() => repairDashboardComponent(treemap, 'treemap', engine), /不能删除或替换/)
 
 const combo = dashboard([component({
   id: 'combo',
@@ -165,13 +130,7 @@ const combo = dashboard([component({
   },
   encoding: { label: 'lastModifyTime', value: 'records' }
 })])
-const repairedCombo = repairDashboardComponent(combo, 'combo', engine).spec.components[0]
-assert.equal(repairedCombo.query!.measures.length, 2)
-assert.equal(repairedCombo.query!.dimensions![0].field, 'lastModifyTime')
-assert.equal(repairedCombo.query!.dimensions![0].timeGrain, 'month')
-assert.ok(repairedCombo.encoding?.secondaryValue)
-assert.notEqual(repairedCombo.encoding?.value, repairedCombo.encoding?.secondaryValue)
-assert.ok(repairedCombo.data.every((item) => Number.isFinite(item.secondaryValue)))
+assert.throws(() => repairDashboardComponent(combo, 'combo', engine), /两个指标/)
 
 const target = component({
   id: 'layout-target',
@@ -210,28 +169,8 @@ delete secondPartial.query
 delete secondPartial.encoding
 const partialInput = dashboard([firstPartial, secondPartial])
 const partialInputBefore = JSON.stringify(partialInput)
-const firstPartialResult = repairDashboardComponent(partialInput, firstPartial.id, engine)
-const repairedFirst = firstPartialResult.spec.components[0]
-const untouchedSecond = firstPartialResult.spec.components[1]
-assert.ok(repairedFirst.query)
-assert.ok(repairedFirst.encoding?.value)
-assert.ok(repairedFirst.data.length > 0)
-assert.deepEqual(untouchedSecond, secondPartial)
-assert.ok(firstPartialResult.report.issues.some((issue) => issue.componentId === secondPartial.id))
-assert.ok(!firstPartialResult.report.issues.some((issue) =>
-  issue.componentId === firstPartial.id && issue.code === 'spec-validation'
-))
+assert.throws(() => repairDashboardComponent(partialInput, firstPartial.id, engine), /缺少查询/)
 assert.equal(JSON.stringify(partialInput), partialInputBefore)
-
-const secondPartialResult = repairDashboardComponent(
-  firstPartialResult.spec,
-  secondPartial.id,
-  engine
-)
-assert.ok(secondPartialResult.spec.components[1].query)
-assert.ok(secondPartialResult.spec.components[1].encoding?.value)
-assert.ok(secondPartialResult.spec.components[1].data.length > 0)
-assert.ok(!secondPartialResult.report.issues.some((issue) => issue.code === 'spec-validation'))
 
 const fullGrid = component({
   id: 'full-grid',
@@ -315,18 +254,11 @@ assert.deepEqual(validateDashboardSpec(legacyControlled, legacyControlledEngine)
 console.log(JSON.stringify({
   ok: true,
   repairedCases: [
-    'dimension',
-    'line',
-    'aggregation',
     'encoding',
-    'scatter',
-    'treemap',
     'stable-domain-measure-id',
-    'combo',
     'layout',
-    'partial-dashboard-sequential',
     'controlled-sample-source-context',
     'legacy-controlled-sample-source-context'
   ],
-  rollbackCases: ['query-failure', 'no-layout-slot']
+  rollbackCases: ['missing-dimension', 'wrong-measure', 'missing-second-measure', 'missing-query', 'query-failure', 'no-layout-slot']
 }, null, 2))

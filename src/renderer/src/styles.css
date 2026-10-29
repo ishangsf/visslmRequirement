@@ -2098,6 +2098,26 @@ body {
   padding: 16px 16px 4px !important;
 }
 
+.push-value-options {
+  margin-top: 16px;
+  min-height: 0;
+}
+
+.push-value-options-content {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+}
+
+.push-value-options-content > .ant-btn {
+  align-self: flex-start;
+}
+
+.push-value-options-content .ant-table-wrapper {
+  min-height: 0;
+}
+
 .push-mapping-section {
   margin-top: 18px;
   padding: 16px;

@@ -1938,14 +1938,16 @@ export class KnowledgeService {
     }
   }
 
-  async rankRecordMatches(question: string, limit = 100_000): Promise<KnowledgeRecordMatch[]> {
+  async rankRecordMatches(question: string, limit = 100_000, options?: { recordUids: readonly string[] }): Promise<KnowledgeRecordMatch[]> {
     const query = question.trim()
     if (!query) return []
     await this.embeddings.prepare()
     if (!this.embeddings.available) return []
     const [queryVector] = await this.embeddings.embedMany([query])
+    const allowedRecordUids = options ? new Set(options.recordUids) : undefined
     const allCandidates = this.vectorRowsForSearch()
-      .filter(({ chunk }) => chunk.sourceType === 'record' && Boolean(chunk.recordUid))
+      .filter(({ chunk }) => chunk.sourceType === 'record' && Boolean(chunk.recordUid) &&
+        (!allowedRecordUids || allowedRecordUids.has(chunk.recordUid!)))
     const queryLexicalProfile = buildKnowledgeLexicalProfile(query)
     const lexicalScores = buildKnowledgeLexicalScores(
       queryLexicalProfile,

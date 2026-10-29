@@ -144,6 +144,11 @@ const componentTypeIcons: Record<DashboardComponentType, string> = {
 const repairableQualityIssueCodes = new Set(['spec-validation', 'query-error'])
 
 const visualizationToolLabels: Record<VisualizationRun['toolCalls'][number]['tool'], string> = {
+  'discover-analysis': '规划业务指标',
+  'mcp-call': '查询分析工具',
+  'quality-check': '检查生成质量',
+  'render-preview': '检查实际渲染',
+  'goal-coverage': '核对业务目标',
   'plan-analysis': '业务分析规划',
   'profile-fields': '字段画像',
   'model-compose': '模型编排',
@@ -684,12 +689,12 @@ export function DashboardStudio({
 
   useEffect(() => {
     const scope = fieldProfileScope
-    if (!scope) {
+    if (!scope || !dashboard) {
       setFieldProfiles([])
       return
     }
     let canceled = false
-    void window.visslm.listFieldProfiles(scope)
+    void window.visslm.listDashboardFieldProfiles(dashboard, scope)
       .then((profiles) => {
         if (!canceled) setFieldProfiles(profiles)
       })
@@ -699,7 +704,7 @@ export function DashboardStudio({
     return () => {
       canceled = true
     }
-  }, [fieldProfileScopeKey])
+  }, [fieldProfileScopeKey, dashboard?.dataSource?.snapshotId, dashboard?.domainContext?.scenario])
   const exportReview = useMemo(
     () => dashboard ? analyzeDashboardExport(dashboard) : null,
     [dashboard]
@@ -826,7 +831,7 @@ export function DashboardStudio({
     const componentId = selectedComponent.id
     setQueryLoading(true)
     try {
-      const dataset = await window.visslm.executeQuery(query)
+      const dataset = await window.visslm.executeDashboardQuery(dashboard!, query)
       mutateDashboard((draft) => {
         const component = draft.components.find((item) => item.id === componentId)
         if (!component) return
@@ -868,7 +873,7 @@ export function DashboardStudio({
           return {
             id: component.id,
             query: filteredQuery,
-            dataset: await window.visslm.executeQuery(filteredQuery)
+            dataset: await window.visslm.executeDashboardQuery(dashboard, filteredQuery)
           }
         }))
         results.push(...nextBatch)
@@ -1019,7 +1024,7 @@ export function DashboardStudio({
     }
     setQueryLoading(true)
     try {
-      const dataset = await window.visslm.executeQuery(plan.component.query)
+      const dataset = await window.visslm.executeDashboardQuery(dashboard!, plan.component.query)
       const hydratedComponent: DashboardComponentSpec = {
         ...plan.component,
         data: queryDataPoints(plan.component, dataset),
@@ -1139,7 +1144,7 @@ export function DashboardStudio({
 
     setQueryLoading(true)
     try {
-      const dataset = await window.visslm.executeQuery(plannedComponent.query)
+      const dataset = await window.visslm.executeDashboardQuery(dashboard!, plannedComponent.query)
       const nextComponent: DashboardComponentSpec = {
         ...plannedComponent,
         data: queryDataPoints(plannedComponent, dataset)
@@ -2895,7 +2900,7 @@ export function DashboardStudio({
           </div>
           <div className="dashboard-preview-meta">
             <span className="live-dot" />
-            本地数据
+            {dashboard?.dataSource ? `平台快照 · ${dashboard.dataSource.recordCount} 条${dashboard.dataSource.completePopulation ? '' : ' · 总量未核实'}` : '本地数据'}
             <time>{dashboard ? new Date(dashboard.updatedAt).toLocaleTimeString('zh-CN') : ''}</time>
           </div>
         </header>

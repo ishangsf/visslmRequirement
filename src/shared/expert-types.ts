@@ -54,6 +54,7 @@ export interface AssistantExecutionSummary {
   groupEntities?: string[]
   searchMode?: 'any' | 'all'
   groupByField?: string
+  analysisRequired?: boolean
   sort?: { field: string; direction: 'asc' | 'desc' }
   limit: number
   scope: {

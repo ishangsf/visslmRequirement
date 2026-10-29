@@ -244,6 +244,7 @@ const run = async (): Promise<void> => {
     for (const fixture of scenarioFixtures) controlled.push(await generateControlledScenario(fixture))
 
     const platformResult = await runDashboardDomainChatRequest({
+      domainSelection: { scenario: 'project-overview', role: 'project-owner' },
       question: '项目负责人生成项目综合态势大屏',
       scope: { projectIds: ['platform-project-001'] },
       permissions,

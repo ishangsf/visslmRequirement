@@ -25,6 +25,7 @@ const cloneDashboard = (dashboard: DashboardSpec): DashboardSpec =>
   JSON.parse(JSON.stringify(dashboard)) as DashboardSpec
 
 const result = await runDashboardDomainChatRequest({
+  domainSelection: { scenario: 'project-overview', role: 'project-owner', tailoringBaselineId: 'sample-tailoring-baseline-v1' },
   question: '项目负责人基于受控样例生成项目综合态势大屏',
   scope,
   generatedAt

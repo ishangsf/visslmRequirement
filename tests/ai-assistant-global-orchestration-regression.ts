@@ -232,7 +232,7 @@ const parseEnvelope = (input: ModelCall): QueryEnvelope | null => {
 }
 
 const isPlannerCall = (input: ModelCall): boolean => (
-  input.think === true && JSON.stringify(input.format ?? {}).includes('"intent"')
+  JSON.stringify(input.format ?? {}).includes('"intent"')
 )
 
 const installCallModel = (
@@ -330,11 +330,8 @@ const testRecordsUseFullStructuredEvidence = async (): Promise<void> => {
     assert.equal(view.total, recordFixtures.length)
     assert.equal(view.loadedRows, rows.length, 'loadedRows must describe the visible preview payload')
     assert.equal(view.isPreview, false, 'a fully loaded result must not be labelled as a preview')
-    assert.equal(
-      queryEnvelopes.at(-1)?.queryResult?.matchedCount,
-      recordFixtures.length,
-      'the model must receive complete matchedCount instead of a Top-K RAG count'
-    )
+    assert.equal(queryEnvelopes.length, 0, 'verified record lists must use the deterministic delivery path')
+    assert.ok(result.answer.includes(String(recordFixtures.length)), 'the answer must retain the full verified count')
   } finally {
     await closeDatabase(directory, db)
   }

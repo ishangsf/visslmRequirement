@@ -35,6 +35,7 @@ globalThis.fetch = (async () => {
 
 try {
   const result = await runDashboardDomainChatRequest({
+    domainSelection: { scenario: testValidationGoldenFixture.scenario, role: testValidationGoldenFixture.role, tailoringBaselineId: 'sample-tailoring-baseline-v1' },
     question: testValidationGoldenFixture.request,
     scope: { projectIds: [testValidationGoldenFixture.projectId] },
     generatedAt: testValidationGoldenFixture.generatedAt
@@ -97,6 +98,7 @@ try {
     raw: Object.fromEntries(Object.entries(record.raw).filter(([field]) => field !== 'codeCoverageRate'))
   }))
   const missingCoverage = await runDashboardDomainChatRequest({
+    domainSelection: { scenario: testValidationGoldenFixture.scenario, role: testValidationGoldenFixture.role, tailoringBaselineId: 'sample-tailoring-baseline-v1' },
     question: testValidationGoldenFixture.request,
     scope: { projectIds: [testValidationGoldenFixture.projectId] },
     generatedAt: testValidationGoldenFixture.generatedAt
@@ -106,6 +108,7 @@ try {
   assert.equal(missingCoverage.dashboard, undefined)
 
   const roleMismatch = await runDashboardDomainChatRequest({
+    domainSelection: { scenario: scenario!.id, role: 'model-org-manager', tailoringBaselineId: 'sample-tailoring-baseline-v1' },
     question: '型号组织管理负责人基于受控样例生成测试与验证充分性大屏',
     scope: { projectIds: [testValidationGoldenFixture.projectId] },
     generatedAt: testValidationGoldenFixture.generatedAt

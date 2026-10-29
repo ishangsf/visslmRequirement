@@ -918,10 +918,13 @@ export function DashboardComponentRendererView({
 
   if (component.type === 'insight') {
     const showIcon = dashboardComponentOptionValue(component.type, component.style, 'showIcon') !== false
+    const insight = component.insight?.trim() || component.data.slice(0, 3)
+      .map((item) => `${item.name}：${formatNumber(item.value)}${component.unit ?? ''}`)
+      .join('；')
     return (
       <div className="viz-insight" role="note" aria-label={`${component.title}洞察`}>
         {showIcon ? <span className="viz-insight-icon"><BulbOutlined /></span> : null}
-        <p style={{ fontSize: component.style?.bodyFontSize }}>{component.insight}</p>
+        <p style={{ fontSize: component.style?.bodyFontSize }}>{insight}</p>
       </div>
     )
   }

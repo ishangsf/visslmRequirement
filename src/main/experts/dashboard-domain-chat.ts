@@ -7,6 +7,7 @@ import {
 } from './dashboard-domain-generation'
 import {
   resolveDashboardDomainRequest,
+  type DashboardDomainSelection,
   type DashboardDomainRequestResult
 } from './dashboard-domain-request'
 import type {
@@ -19,6 +20,7 @@ import { validateDashboardDomainAdapterAccess } from './dashboard-domain-adapter
 import type { DashboardDomainPlanClarificationReason } from './dashboard-domain-planner'
 
 export interface DashboardDomainChatInput {
+  domainSelection?: DashboardDomainSelection
   question: string
   scope: DataScope
   generatedAt: string
@@ -132,7 +134,7 @@ const promptForPlannerOption = (input: {
     if (optionId === 'provide-tailoring-baseline' && role) {
       return { prompt: businessPrompt(role, scenario), action: 'submit' }
     }
-    if (/cancel|暂不/.test(optionId + optionLabel)) {
+    if (['scope-cancel', 'cancel-conflict', 'cancel-missing-source', 'cancel-baseline', 'cancel-permission', 'cancel-quality', 'cancel-inactive-scenario'].includes(optionId)) {
       return { prompt: `暂不生成${name}大屏`, action: 'submit' }
     }
     return {
@@ -142,38 +144,38 @@ const promptForPlannerOption = (input: {
   }
 
   if (reason === 'missing-project-scope') {
-    if (/portfolio|组合|scope-portfolio/.test(optionId + optionLabel)) {
+    if (optionId === 'scope-portfolio') {
       return { prompt: `请选择项目组合后，生成${name}大屏`, action: 'compose' }
     }
-    if (/cancel|暂不/.test(optionId + optionLabel)) {
+    if (['scope-cancel', 'cancel-conflict', 'cancel-missing-source', 'cancel-baseline', 'cancel-permission', 'cancel-quality', 'cancel-inactive-scenario'].includes(optionId)) {
       return { prompt: `暂不生成${name}大屏`, action: 'submit' }
     }
     return { prompt: `请选择项目后，生成${name}大屏`, action: 'compose' }
   }
 
   if (reason === 'missing-metric-source') {
-    if (/cancel|暂不/.test(optionId + optionLabel)) {
+    if (['scope-cancel', 'cancel-conflict', 'cancel-missing-source', 'cancel-baseline', 'cancel-permission', 'cancel-quality', 'cancel-inactive-scenario'].includes(optionId)) {
       return { prompt: `暂不生成${name}大屏`, action: 'submit' }
     }
     return { prompt: `请补充${name}所需的数据来源后，重新生成大屏`, action: 'compose' }
   }
 
   if (reason === 'insufficient-permission') {
-    if (/cancel|暂不/.test(optionId + optionLabel)) {
+    if (['scope-cancel', 'cancel-conflict', 'cancel-missing-source', 'cancel-baseline', 'cancel-permission', 'cancel-quality', 'cancel-inactive-scenario'].includes(optionId)) {
       return { prompt: `暂不生成${name}大屏`, action: 'submit' }
     }
     return { prompt: `请确认项目与过程证据读取授权后，重新生成${name}大屏`, action: 'compose' }
   }
 
   if (reason === 'invalid-data-quality') {
-    if (/cancel|暂不/.test(optionId + optionLabel)) {
+    if (['scope-cancel', 'cancel-conflict', 'cancel-missing-source', 'cancel-baseline', 'cancel-permission', 'cancel-quality', 'cancel-inactive-scenario'].includes(optionId)) {
       return { prompt: `暂不生成${name}大屏`, action: 'submit' }
     }
     return { prompt: `请刷新并核验项目数据质量后，重新生成${name}大屏`, action: 'compose' }
   }
 
   if (reason === 'metric-definition-conflict') {
-    if (/cancel|暂不/.test(optionId + optionLabel)) {
+    if (['scope-cancel', 'cancel-conflict', 'cancel-missing-source', 'cancel-baseline', 'cancel-permission', 'cancel-quality', 'cancel-inactive-scenario'].includes(optionId)) {
       return { prompt: `暂不生成${name}大屏`, action: 'submit' }
     }
     return { prompt: `请确认${optionLabel}后，重新生成${name}大屏`, action: 'compose' }
@@ -304,7 +306,7 @@ export const runDashboardDomainChatRequest = async (
   input: DashboardDomainChatInput,
   queryEngine: QueryEngine
 ): Promise<DashboardDomainChatResult> => {
-  const request = resolveDashboardDomainRequest(input.question, input.scope)
+  const request = resolveDashboardDomainRequest(input.question, input.scope, input.domainSelection)
 
   if (!request.recognized) {
     return {

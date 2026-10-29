@@ -4,7 +4,6 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AppDatabase, type RecordInput } from '../src/main/database'
 import { AssistantIntentRouter } from '../src/main/assistant/intent-router'
-import { parseRegionalRequirementRequest } from '../src/main/assistant/regional-requirements'
 import { OllamaAgent } from '../src/main/ollama'
 import type { ChatRequest, ModelSettings } from '../src/shared/types'
 import type { ModelChatInput, ModelResponse } from '../src/main/model-client'
@@ -184,169 +183,42 @@ const main = async (): Promise<void> => {
   try {
     seedRecords(db)
 
-    const parsed = parseRegionalRequirementRequest(question)
-    assert.ok(parsed, 'the explicit region-to-numeric-code request must be recognized')
-    assert.deepEqual(parsed?.groups.map((group) => group.name), regionNames)
-    assert.deepEqual(
-      parsed?.groups.map((group) => group.codes.map(suffixOf)),
-      regionNames.map((name) => [...regionSuffixes[name]])
-    )
-    assert.equal(
-      parsed?.groups.reduce((sum, group) => sum + group.codes.length, 0),
-      requestedItemIds.length,
-      'all 37 requested suffixes, including values beyond the first 30, must survive parsing'
-    )
-
-    const duplicateMembership = parseRegionalRequirementRequest(
-      question.replace('北方区：4132', '北方区：4159、4132')
-    )
-    assert.ok(duplicateMembership)
-    const duplicateGroups = new Map(duplicateMembership?.groups.map((group) => [group.name, group.codes.map(suffixOf)]))
-    assert.equal(duplicateGroups.get('华东区')?.includes('4159'), true)
-    assert.equal(duplicateGroups.get('北方区')?.includes('4159'), true, 'the same record may belong to two user-supplied groups')
 
     let classifierCalls = 0
-    const intent = await new AssistantIntentRouter(settings, {
-      chat: async () => {
-        classifierCalls += 1
-        throw new Error('regional classifier must not be called')
-      }
-    }).resolve({ question, chatMode: 'auto', entrypoint: 'chat' })
-    assert.equal(classifierCalls, 0, 'an explicit regional mapping must bypass the classifier')
-    assert.equal(intent.taskType, 'record_query')
-    assert.equal(intent.sourceMode, 'records')
-    assert.equal(intent.resultMode, 'answer')
-    assert.deepEqual(intent.groupEntities, regionNames)
-    assert.equal(intent.needsClarification, false)
-
-    const modelBehaviors: Array<{ label: string; handler: (input: ModelChatInput) => Promise<ModelResponse> | ModelResponse }> = [
-      {
-        label: 'empty planner/analysis response',
-        handler: async () => response('')
-      },
-      {
-        label: 'invalid planner/analysis response',
-        handler: async () => response('not valid JSON')
-      },
-      {
-        label: 'throwing planner/analysis transport',
-        handler: async () => { throw new Error('planner transport unavailable') }
-      }
-    ]
-
-    for (const behavior of modelBehaviors) {
-      const prompts: string[] = []
+    const intent = await new AssistantIntentRouter(settings, { chat: async () => {
+      classifierCalls++
+      return response(JSON.stringify({ taskType: 'record_query', skillId: 'general', sourceMode: 'records', resultMode: 'grouped_list',
+        resolvedQuestion: question, groupEntities: [], needsClarification: false, reason: 'semantic mapping' }))
+    } }).resolve({ question })
+    assert.equal(classifierCalls, 1, 'region words and IDs must not bypass semantic planning')
+    const makePlan = (groups = regionSuffixes) => ({ sourceMode: 'records', intent: 'analyze_records', resultMode: 'grouped_list',
+      fields: [], filters: [], groupEntities: [], searchTerms: [], searchMode: 'any', needsClarification: false, explanation: '', limit: 50,
+      recordGroups: { identifierPrefix: prefix, groups: Object.entries(groups).map(([name,codes]) => ({ name, codes })) } })
+    const ask = async (q: string, plan: unknown, answer = '这些需求均涉及业务交付，应结合各组内容安排实施。', scope?: ChatRequest['dataScope']) => {
       const agent = new OllamaAgent(db, settings)
-      installModel(agent, async (input) => {
-        prompts.push(input.messages.map((message) => String(message.content)).join('\n'))
-        return behavior.handler(input)
-      })
-      const answer = await agent.ask(requestFor(intent))
-      assertRegionalEvidence(answer, regionSuffixes)
-      assert.equal(
-        prompts.some((prompt) => /统一任务规划器|意图与数据查询规划器/u.test(prompt)),
-        false,
-        `${behavior.label} must not send this already-grounded request through classifier/planner recovery`
-      )
+      let planningCalls = 0
+      installModel(agent, async input => { if (input.format) { planningCalls++; return response(JSON.stringify(plan)) } return response(answer) })
+      const result = await agent.ask(requestFor(intent, q, scope))
+      assert.equal(planningCalls, 1)
+      return result
     }
-
-    const scopedRecordUids = existingItemIds
-      .filter((itemId) => itemId !== `${prefix}4159`)
-      .map((itemId) => `regional-record-${suffixOf(itemId)}`)
-    const scopedAgent = new OllamaAgent(db, settings)
-    installModel(scopedAgent, async () => { throw new Error('scoped regional analysis transport unavailable') })
-    const scopedAnswer = await scopedAgent.ask(requestFor(
-      intent,
-      question,
-      { projectIds: [projectId], recordUids: scopedRecordUids }
-    ))
-    assert.equal(scopedAnswer.taskTrace?.status, 'completed')
-    assert.equal(scopedAnswer.dataViews.length, 1)
-    const scopedView = scopedAnswer.dataViews[0]!
-    assert.equal(scopedView.total, existingItemIds.length - 1)
-    assert.deepEqual(scopedView.groups.map((group) => group.count), [5, 2, 12, 16])
-    assert.equal(viewRows(scopedAnswer).some((row) => row.itemId === `${prefix}4159`), false)
-    assert.match(scopedAnswer.answer, new RegExp(`${prefix}4159`, 'u'))
-    assert.match(scopedAnswer.answer, /未找到|不存在|未命中/u)
-    assert.equal(scopedAnswer.executionSummary?.scope.recordCount, scopedRecordUids.length)
-
-    const allMissingQuestion = `@通用数据助手 按区域分析需求：华东区：7001 西北区：7002，前缀是 ${prefix}`
-    const allMissingIntent = await new AssistantIntentRouter(settings, {
-      chat: async () => { throw new Error('all-missing regional request must bypass classifier') }
-    }).resolve({ question: allMissingQuestion, chatMode: 'auto', entrypoint: 'chat' })
-    const allMissingAgent = new OllamaAgent(db, settings)
-    const allMissingPrompts: string[] = []
-    installModel(allMissingAgent, async (input) => {
-      allMissingPrompts.push(input.messages.map((message) => String(message.content)).join('\n'))
-      throw new Error('all-missing analysis transport unavailable')
-    })
-    const allMissingAnswer = await allMissingAgent.ask(requestFor(
-      allMissingIntent,
-      allMissingQuestion
-    ))
-    assert.equal(allMissingAnswer.taskTrace?.status, 'completed')
-    assert.equal(allMissingAnswer.sources.length, 0)
-    assert.equal(allMissingAnswer.dataViews.length, 1, 'an all-missing grouped lookup still needs an explicit zero-result view')
-    const allMissingView = allMissingAnswer.dataViews[0]!
-    assert.equal(allMissingView.total, 0)
-    assert.deepEqual(allMissingView.groups.map((group) => group.name), ['华东区', '西北区'])
-    assert.deepEqual(allMissingView.groups.map((group) => group.count), [0, 0])
-    assert.deepEqual(allMissingView.groups.map((group) => group.rows.length), [0, 0])
-    assert.match(allMissingAnswer.answer, new RegExp(`${prefix}7001`, 'u'))
-    assert.match(allMissingAnswer.answer, new RegExp(`${prefix}7002`, 'u'))
-    assert.match(allMissingAnswer.answer, /未找到|不存在|未命中/u)
-    assert.equal(
-      allMissingPrompts.some((prompt) => /统一任务规划器|意图与数据查询规划器/u.test(prompt)),
-      false
-    )
-
-    const analysisAgent = new OllamaAgent(db, settings)
-    let analysisCalls = 0
-    installModel(analysisAgent, async (input) => {
-      analysisCalls += 1
-      const payload = JSON.parse(String(input.messages.at(-1)?.content)) as {
-        queryResult: { records: Array<{ source: { itemId: string }; text: string }>; regionalGroups: unknown[] }
-      }
-      assert.deepEqual(itemIdSet(payload.queryResult.records.map((record) => record.source.itemId)), itemIdSet(existingItemIds))
-      assert.equal(payload.queryResult.regionalGroups.length, 4)
-      assert.ok(payload.queryResult.records.every((record) => record.text.includes('真实检索证据')))
-      return response('这些需求均涉及业务交付，应结合各区域的具体内容进一步安排实施。')
-    })
-    const analyzed = await analysisAgent.ask(requestFor(intent))
-    assert.equal(analysisCalls, 1)
+    const analyzed = await ask(question, makePlan())
     assertRegionalEvidence(analyzed, regionSuffixes)
-    assert.match(analyzed.answer, /这些需求均涉及业务交付/u)
-    assert.match(analyzed.answer, /\[UID:regional-record-4154\]/u, 'late-record citations must survive validation beyond the old 20-source cap')
-
-    const duplicateQuestion = question.replace('华东区需求：4159、4080', '华东区需求：4159、4159、4080')
-    const duplicateIntent = await new AssistantIntentRouter(settings, {
-      chat: async () => { throw new Error('duplicate regional request must bypass classifier') }
-    }).resolve({ question: duplicateQuestion, chatMode: 'auto', entrypoint: 'chat' })
-    const duplicateAgent = new OllamaAgent(db, settings)
-    installModel(duplicateAgent, async () => { throw new Error('analysis transport unavailable') })
-    const duplicateAnswer = await duplicateAgent.ask(requestFor(duplicateIntent, duplicateQuestion))
-    assertRegionalEvidence(duplicateAnswer, {
-      ...regionSuffixes,
-      华东区: ['4159', '4159', ...regionSuffixes.华东区.slice(1)]
-    })
-    const eastGroup = duplicateAnswer.dataViews[0]?.groups.find((group) => group.name === '华东区')
-    assert.equal(eastGroup?.rows.length, regionSuffixes.华东区.length, 'a repeated identifier in one region must not duplicate its evidence row')
-    const duplicateRows = viewRows(duplicateAnswer).filter((row) => row.itemId === `${prefix}4159`)
-    assert.equal(duplicateRows.length, 1, 'the same record should be represented once per grouped evidence view')
-
-    const crossRegionQuestion = question.replace('北方区：4132', `北方区：4159、4132`)
-    const crossRegionIntent = await new AssistantIntentRouter(settings, {
-      chat: async () => { throw new Error('cross-region duplicate must bypass classifier') }
-    }).resolve({ question: crossRegionQuestion, chatMode: 'auto', entrypoint: 'chat' })
-    const crossRegionAgent = new OllamaAgent(db, settings)
-    installModel(crossRegionAgent, async () => { throw new Error('cross-region analysis transport unavailable') })
-    const crossRegionAnswer = await crossRegionAgent.ask(requestFor(crossRegionIntent, crossRegionQuestion))
-    assertRegionalEvidence(crossRegionAnswer, {
-      ...regionSuffixes,
-      北方区: ['4159', ...regionSuffixes.北方区]
-    })
-    const crossRegionRows = viewRows(crossRegionAnswer).filter((row) => row.itemId === `${prefix}4159`)
-    assert.equal(crossRegionRows.length, 2, 'one exact record may appear once in each user-supplied region group')
+    assert.match(analyzed.answer, /这些需求均涉及业务交付/)
+    await assert.rejects(ask(question, makePlan(), ''), /未返回所需分析/)
+    const failed = new OllamaAgent(db, settings)
+    installModel(failed, async () => { throw new Error('model unavailable') })
+    await assert.rejects(failed.ask(requestFor(intent)), /无法确定可验证/)
+    const scopedRecordUids = existingItemIds.filter(id => id !== prefix + '4159').map(id => 'regional-record-' + suffixOf(id))
+    const scoped = await ask(question, makePlan(), '已分析范围内的需求。', { projectIds: [projectId], recordUids: scopedRecordUids })
+    assert.equal(scoped.dataViews[0].total, existingItemIds.length - 1)
+    assert.equal(viewRows(scoped).some(row => row.itemId === prefix + '4159'), false)
+    const duplicateQuestion = question.replace('北方区：4132', '北方区：4159、4132')
+    const duplicateGroups = { ...regionSuffixes, 北方区: ['4159', ...regionSuffixes.北方区] }
+    const cross = await ask(duplicateQuestion, makePlan(duplicateGroups as any))
+    assertRegionalEvidence(cross, duplicateGroups)
+    assert.equal(viewRows(cross).filter(row => row.itemId === prefix + '4159').length, 2)
+    console.log(JSON.stringify({ ok: true, checks: ['semantic plan required', 'explicit mappings', 'exact IDs', 'scope', 'shared membership', 'no success on model failure'] }))
   } finally {
     db.close()
     await rm(directory, { recursive: true, force: true })

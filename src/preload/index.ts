@@ -194,6 +194,10 @@ const api: AppApi = {
   ) => ipcRenderer.invoke('analytics:field-profile-semantics', scope, field, patch),
   executeQuery: (spec: QuerySpec) =>
     ipcRenderer.invoke('analytics:execute-query', spec),
+  executeDashboardQuery: (dashboard: DashboardSpec, spec: QuerySpec) =>
+    ipcRenderer.invoke('dashboards:execute-query', dashboard, spec),
+  listDashboardFieldProfiles: (dashboard: DashboardSpec, scope: DataScope) =>
+    ipcRenderer.invoke('dashboards:field-profiles', dashboard, scope),
   listDashboards: () => ipcRenderer.invoke('dashboards:list'),
   getDashboard: (id: string, version?: number) =>
     ipcRenderer.invoke('dashboards:get', id, version),

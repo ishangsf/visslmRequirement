@@ -24,7 +24,7 @@ assert.ok(visualizationEnd > visualizationStart, 'visualization 分支边界缺�
 const visualizationBranch = mainSource.slice(visualizationStart, visualizationEnd)
 
 const scopeIndex = visualizationBranch.indexOf('const scope =')
-const queryEngineIndex = visualizationBranch.indexOf('const queryEngine = new QueryEngine(db)')
+const queryEngineIndex = visualizationBranch.indexOf('const queryEngine = dataSource ?')
 assert.ok(scopeIndex >= 0, '领域 helper 调用前必须解析数据 scope')
 assert.ok(queryEngineIndex > scopeIndex, '领域 helper 调用前必须创建 QueryEngine')
 
@@ -74,7 +74,7 @@ assert.ok(rejectedIndex > clarificationIndex, 'clarification 分流后必须处�
 const readyRegion = visualizationBranch.slice(readyIndex, clarificationIndex)
 assert.match(readyRegion, new RegExp(`dashboard\\s*:\\s*${helperName}\\.dashboard`),
   'ready 结果必须交付 helper 返回的 dashboard')
-assert.match(readyRegion, new RegExp(`answer\\s*:\\s*${helperName}\\.answer`),
+assert.match(readyRegion, new RegExp(`answer\\s*:\\s*\\(?${helperName}\\.answer`),
   'ready 结果 answer 不得覆盖 helper 的受控样例/预览说明')
 assert.match(readyRegion, /type:\s*['"]artifact['"]/,
   'ready 结果必须发出 dashboard artifact event')

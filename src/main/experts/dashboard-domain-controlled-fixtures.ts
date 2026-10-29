@@ -2,6 +2,7 @@ import type { DataScope } from '../../shared/query-spec'
 import type { DashboardSpec } from '../../shared/dashboard'
 import type { AnalyticsRecord, AppDatabase } from '../database'
 import { QueryEngine } from '../analytics/query-engine'
+import { platformSnapshotQueryEngine } from '../dashboards/platform-snapshot'
 import { configurationChangeGoldenFixture } from './dashboard-configuration-change'
 import { gjb5000bComplianceGoldenFixture } from './dashboard-gjb5000b-compliance'
 import { organizationImprovementGoldenFixture } from './dashboard-organization-improvement'
@@ -150,8 +151,13 @@ export const dashboardDomainDataMode = (
 
 export const createDashboardQueryEngineForSpec = (
   spec: DashboardSpec,
-  database: AppDatabase
+  database: AppDatabase,
+  snapshotRoot?: string
 ): QueryEngine => {
+  if (spec.dataSource?.kind === 'platform-snapshot') {
+    if (!snapshotRoot) throw new Error('平台快照目录不可用，不能切换到本地数据')
+    return platformSnapshotQueryEngine(snapshotRoot, spec.dataSource)
+  }
   if (dashboardDomainDataMode(spec) === 'controlled-sample') {
     const scenarioId = spec.domainContext?.scenario?.trim()
     const controlledContext = scenarioId

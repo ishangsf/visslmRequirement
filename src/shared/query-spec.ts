@@ -88,6 +88,9 @@ export interface FieldProfile {
   displayName?: string
   role?: FieldProfileRole
   synonyms?: string[]
+  businessMeaning?: string
+  unit?: string
+  valueLabels?: Record<string, string>
   profiledAt?: string
 }
 
@@ -96,6 +99,9 @@ export interface FieldProfileSemanticPatch {
   role?: FieldProfileRole
   synonyms?: string[]
   sensitivity?: FieldSensitivity
+  businessMeaning?: string
+  unit?: string
+  valueLabels?: Record<string, string>
 }
 
 export interface QueryDataset {

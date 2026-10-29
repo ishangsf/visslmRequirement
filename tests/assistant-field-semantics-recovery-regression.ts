@@ -58,11 +58,10 @@ try {
   checks.push('Data Center Agent consumes manually maintained field semantics')
 
   assert.deepEqual(
-    findAmbiguousSemanticAliases('请按负责人分别统计需求', catalog.fields),
+    findAmbiguousSemanticAliases(catalog.fields),
     [{ alias: '负责人', fields: ['OwnerBackup', 'OwnerPrimary'] }]
   )
-  assert.deepEqual(findAmbiguousSemanticAliases('请按金额统计需求', catalog.fields), [])
-  checks.push('a mentioned alias mapped to multiple fields is detected deterministically')
+  checks.push('alias collisions are provided as catalog metadata, without scanning the request')
 
   const summary: AssistantExecutionSummary = {
     question: '统计华东区域的需求',
@@ -95,8 +94,8 @@ const [mainSource, ollamaSource, rendererSource] = await Promise.all([
   readFile(new URL('../src/renderer/src/App.tsx', import.meta.url), 'utf8')
 ])
 
-assert.match(ollamaSource, /findAmbiguousSemanticAliases\(groundingQuestion, catalog\)/)
-assert.match(mainSource, /buildSafeQueryRecoverySuggestions\(confirmedExecutionSummary\)/)
+assert.match(ollamaSource, /aliasConflicts: findAmbiguousSemanticAliases\(catalog\)/)
+assert.match(mainSource, /recoverySuggestions:\s*buildSafeQueryRecoverySuggestions\([^)]*executionSummary\)/)
 assert.match(rendererSource, /字段语义词典/)
 assert.match(rendererSource, /saveFieldProfileSemantics/)
 assert.match(rendererSource, /message\.recoverySuggestions\.map/)

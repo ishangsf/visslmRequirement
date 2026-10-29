@@ -14,8 +14,8 @@ import {
   sanitizeContextText
 } from '../../context-budget'
 import { assertAssistantAgentToolAllowed } from '../agent-registry'
-import { executeRegionalRequirements, renderRegionalRequirements } from '../regional-requirements'
-import type { RegionalRequirementRequest, RegionalRequirementResult } from '../regional-requirements'
+import { executeExplicitRecordGroups, renderExplicitRecordGroups } from '../explicit-record-groups'
+import type { ExplicitRecordGroups, ExplicitRecordGroupResult } from '../explicit-record-groups'
 
 const MODEL_TOOL_TEXT_LIMIT = 4_096
 const MODEL_TOOL_FIELD_LIMIT = 512
@@ -32,7 +32,9 @@ export type DataCenterPlanIntent =
   | 'search_content'
 
 export interface DataCenterQueryPlan {
-  regionalRequirements?: RegionalRequirementRequest
+  /** Analysis is an additional obligation, independent of list/table presentation. */
+  analysisRequired?: boolean
+  recordGroups?: ExplicitRecordGroups
   sourceMode: 'conversation' | 'records' | 'knowledge' | 'mixed'
   needsClarification: boolean
   clarificationQuestion?: string
@@ -73,6 +75,9 @@ export interface DataCenterFieldCatalogEntry {
   displayName?: string
   role?: 'dimension' | 'measure' | 'time' | 'identifier'
   synonyms: string[]
+  businessMeaning?: string
+  unit?: string
+  valueLabels?: Record<string, string>
   kind: 'technical' | 'business'
   declaredType?: FieldDefinitionNormalizedType
   sourceType?: string
@@ -98,14 +103,12 @@ const normalizeSemanticAlias = (value: string): string => value
   .toLocaleLowerCase()
 
 /**
- * Resolve only user-maintained aliases. When one mentioned alias points to
- * multiple real fields the planner must stop instead of choosing a field.
+ * Describe collisions in maintained field aliases as planner metadata.
+ * This function does not inspect the question or trigger clarification.
  */
 export const findAmbiguousSemanticAliases = (
-  question: string,
   catalog: DataCenterFieldCatalogEntry[]
 ): AmbiguousSemanticAlias[] => {
-  const normalizedQuestion = normalizeSemanticAlias(question)
   const fieldsByAlias = new Map<string, Set<string>>()
   for (const field of catalog) {
     for (const synonym of field.synonyms) {
@@ -117,7 +120,7 @@ export const findAmbiguousSemanticAliases = (
     }
   }
   return [...fieldsByAlias.entries()]
-    .filter(([alias, fields]) => fields.size > 1 && normalizedQuestion.includes(alias))
+    .filter(([alias, fields]) => fields.size > 1)
     .map(([alias, fields]) => ({ alias, fields: [...fields].sort() }))
     .sort((left, right) => left.alias.localeCompare(right.alias))
 }
@@ -195,40 +198,6 @@ const normalizeGroupTerm = (value: string): string => value
   .trim()
   .toLocaleLowerCase()
 
-const normalizeRecordTypeTerm = (value: unknown): string => String(value ?? '')
-  .normalize('NFKC')
-  .toLocaleLowerCase()
-  .replace(/[\s，,。！？!?：:；;、]+/gu, '')
-
-/**
- * Broad record nouns identify the business collection, not a full-text
- * constraint. In particular, a count of "需求" / "需求记录" must count the
- * complete authorized record set rather than the subset whose text happens
- * to contain that noun.
- */
-export const isGenericRecordTypeTerm = (value: unknown): boolean => {
-  const normalized = normalizeRecordTypeTerm(value)
-  return /^(?:(?:当前|本地)?(?:数据中心)?(?:全部|所有)?(?:的)?(?:需求(?:记录)?|记录))$/u.test(normalized)
-}
-
-/**
- * Models sometimes echo the question grammar as a search term (for example
- * "一共有多少条" or "当前数据中心"). These words are still query
- * scaffolding, not a record-text constraint, when deciding whether a count
- * is unconstrained.
- */
-export const isRecordCountScaffoldingTerm = (value: unknown): boolean => {
-  const normalized = normalizeRecordTypeTerm(value)
-  if (!normalized) return false
-  return /^(?:(?:当前|本地)?数据中心|当前|本地|全部|所有|的|需求记录|需求|记录|一共有|一共|总共有|总共|共有|有|多少|几|数量|总数|数一下|数一数|算一下|算一算|统计一下|统计|条|个|项|是|吗|呢|请问|请|麻烦|帮我|帮忙|想知道|告诉我)+$/u.test(normalized)
-}
-
-const isUnconstrainedRecordCountPlan = (plan: DataCenterQueryPlan): boolean => (
-  plan.intent === 'count_matching' &&
-  plan.filters.length === 0 &&
-  plan.searchTerms.every((term) => isRecordCountScaffoldingTerm(term))
-)
-
 export class DataCenterAgent {
   constructor(private readonly db: AppDatabase) {}
 
@@ -254,6 +223,9 @@ export class DataCenterAgent {
             : {}),
           ...(semantics?.role ? { role: semantics.role } : {}),
           synonyms: [...new Set(semantics?.synonyms ?? [])],
+          businessMeaning: semantics?.businessMeaning,
+          unit: semantics?.unit,
+          valueLabels: semantics?.valueLabels,
           kind: /^_valm_|^(Record|uid|parentId|projectId|nodeType)$/i.test(field.field)
             ? 'technical' as const
             : 'business' as const,
@@ -269,27 +241,26 @@ export class DataCenterAgent {
   }
 
   executePlan(projectId: string | undefined, plan: DataCenterQueryPlan): DataCenterExecution {
-    if (plan.regionalRequirements) {
+    if (plan.nodeType && plan.scope?.nodeTypes?.length && !plan.scope.nodeTypes.includes(plan.nodeType)) {
+      throw new Error('计划中的数据类型超出当前选择的范围')
+    }
+    if (plan.recordGroups) {
       assertAssistantAgentToolAllowed('data-center', 'query_records_by_fields')
       return {
         toolName: 'query_records_by_fields',
-        args: { result_mode: 'grouped_list', group_entities: plan.regionalRequirements.groups.map((group) => group.name) },
-        result: executeRegionalRequirements(this.db, plan.regionalRequirements, projectId, plan.scope, plan.scope?.baseFilters?.map(scopeFilterToDatabaseFilter))
+        args: { result_mode: 'grouped_list', group_entities: plan.recordGroups.groups.map((group) => group.name) },
+        result: executeExplicitRecordGroups(this.db, plan.recordGroups, projectId, plan.scope, plan.scope?.baseFilters?.map(scopeFilterToDatabaseFilter), {
+          filters: plan.filters, fields: plan.fields, nodeType: plan.nodeType, searchTerms: plan.searchTerms, searchMode: plan.searchMode
+        })
       }
     }
-    // Keep direct/legacy callers safe even when a planner has mistaken the
-    // collection noun for a full-text term. The returned aggregate result is
-    // still rendered against the original plan by renderVerifiedAnswer, which
-    // also handles this canonicalization for its human-facing wording.
-    const effectivePlan = isUnconstrainedRecordCountPlan(plan)
-      ? { ...plan, intent: 'total' as const, searchTerms: [] }
-      : plan
+    const effectivePlan = plan
     let toolName: string
     let args: Record<string, unknown>
     let result: unknown
     const scope = effectivePlan.scope
     const scopeProjectIds = scope?.projectIds
-    const scopeNodeTypes = scope?.nodeTypes
+    const scopeNodeTypes = effectivePlan.nodeType ? [effectivePlan.nodeType] : scope?.nodeTypes
     const scopeRecordUids = scope?.recordUids
     const scopeBaseFilters = scope?.baseFilters?.map(scopeFilterToDatabaseFilter)
     const scopeArguments = {
@@ -326,6 +297,8 @@ export class DataCenterAgent {
         node_type: effectivePlan.nodeType,
         limit: effectivePlan.limit,
         split_multi_value: true,
+        search_terms: effectivePlan.searchTerms,
+        search_mode: effectivePlan.searchMode,
         filters: effectivePlan.filters,
         ...scopeArguments
       }
@@ -333,7 +306,7 @@ export class DataCenterAgent {
     } else {
       toolName = 'query_records_by_fields'
       assertAssistantAgentToolAllowed('data-center', toolName)
-      const effectiveSearchTerms = effectivePlan.resultMode === 'grouped_list'
+      const effectiveSearchTerms = effectivePlan.resultMode === 'grouped_list' && !effectivePlan.groupByField
         ? [...effectivePlan.searchTerms, ...effectivePlan.groupEntities]
             .map((term) => String(term).trim())
             .filter(Boolean)
@@ -353,6 +326,7 @@ export class DataCenterAgent {
         sort: effectivePlan.sort,
         limit: effectivePlan.limit,
         result_mode: effectivePlan.resultMode,
+        group_by_field: effectivePlan.groupByField,
         group_entities: effectivePlan.groupEntities
       }
       result = this.db.queryRecordsByFields({
@@ -368,6 +342,7 @@ export class DataCenterAgent {
         baseFilters: scopeBaseFilters,
         filters: effectivePlan.filters,
         fields: effectivePlan.fields,
+        groupByField: effectivePlan.groupByField,
         sort: effectivePlan.sort,
         limit: effectivePlan.limit
       })
@@ -573,6 +548,8 @@ export class DataCenterAgent {
     }
     if (name === 'aggregate_by_field') {
       return this.db.aggregateByField({
+        searchTerms: normalizedStringArray(args.search_terms),
+        searchMode: args.search_mode === 'all' ? 'all' : 'any',
         field: String(args.field ?? ''),
         ...(projectIds === undefined
           ? { projectId: fallbackProjectId }
@@ -761,7 +738,7 @@ export class DataCenterAgent {
       const groupEntities = Array.isArray(args.group_entities)
         ? args.group_entities.map((entity) => String(entity).trim()).filter(Boolean).slice(0, 12)
         : []
-      const groupedResult = args.result_mode === 'grouped_list' && groupEntities.length > 0
+      const groupedResult = args.result_mode === 'grouped_list' && (groupEntities.length > 0 || Boolean(query.grouping))
       // A grouped query is also a useful empty result: preserve one explicit
       // zero-count group per requested entity so the UI can distinguish
       // "nothing matched for this entity" from a missing data view. Keep the
@@ -794,7 +771,13 @@ export class DataCenterAgent {
         if (!matchingEntry) return undefined
         return compactRecordUids(matchingEntry[1])
       }
-      const grouped = groupedResult
+      const grouped = query.grouping
+        ? query.grouping.groups.map((group) => {
+            const members = new Set(group.recordUids)
+            return { name: group.name, count: group.count, recordUids: group.recordUids,
+              rows: records.filter((row) => members.has(row.source.uid)).map(toRow) }
+          })
+        : groupedResult
         ? groupEntities.map((entity) => {
             const key = normalizeGroupValue(entity)
             const rows = records.filter((record) => {
@@ -822,7 +805,7 @@ export class DataCenterAgent {
         : [{ name: '查询结果', count: matchedCount, rows: records.map(toRow) }]
       return {
         id: `field-query:${fields.join(',') || 'records'}`,
-        title: args.result_mode === 'grouped_list' && groupEntities.length ? '分组属性查询数据' : '属性查询数据',
+        title: groupedResult ? '分组属性查询数据' : '属性查询数据',
         description: `共命中 ${matchedCount} 条，当前展示 ${returnedCount} 条${matchedCount > returnedCount ? '，可分页查看其余记录' : ''}`,
         total: matchedCount,
         recordUids,
@@ -883,12 +866,30 @@ export class DataCenterAgent {
     result: unknown,
     modelAnswer: string
   ): string {
-    if (plan.regionalRequirements) return renderRegionalRequirements(result as RegionalRequirementResult, modelAnswer)
+    if ((plan.analysisRequired || plan.intent === 'analyze_records') && !modelAnswer.trim()) return ''
+    if (plan.recordGroups) return renderExplicitRecordGroups(result as ExplicitRecordGroupResult, modelAnswer)
+    if (plan.analysisRequired || (plan.intent === 'analyze_records' && plan.resultMode !== 'answer')) {
+      const verifiedList = this.renderVerifiedAnswer({ ...plan, analysisRequired: false, intent: plan.intent === 'analyze_records' ? 'filter_records' : plan.intent }, result, '')
+      return [verifiedList, modelAnswer].filter(Boolean).join('\n\n')
+    }
+    if (plan.groupByField && plan.intent !== 'field_aggregate' && plan.resultMode === 'grouped_list' && result && typeof result === 'object') {
+      const query = result as FieldQueryResult
+      if (!query.grouping) throw new Error('字段分组结果缺失，不能交付为已完成的分组清单')
+      const label = query.fieldLabels?.[plan.groupByField] ?? plan.groupByField
+      const sections = query.grouping.groups.map((group) => {
+        const members = new Set(group.recordUids)
+        const rows = query.records.filter((row) => members.has(row.source.uid))
+        const lines = rows.map((row, index) => this.renderRecordLine(row, query.fields, query.fieldLabels, index))
+        return [`### ${group.name}（${group.count} 条）`, ...lines,
+          ...(rows.length < group.count ? [`当前列出 ${rows.length} 条；该组其余记录可在查询数据中分页查看。`] : []),
+          ...(group.recordUids.length < group.count ? ['该组分页索引达到安全上限，请缩小范围查看其余记录。'] : [])].join('\n')
+      })
+      return [`按“${label}”的实际字段值分组，共 ${query.matchedCount} 条记录、${query.grouping.groups.length} 个分组。多值记录分别归入各组，空值单独列出。`,
+        ...sections,
+        `清单正文展示 ${query.records.length}/${query.matchedCount} 条记录；分组数量基于完整筛选结果。`
+      ].join('\n\n')
+    }
     if (plan.intent === 'count_matching' && result && typeof result === 'object') {
-      const aggregateValue = Number((result as { value?: unknown }).value)
-      if (isUnconstrainedRecordCountPlan(plan) && Number.isFinite(aggregateValue)) {
-        return `当前授权范围内的需求记录共有 **${aggregateValue}** 条。`
-      }
       const query = result as { matchedCount?: number }
       const matchedCount = Number(query.matchedCount ?? 0)
       if (plan.resultMode === 'answer' && plan.groupEntities.length >= 2) {
@@ -964,7 +965,9 @@ export class DataCenterAgent {
         matchedCount?: number
         returnedCount?: number
         recordUidsByTerm?: Record<string, string[]>
-        records?: Array<{ source: ChatSource; matchedTerms?: string[] }>
+        records?: Array<{ source: ChatSource; matchedTerms?: string[]; values?: Record<string, string | string[]> }>
+        fields?: string[]
+        fieldLabels?: Record<string, string>
       }
       const records = query.records ?? []
       const matchedCount = Number(query.matchedCount ?? records.length)
@@ -997,10 +1000,7 @@ export class DataCenterAgent {
             return normalizeGroupValue(searchable).includes(key)
           })
           const lines = groupRecords.map((record, index) => {
-            const source = record.source
-            const metadata = [source.nodeType, source.itemId].filter(Boolean).join(' · ')
-            const citation = source.uid ? ` [UID:${source.uid}]` : ''
-            return `${index + 1}. ${source.name || '未命名记录'}${metadata ? `（${metadata}）` : ''}${citation}`
+            return this.renderRecordLine(record, plan.fields, query.fieldLabels, index)
           })
           const groupCount = completeGroupCount(entity, groupRecords.length)
           const countLabel = groupRecords.length < groupCount
@@ -1020,10 +1020,7 @@ export class DataCenterAgent {
         ].join('\n')
       }
       const list = visibleRecords.map((record, index) => {
-        const source = record.source
-        const metadata = [source.nodeType, source.itemId].filter(Boolean).join(' · ')
-        const citation = source.uid ? ` [UID:${source.uid}]` : ''
-        return `${index + 1}. ${source.name || '未命名记录'}${metadata ? `（${metadata}）` : ''}${citation}`
+        return this.renderRecordLine(record, plan.fields, query.fieldLabels, index)
       })
       const remainder = Math.max(0, matchedCount - returnedCount)
       return [
@@ -1060,5 +1057,19 @@ export class DataCenterAgent {
       }
     }
     return modelAnswer
+  }
+
+  private renderRecordLine(
+    record: { source: ChatSource; values?: Record<string, string | string[]> },
+    fields: string[], labels: Record<string, string> | undefined, index: number
+  ): string {
+    const plain = (value: string) => sanitizeContextText(value, 400).replace(/[\r\n]+/gu, ' ')
+    const source = record.source
+    const metadata = [source.nodeType, source.itemId].filter(Boolean).map(plain).join(' · ')
+    const properties = fields.map((field) => {
+      const value = record.values?.[field]
+      return `${plain(labels?.[field] ?? field)}：${plain(Array.isArray(value) ? value.join('、') : value || '未填写')}`
+    })
+    return `${index + 1}. ${plain(source.name || '未命名记录')}${metadata ? `（${metadata}）` : ''}${properties.length ? ` — ${properties.join('；')}` : ''}${source.uid ? ` [UID:${source.uid}]` : ''}`
   }
 }

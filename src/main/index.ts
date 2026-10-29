@@ -96,6 +96,9 @@ import { validateDashboardSpec } from './dashboards/validator'
 import { diagnoseDashboard } from './dashboards/diagnostics'
 import { evaluateDashboardDomainSaveGate } from './dashboards/dashboard-domain-save-gate'
 import { repairDashboardComponent } from './dashboards/component-repair'
+import { renderDashboardPreview } from './dashboards/render-preview'
+import { capturePlatformDashboardSnapshot, platformSnapshotQueryEngine } from './dashboards/platform-snapshot'
+import { PlatformMcpClient } from './assistant/platform-mcp'
 import { dashboardSpecHash } from './dashboards/spec-hash'
 import { ExpertRouter } from './experts/router'
 import { autoRequirementIds } from './experts/auto-routing'
@@ -145,9 +148,10 @@ import {
   dashboardDomainPlatformAdaptersSettingKey,
   parseDashboardDomainPlatformAdapters
 } from './experts/dashboard-domain-adapter'
-import { resolveVisualizationRequestMode } from './experts/visualization-intent'
+import { planVisualizationIntent } from './experts/visualization-planner'
 import { OllamaAgent } from './ollama'
 import { PlainChatAgent } from './plain-chat'
+import { isPlatformAnalysisRequest, PlatformAnalysisAgent } from './assistant/platform-analysis'
 import { DirectRequirementDataAnalysisAgent } from './direct-data-analysis'
 import { chatHistoryFromMessages, contextRefsFromResponse } from './context-budget'
 import { SettingsService } from './settings'
@@ -1412,6 +1416,7 @@ const registerIpc = (): void => {
       }
       return true
     }
+
     if (isAutoChat) {
       const emitIntentStatus = (
         stage: 'classify' | 'skill',
@@ -1545,11 +1550,33 @@ const registerIpc = (): void => {
       }
       request = {
         ...request,
-        question: assistantIntent.resolvedQuestion,
+        question: originalUserQuestion,
         assistantIntent
       }
     }
     if (!isAutoChat) recoverPersistedHistory()
+    if (isPlatformAnalysisRequest(request)) {
+      const platformTrace: AssistantTraceContext = { taskType: 'record_query', sourceMode: 'records', resultMode: 'answer', primaryAgent: 'data-center', invokedAgents: ['data-center'] }
+      try {
+        const platform = settings.getAll().platform
+        const agent = new PlatformAnalysisAgent({
+          serverPath: platform.mcpServerPath || join(app.isPackaged ? process.resourcesPath : app.getAppPath(), app.isPackaged ? 'mcp' : 'resources', 'visslm-mcp', 'server.js'),
+          credentials: settings.getPlatformCredentials(),
+          nodeTypes: [...new Set([...(settings.getSyncConfig()?.selectedTypes ?? []), ...db.listNodeTypes()])],
+          model: settings.getModelCredentials(),
+          fieldSemantics: (projectId) => new QueryEngine(db).profile(projectId ? { projectIds: [projectId] } : {}),
+          onProgress: (message) => emitAgentProgress({ type: 'status', stage: 'query', message })
+        })
+        const response = await agent.ask(request)
+        return attachAssistantIntent(response, response.needsClarification
+          ? { status: 'clarification', clarificationQuestion: response.answer }
+          : {}, platformTrace)
+      } catch (error) {
+        if (isAssistantRunCancellation(error)) throw error
+        const message = error instanceof Error ? error.message : '平台查询失败'
+        return attachAssistantIntent({ answer: message, sources: [], dataViews: [], events: [{ type: 'error', code: 'PLATFORM_ANALYSIS_FAILED', message, recoverable: true, stage: 'query' }] }, { status: 'failed', error: { code: 'PLATFORM_ANALYSIS_FAILED', message } }, platformTrace)
+      }
+    }
     const autoRequirementIdsForRequest = isAutoChat && assistantIntent?.taskType === 'requirement_matching'
       ? autoRequirementIds(request.question, request.history)
       : null
@@ -1823,19 +1850,42 @@ const registerIpc = (): void => {
         .find((component) => component.query?.scope)?.query?.scope ?? {
         ...(request.projectId ? { projectIds: [request.projectId] } : {})
       }
-      const queryEngine = new QueryEngine(db)
-      const requestMode = resolveVisualizationRequestMode(
+      const visualizationPlan = await planVisualizationIntent(
         route.question,
         Boolean(activeArtifact),
-        focusComponentId
+        focusComponentId,
+        settings.getModelCredentials()
       )
-      const isPatchRequest = requestMode === 'patch'
+      const isPatchRequest = visualizationPlan.mode === 'patch'
+      const snapshotRoot = join(app.getPath('userData'), 'dashboard-snapshots')
+      const currentSource = activeArtifact?.dashboard.dataSource
+      const wantsPlatform = visualizationPlan.recordOrigin === 'platform' ||
+        (visualizationPlan.recordOrigin === 'inherit' && (assistantIntent?.recordOrigin === 'platform' || Boolean(currentSource)))
+      if (isPatchRequest && ((currentSource && visualizationPlan.recordOrigin === 'local') ||
+          (!currentSource && wantsPlatform) || (currentSource && visualizationPlan.recordOrigin === 'platform'))) {
+        throw new Error('切换或重新获取数据来源需要生成新大屏，避免组件混用不同快照')
+      }
+      let dataSource = isPatchRequest ? currentSource : undefined
+      if (!isPatchRequest && wantsPlatform) {
+        if (visualizationPlan.domainSelection?.tailoringBaselineId) throw new Error('平台数据不能与受控样例混用')
+        const platform = settings.getAll().platform
+        const serverPath = platform.mcpServerPath || join(app.isPackaged ? process.resourcesPath : app.getAppPath(), app.isPackaged ? 'mcp' : 'resources', 'visslm-mcp', 'server.js')
+        emitAgentProgress({ type: 'status', stage: 'query', message: '正在读取平台数据并固定本次大屏快照' })
+        dataSource = await capturePlatformDashboardSnapshot({
+          reader: new PlatformMcpClient(serverPath, settings.getPlatformCredentials(), registration.signal),
+          credentials: settings.getPlatformCredentials(),
+          nodeTypes: [...new Set([...(settings.getSyncConfig()?.selectedTypes ?? []), ...db.listNodeTypes()])],
+          scope, root: snapshotRoot
+        })
+      }
+      const queryEngine = dataSource ? platformSnapshotQueryEngine(snapshotRoot, dataSource) : new QueryEngine(db)
       emitActivity(workLogForStatus('execute'))
       if (!isPatchRequest) {
         const platformAdapterConfiguration = parseDashboardDomainPlatformAdapters(
           db.getSetting(dashboardDomainPlatformAdaptersSettingKey) ?? undefined
         )
         const domainChatResult = await runDashboardDomainChatRequest({
+          domainSelection: visualizationPlan.domainSelection,
           question: route.question,
           scope,
           generatedAt: new Date().toISOString(),
@@ -1848,10 +1898,13 @@ const registerIpc = (): void => {
           if (!domainChatResult.dashboard) {
             throw new Error('领域大屏生成成功但未返回 DashboardSpec')
           }
+          if (dataSource) domainChatResult.dashboard.dataSource = dataSource
+          const preview = await renderDashboardPreview(domainChatResult.dashboard, registration.signal)
+          if (preview.issues.length) throw new Error(`领域大屏渲染检查未通过：${preview.issues.map(issue => issue.message).join('；')}`)
           emitActivity(workLogForVerification())
           emitActivity(workLogForDelivery())
           return attachAssistantIntent({
-            answer: domainChatResult.answer ?? '领域大屏已生成，等待预览。',
+            answer: (domainChatResult.answer ?? '领域大屏已生成，等待预览。') + (dataSource && !dataSource.completePopulation ? ' 平台返回数据的完整总量尚未核实。' : ''),
             sources: [],
             dataViews: [],
             expertId: route.expert.id,
@@ -1917,7 +1970,8 @@ const registerIpc = (): void => {
           latestVisualizationRun = run
           if (!registration.signal.aborted) db.recordVisualizationRun(run)
         },
-        (event) => emitAgentProgress(event)
+        (event) => emitAgentProgress(event),
+        { renderPreview: (spec) => renderDashboardPreview(spec, registration.signal), signal: registration.signal, dataSource }
       )
       const task = activeArtifact && isPatchRequest
         ? agent.patch(
@@ -1930,7 +1984,7 @@ const registerIpc = (): void => {
         : agent.generate(route.question, scope)
       return task
         .then((dashboard) => ({
-          answer: `已生成“${dashboard.title}”，共 ${dashboard.components.length} 个组件。所有指标均由 QuerySpec 在本地数据范围内计算。`,
+          answer: `已生成“${dashboard.title}”，共 ${dashboard.components.length} 个组件。指标基于${dataSource ? `平台返回的 ${dataSource.recordCount} 条记录快照${dataSource.completePopulation ? '' : '（完整总量尚未核实）'}` : '本地数据范围'}计算。`,
           sources: [],
           dataViews: [],
           expertId: route.expert.id,
@@ -2232,6 +2286,12 @@ const registerIpc = (): void => {
   ipcMain.handle('analytics:execute-query', (_event, spec: QuerySpec) =>
     new QueryEngine(db).execute(spec)
   )
+  ipcMain.handle('dashboards:execute-query', (_event, dashboard: DashboardSpec, spec: QuerySpec) =>
+    createDashboardQueryEngineForSpec(dashboard, db, join(app.getPath('userData'), 'dashboard-snapshots')).execute(spec)
+  )
+  ipcMain.handle('dashboards:field-profiles', (_event, dashboard: DashboardSpec, scope: DataScope) =>
+    createDashboardQueryEngineForSpec(dashboard, db, join(app.getPath('userData'), 'dashboard-snapshots')).profile(scope)
+  )
   ipcMain.handle('dashboards:list', () => db.listDashboards())
   ipcMain.handle('dashboards:get', (_event, id: string, version?: number) =>
     db.getDashboard(id, version)
@@ -2241,7 +2301,7 @@ const registerIpc = (): void => {
   )
   ipcMain.handle('dashboards:save', (_event, input: DashboardSaveInput) => {
     try {
-      const dashboardQueryEngine = createDashboardQueryEngineForSpec(input.spec, db)
+      const dashboardQueryEngine = createDashboardQueryEngineForSpec(input.spec, db, join(app.getPath('userData'), 'dashboard-snapshots'))
       const errors = validateDashboardSpec(input.spec, dashboardQueryEngine)
       if (errors.length) throw new Error(`大屏校验失败：${errors.join('；')}`)
       const domainSaveGate = evaluateDashboardDomainSaveGate(input.spec, dashboardQueryEngine)
@@ -2297,7 +2357,7 @@ const registerIpc = (): void => {
   })
   ipcMain.handle('dashboards:diagnose', (_event, spec: DashboardSpec) => {
     try {
-      const report = diagnoseDashboard(spec, createDashboardQueryEngineForSpec(spec, db))
+      const report = diagnoseDashboard(spec, createDashboardQueryEngineForSpec(spec, db, join(app.getPath('userData'), 'dashboard-snapshots')))
       recordDashboardAudit({
         dashboardId: spec.id,
         action: 'diagnose',
@@ -2327,7 +2387,7 @@ const registerIpc = (): void => {
         const result = repairDashboardComponent(
           spec,
           componentId,
-          createDashboardQueryEngineForSpec(spec, db)
+          createDashboardQueryEngineForSpec(spec, db, join(app.getPath('userData'), 'dashboard-snapshots'))
         )
         recordDashboardAudit({
           dashboardId: spec.id,
@@ -2362,7 +2422,7 @@ const registerIpc = (): void => {
   )
   ipcMain.handle('dashboards:export-json', async (_event, spec: DashboardSpec, version?: number) => {
     try {
-      const errors = validateDashboardSpec(spec, createDashboardQueryEngineForSpec(spec, db))
+      const errors = validateDashboardSpec(spec, createDashboardQueryEngineForSpec(spec, db, join(app.getPath('userData'), 'dashboard-snapshots')))
       if (errors.length) throw new Error(`导出前校验失败：${errors.join('；')}`)
       const safeTitle = spec.title.replace(/[<>:"/\\|?*\u0000-\u001F]/g, '-').slice(0, 80)
       const result = await dialog.showSaveDialog(mainWindow!, {
@@ -2408,7 +2468,7 @@ const registerIpc = (): void => {
     try {
       const errors = validateDashboardSpec(
         spec,
-        createDashboardQueryEngineForSpec(spec, db),
+        createDashboardQueryEngineForSpec(spec, db, join(app.getPath('userData'), 'dashboard-snapshots')),
         { allowInlineData: true }
       )
       if (errors.length) throw new Error(`离线导出前校验失败：${errors.join('；')}`)
@@ -2469,7 +2529,7 @@ const registerIpc = (): void => {
   })
   ipcMain.handle('dashboards:export-pdf', async (_event, spec: DashboardSpec, version?: number) => {
     try {
-      const errors = validateDashboardSpec(spec, createDashboardQueryEngineForSpec(spec, db))
+      const errors = validateDashboardSpec(spec, createDashboardQueryEngineForSpec(spec, db, join(app.getPath('userData'), 'dashboard-snapshots')))
       if (errors.length) throw new Error(`导出前校验失败：${errors.join('；')}`)
       if (!mainWindow) throw new Error('主窗口尚未就绪')
       const safeTitle = spec.title.replace(/[<>:"/\\|?*\u0000-\u001F]/g, '-').slice(0, 80)
@@ -2525,7 +2585,7 @@ const registerIpc = (): void => {
     version?: number
   ) => {
     try {
-      const errors = validateDashboardSpec(spec, createDashboardQueryEngineForSpec(spec, db))
+      const errors = validateDashboardSpec(spec, createDashboardQueryEngineForSpec(spec, db, join(app.getPath('userData'), 'dashboard-snapshots')))
       if (errors.length) throw new Error(`导出前校验失败：${errors.join('；')}`)
       const prefix = 'data:image/png;base64,'
       if (typeof dataUrl !== 'string' || !dataUrl.startsWith(prefix)) {

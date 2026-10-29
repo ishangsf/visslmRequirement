@@ -90,7 +90,7 @@ const repairMeasures = (
   const idMap = new Map<string, string>()
   const input = query.measures?.length
     ? query.measures
-    : [{ id: 'records', aggregation: 'count' as const }]
+    : (() => { throw new Error('缺少指标定义，不能自动补成记录数') })()
   const assigned = input.slice(0, 8).map((measure, index) => {
     const originalId = measure.id?.trim() || `metric${index + 1}`
     const id = uniqueId(originalId, used)
@@ -104,37 +104,13 @@ const repairMeasures = (
     const currentProfile = measure.field
       ? catalog.get(measure.field.toLocaleLowerCase())
       : undefined
-    let aggregation = supportedAggregations.has(measure.aggregation)
-      ? measure.aggregation
-      : 'count'
-    let field = currentProfile?.field
-
-    if (['sum', 'avg', 'min', 'max'].includes(aggregation)) {
-      const selected = currentProfile?.inferredType === 'number'
-        ? currentProfile
-        : numeric[0]
-      if (selected) {
-        field = selected.field
-        if (field !== measure.field) actions.push(`指标 ${id} 改用数值字段 ${field}`)
-      } else {
-        aggregation = 'count'
-        field = undefined
-        actions.push(`指标 ${id} 无可用数值字段，已回退为记录数`)
-      }
-    } else if (aggregation === 'countDistinct' && !currentProfile) {
-      const selected = profiles.find((profile) => profile.role !== 'identifier') ?? profiles[0]
-      if (selected) {
-        field = selected.field
-        actions.push(`指标 ${id} 的去重字段改为 ${field}`)
-      } else {
-        aggregation = 'count'
-        field = undefined
-        actions.push(`指标 ${id} 无可用去重字段，已回退为记录数`)
-      }
-    } else if (aggregation === 'count') {
-      field = currentProfile?.field
-    }
-
+    if (!supportedAggregations.has(measure.aggregation)) throw new Error('不支持的聚合，不能更改指标口径')
+    const aggregation = measure.aggregation
+    const field = currentProfile?.field
+    if (measure.field && !currentProfile) throw new Error('指标字段不存在，不能替换为其他业务字段：' + measure.field)
+    if (currentProfile?.sensitivity === 'sensitive') throw new Error('指标字段不可用于自动修正')
+    if (!measure.formula && ['sum', 'avg', 'min', 'max'].includes(aggregation) && currentProfile?.inferredType !== 'number') throw new Error('指标需要原定义中的数值字段，不能回退为其他指标')
+    if (aggregation === 'countDistinct' && !currentProfile) throw new Error('去重统计缺少原字段，不能猜测替换')
     const repaired: QueryMeasure = {
       id,
       aggregation,
@@ -163,13 +139,22 @@ const repairDimensions = (
   component: DashboardComponentSpec,
   query: QuerySpec,
   profiles: FieldProfile[],
-  actions: string[]
+  actions: string[],
+  allowDimensionInference = false
 ): QueryDimension[] | undefined => {
   if (singleValueTypes.has(component.type)) {
+    if (!allowDimensionInference && query.dimensions?.length) throw new Error('不能在修正时删除业务分组维度')
     if (query.dimensions?.length) actions.push('移除单值组件不支持的分组维度')
     return undefined
   }
   const catalog = profileCatalog(profiles)
+  for (const dimension of query.dimensions ?? []) if (!catalog.has(dimension.field.toLocaleLowerCase())) throw new Error('分组字段不存在，不能删除或替换：' + dimension.field)
+  if (!allowDimensionInference) {
+    const dimensions = query.dimensions ?? []
+    if (singleValueTypes.has(component.type) && dimensions.length) throw new Error('单值组件不能在修正时静默删除业务维度')
+    if ((categoryTypes.has(component.type) || component.type === 'line' || component.type === 'combo') && !dimensions.length) throw new Error('组件缺少业务维度，不能自动猜测')
+    return dimensions.length ? structuredClone(dimensions) : undefined
+  }
   const valid = (query.dimensions ?? []).flatMap((dimension) => {
     const profile = catalog.get(dimension.field.toLocaleLowerCase())
     if (!profile) return []
@@ -251,79 +236,33 @@ const repairQuery = (
   spec: DashboardSpec,
   component: DashboardComponentSpec,
   queryEngine: QueryEngine,
-  actions: string[]
+  actions: string[],
+  allowDimensionInference = false
 ): { query: QuerySpec; encoding: NonNullable<DashboardComponentSpec['encoding']> } => {
   const fallbackScope = spec.components.find((item) => item.query)?.query?.scope ?? {}
   const sourceQuery: QuerySpec = component.query
     ? cloneSpec({ ...spec, components: [component] }).components[0].query!
-    : { source: 'records', scope: fallbackScope, measures: [{ id: 'records', aggregation: 'count' }] }
+    : (() => { throw new Error('组件缺少查询，必须先选择业务指标') })()
   if (!component.query) actions.push('依据当前大屏数据范围补建受控查询')
 
   const profiles = queryEngine.profile(sourceQuery.scope)
   const catalog = profileCatalog(profiles)
   const { measures, idMap } = repairMeasures(sourceQuery, profiles, actions)
-  const dimensions = repairDimensions(component, sourceQuery, profiles, actions)
+  const dimensions = repairDimensions(component, sourceQuery, profiles, actions, allowDimensionInference)
   const hasTimeDimension = Boolean(dimensions?.some((dimension) => dimension.timeGrain))
   const safeMeasures = measures.map((measure) => {
     if (hasTimeDimension || (!measure.calculation && !measure.comparison)) return measure
-    actions.push(`移除指标 ${measure.id} 中缺少时间维度的派生计算`)
-    const { calculation: _calculation, comparison: _comparison, ...safe } = measure
-    return safe
+    if (measure.calculation === 'share' && !measure.comparison) return measure
+    throw new Error('派生指标缺少时间维度，不能删除计算或对比口径')
   })
   let resultMeasures = safeMeasures
-  if (component.type === 'scatter') {
-    const numeric = numericProfiles(profiles)
-    const numericFields = new Set(numeric.map((profile) => profile.field))
-    const selected: QueryMeasure[] = []
-    const usedFields = new Set<string>()
-    for (const measure of safeMeasures) {
-      if (!measure.field || !numericFields.has(measure.field) || usedFields.has(measure.field)) continue
-      selected.push(measure)
-      usedFields.add(measure.field)
-      if (selected.length === 2) break
-    }
-    for (const profile of numeric) {
-      if (selected.length === 2) break
-      if (usedFields.has(profile.field)) continue
-      selected.push({
-        id: uniqueId(profile.field, new Set(selected.map((measure) => measure.id))),
-        field: profile.field,
-        aggregation: 'sum'
-      })
-      usedFields.add(profile.field)
-      actions.push(`为散点图补充数值指标 ${profile.field}`)
-    }
-    if (selected.length !== 2) {
-      throw new Error('散点图需要两个不同的安全数值字段，但当前数据范围不足')
-    }
-    resultMeasures = selected
-  } else if (component.type === 'combo') {
-    const signatures = new Set<string>()
-    const selected = safeMeasures.filter((measure) => {
-      const signature = `${measure.field ?? ''}:${measure.aggregation}`
-      if (signatures.has(signature)) return false
-      signatures.add(signature)
-      return true
-    }).slice(0, 2)
-    const usedFields = new Set(selected.flatMap((measure) => measure.field ? [measure.field] : []))
-    const usedIds = new Set(selected.map((measure) => measure.id))
-    for (const profile of numericProfiles(profiles)) {
-      if (selected.length === 2) break
-      if (usedFields.has(profile.field)) continue
-      selected.push({
-        id: uniqueId(profile.field, usedIds),
-        field: profile.field,
-        aggregation: 'sum'
-      })
-      usedFields.add(profile.field)
-      actions.push(`为组合图补充第二指标 ${profile.field}`)
-    }
-    if (selected.length !== 2) {
-      throw new Error('组合图需要两个不同的指标，但当前数据范围不足')
-    }
-    resultMeasures = selected
+  if (component.type === 'scatter' || component.type === 'combo') {
+    if (safeMeasures.length !== 2) throw new Error('双指标组件必须明确提供两个指标，不能自动选择其他业务字段')
+    if (component.type === 'scatter' && (safeMeasures.some(item => !item.field) || new Set(safeMeasures.map(item => item.field)).size !== 2)) throw new Error('散点图必须明确提供两个不同的安全数值字段')
   }
-
+  for (const filter of [...(sourceQuery.filters ?? []), ...(sourceQuery.scope.baseFilters ?? [])]) {
+    if (!catalog.has(filter.field.toLocaleLowerCase())) throw new Error('筛选字段不存在，不能删除用户约束：' + filter.field)
+  }
   const filters = sourceQuery.filters?.filter((filter) =>
     catalog.has(filter.field.toLocaleLowerCase())
   )
@@ -346,11 +285,7 @@ const repairQuery = (
     ...(dimensions?.length ? { dimensions } : {}),
     measures: resultMeasures,
     ...(filters?.length ? { filters } : {}),
-    limit: component.type === 'pie'
-      ? Math.min(sourceQuery.limit ?? 6, 6)
-      : singleValueTypes.has(component.type)
-        ? 1
-        : Math.min(sourceQuery.limit ?? 100, 100)
+    limit: singleValueTypes.has(component.type) ? 1 : Math.min(sourceQuery.limit ?? 100, 500)
   }
   query.sort = validSort({ ...query, sort: sourceQuery.sort })
 
@@ -428,12 +363,13 @@ const fitTargetLayout = (
 export const adaptDashboardComponentQuery = (
   input: DashboardSpec,
   componentId: string,
-  queryEngine: QueryEngine
+  queryEngine: QueryEngine,
+  options: { allowDimensionInference?: boolean } = {}
 ): { component: DashboardComponentSpec; actions: string[] } => {
   const component = input.components.find((item) => item.id === componentId)
   if (!component) throw new Error(`组件 ${componentId} 不存在`)
   const actions: string[] = []
-  const repairedQuery = repairQuery(input, component, queryEngine, actions)
+  const repairedQuery = repairQuery(input, component, queryEngine, actions, options.allowDimensionInference)
   return {
     component: {
       ...component,

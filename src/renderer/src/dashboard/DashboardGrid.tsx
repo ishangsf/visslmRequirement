@@ -399,6 +399,7 @@ export function DashboardGrid({
             }
             return (
               <section
+                data-component-id={component.id}
                 className={[
                   'dashboard-widget',
                   `widget-${component.type}`,

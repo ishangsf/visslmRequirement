@@ -92,6 +92,7 @@ assert.equal(parsed.adapters[0]?.id, adapter.id)
 assert.equal(parseDashboardDomainPlatformAdapters('{bad json').errors[0], '平台适配器配置不是有效 JSON')
 
 const result = await runDashboardDomainChatRequest({
+  domainSelection: { scenario: 'project-overview', role: 'project-owner' },
   question: '项目负责人生成项目综合态势大屏',
   scope: { projectIds: ['project-alpha'] },
   generatedAt: '2026-08-28T00:00:00.000Z',
@@ -125,6 +126,7 @@ assert.equal(
 
 const missingMetricAdapter = { ...adapter, metricBindings: adapter.metricBindings.slice(1) }
 const missingMetric = await runDashboardDomainChatRequest({
+  domainSelection: { scenario: 'project-overview', role: 'project-owner' },
   question: '项目负责人生成项目综合态势大屏',
   scope: { projectIds: ['project-alpha'] },
   generatedAt: '2026-08-28T00:00:00.000Z',
@@ -140,6 +142,7 @@ const unknownFieldAdapter: DashboardDomainPlatformAdapter = {
   )
 }
 const unknownField = await runDashboardDomainChatRequest({
+  domainSelection: { scenario: 'project-overview', role: 'project-owner' },
   question: '项目负责人生成项目综合态势大屏',
   scope: { projectIds: ['project-alpha'] },
   generatedAt: '2026-08-28T00:00:00.000Z',
@@ -149,6 +152,7 @@ assert.equal(unknownField.status, 'rejected')
 assert.equal(unknownField.reason, 'invalid-adapter-field-mapping')
 
 const scopeViolation = await runDashboardDomainChatRequest({
+  domainSelection: { scenario: 'project-overview', role: 'project-owner' },
   question: '项目负责人生成项目综合态势大屏',
   scope: { projectIds: ['project-alpha'], nodeTypes: ['UnauthorizedRecord'] },
   generatedAt: '2026-08-28T00:00:00.000Z',
@@ -158,6 +162,7 @@ assert.equal(scopeViolation.status, 'rejected')
 assert.equal(scopeViolation.reason, 'adapter-scope-violation')
 
 const projectScopeViolation = await runDashboardDomainChatRequest({
+  domainSelection: { scenario: 'project-overview', role: 'project-owner' },
   question: '项目负责人生成项目综合态势大屏',
   scope: { projectIds: ['project-not-allowed'] },
   generatedAt: '2026-08-28T00:00:00.000Z',
@@ -171,6 +176,7 @@ const missingPermissionAdapter: DashboardDomainPlatformAdapter = {
   permissions: ['project:read']
 }
 const missingPermission = await runDashboardDomainChatRequest({
+  domainSelection: { scenario: 'project-overview', role: 'project-owner' },
   question: '项目负责人生成项目综合态势大屏',
   scope: { projectIds: ['project-alpha'] },
   generatedAt: '2026-08-28T00:00:00.000Z',
@@ -181,6 +187,7 @@ assert.equal(missingPermission.reason, 'insufficient-permission')
 assert.equal(missingPermission.clarificationOptions?.length, 2)
 
 const callerPermissionMissing = await runDashboardDomainChatRequest({
+  domainSelection: { scenario: 'project-overview', role: 'project-owner' },
   question: '项目负责人生成项目综合态势大屏',
   scope: { projectIds: ['project-alpha'] },
   permissions: ['project:read'],

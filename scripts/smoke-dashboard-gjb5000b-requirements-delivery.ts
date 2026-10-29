@@ -35,6 +35,7 @@ globalThis.fetch = (async () => {
 
 try {
   const result = await runDashboardDomainChatRequest({
+    domainSelection: { scenario: requirementsDeliveryGoldenFixture.scenario, role: requirementsDeliveryGoldenFixture.role, tailoringBaselineId: 'sample-tailoring-baseline-v1' },
     question: requirementsDeliveryGoldenFixture.request,
     scope: { projectIds: [requirementsDeliveryGoldenFixture.projectId] },
     generatedAt: requirementsDeliveryGoldenFixture.generatedAt
@@ -90,6 +91,7 @@ try {
     )
   }))
   const incomplete = await runDashboardDomainChatRequest({
+    domainSelection: { scenario: requirementsDeliveryGoldenFixture.scenario, role: requirementsDeliveryGoldenFixture.role, tailoringBaselineId: 'sample-tailoring-baseline-v1' },
     question: requirementsDeliveryGoldenFixture.request,
     scope: { projectIds: [requirementsDeliveryGoldenFixture.projectId] },
     generatedAt: requirementsDeliveryGoldenFixture.generatedAt
@@ -99,6 +101,7 @@ try {
   assert.equal(incomplete.dashboard, undefined)
 
   const roleMismatch = await runDashboardDomainChatRequest({
+    domainSelection: { scenario: scenario!.id, role: 'model-org-manager', tailoringBaselineId: 'sample-tailoring-baseline-v1' },
     question: '型号组织管理负责人基于受控样例生成需求到交付全链路大屏',
     scope: { projectIds: [requirementsDeliveryGoldenFixture.projectId] },
     generatedAt: requirementsDeliveryGoldenFixture.generatedAt

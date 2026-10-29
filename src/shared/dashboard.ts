@@ -389,6 +389,23 @@ export interface DashboardSpec {
     objective: string
     scopeDescription: string
   }
+  generationEvidence?: {
+    snapshotId: string
+    capturedAt: string
+    snapshotRetention: 'generation-only'
+    contract: import('./dashboard-generation').DashboardAnalysisContract
+    qualityScore: number
+    rendered: boolean
+    checkedAt: string
+    warnings: string[]
+  }
+  dataSource?: {
+    kind: 'platform-snapshot'
+    snapshotId: string
+    fetchedAt: string
+    completePopulation: boolean
+    recordCount: number
+  }
   viewport?: { width: 1920; height: 1080; columns: 24; rowHeight: number }
   theme: DashboardThemeId
   /** Stable dashboard-level data range; component deletion must not erase it. */
@@ -555,6 +572,7 @@ export interface DashboardComponentRepairResult {
   componentId: string
   actions: string[]
   report: DashboardQualityReport
+  semanticChanges?: string[]
 }
 
 export interface VisualizationRunInput {
@@ -573,6 +591,11 @@ export interface VisualizationRunInput {
 }
 
 export type VisualizationToolName =
+  | 'discover-analysis'
+  | 'mcp-call'
+  | 'quality-check'
+  | 'render-preview'
+  | 'goal-coverage'
   | 'plan-analysis'
   | 'profile-fields'
   | 'model-compose'

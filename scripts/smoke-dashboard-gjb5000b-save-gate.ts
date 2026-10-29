@@ -42,7 +42,7 @@ assert.ok(dbSaveIndex > gateCallIndex,
   '保存质量门禁必须在 db.saveDashboard(input) 之前执行')
 assert.match(saveRoute.slice(gateCallIndex, gateCallIndex + 500), /input\.spec/,
   '保存质量门禁必须检查待保存的 input.spec')
-assert.match(saveRoute.slice(gateCallIndex, gateCallIndex + 500), /new QueryEngine\(db\)/,
+assert.match(saveRoute, /const dashboardQueryEngine = createDashboardQueryEngineForSpec\(input\.spec, db, join\(app\.getPath\('userData'\), 'dashboard-snapshots'\)\)/,
   '保存质量门禁必须使用当前数据库 QueryEngine')
 assert.match(saveRoute.slice(gateCallIndex, dbSaveIndex), /!\w+\.allowed|allowed\s*===\s*false/,
   '保存质量门禁拒绝时必须在写库前抛错')
@@ -63,6 +63,7 @@ const cloneDashboard = (dashboard: DashboardSpec): DashboardSpec =>
   JSON.parse(JSON.stringify(dashboard)) as DashboardSpec
 
 const readyChat = await runDashboardDomainChatRequest({
+  domainSelection: { scenario: 'project-overview', role: 'project-owner', tailoringBaselineId: 'sample-tailoring-baseline-v1' },
   question: '项目负责人基于受控样例生成项目综合态势大屏',
   scope: { projectIds: ['sample-project-001'] },
   generatedAt: '2026-08-28T00:00:00.000Z'

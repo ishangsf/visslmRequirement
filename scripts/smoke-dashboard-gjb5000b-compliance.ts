@@ -1,3 +1,4 @@
+import '../tests/helpers/visualization-discovery-fixture'
 import { strict as assert } from 'node:assert'
 
 import { QueryEngine } from '../src/main/analytics/query-engine'
@@ -35,6 +36,7 @@ globalThis.fetch = (async () => {
 
 try {
   const result = await runDashboardDomainChatRequest({
+    domainSelection: { scenario: gjb5000bComplianceGoldenFixture.scenario, role: gjb5000bComplianceGoldenFixture.role, tailoringBaselineId: 'sample-tailoring-baseline-v1' },
     question: gjb5000bComplianceGoldenFixture.request,
     scope: { projectIds: [gjb5000bComplianceGoldenFixture.projectId] },
     generatedAt: gjb5000bComplianceGoldenFixture.generatedAt
@@ -134,6 +136,7 @@ try {
     raw: Object.fromEntries(Object.entries(record.raw).filter(([field]) => field !== 'evidenceSufficiencyRate'))
   }))
   const missingEvidence = await runDashboardDomainChatRequest({
+    domainSelection: { scenario: gjb5000bComplianceGoldenFixture.scenario, role: gjb5000bComplianceGoldenFixture.role, tailoringBaselineId: 'sample-tailoring-baseline-v1' },
     question: gjb5000bComplianceGoldenFixture.request,
     scope: { projectIds: [gjb5000bComplianceGoldenFixture.projectId] },
     generatedAt: gjb5000bComplianceGoldenFixture.generatedAt
@@ -142,6 +145,7 @@ try {
   assert.equal(missingEvidence.reason, 'missing-metric-source')
 
   const roleMismatch = await runDashboardDomainChatRequest({
+    domainSelection: { scenario: scenario!.id, role: 'project-owner', tailoringBaselineId: 'sample-tailoring-baseline-v1' },
     question: '项目负责人基于受控样例生成 GJB5000B 过程符合度与证据审计大屏',
     scope: { projectIds: [gjb5000bComplianceGoldenFixture.projectId] },
     generatedAt: gjb5000bComplianceGoldenFixture.generatedAt

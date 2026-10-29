@@ -1,3 +1,4 @@
+import '../tests/helpers/visualization-discovery-fixture'
 import { strict as assert } from 'node:assert'
 import { QueryEngine } from '../src/main/analytics/query-engine'
 import type { AnalyticsRecord, AppDatabase } from '../src/main/database'

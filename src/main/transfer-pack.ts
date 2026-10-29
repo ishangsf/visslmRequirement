@@ -210,53 +210,155 @@ const containsImageDataUri = (input: unknown): boolean => {
   return false
 }
 
-const tokenizeLegacyDescription = (row: JsonObject): JsonObject => {
+const imageExtension = /\.(png|jpe?g|gif|webp|bmp|svg)(?:$|[?#])/i
+const assetTokenPattern = /visslm-asset:\/\/([a-f0-9]{64})\/[A-Za-z0-9_-]{1,128}/gi
+
+/**
+ * A plain image value is allowed to be a field value in newer exports. Keep
+ * this deliberately narrow so an ordinary text value such as "icon.png" is
+ * never treated as an image source.
+ */
+const isStandaloneImageSource = (input: string): boolean =>
+  !parseAssetToken(input) && (/^data:image\//i.test(input) ||
+    (input.includes('/') && !/[\s<>"']/.test(input) && imageExtension.test(input)))
+
+const dataUriSha256 = (value: string): string => {
+  const match = /^data:image\/[^;,\s]+;base64,([A-Za-z0-9+/]*={0,2})$/i.exec(value.trim())
+  if (!match || match[1].length % 4 === 1) return ''
+  try {
+    const bytes = Buffer.from(match[1], 'base64')
+    return bytes.length ? createHash('sha256').update(bytes).digest('hex') : ''
+  } catch {
+    return ''
+  }
+}
+
+const sourceMatchesAlias = (source: string, candidate: string): boolean => {
+  const left = source.trim()
+  const right = candidate.trim()
+  if (!left || !right) return false
+  if (left === right) return true
+  // Data URI bytes are compacted in exported image metadata and references.
+  if (/^data:image\//i.test(left)) {
+    const sha256 = dataUriSha256(left)
+    const compact = /^inline:data-uri(?::([a-f0-9]{64}))?$/i.exec(right)
+    if (!compact) return false
+    return Boolean(sha256) && (compact[1] ? compact[1].toLowerCase() === sha256 : true)
+  }
+  if (/^data:image\//i.test(right)) return sourceMatchesAlias(right, left)
+  return false
+}
+
+const uniqueImageCandidate = (
+  images: JsonObject[],
+  source: string
+): JsonObject | undefined => {
+  const sourceSha = dataUriSha256(source)
+  const candidates = images.filter((image) => {
+    const imageSha = validSha256(image.sha256)
+    if (sourceSha && imageSha && sourceSha !== imageSha) return false
+    return sourceMatchesAlias(source, text(image.sourceUrl))
+  })
+  return candidates.length === 1 ? candidates[0] : undefined
+}
+
+const rowRecordUid = (row: JsonObject): string => {
+  const metadata = asObject(row.metadata)
+  const sourceId = text(metadata?.sourceId).trim()
+  if (sourceId) return sourceId
+  const uid = text(row.uid).trim()
+  if (uid) return uid
+  const documentId = text(row.documentId).trim()
+  const separator = documentId.indexOf(':')
+  return separator >= 0 ? documentId.slice(separator + 1) : documentId
+}
+
+const referenceMatches = (
+  reference: JsonObject,
+  recordUid: string,
+  fieldPath: string,
+  ordinal: number,
+  source: string
+): boolean => {
+  const referenceRecordUid = text(reference.recordUid).trim()
+  if (referenceRecordUid && recordUid && referenceRecordUid !== recordUid) return false
+  if (text(reference.fieldPath).trim() !== fieldPath) return false
+  const referenceOrdinal = Number(reference.ordinal ?? reference.occurrence)
+  if (!Number.isSafeInteger(referenceOrdinal) || referenceOrdinal !== ordinal) return false
+  const sourceSha = dataUriSha256(source)
+  const referencedSha = validSha256(reference.assetSha256 || reference.sha256)
+  if (sourceSha && referencedSha && sourceSha !== referencedSha) return false
+  const originalSource = text(reference.originalSource).trim()
+  // References from current exports carry the original source. A source-less
+  // legacy reference is only safe when its field/ordinal pair is exact.
+  return !originalSource || sourceMatchesAlias(source, originalSource)
+}
+
+const validSha256 = (value: unknown): string => {
+  const sha256 = text(value).trim().toLowerCase()
+  return /^[a-f0-9]{64}$/.test(sha256) ? sha256 : ''
+}
+
+/** Tokenize legacy image-bearing values throughout the raw object. */
+const tokenizeLegacyImages = (row: JsonObject): JsonObject => {
   const raw = asObject(row.raw)
   const images = Array.isArray(row.images) ? row.images.map(asObject).filter(Boolean) as JsonObject[] : []
-  const description = text(raw?._valm_Description)
-  if (!raw || !description || !images.length) return row
+  if (!raw) return row
   let imageIndex = 0
-  const recordKey = (text(asObject(row.metadata)?.sourceId) || text(row.documentId) || text(row.title))
+  const recordUid = rowRecordUid(row)
+  const recordKey = (recordUid || text(row.title))
     .replace(/[^A-Za-z0-9_-]/g, '_')
     .slice(0, 24) || 'record'
   const imageReferences = Array.isArray(row.imageReferences)
     ? row.imageReferences.map((input) => asObject(input)).filter(Boolean) as JsonObject[]
     : []
-  const tokenized = replaceRichTextImageSources(description, (source) => {
-    const match = images.find((image) => {
-      const sourceUrl = text(image.sourceUrl)
-      return sourceUrl === source.source || sourceUrl.includes(source.source) ||
-        (source.source.startsWith('data:image/') && sourceUrl.startsWith('inline:data-uri'))
-    })
-    const sha256 = text(match?.sha256).trim().toLowerCase()
-    if (!/^[a-f0-9]{64}$/.test(sha256)) return undefined
-    imageIndex += 1
+  const resolveSource = (source: string, fieldPath: string, ordinal: number): string | undefined => {
     const existingReference = imageReferences.find((reference) =>
-      text(reference.assetSha256).toLowerCase() === sha256 &&
-      Number(reference.ordinal ?? -1) === source.occurrence
+      referenceMatches(reference, recordUid, fieldPath, ordinal, source)
     )
-    const referenceId = text(existingReference?.id) || `legacy-${recordKey}-${imageIndex}`
+    const referencedSha = validSha256(existingReference?.assetSha256 || existingReference?.sha256)
+    const match = uniqueImageCandidate(images, source)
+    const sha256 = referencedSha || validSha256(match?.sha256)
+    if (!sha256) return undefined
+    const referenceId = text(existingReference?.id).trim() || `legacy-${recordKey}-${++imageIndex}`
     if (!existingReference) {
       imageReferences.push({
         id: referenceId,
-        recordUid: text(row.metadata && asObject(row.metadata)?.sourceId),
-        fieldPath: '_valm_Description',
-        occurrence: source.occurrence,
-        ordinal: source.occurrence,
+        recordUid,
+        fieldPath,
+        occurrence: ordinal,
+        ordinal,
         assetSha256: sha256,
         sourceType: 'legacy-export',
         sourceName: text(match?.name),
-        originalSource: /^data:image\//i.test(source.source)
+        originalSource: /^data:image\//i.test(source)
           ? `inline:data-uri:${sha256}`
-          : source.source
+          : source
       })
     }
     return `visslm-asset://${sha256}/${referenceId}`
-  })
-  if (!tokenized.replacements.length) return row
+  }
+  const tokenize = (input: unknown, fieldPath: string): unknown => {
+    if (typeof input === 'string') {
+      if (isStandaloneImageSource(input)) return resolveSource(input, fieldPath, 0) ?? input
+      return replaceRichTextImageSources(input, (source) =>
+        parseAssetToken(source.source)
+          ? undefined
+          : resolveSource(source.source, fieldPath, source.occurrence)).html
+    }
+    if (Array.isArray(input)) {
+      return input.map((entry, index) => tokenize(entry, `${fieldPath}[${index}]`))
+    }
+    if (input && typeof input === 'object') {
+      return Object.fromEntries(Object.entries(input as JsonObject).map(([key, entry]) =>
+        [key, tokenize(entry, fieldPath ? `${fieldPath}.${key}` : key)]))
+    }
+    return input
+  }
+  const tokenizedRaw = tokenize(raw, '') as JsonObject
   return {
     ...row,
-    raw: { ...raw, _valm_Description: tokenized.html },
+    raw: tokenizedRaw,
     imageReferences
   }
 }
@@ -403,7 +505,7 @@ export async function exportVisslmPack(
     }
     const rows = db.iterateExportRowsWithoutBinary?.(recordUids) ?? db.iterateExportRows(recordUids)
     for (const originalRow of rows) {
-      const row = tokenizeLegacyDescription(stripBinaryFields(originalRow))
+      const row = tokenizeLegacyImages(stripBinaryFields(originalRow))
       const images = Array.isArray(originalRow.images) ? originalRow.images : []
       const imageBySha = new Map<string, JsonObject>()
       const validImages: JsonObject[] = []
@@ -446,32 +548,56 @@ export async function exportVisslmPack(
         })
       }
       const raw = asObject(row.raw)
-      const description = text(raw?._valm_Description)
-      let nextDescription = description
-      if (description) {
-        nextDescription = replaceRichTextSourcesForExport(description, (source) => {
+      const resolveTokenForExport = (sha256Input: string, token: string): string => {
+        const sha256 = validSha256(sha256Input)
+        if (!sha256) return ''
+        if (unavailableAssetShas.has(sha256)) {
+          noteSkipped(recordLabel, `asset:${sha256}`)
+          return ''
+        }
+        const candidate = imageBySha.get(sha256)
+        let blob: ReturnType<TransferPackDatabase['getAssetBlob']> = null
+        try { blob = db.getAssetBlob(sha256) } catch { blob = null }
+        const image = {
+          ...(candidate ?? {}),
+          sha256,
+          mimeType: text(candidate?.mimeType) || text(blob?.mimeType)
+        }
+        if (addAsset(sha256, image)) return token
+        unavailableAssetShas.add(sha256)
+        noteSkipped(recordLabel, `asset:${sha256}`)
+        return ''
+      }
+      const rewriteExportString = (input: string): string => {
+        let result = replaceRichTextSourcesForExport(input, (source) => {
           const parsed = parseAssetToken(source.source)
-          if (parsed) {
-            if (unavailableAssetShas.has(parsed.sha256)) {
-              noteSkipped(recordLabel, `asset:${parsed.sha256}`)
-              return ''
-            }
-            const candidate = imageBySha.get(parsed.sha256)
-            const blob = db.getAssetBlob(parsed.sha256)
-            const image = {
-              ...(candidate ?? {}),
-              sha256: parsed.sha256,
-              mimeType: text(candidate?.mimeType) || text(blob?.mimeType)
-            }
-            if (addAsset(parsed.sha256, image)) return source.source
-            unavailableAssetShas.add(parsed.sha256)
-            noteSkipped(recordLabel, `asset:${parsed.sha256}`)
-            return ''
-          }
+          if (parsed) return resolveTokenForExport(parsed.sha256, source.source)
           noteSkipped(recordLabel, `source:${source.source}`)
           return ''
         })
+        // Collector-generated standalone tokens are valid even when they are
+        // not nested in an <img>/<source> attribute.
+        result = result.replace(assetTokenPattern, (token, sha256: string) =>
+          resolveTokenForExport(sha256, token)
+        )
+        if (isStandaloneImageSource(result)) {
+          noteSkipped(recordLabel, `source:${result}`)
+          return '[图片未能导出]'
+        }
+        return result
       }
+      const rewriteRaw = (input: unknown, fieldPath: string): unknown => {
+        if (typeof input === 'string') return rewriteExportString(input)
+        if (Array.isArray(input)) {
+          return input.map((entry, index) => rewriteRaw(entry, `${fieldPath}[${index}]`))
+        }
+        if (input && typeof input === 'object') {
+          return Object.fromEntries(Object.entries(input as JsonObject).map(([key, entry]) =>
+            [key, rewriteRaw(entry, fieldPath ? `${fieldPath}.${key}` : key)]))
+        }
+        return input
+      }
+      const nextRaw = raw ? rewriteRaw(raw, '') as JsonObject : raw
       const sourceReferences = Array.isArray(row.imageReferences) ? row.imageReferences : []
       const validReferences = sourceReferences.flatMap((input, referenceIndex) => {
         const reference = asObject(input)
@@ -494,7 +620,7 @@ export async function exportVisslmPack(
         ...row,
         images: validImages,
         imageReferences: validReferences,
-        ...(raw && description ? { raw: { ...raw, _valm_Description: nextDescription } } : {})
+        ...(nextRaw ? { raw: nextRaw } : {})
       }
       if (containsImageDataUri(exportRow)) {
         noteSkipped(recordLabel, 'source:embedded-data-uri')
@@ -555,7 +681,7 @@ export async function exportVisslmPack(
       ok: true,
       path: targetPath,
       recordCount,
-      message: `已导出 ${recordCount} 条数据和 ${assets.size} 个二进制资源${skippedImageCount ? `，跳过 ${skippedImageCount} 张无法恢复的图片` : ''}`,
+      message: `已导出 ${recordCount} 条数据和 ${assets.size} 个二进制资源${skippedImageCount ? `，跳过 ${skippedImageCount} 张图片（本地尚无可用图片文件，请重新采集后再导出）` : ''}`,
       format: 'visslmpack',
       packVersion: PACK_VERSION,
       assetCount: assets.size,
@@ -714,6 +840,28 @@ export async function importVisslmPack(
     const referencedAssets = new Set<string>()
     const validatedAssets = new Set<string>()
     const assetMimeTypes = new Map<string, string>()
+    const ensureImportedAsset = (
+      sha256Input: string,
+      preferredMime: string,
+      context: string
+    ): { assetPath: string; mimeType: string } => {
+      const sha256 = validSha256(sha256Input)
+      if (!sha256) throw new Error(`${context} 图片资源 SHA-256 无效：${sha256Input}`)
+      const assetPath = `assets/${sha256}`
+      const stagedAsset = entries.get(assetPath)
+      if (!stagedAsset) throw new Error(`${context} 引用了缺失图片资源：${sha256}`)
+      referencedAssets.add(assetPath)
+      const rawAssetBytes = readFileSync(stagedAsset)
+      const detectedMime = detectMimeType(rawAssetBytes)
+      const declaredMime = normalizePackMime(preferredMime)
+      const mimeType = declaredMime.startsWith('image/') ? declaredMime : detectedMime
+      assetMimeTypes.set(sha256, assetMimeTypes.get(sha256) || mimeType)
+      if (!validatedAssets.has(sha256)) {
+        validateAssetBytes(sha256, mimeType, rawAssetBytes)
+        validatedAssets.add(sha256)
+      }
+      return { assetPath, mimeType: assetMimeTypes.get(sha256) || mimeType }
+    }
     const reader = createInterface({ input: createReadStream(recordsPath), crlfDelay: Infinity })
     let lineNumber = 0
     for await (const line of reader) {
@@ -725,57 +873,63 @@ export async function importVisslmPack(
       const convertedImages = images.map((input) => {
         const image = asObject(input)
         if (!image) return input
-        const sha256 = text(image.sha256).trim().toLowerCase()
+        const sha256 = validSha256(image.sha256)
         if (!/^[a-f0-9]{64}$/.test(sha256)) return image
         const assetPath = safeEntryName(text(image.assetPath) || `assets/${sha256}`)
         if (assetPath !== `assets/${sha256}`) throw new Error(`图片资源路径与 SHA 不一致：${sha256}`)
-        const stagedAsset = entries.get(assetPath)
-        if (!stagedAsset) throw new Error(`记录引用了缺失图片资源：${sha256}`)
-        referencedAssets.add(assetPath)
-        assetMimeTypes.set(sha256, normalizePackMime(image.mimeType))
-        if (!validatedAssets.has(sha256)) {
-          validateAssetBytes(sha256, text(image.mimeType) || 'application/octet-stream', readFileSync(stagedAsset))
-          validatedAssets.add(sha256)
-        }
+        const importedAsset = ensureImportedAsset(sha256, text(image.mimeType), `记录第 ${lineNumber} 行`)
         const existingToken = parseAssetToken(text(image.assetUrl))
         return {
           ...image,
+          mimeType: importedAsset.mimeType,
           assetUrl: existingToken?.sha256 === sha256
             ? text(image.assetUrl)
             : `visslm-asset://${sha256}/import-${sha256.slice(0, 16)}`
         }
       })
       const raw = asObject(row.raw)
-      const description = text(raw?._valm_Description)
-      if (description) {
-        for (const source of findRichTextImageSources(description)) {
-          const parsed = parseAssetToken(source.source)
-          if (!parsed) throw new Error(`records.jsonl 第 ${lineNumber} 行含未令牌化图片`)
-          const assetPath = `assets/${parsed.sha256}`
-          const stagedAsset = entries.get(assetPath)
-          if (!stagedAsset) throw new Error(`记录引用了缺失图片资源：${parsed.sha256}`)
-          referencedAssets.add(assetPath)
-          const rawAssetBytes = readFileSync(stagedAsset)
-          const detectedMime = detectMimeType(rawAssetBytes)
-          assetMimeTypes.set(parsed.sha256, assetMimeTypes.get(parsed.sha256) || detectedMime)
-          if (!validatedAssets.has(parsed.sha256)) {
-            validateAssetBytes(parsed.sha256, detectedMime, rawAssetBytes)
-            validatedAssets.add(parsed.sha256)
+      const validateRawImages = (input: unknown, fieldPath = ''): void => {
+        if (typeof input === 'string') {
+          for (const match of input.matchAll(assetTokenPattern)) {
+            const parsed = parseAssetToken(match[0])
+            if (!parsed) continue
+            const importedAsset = ensureImportedAsset(parsed.sha256, '', `records.jsonl 第 ${lineNumber} 行`)
+            if (!convertedImages.some((candidate) =>
+              validSha256(asObject(candidate)?.sha256) === parsed.sha256 ||
+              parseAssetToken(text(asObject(candidate)?.assetUrl))?.sha256 === parsed.sha256
+            )) {
+              const verifiedAsset = verified.get(importedAsset.assetPath)
+              convertedImages.push({
+                id: parsed.referenceId,
+                name: '',
+                mimeType: importedAsset.mimeType,
+                sourceUrl: 'imported:asset',
+                sha256: parsed.sha256,
+                byteSize: verifiedAsset?.byteSize ?? 0,
+                assetUrl: match[0]
+              })
+            }
           }
-          if (!convertedImages.some((input) => parseAssetToken(text(asObject(input)?.assetUrl))?.sha256 === parsed.sha256)) {
-            const verifiedAsset = verified.get(assetPath)
-            convertedImages.push({
-              id: parsed.referenceId,
-              name: '',
-              mimeType: detectedMime,
-              sourceUrl: 'imported:asset',
-              sha256: parsed.sha256,
-              byteSize: verifiedAsset?.byteSize ?? 0,
-              assetUrl: source.source
-            })
+          for (const source of findRichTextImageSources(input)) {
+            if (!parseAssetToken(source.source) && fieldPath === '_valm_Description') {
+              throw new Error(`records.jsonl 第 ${lineNumber} 行含未令牌化图片`)
+            }
           }
+          if (isStandaloneImageSource(input) && fieldPath === '_valm_Description') {
+            throw new Error(`records.jsonl 第 ${lineNumber} 行含未令牌化图片`)
+          }
+          return
+        }
+        if (Array.isArray(input)) {
+          input.forEach((entry, index) => validateRawImages(entry, `${fieldPath}[${index}]`))
+          return
+        }
+        if (input && typeof input === 'object') {
+          Object.entries(input as JsonObject).forEach(([key, entry]) =>
+            validateRawImages(entry, fieldPath ? `${fieldPath}.${key}` : key))
         }
       }
+      validateRawImages(raw)
       preparedRows.push({ ...row, images: convertedImages })
     }
     if (lineNumber !== manifestRecordCount) {

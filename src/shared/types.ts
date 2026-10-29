@@ -66,6 +66,7 @@ export interface PlatformSettings {
   username: string
   hasToken: boolean
   hasUploadPassword: boolean
+  mcpServerPath?: string
 }
 
 export interface PlatformSettingsInput {
@@ -73,6 +74,7 @@ export interface PlatformSettingsInput {
   username: string
   token?: string
   uploadPassword?: string
+  mcpServerPath?: string
 }
 
 export interface SystemSettings {
@@ -633,7 +635,29 @@ export interface PushFieldMapping {
   targetField: string
 }
 
-export interface PushConfig {
+export interface PushUserMapping {
+  id: string
+  sourceLogin: string
+  targetLogin: string
+}
+
+export interface PushFixedParameter {
+  id: string
+  location: 'body' | 'query'
+  key: string
+  valueType: 'text' | 'json'
+  value: string
+}
+
+export interface PushValueOptions {
+  /** Literal target body keys, after field-name mapping. */
+  userMappingFields?: string[]
+  userMappings?: PushUserMapping[]
+  unmappedUserPolicy?: 'error' | 'keep'
+  fixedParameters?: PushFixedParameter[]
+}
+
+export interface PushConfig extends PushValueOptions {
   recordUids: string[]
   nodeType: string
   projectId: string
@@ -980,6 +1004,13 @@ export interface ChatSource {
   sheetName?: string
   snippet?: string
   score?: number
+  /** Bounded evidence captured from a live platform query, never a local record lookup. */
+  platformSnapshot?: {
+    fetchedAt: string
+    text: string
+    fields: Record<string, unknown>
+    fieldLabels: Record<string, string>
+  }
 }
 
 export type KnowledgeDocumentStatus = 'queued' | 'processing' | 'ready' | 'failed'
@@ -1162,6 +1193,8 @@ export type AssistantIntentResultMode =
 export type AssistantThinkingMode = 'auto' | 'on' | 'off'
 
 export interface AssistantIntentDecision {
+  recordOrigin?: 'local' | 'platform'
+  delivery?: { format: 'docx' | 'xlsx' | 'pptx' | 'zip'; instructions: string; referencesPriorResult: boolean }
   taskType: AssistantIntentTaskType
   skillId: ExpertId
   sourceMode: AssistantIntentSourceMode
@@ -1525,6 +1558,8 @@ export interface AppApi {
     patch: FieldProfileSemanticPatch
   ): Promise<FieldProfile>
   executeQuery(spec: QuerySpec): Promise<QueryDataset>
+  executeDashboardQuery(dashboard: DashboardSpec, spec: QuerySpec): Promise<QueryDataset>
+  listDashboardFieldProfiles(dashboard: DashboardSpec, scope: DataScope): Promise<FieldProfile[]>
   listDashboards(): Promise<DashboardSummary[]>
   getDashboard(id: string, version?: number): Promise<DashboardVersion | null>
   listDashboardVersions(id: string): Promise<DashboardVersion[]>

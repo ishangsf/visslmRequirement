@@ -1,3 +1,4 @@
+import '../tests/helpers/visualization-discovery-fixture'
 import { join } from 'node:path'
 import { QueryEngine } from '../src/main/analytics/query-engine'
 import { AppDatabase } from '../src/main/database'

@@ -115,7 +115,7 @@ for (const match of unresolvedRecords.matchAll(/visslm-asset:\/\/([a-f0-9]{64})\
   assert.ok(archiveAssetEntries.has(`assets/${match[1].toLowerCase()}`), `正文引用了缺失图片资源：${match[1]}`)
 }
 
-assert.match(partialExport.message, /跳过 1 张无法恢复的图片/)
+assert.match(partialExport.message, /跳过 1 张图片（本地尚无可用图片文件，请重新采集后再导出）/)
 
 const partialTarget = new AppDatabase(join(root, 'partial-target.db'), join(root, 'partial-target-assets'))
 const partialImported = await importVisslmPack(partialTarget, unresolvedPackPath)

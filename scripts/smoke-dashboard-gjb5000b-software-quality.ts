@@ -35,6 +35,7 @@ globalThis.fetch = (async () => {
 
 try {
   const result = await runDashboardDomainChatRequest({
+    domainSelection: { scenario: softwareQualityGoldenFixture.scenario, role: softwareQualityGoldenFixture.role, tailoringBaselineId: 'sample-tailoring-baseline-v1' },
     question: softwareQualityGoldenFixture.request,
     scope: { projectIds: [softwareQualityGoldenFixture.projectId] },
     generatedAt: softwareQualityGoldenFixture.generatedAt
@@ -89,6 +90,7 @@ try {
     raw: Object.fromEntries(Object.entries(record.raw).filter(([field]) => field !== 'defectDensity'))
   }))
   const missingDensity = await runDashboardDomainChatRequest({
+    domainSelection: { scenario: softwareQualityGoldenFixture.scenario, role: softwareQualityGoldenFixture.role, tailoringBaselineId: 'sample-tailoring-baseline-v1' },
     question: softwareQualityGoldenFixture.request,
     scope: { projectIds: [softwareQualityGoldenFixture.projectId] },
     generatedAt: softwareQualityGoldenFixture.generatedAt
@@ -99,6 +101,7 @@ try {
   assert.ok(!JSON.stringify(missingDensity).includes('缺陷总数'))
 
   const roleMismatch = await runDashboardDomainChatRequest({
+    domainSelection: { scenario: scenario!.id, role: 'model-org-manager', tailoringBaselineId: 'sample-tailoring-baseline-v1' },
     question: '型号组织管理负责人基于受控样例生成软件质量与缺陷闭环大屏',
     scope: { projectIds: [softwareQualityGoldenFixture.projectId] },
     generatedAt: softwareQualityGoldenFixture.generatedAt
