@@ -653,7 +653,6 @@ export interface PushValueOptions {
   /** Literal target body keys, after field-name mapping. */
   userMappingFields?: string[]
   userMappings?: PushUserMapping[]
-  unmappedUserPolicy?: 'error' | 'keep'
   fixedParameters?: PushFixedParameter[]
 }
 

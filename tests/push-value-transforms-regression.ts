@@ -25,9 +25,10 @@ assert.deepEqual(transform({ Devs: 'alice.ext; bob.ext，alice.ext\nbob.ext', Re
   Devs: 'alice.internal;bob.internal，alice.internal\nbob.internal', Reviewers: ['bob.internal', null, ''], Description: 'alice.ext',
   Source: '内网导入', Flags: { enabled: true, count: 0, tags: ['a'], empty: null }
 })
-assert.throws(() => transform({ Devs: 'Alice.ext' }, {}), /未配置映射/)
 assert.throws(() => transform({ Devs: { login: 'alice.ext' } }, {}), /数据结构/)
-assert.equal(compilePushValueTransforms({ ...options, unmappedUserPolicy: 'keep' })({ Devs: 'alice.ext;unknown' }, {}).body.Devs, 'alice.internal;unknown')
+const mixedUsers = transform({ Devs: 'alice.ext; liubing，bob.ext\nAlice.ext', Reviewers: ['bob.ext', 'liubing'] }, {}).body
+assert.equal(mixedUsers.Devs, 'alice.internal; liubing，bob.internal\nAlice.ext')
+assert.deepEqual(mixedUsers.Reviewers, ['bob.internal', 'liubing'])
 assert.equal(compilePushValueTransforms({ ...options, fixedParameters: [
   { id: 'override', location: 'body', key: 'Devs', valueType: 'text', value: 'fixed.internal' }
 ] })({ Devs: 'unknown' }, {}).body.Devs, 'fixed.internal')
@@ -49,7 +50,7 @@ for (const value of ['{oops}', 'undefined', '1e999']) {
 assert.throws(() => compilePushValueTransforms({ ...options, userMappings: [...options.userMappings!, options.userMappings![0]] }), /重复/)
 assert.throws(() => compilePushValueTransforms({ ...options, fixedParameters: [...options.fixedParameters!, options.fixedParameters![0]] }), /重复/)
 assert.throws(() => compilePushValueTransforms({ ...options, userMappingFields: [] }), /目标字段/)
-assert.throws(() => compilePushValueTransforms({ ...options, userMappings: [] }), /至少/)
+assert.deepEqual(compilePushValueTransforms({ ...options, userMappings: [] })({ Devs: 'alice.ext; liubing' }, {}).body.Devs, 'alice.ext; liubing')
 
 const directory = mkdtempSync(join(tmpdir(), 'push-values-regression-'))
 const db = new AppDatabase(join(directory, 'data.db'), join(directory, 'assets'))
@@ -63,13 +64,13 @@ const client = {
   }
 } as unknown as VisslmClient
 try {
-  for (const [uid, rao] of [['first', 'alice.ext;bob.ext'], ['second', 'unknown']]) {
+  for (const [uid, rao] of [['first', 'alice.ext;bob.ext'], ['second', 'liubing']]) {
     db.upsertRecord({ uid, projectId: 'source', nodeType: 'Task', itemId: uid, parentId: '', name: uid,
       lastModifyTime: '', normalizedText: uid, raw: { RAO: rao, Reviewers: ['bob.ext'], Source: 'original', Secret: 'unmapped' } })
   }
   const service = new PushService(db, () => client)
   const config: PushConfig = {
-    ...options, recordUids: ['first'], nodeType: 'Task', projectId: 'internal',
+    ...options, recordUids: ['first', 'second'], nodeType: 'Task', projectId: 'internal',
     fieldMappings: [
       { id: 'dev', sourceField: 'RAO', targetField: 'Devs' },
       { id: 'review', sourceField: 'Reviewers', targetField: 'Reviewers' },
@@ -79,19 +80,20 @@ try {
   const preview = service.preview(config)
   assert.equal(calls.length, 0)
   assert.equal(preview.requests[0].body.Devs, 'alice.internal;bob.internal')
+  assert.equal(preview.requests[1].body.Devs, 'liubing')
   assert.equal(preview.requests[0].body.Source, '内网导入')
   assert.equal(preview.requests[0].body.Secret, undefined)
   assert.equal(preview.requests[0].params.workflow, '审批 & 导入=1')
   assert.throws(() => service.preview({ ...config, userMappingFields: ['RAO'] }), /不在推送目标字段/)
-  await assert.rejects(service.push({ ...config, recordUids: ['first', 'second'] }), /second.*unknown.*未配置映射/)
+  await assert.rejects(service.push({ ...config, userMappings: [{ id: 'empty', sourceLogin: 'alice.ext', targetLogin: '' }] }), /请完整填写/)
   assert.equal(calls.length, 0, 'validate the whole batch before sending any record')
   const result = await service.push(config)
-  assert.equal(result.successCount, 1)
-  assert.deepEqual(calls[0].body, preview.requests[0].body)
+  assert.equal(result.successCount, 2)
+  assert.deepEqual(calls.map((call) => call.body), preview.requests.map((request) => request.body))
   assert.equal(calls[0].params.workflow, preview.requests[0].params.workflow)
   assert.equal(calls[0].params.ApiToken, undefined)
   assert.equal(db.getRecord('first', false)!.raw.RAO, 'alice.ext;bob.ext')
-  const constantsOnly = service.preview({ ...config, fieldMappings: [], userMappingFields: [], userMappings: [] })
+  const constantsOnly = service.preview({ ...config, fieldMappings: [], userMappings: [] })
   assert.deepEqual(Object.keys(constantsOnly.requests[0].body).sort(), ['Flags', 'Source'])
   const legacy = service.preview({ ...config, fieldMappings: undefined, userMappingFields: ['RAO'] })
   assert.equal(legacy.requests[0].body.RAO, 'alice.internal;bob.internal')
@@ -100,8 +102,12 @@ try {
   rmSync(directory, { recursive: true, force: true })
 }
 
-const draft = parsePushConfigDraft({ version: 3, fieldMappings: [], valueOptions: options })!
-assert.deepEqual(compilePushValueTransforms(draft.valueOptions!)({ Devs: 'alice.ext' }, {}), transform({ Devs: 'alice.ext' }, {}))
+const oldOptions = { ...options, unmappedUserPolicy: 'error' }
+const draft = parsePushConfigDraft({ version: 3, fieldMappings: [], valueOptions: oldOptions })!
+assert.equal(Object.hasOwn(draft.valueOptions!, 'unmappedUserPolicy'), false)
+const body = { Devs: 'alice.ext;liubing' }
+assert.deepEqual(compilePushValueTransforms(draft.valueOptions!)(body, {}), transform(body, {}))
+assert.deepEqual(compilePushValueTransforms(oldOptions)(body, {}), transform(body, {}))
 const storage = new Map<string, string>()
 const previousWindow = globalThis.window
 Object.defineProperty(globalThis, 'window', { configurable: true, value: { localStorage: {

@@ -2388,7 +2388,7 @@ export class PushService {
       targetFields.add(mapping.targetField)
     }
     const transformValues = compilePushValueTransforms(config)
-    if (Array.isArray(config.fieldMappings)) {
+    if (config.userMappings?.length && Array.isArray(config.fieldMappings)) {
       const fixedBodyFields = new Set((config.fixedParameters ?? [])
         .filter((parameter) => parameter.location === 'body').map((parameter) => parameter.key.trim()))
       for (const field of config.userMappingFields ?? []) {

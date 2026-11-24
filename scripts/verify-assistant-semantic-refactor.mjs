@@ -2,6 +2,7 @@
 import { spawnSync } from 'node:child_process'
 import { mkdirSync, writeFileSync } from 'node:fs'
 const files = [
+ 'tests/model-client-json-contract-regression.ts',
  'tests/ai-assistant-agent-intent-regression.ts', 'tests/assistant-query-contract-regression.ts',
  'tests/assistant-orchestrator-regression.ts', 'tests/ai-assistant-global-orchestration-regression.ts',
  'tests/assistant-natural-language-delivery-regression.ts', 'tests/assistant-field-semantics-recovery-regression.ts',

@@ -23,18 +23,13 @@ export function PushValueOptionsEditor({ value, targetFields, onChange }: {
       key: 'users', label: `用户登录名映射（${users.length} 组）`,
       children: <div className="push-value-options-content">
         <Typography.Text type="secondary">
-          在字段名映射后转换指定字段的用户值。精确匹配、区分大小写；支持文本、数组及逗号/分号/换行分隔的多用户。源数据保持不变。
+          只需配置内外网登录名不同的账号，未匹配的登录名按原值推送。映射区分大小写，支持单个登录名、数组及逗号、分号或换行分隔的多个登录名。
         </Typography.Text>
         <Form layout="vertical">
           <Form.Item label="需要转换的目标字段 Key" extra="例如 RAO → Devs 时填写 Devs。可选择已有目标字段，也可输入后按回车；点号按完整 Key 处理。">
             <Select mode="tags" aria-label="需要转换的目标字段 Key" value={value.userMappingFields ?? []}
               options={[...new Set(targetFields.map((field) => field.trim()).filter(Boolean))].map((field) => ({ value: field, label: field }))}
               onChange={(fields) => onChange({ ...value, userMappingFields: fields })} />
-          </Form.Item>
-          <Form.Item label="未匹配用户">
-            <Select aria-label="未匹配用户" style={{ width: 240 }} value={value.unmappedUserPolicy ?? 'error'}
-              options={[{ value: 'error', label: '阻止推送并提示（默认）' }, { value: 'keep', label: '保留原值继续推送' }]}
-              onChange={(policy) => onChange({ ...value, unmappedUserPolicy: policy })} />
           </Form.Item>
         </Form>
         <Button icon={<PlusOutlined />} onClick={() => onChange({ ...value, userMappings: [...users, {

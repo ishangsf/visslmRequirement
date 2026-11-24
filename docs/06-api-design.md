@@ -221,6 +221,8 @@ HTTP 500、损坏 JSON 和普通 HTML 不会触发会话兜底。缺少或错误
 | API-EXT-012 | RawChat Codex `GET {baseUrl}/models` | RawChat Codex（Responses）连接测试 | `Authorization: Bearer <API Key>`；地址通常为 `https://rawchat.cn/codex`；响应支持 `data[].id` 或 `models[].id` | `src/main/model-client.ts:284-302,47-57` |
 | API-EXT-013 | RawChat Codex `POST {baseUrl}/responses` | RawChat Codex 对话、结构化输出和工具调用 | Bearer；JSON 使用 `input`、`text.format`、`reasoning.effort`、`max_output_tokens`，工具续接使用 `function_call_output` | `src/main/model-client.ts:572-654` |
 
+结构化输出：`ModelChatInput.format` 传入 JSON Schema 时，OpenAI 使用原生 `json_schema`；Qwen、DeepSeek、智谱等兼容接口使用 `json_object`，并由 `ModelClient` 将完整 Schema 合入系统消息，保留必填字段、枚举和嵌套约束。`json_object` 只保证 JSON 语法，调用方仍须校验意图与查询计划；无效结果不得通过猜测任务或丢弃筛选条件继续执行。回归入口为 `npm run test:model-json-contract`。
+
 线上模型上下文可能包含用户问题、检索证据、结构化查询结果、协议内容和大屏生成数据；是否允许技术协议外发由 `projects:upload-agreement` 的 `allowExternalProcessing` 显式确认控制，但普通 AI 问答的外发范围仍取决于用户选择的在线模型配置，见 `src/main/project-management.ts:191-194`、`src/main/model-client.ts`。
 
 ## 5. 请求和响应示例

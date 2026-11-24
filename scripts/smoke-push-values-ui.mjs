@@ -20,7 +20,7 @@ const db = new Database(join(profile, 'visslm-agent.db'), join(profile, 'assets'
 db.setSetting('platform.baseUrl', 'http://127.0.0.1:1/alm')
 for (const feature of ['dashboard', 'data', 'chat', 'sync', 'push', 'projects']) db.setSetting(`feature.${feature}`, 'true')
 db.upsertRecord({ uid: 'push-ui', projectId: 'source', nodeType: 'Task', itemId: 'UI-1', parentId: '', name: '用户映射验证',
-  lastModifyTime: '', normalizedText: '用户映射验证', raw: { RAO: 'alice.ext;bob.ext', _valm_Name: '用户映射验证' } })
+  lastModifyTime: '', normalizedText: '用户映射验证', raw: { RAO: 'alice.ext;liubing;bob.ext', _valm_Name: '用户映射验证' } })
 db.close()
 const portServer = createServer()
 await new Promise((done) => portServer.listen(0, '127.0.0.1', done))
@@ -83,7 +83,7 @@ try {
     version: 3, formValues: { nodeType: 'Task', projectId: 'internal' },
     fieldMappings: [{ id: 'dev', sourceField: 'RAO', targetField: 'Devs' }], mappingInitialized: true,
     selectedRowKeys: ['push-ui'], search: '', page: 1, pageSize: 20,
-    valueOptions: { userMappingFields: ['Devs'], userMappings: [
+    valueOptions: { userMappingFields: ['Devs'], unmappedUserPolicy: 'error', userMappings: [
       { id: 'alice', sourceLogin: 'alice.ext', targetLogin: 'alice.internal' },
       { id: 'bob', sourceLogin: 'bob.ext', targetLogin: 'bob.internal' }
     ], fixedParameters: [
@@ -94,6 +94,7 @@ try {
   await evaluate(`localStorage.setItem('visslm:push-config-draft:v3', ${JSON.stringify(JSON.stringify(draft))})`)
   await openOptions()
   assert.equal(await evaluate(`document.querySelectorAll('input[aria-label="源平台登录名"]').length`), 2)
+  assert.ok(await evaluate(`document.querySelector('.push-value-options').textContent.includes('未匹配的登录名按原值推送')`))
   // Exercise controlled editor updates and restore them after a full reload.
   await evaluate(`(() => { const input = document.querySelector('input[aria-label="内网登录名或能力名"]'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, 'alice.changed'); input.dispatchEvent(new Event('input', { bubbles: true })); })()`)
   await waitFor(`JSON.parse(localStorage.getItem('visslm:push-config-draft:v3')).valueOptions.userMappings[0].targetLogin === 'alice.changed'`)
@@ -114,9 +115,9 @@ try {
   await evaluate(`[...document.querySelectorAll('button')].find(el => el.textContent.trim() === '测试预览').click()`)
   await waitFor(`!!document.querySelector('.push-request-collapse .ant-collapse-header')`)
   await evaluate(`document.querySelector('.push-request-collapse .ant-collapse-header').click()`)
-  await waitFor(`document.body.textContent.includes('alice.changed;bob.internal')`)
+  await waitFor(`document.body.textContent.includes('alice.changed;liubing;bob.internal')`)
   const preview = await evaluate(`window.visslm.previewPush({ ...JSON.parse(localStorage.getItem('visslm:push-config-draft:v3')).formValues, ...JSON.parse(localStorage.getItem('visslm:push-config-draft:v3')).valueOptions, recordUids: ['push-ui'], fieldMappings: [{ id: 'dev', sourceField: 'RAO', targetField: 'Devs' }] })`)
-  assert.equal(preview.requests[0].body.Devs, 'alice.changed;bob.internal')
+  assert.equal(preview.requests[0].body.Devs, 'alice.changed;liubing;bob.internal')
   assert.equal(preview.requests[0].body.Priority, 3)
   assert.equal(preview.requests[0].params.workflow, 'internal')
   await navigate('资产中心')

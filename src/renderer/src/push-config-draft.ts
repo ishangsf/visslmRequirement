@@ -89,7 +89,6 @@ export const parsePushConfigDraft = (parsed: unknown): PushConfigDraft | null =>
     ? {
         userMappingFields: Array.isArray(parsed.valueOptions.userMappingFields)
           ? parsed.valueOptions.userMappingFields.filter((value): value is string => typeof value === 'string') : [],
-        unmappedUserPolicy: parsed.valueOptions.unmappedUserPolicy === 'keep' ? 'keep' : 'error',
         userMappings: Array.isArray(parsed.valueOptions.userMappings)
           ? parsed.valueOptions.userMappings.map((value, index) => ({
               id: `restored-user-${index}`,

@@ -1674,6 +1674,19 @@ export class ModelClient {
           }
         : {})
     }))
+    // Compatible providers use JSON-object mode, which enforces JSON syntax
+    // but does not transmit the caller's schema. Keep the complete contract
+    // in system instructions so required fields, enums and nested query
+    // constraints are available to the model. Callers still validate output.
+    if (input.format && input.format !== 'json' && this.settings.provider !== 'openai') {
+      const schemaInstruction = '输出必须是符合以下 JSON Schema 的完整 JSON 对象。遵守必填字段、字段类型和枚举约束，不要输出 Markdown 或额外说明。\n' + JSON.stringify(input.format)
+      const systemMessage = messages.find((message) => message.role === 'system')
+      if (systemMessage && typeof systemMessage.content === 'string') {
+        systemMessage.content += '\n\n' + schemaInstruction
+      } else {
+        messages.unshift({ role: 'system', content: schemaInstruction })
+      }
+    }
     const body: Record<string, unknown> = {
       model: this.settings.model,
       messages,

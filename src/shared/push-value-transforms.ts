@@ -19,12 +19,6 @@ export const compilePushValueTransforms = (options: PushValueOptions) => {
   for (const key of ['userMappingFields', 'userMappings', 'fixedParameters'] as const) {
     if (options[key] !== undefined && !Array.isArray(options[key])) throw new Error(`${key} 必须为数组`)
   }
-  if (options.unmappedUserPolicy !== undefined && !['error', 'keep'].includes(options.unmappedUserPolicy)) {
-    throw new Error('未匹配用户处理方式无效')
-  }
-  const fields = (options.userMappingFields ?? []).map(validateKey)
-  if (new Set(fields).size !== fields.length) throw new Error('用户映射字段存在重复')
-  if (fields.some((field) => pushForbiddenTargetFields.has(field))) throw new Error('用户映射不能使用消息体禁止字段')
   const users = new Map<string, string>()
   for (const row of options.userMappings ?? []) {
     if (!row || typeof row.sourceLogin !== 'string' || typeof row.targetLogin !== 'string' ||
@@ -33,8 +27,10 @@ export const compilePushValueTransforms = (options: PushValueOptions) => {
     if (users.has(source)) throw new Error(`源登录名 ${source} 存在重复映射`)
     users.set(source, row.targetLogin.trim())
   }
+  const fields = users.size ? (options.userMappingFields ?? []).map(validateKey) : []
   if (users.size && !fields.length) throw new Error('请指定需要转换用户的目标字段 Key')
-  if (fields.length && !users.size) throw new Error('请至少添加一组用户映射')
+  if (new Set(fields).size !== fields.length) throw new Error('用户映射字段存在重复')
+  if (fields.some((field) => pushForbiddenTargetFields.has(field))) throw new Error('用户映射不能使用消息体禁止字段')
   const usedParameters = new Set<string>()
   const fixed = (options.fixedParameters ?? []).map((row) => {
     if (!row || !['body', 'query'].includes(row.location)) throw new Error('固定参数位置无效')
@@ -62,20 +58,16 @@ export const compilePushValueTransforms = (options: PushValueOptions) => {
     return { key, location: row.location, value }
   })
 
-  const mapLogin = (login: string, field: string): string => {
-    if (!login.trim()) return login
-    const target = users.get(login.trim())
-    if (target !== undefined) return target
-    if (options.unmappedUserPolicy === 'keep') return login
-    throw new Error(`用户字段 ${field} 的登录名“${login.trim()}”未配置映射`)
-  }
   const mapValue = (value: unknown, field: string): unknown => {
     if (value === null || value === undefined || value === '') return value
     if (Array.isArray(value)) return value.map((item) => mapValue(item, field))
     if (typeof value !== 'string') throw new Error(`用户字段 ${field} 需为登录名文本或数组，请先核对数据结构`)
     // Prefer a whole-value match; otherwise preserve the original multi-user delimiters.
-    if (users.has(value.trim())) return users.get(value.trim())
-    return value.split(/([,;，；\r\n]+)/).map((part, index) => index % 2 ? part : mapLogin(part, field)).join('')
+    const target = users.get(value.trim())
+    if (target !== undefined) return target
+    return value.split(/([,;，；\r\n]+)/)
+      .map((part, index) => index % 2 ? part : (users.get(part.trim()) ?? part))
+      .join('')
   }
   return (body: Record<string, unknown>, params: Record<string, string>) => {
     const nextBody = { ...body }
